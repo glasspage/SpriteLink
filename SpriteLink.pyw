@@ -3921,8 +3921,7 @@ class EncryptedChatClient(QObject):
                 )
             return
 
-        self.chat_tooltip_timer.stop()
-        QToolTip.hideText()
+        self._hide_chat_tooltip()
         self._hovered_message_id = message_id
         self._pending_tooltip_message_id = message_id
         self._pending_tooltip_global_position = QPoint(global_position)
@@ -3946,6 +3945,11 @@ class EncryptedChatClient(QObject):
         self._pending_tooltip_message_id = None
         self._hovered_message_id = None
         QToolTip.hideText()
+        app = QApplication.instance()
+        if app is not None:
+            for widget in app.topLevelWidgets():
+                if widget.windowType() == Qt.WindowType.ToolTip:
+                    widget.hide()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if (
