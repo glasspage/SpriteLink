@@ -41,6 +41,7 @@ try:
         QColor,
         QFont,
         QFontMetrics,
+        QPainter,
         QPalette,
         QPolygon,
         QTextBlockFormat,
@@ -70,8 +71,6 @@ try:
         QPushButton,
         QScrollArea,
         QSizePolicy,
-        QProxyStyle,
-        QStyle,
         QStyleFactory,
         QTextBrowser,
         QToolTip,
@@ -145,6 +144,7 @@ MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
 DEFAULT_MESSAGE_FONT = "Segoe UI"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
+MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f2f2f2")
 SELECTABLE_MESSAGE_FONTS = (
     "Arial",
     "Calibri",
@@ -999,30 +999,29 @@ class ChatroomListRow(QWidget):
             self.setGraphicsEffect(opacity)
 
 
-class WindowsClassicStyle(QProxyStyle):
-    """Keep combo-box arrows visible over the classic drop-down button."""
+class ThemeComboBox(QComboBox):
+    """Draw a guaranteed-visible Classic arrow above Qt's styled control."""
 
-    def drawPrimitive(
-        self,
-        element: QStyle.PrimitiveElement,
-        option: Any,
-        painter: Any,
-        widget: QWidget | None = None,
-    ) -> None:
-        if element == QStyle.PrimitiveElement.PE_IndicatorArrowDown:
-            center = option.rect.center()
-            arrow = QPolygon([
-                QPoint(center.x() - 4, center.y() - 2),
-                QPoint(center.x() + 4, center.y() - 2),
-                QPoint(center.x(), center.y() + 3),
-            ])
-            painter.save()
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#000000"))
-            painter.drawPolygon(arrow)
-            painter.restore()
+    def paintEvent(self, event: Any) -> None:
+        super().paintEvent(event)
+        app = QApplication.instance()
+        if app is None or not bool(
+            app.property("spritelinkWindowsClassic")
+        ):
             return
-        super().drawPrimitive(element, option, painter, widget)
+
+        center_x = self.width() - 11
+        center_y = self.height() // 2
+        arrow = QPolygon([
+            QPoint(center_x - 4, center_y - 2),
+            QPoint(center_x + 4, center_y - 2),
+            QPoint(center_x, center_y + 3),
+        ])
+        painter = QPainter(self)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#000000"))
+        painter.drawPolygon(arrow)
+        painter.end()
 
 
 class MainWindow(QMainWindow):
@@ -1055,7 +1054,6 @@ class EncryptedChatClient(QObject):
         self._basic_application_stylesheet = (
             app.styleSheet() if app is not None else ""
         )
-        self._classic_proxy_style: WindowsClassicStyle | None = None
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
@@ -1084,6 +1082,7 @@ class EncryptedChatClient(QObject):
         self.active_chatroom_id = str(
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
         )
+        self._update_window_title()
         cleared_stale_unread = (
             self.config_data.setdefault("unread_counts", {}).pop(
                 self.active_chatroom_id,
@@ -1317,14 +1316,12 @@ class EncryptedChatClient(QObject):
             available_styles = {
                 name.casefold(): name for name in QStyleFactory.keys()
             }
-            classic_style_name = available_styles.get(
-                "windows",
-                available_styles.get("fusion", "Fusion"),
+            app.setStyle(
+                available_styles.get(
+                    "windows",
+                    available_styles.get("fusion", "Fusion"),
+                )
             )
-            self._classic_proxy_style = WindowsClassicStyle(
-                classic_style_name
-            )
-            app.setStyle(self._classic_proxy_style)
             app.setPalette(self._windows_classic_palette())
             app.setStyleSheet(WINDOWS_CLASSIC_STYLESHEET)
         else:
@@ -1336,9 +1333,16 @@ class EncryptedChatClient(QObject):
             )
             if basic_style is not None:
                 app.setStyle(basic_style)
-            self._classic_proxy_style = None
             app.setPalette(QPalette(self._basic_palette))
             app.setStyleSheet(self._basic_application_stylesheet)
+
+        app.setProperty(
+            "spritelinkWindowsClassic",
+            self._is_windows_classic_theme(),
+        )
+        for widget in app.allWidgets():
+            if isinstance(widget, ThemeComboBox):
+                widget.update()
 
         if hasattr(self, "config_panel"):
             self.config_panel.setStyleSheet(
@@ -1469,6 +1473,10 @@ class EncryptedChatClient(QObject):
         self.active_chatroom_id = GLOBAL_CHATROOM_ID
         self.config_data["active_chatroom_id"] = GLOBAL_CHATROOM_ID
         return self._chatroom_definitions()[0]
+
+    def _update_window_title(self) -> None:
+        room_name = self._active_chatroom()["nickname"]
+        self.root.setWindowTitle(f"{APP_NAME} ({room_name})")
 
     def _room_profile(self, room_id: str) -> dict[str, str]:
         profiles = self.config_data.setdefault("room_profiles", {})
@@ -1726,6 +1734,7 @@ class EncryptedChatClient(QObject):
 
     def _switch_active_chatroom(self) -> None:
         self._unread_counts().pop(self.active_chatroom_id, None)
+        self._update_window_title()
         try:
             save_config(self.config_data)
         except Exception:
@@ -1844,7 +1853,7 @@ class EncryptedChatClient(QObject):
         font_layout.setContentsMargins(8, 5, 8, 5)
         font_layout.setSpacing(7)
         font_layout.addWidget(QLabel("Font"))
-        self.message_font_combo = QComboBox()
+        self.message_font_combo = ThemeComboBox()
         self.message_font_combo.addItems(list(SELECTABLE_MESSAGE_FONTS))
         self._refresh_message_font_combo_fonts()
         self.message_font_combo.currentTextChanged.connect(
@@ -2113,7 +2122,7 @@ class EncryptedChatClient(QObject):
         row += 1
 
         layout.addWidget(QLabel("Preset"), row, 0)
-        self.server_preset_combo = QComboBox()
+        self.server_preset_combo = ThemeComboBox()
         self.server_preset_combo.addItems(list(SERVER_PRESETS.keys()))
         self.server_preset_combo.setCurrentText(str(self.server_preset_var.get()))
         self.server_preset_combo.currentTextChanged.connect(
@@ -2153,7 +2162,7 @@ class EncryptedChatClient(QObject):
         row += 1
 
         layout.addWidget(QLabel("Themes"), row, 0)
-        self.theme_combo = QComboBox()
+        self.theme_combo = ThemeComboBox()
         self.theme_combo.addItems(list(THEMES))
         self.theme_combo.setCurrentText(str(self.theme_var.get()))
         self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
@@ -3509,7 +3518,7 @@ class EncryptedChatClient(QObject):
         previous_timestamp: int | None = None
         first_item = True
 
-        for item in self.message_log:
+        for message_index, item in enumerate(self.message_log):
             current_timestamp = self._display_timestamp_for_item(item)
 
             if (
@@ -3540,6 +3549,9 @@ class EncryptedChatClient(QObject):
                 item,
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
+                background_color=MESSAGE_ROW_BACKGROUNDS[
+                    message_index % len(MESSAGE_ROW_BACKGROUNDS)
+                ],
             )
             first_item = False
             previous_timestamp = current_timestamp
@@ -3555,7 +3567,13 @@ class EncryptedChatClient(QObject):
         *,
         muted_ids: set[str],
         collapsed_ids: set[str],
+        background_color: str,
     ) -> None:
+        message_start_position = cursor.position()
+        row_format = cursor.blockFormat()
+        row_format.setBackground(QColor(background_color))
+        cursor.setBlockFormat(row_format)
+
         message = item["message"]
         timestamp = self._display_timestamp_for_item(item)
         username = str(message["u"])
@@ -3649,6 +3667,19 @@ class EncryptedChatClient(QObject):
                 self._text_format("#b00020", font_name=font_name),
             )
 
+        # Explicit newlines create additional QTextBlocks. Apply the same
+        # block background to every block belonging to this message so a
+        # multi-line message remains one consistent visual row.
+        document = cursor.document()
+        block = document.findBlock(message_start_position)
+        final_block_number = cursor.block().blockNumber()
+        while block.isValid() and block.blockNumber() <= final_block_number:
+            block_cursor = QTextCursor(block)
+            block_format = block.blockFormat()
+            block_format.setBackground(QColor(background_color))
+            block_cursor.setBlockFormat(block_format)
+            block = block.next()
+
     def _append_system_message(
         self,
         text: str,
@@ -3659,6 +3690,9 @@ class EncryptedChatClient(QObject):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         if not self.chat_display.document().isEmpty():
             cursor.insertBlock()
+        system_block = cursor.blockFormat()
+        system_block.setBackground(QColor("#ffffff"))
+        cursor.setBlockFormat(system_block)
         cursor.insertText(
             f"[{display_time}] ",
             self._text_format("#777777"),
