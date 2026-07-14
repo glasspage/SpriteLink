@@ -32,7 +32,6 @@ import secrets
 import threading
 import time
 import traceback
-import math
 import sys
 import uuid
 import zlib
@@ -120,8 +119,8 @@ MAX_MESSAGE_CHARS = 4000
 NTFY_MAX_BODY_BYTES = 4096
 PACKET_PADDING_BLOCK = 128
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
-MESSAGE_ENTRY_MIN_LINES = 3
-MESSAGE_ENTRY_MAX_LINES = 7
+MESSAGE_ENTRY_MIN_LINES = 1
+MESSAGE_ENTRY_MAX_LINES = 6
 
 # Dark, moderately saturated colors that remain readable against the standard
 # light Tkinter text background. A color is selected only when a new local
@@ -1209,24 +1208,29 @@ class EncryptedChatClient(QObject):
             1,
             QFontMetrics(self.message_entry.font()).lineSpacing(),
         )
-        display_lines = max(
-            1,
-            int(math.ceil(document.size().height() / line_height)),
-        )
+        document_margins = int(document.documentMargin() * 2)
+        document.size()  # Force wrapped line layouts to update.
+        display_lines = 0
+        block = document.begin()
+        while block.isValid():
+            display_lines += max(1, block.layout().lineCount())
+            block = block.next()
+        display_lines = max(1, display_lines)
         visible_lines = max(
             MESSAGE_ENTRY_MIN_LINES,
             min(MESSAGE_ENTRY_MAX_LINES, display_lines),
         )
         margins = (
             self.message_entry.frameWidth() * 2
-            + int(document.documentMargin() * 2)
-            + 4
+            + document_margins
+            + 2
         )
         self.message_entry.setFixedHeight(
             visible_lines * line_height + margins
         )
 
         if display_lines > MESSAGE_ENTRY_MAX_LINES:
+            self.message_entry.ensureCursorVisible()
             scrollbar = self.message_entry.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
 
@@ -1256,7 +1260,10 @@ class EncryptedChatClient(QObject):
             min(packet_size, NTFY_MAX_BODY_BYTES)
         )
         self.message_size_bar.setStyleSheet(
-            "QProgressBar { text-align: center; } "
+            "QProgressBar { background-color: #eeeeee; "
+            "border: 1px solid #a8a8a8; color: "
+            + ("#ffffff" if at_or_over_limit else "#202020")
+            + "; text-align: center; } "
             "QProgressBar::chunk { background: "
             + ("#303030" if at_or_over_limit else "#b8b8b8")
             + "; }"
