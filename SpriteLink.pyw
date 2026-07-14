@@ -47,6 +47,7 @@ try:
         QTextBlockFormat,
         QTextCharFormat,
         QTextCursor,
+        QTextFormat,
         QTextOption,
     )
     from PySide6.QtWidgets import (
@@ -73,6 +74,7 @@ try:
         QSizePolicy,
         QStyleFactory,
         QTextBrowser,
+        QTextEdit,
         QToolTip,
         QVBoxLayout,
         QWidget,
@@ -1795,7 +1797,7 @@ class EncryptedChatClient(QObject):
         self.chat_display.setUndoRedoEnabled(False)
         self.chat_display.setFont(self._make_font("Segoe UI", 10))
         self.chat_display.setViewportMargins(0, 0, 0, 0)
-        self.chat_display.document().setDocumentMargin(0)
+        self.chat_display.document().setDocumentMargin(10)
         text_option = self.chat_display.document().defaultTextOption()
         text_option.setWrapMode(QTextOption.WrapMode.WrapAnywhere)
         self.chat_display.document().setDefaultTextOption(text_option)
@@ -3515,6 +3517,7 @@ class EncryptedChatClient(QObject):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
+        row_selections: list[QTextEdit.ExtraSelection] = []
         previous_timestamp: int | None = None
         first_item = True
 
@@ -3552,9 +3555,12 @@ class EncryptedChatClient(QObject):
                 background_color=MESSAGE_ROW_BACKGROUNDS[
                     message_index % len(MESSAGE_ROW_BACKGROUNDS)
                 ],
+                row_selections=row_selections,
             )
             first_item = False
             previous_timestamp = current_timestamp
+
+        self.chat_display.setExtraSelections(row_selections)
 
         if scroll_to_bottom:
             scrollbar = self.chat_display.verticalScrollBar()
@@ -3568,11 +3574,9 @@ class EncryptedChatClient(QObject):
         muted_ids: set[str],
         collapsed_ids: set[str],
         background_color: str,
+        row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
         message_start_position = cursor.position()
-        row_format = cursor.blockFormat()
-        row_format.setBackground(QColor(background_color))
-        cursor.setBlockFormat(row_format)
 
         message = item["message"]
         timestamp = self._display_timestamp_for_item(item)
@@ -3667,17 +3671,22 @@ class EncryptedChatClient(QObject):
                 self._text_format("#b00020", font_name=font_name),
             )
 
-        # Explicit newlines create additional QTextBlocks. Apply the same
-        # block background to every block belonging to this message so a
-        # multi-line message remains one consistent visual row.
+        # Explicit newlines create additional QTextBlocks. A full-width extra
+        # selection paints each block to the viewport edges independently of
+        # the document margin that keeps the text itself padded.
         document = cursor.document()
         block = document.findBlock(message_start_position)
         final_block_number = cursor.block().blockNumber()
         while block.isValid() and block.blockNumber() <= final_block_number:
-            block_cursor = QTextCursor(block)
-            block_format = block.blockFormat()
-            block_format.setBackground(QColor(background_color))
-            block_cursor.setBlockFormat(block_format)
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = QTextCursor(block)
+            selection.cursor.clearSelection()
+            selection.format.setBackground(QColor(background_color))
+            selection.format.setProperty(
+                QTextFormat.Property.FullWidthSelection,
+                True,
+            )
+            row_selections.append(selection)
             block = block.next()
 
     def _append_system_message(
@@ -3711,6 +3720,7 @@ class EncryptedChatClient(QObject):
         self.message_log.clear()
         self.rendered_message_items.clear()
         self.rendered_tooltips.clear()
+        self.chat_display.setExtraSelections([])
         self.chat_display.clear()
 
     def _play_chime(self) -> None:
