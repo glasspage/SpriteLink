@@ -1,4 +1,4 @@
-# SpriteLink v11
+# SpriteLink v13
 # Windows + Python 3.10+
 #
 # Required packages:
@@ -36,15 +36,18 @@ import sys
 import uuid
 import zlib
 try:
-    from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
+    from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, Signal
     from PySide6.QtGui import (
         QColor,
         QFont,
         QFontMetrics,
+        QPainter,
         QPalette,
+        QPolygon,
         QTextBlockFormat,
         QTextCharFormat,
         QTextCursor,
+        QTextFormat,
         QTextOption,
     )
     from PySide6.QtWidgets import (
@@ -69,7 +72,9 @@ try:
         QPushButton,
         QScrollArea,
         QSizePolicy,
+        QStyleFactory,
         QTextBrowser,
+        QTextEdit,
         QToolTip,
         QVBoxLayout,
         QWidget,
@@ -105,7 +110,7 @@ except ImportError:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 11
+CONFIG_FORMAT_VERSION = 13
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
@@ -119,6 +124,13 @@ SERVER_PRESETS: dict[str, str] = {
     "Local ntfy server": "http://127.0.0.1:8080",
     "Custom ntfy server": "",
 }
+
+DEFAULT_THEME = "Modern (Light)"
+LEGACY_BASIC_THEME = "Basic (Light)"
+THEMES = (
+    DEFAULT_THEME,
+    "Windows Classic",
+)
 
 POLL_INTERVAL_SECONDS = 6.0
 MIN_POLL_REQUEST_SPACING_SECONDS = 5.0
@@ -134,9 +146,9 @@ MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
 DEFAULT_MESSAGE_FONT = "Segoe UI"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
+MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
 SELECTABLE_MESSAGE_FONTS = (
     "Arial",
-    "Bahnschrift",
     "Calibri",
     "Comic Sans MS",
     "Consolas",
@@ -147,7 +159,6 @@ SELECTABLE_MESSAGE_FONTS = (
 )
 MESSAGE_FONT_POINT_SIZES = {
     "Arial": 13,
-    "Bahnschrift": 13,
     "Calibri": 14,
     "Comic Sans MS": 12,
     "Consolas": 14,
@@ -156,10 +167,104 @@ MESSAGE_FONT_POINT_SIZES = {
     "Times New Roman": 14,
     "Tahoma": 12,
 }
-# Preserve receive compatibility with messages created by an earlier v11
-# draft, where "System" resolved to the application UI font rather than the
-# legacy Windows bitmap face.
-SUPPORTED_MESSAGE_FONTS = SELECTABLE_MESSAGE_FONTS + ("System",)
+# Preserve receive compatibility with messages created by earlier v11 drafts.
+# Neither legacy value remains selectable for new messages.
+SUPPORTED_MESSAGE_FONTS = SELECTABLE_MESSAGE_FONTS + (
+    "System",
+    "Bahnschrift",
+)
+
+WINDOWS_CLASSIC_STYLESHEET = """
+QMainWindow, QDialog, QWidget {
+    background-color: #c0c0c0;
+    color: #000000;
+}
+QLabel {
+    background-color: transparent;
+}
+QPushButton {
+    background-color: #c0c0c0;
+    color: #000000;
+    border-top: 2px solid #ffffff;
+    border-left: 2px solid #ffffff;
+    border-right: 2px solid #000000;
+    border-bottom: 2px solid #000000;
+    border-radius: 0px;
+    padding: 3px 8px;
+    min-height: 18px;
+}
+QPushButton:pressed, QPushButton:checked {
+    border-top: 2px solid #000000;
+    border-left: 2px solid #000000;
+    border-right: 2px solid #ffffff;
+    border-bottom: 2px solid #ffffff;
+    padding-top: 4px;
+    padding-left: 9px;
+    padding-right: 7px;
+    padding-bottom: 2px;
+}
+QPushButton:disabled {
+    color: #808080;
+}
+QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
+    background-color: #ffffff;
+    color: #000000;
+    border-top: 2px solid #808080;
+    border-left: 2px solid #808080;
+    border-right: 2px solid #ffffff;
+    border-bottom: 2px solid #ffffff;
+    border-radius: 0px;
+    selection-background-color: #007f82;
+    selection-color: #000000;
+}
+QComboBox {
+    padding: 2px 4px;
+}
+QComboBox::drop-down {
+    background-color: #c0c0c0;
+    border-left: 1px solid #808080;
+    width: 20px;
+}
+QComboBox::down-arrow {
+    width: 9px;
+    height: 5px;
+}
+QComboBox QAbstractItemView, QMenu {
+    background-color: #ffffff;
+    color: #000000;
+    border: 1px solid #000000;
+    selection-background-color: #007f82;
+    selection-color: #000000;
+}
+QListWidget::item:selected, QMenu::item:selected {
+    background-color: #007f82;
+    color: #000000;
+}
+QCheckBox {
+    spacing: 6px;
+}
+QProgressBar {
+    background-color: #ffffff;
+    color: #000000;
+    border-top: 2px solid #808080;
+    border-left: 2px solid #808080;
+    border-right: 2px solid #ffffff;
+    border-bottom: 2px solid #ffffff;
+    border-radius: 0px;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background-color: #007f82;
+}
+QToolTip {
+    background-color: #ffffe1;
+    color: #000000;
+    border: 1px solid #000000;
+}
+QFrame[frameShape="4"], QFrame[frameShape="5"] {
+    color: #808080;
+}
+"""
 
 # Dark, moderately saturated colors that remain readable against the standard
 # light chat background. A color is selected only when a new local
@@ -322,8 +427,8 @@ def default_config() -> dict[str, Any]:
         "config_version": CONFIG_FORMAT_VERSION,
         "server_preset": DEFAULT_SERVER_PRESET,
         "server_url": DEFAULT_SERVER_URL,
+        "theme": DEFAULT_THEME,
         "chime_enabled": True,
-        "anti_aliased_text": True,
         "client_id": secrets.token_hex(32),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
@@ -478,9 +583,11 @@ def load_config() -> dict[str, Any]:
     config.pop("username", None)
     config.pop("username_color", None)
 
-    config["anti_aliased_text"] = bool(
-        config.get("anti_aliased_text", True)
-    )
+    config.pop("anti_aliased_text", None)
+    theme = str(config.get("theme", DEFAULT_THEME))
+    if theme == LEGACY_BASIC_THEME:
+        theme = DEFAULT_THEME
+    config["theme"] = theme if theme in THEMES else DEFAULT_THEME
 
     muted_chatrooms = config.get("muted_chatrooms")
     if not isinstance(muted_chatrooms, list):
@@ -894,6 +1001,69 @@ class ChatroomListRow(QWidget):
             self.setGraphicsEffect(opacity)
 
 
+class ThemeComboBox(QComboBox):
+    """Draw a guaranteed-visible Classic arrow above Qt's styled control."""
+
+    def paintEvent(self, event: Any) -> None:
+        super().paintEvent(event)
+        app = QApplication.instance()
+        if app is None or not bool(
+            app.property("spritelinkWindowsClassic")
+        ):
+            return
+
+        center_x = self.width() - 11
+        center_y = self.height() // 2
+        arrow = QPolygon([
+            QPoint(center_x - 4, center_y - 2),
+            QPoint(center_x + 4, center_y - 2),
+            QPoint(center_x, center_y + 3),
+        ])
+        painter = QPainter(self)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#000000"))
+        painter.drawPolygon(arrow)
+        painter.end()
+
+
+class MessageLogBrowser(QTextBrowser):
+    """Complete full-width row selections across paragraph left margins."""
+
+    def paintEvent(self, event: Any) -> None:
+        super().paintEvent(event)
+        selections = self.extraSelections()
+        if not selections:
+            return
+
+        painter = QPainter(self.viewport())
+        document_layout = self.document().documentLayout()
+        for selection in selections:
+            if not bool(selection.format.property(
+                QTextFormat.Property.FullWidthSelection
+            )):
+                continue
+            block = selection.cursor.block()
+            if not block.isValid():
+                continue
+            block_cursor = QTextCursor(block)
+            left_width = max(0, self.cursorRect(block_cursor).left())
+            if left_width <= 0:
+                continue
+            top = self.cursorRect(block_cursor).top()
+            height = max(
+                1,
+                round(document_layout.blockBoundingRect(block).height()),
+            )
+            painter.fillRect(
+                0,
+                top,
+                left_width + 1,
+                height + 1,
+                selection.format.background(),
+            )
+        painter.end()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -914,6 +1084,16 @@ class EncryptedChatClient(QObject):
         self.root.setMinimumSize(670, 500)
 
         self.config_data = load_config()
+        app = QApplication.instance()
+        self._basic_style_name = (
+            app.style().objectName() if app is not None else "Fusion"
+        )
+        self._basic_palette = (
+            QPalette(app.palette()) if app is not None else QPalette()
+        )
+        self._basic_application_stylesheet = (
+            app.styleSheet() if app is not None else ""
+        )
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
@@ -942,6 +1122,7 @@ class EncryptedChatClient(QObject):
         self.active_chatroom_id = str(
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
         )
+        self._update_window_title()
         cleared_stale_unread = (
             self.config_data.setdefault("unread_counts", {}).pop(
                 self.active_chatroom_id,
@@ -965,11 +1146,11 @@ class EncryptedChatClient(QObject):
         self.server_url_var = ValueModel(
             self.config_data["server_url"]
         )
+        self.theme_var = ValueModel(
+            self.config_data.get("theme", DEFAULT_THEME)
+        )
         self.chime_var = ValueModel(
             bool(self.config_data["chime_enabled"])
-        )
-        self.anti_alias_var = ValueModel(
-            bool(self.config_data.get("anti_aliased_text", True))
         )
         self.status_var = ValueModel("Connecting")
 
@@ -995,19 +1176,21 @@ class EncryptedChatClient(QObject):
         self.ui_queue_timer.timeout.connect(self._process_ui_queue)
         self.ui_queue_timer.start(100)
 
+        self._apply_theme()
         self._apply_application_font_strategy()
         self._build_ui()
         self._apply_server_preset_state()
         self._load_saved_history_for_current_room()
 
         self.root.close_callback = self._on_close
+        QTimer.singleShot(0, self._apply_titlebar_theme)
         self._start_network_thread()
 
     def _font_style_strategy(self) -> QFont.StyleStrategy:
         return (
-            QFont.StyleStrategy.PreferDefault
-            if self.anti_alias_var.get()
-            else QFont.StyleStrategy.NoAntialias
+            QFont.StyleStrategy.NoAntialias
+            if self._is_windows_classic_theme()
+            else QFont.StyleStrategy.PreferDefault
         )
 
     def _resolved_font_family(self, font_name: str) -> str:
@@ -1059,6 +1242,157 @@ class EncryptedChatClient(QObject):
             widget_font = QFont(widget.font())
             widget_font.setStyleStrategy(strategy)
             widget.setFont(widget_font)
+        self._refresh_message_font_combo_fonts()
+
+    def _is_windows_classic_theme(self) -> bool:
+        return self.theme_var.get() == "Windows Classic"
+
+    def _windows_classic_palette(self) -> QPalette:
+        palette = QPalette()
+        colors = {
+            QPalette.ColorRole.Window: "#c0c0c0",
+            QPalette.ColorRole.WindowText: "#000000",
+            QPalette.ColorRole.Base: "#ffffff",
+            QPalette.ColorRole.AlternateBase: "#dfdfdf",
+            QPalette.ColorRole.ToolTipBase: "#ffffe1",
+            QPalette.ColorRole.ToolTipText: "#000000",
+            QPalette.ColorRole.Text: "#000000",
+            QPalette.ColorRole.Button: "#c0c0c0",
+            QPalette.ColorRole.ButtonText: "#000000",
+            QPalette.ColorRole.BrightText: "#ffffff",
+            QPalette.ColorRole.Light: "#ffffff",
+            QPalette.ColorRole.Midlight: "#dfdfdf",
+            QPalette.ColorRole.Mid: "#a0a0a0",
+            QPalette.ColorRole.Dark: "#808080",
+            QPalette.ColorRole.Shadow: "#000000",
+            QPalette.ColorRole.Highlight: "#007f82",
+            QPalette.ColorRole.HighlightedText: "#000000",
+            QPalette.ColorRole.Link: "#007f82",
+            QPalette.ColorRole.LinkVisited: "#800080",
+        }
+        for role, color in colors.items():
+            palette.setColor(role, QColor(color))
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.Text,
+            QColor("#808080"),
+        )
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.ButtonText,
+            QColor("#808080"),
+        )
+        return palette
+
+    def _config_panel_stylesheet(self) -> str:
+        if self._is_windows_classic_theme():
+            return (
+                "QFrame#configPanel { background: #c0c0c0;"
+                " border-top: 2px solid #ffffff;"
+                " border-left: 2px solid #ffffff;"
+                " border-right: 2px solid #000000;"
+                " border-bottom: 2px solid #000000;"
+                " border-radius: 0px; }"
+            )
+        return (
+            "QFrame#configPanel { background: palette(window); "
+            "border: 1px solid palette(mid); border-radius: 3px; }"
+        )
+
+    @staticmethod
+    def _windows_colorref(color: str) -> int:
+        qt_color = QColor(color)
+        return (
+            qt_color.red()
+            | (qt_color.green() << 8)
+            | (qt_color.blue() << 16)
+        )
+
+    def _apply_titlebar_theme(self) -> None:
+        if os.name != "nt" or not hasattr(ctypes, "windll"):
+            return
+
+        try:
+            hwnd = wintypes.HWND(int(self.root.winId()))
+            dwmapi = ctypes.windll.dwmapi
+
+            def set_attribute(attribute: int, value: int) -> None:
+                data = ctypes.c_uint(value)
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd,
+                    ctypes.c_uint(attribute),
+                    ctypes.byref(data),
+                    ctypes.sizeof(data),
+                )
+
+            # Keep both themes light, then color the Windows 11 non-client
+            # frame where the DWM color attributes are supported.
+            set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
+            if self._is_windows_classic_theme():
+                border = "#000000"
+                caption = "#000080"
+                text = "#ffffff"
+                corner_preference = 1  # DWMWCP_DONOTROUND
+            else:
+                border = "#d0d0d0"
+                caption = "#f0f0f0"
+                text = "#000000"
+                corner_preference = 0  # DWMWCP_DEFAULT
+
+            set_attribute(33, corner_preference)  # DWMWA_WINDOW_CORNER_PREFERENCE
+            set_attribute(34, self._windows_colorref(border))
+            set_attribute(35, self._windows_colorref(caption))
+            set_attribute(36, self._windows_colorref(text))
+        except Exception:
+            # Older Windows versions do not expose the color attributes.
+            pass
+
+    def _apply_theme(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        if self._is_windows_classic_theme():
+            available_styles = {
+                name.casefold(): name for name in QStyleFactory.keys()
+            }
+            app.setStyle(
+                available_styles.get(
+                    "windows",
+                    available_styles.get("fusion", "Fusion"),
+                )
+            )
+            app.setPalette(self._windows_classic_palette())
+            app.setStyleSheet(WINDOWS_CLASSIC_STYLESHEET)
+        else:
+            available_styles = {
+                name.casefold(): name for name in QStyleFactory.keys()
+            }
+            basic_style = available_styles.get(
+                self._basic_style_name.casefold()
+            )
+            if basic_style is not None:
+                app.setStyle(basic_style)
+            app.setPalette(QPalette(self._basic_palette))
+            app.setStyleSheet(self._basic_application_stylesheet)
+
+        app.setProperty(
+            "spritelinkWindowsClassic",
+            self._is_windows_classic_theme(),
+        )
+        for widget in app.allWidgets():
+            if isinstance(widget, ThemeComboBox):
+                widget.update()
+
+        if hasattr(self, "config_panel"):
+            self.config_panel.setStyleSheet(
+                self._config_panel_stylesheet()
+            )
+        if hasattr(self, "message_size_bar"):
+            self._draw_message_size_bar()
+        if hasattr(self, "chatrooms_toggle"):
+            self._update_chatrooms_toggle_unread_style()
+        self._apply_titlebar_theme()
 
     def _heading(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -1179,6 +1513,10 @@ class EncryptedChatClient(QObject):
         self.active_chatroom_id = GLOBAL_CHATROOM_ID
         self.config_data["active_chatroom_id"] = GLOBAL_CHATROOM_ID
         return self._chatroom_definitions()[0]
+
+    def _update_window_title(self) -> None:
+        room_name = self._active_chatroom()["nickname"]
+        self.root.setWindowTitle(f"{APP_NAME} ({room_name})")
 
     def _room_profile(self, room_id: str) -> dict[str, str]:
         profiles = self.config_data.setdefault("room_profiles", {})
@@ -1436,6 +1774,7 @@ class EncryptedChatClient(QObject):
 
     def _switch_active_chatroom(self) -> None:
         self._unread_counts().pop(self.active_chatroom_id, None)
+        self._update_window_title()
         try:
             save_config(self.config_data)
         except Exception:
@@ -1489,14 +1828,14 @@ class EncryptedChatClient(QObject):
         content_layout.setSpacing(7)
         layout.addWidget(self.chat_content, 1)
 
-        self.chat_display = QTextBrowser()
+        self.chat_display = MessageLogBrowser()
         self.chat_display.setReadOnly(True)
         self.chat_display.setOpenLinks(False)
         self.chat_display.setOpenExternalLinks(False)
         self.chat_display.setUndoRedoEnabled(False)
         self.chat_display.setFont(self._make_font("Segoe UI", 10))
-        self.chat_display.setViewportMargins(6, 6, 6, 6)
-        self.chat_display.document().setDocumentMargin(4)
+        self.chat_display.setViewportMargins(0, 0, 0, 0)
+        self.chat_display.document().setDocumentMargin(0)
         text_option = self.chat_display.document().defaultTextOption()
         text_option.setWrapMode(QTextOption.WrapMode.WrapAnywhere)
         self.chat_display.document().setDefaultTextOption(text_option)
@@ -1554,14 +1893,9 @@ class EncryptedChatClient(QObject):
         font_layout.setContentsMargins(8, 5, 8, 5)
         font_layout.setSpacing(7)
         font_layout.addWidget(QLabel("Font"))
-        self.message_font_combo = QComboBox()
+        self.message_font_combo = ThemeComboBox()
         self.message_font_combo.addItems(list(SELECTABLE_MESSAGE_FONTS))
-        for index, font_name in enumerate(SELECTABLE_MESSAGE_FONTS):
-            self.message_font_combo.setItemData(
-                index,
-                self._make_message_font(font_name),
-                Qt.ItemDataRole.FontRole,
-            )
+        self._refresh_message_font_combo_fonts()
         self.message_font_combo.currentTextChanged.connect(
             self._on_message_font_changed
         )
@@ -1641,6 +1975,21 @@ class EncryptedChatClient(QObject):
     @staticmethod
     def _set_color_preview(preview: QLabel, color: str) -> None:
         preview.setStyleSheet(f"background-color: {color};")
+
+    def _refresh_message_font_combo_fonts(self) -> None:
+        if not hasattr(self, "message_font_combo"):
+            return
+        for index, font_name in enumerate(SELECTABLE_MESSAGE_FONTS):
+            self.message_font_combo.setItemData(
+                index,
+                self._make_message_font(font_name),
+                Qt.ItemDataRole.FontRole,
+            )
+        current_font = self.message_font_combo.currentText()
+        if current_font in SELECTABLE_MESSAGE_FONTS:
+            self.message_font_combo.setFont(
+                self._make_message_font(current_font)
+            )
 
     def _load_active_room_profile_into_controls(self) -> None:
         if not hasattr(self, "identity_username_entry"):
@@ -1778,10 +2127,7 @@ class EncryptedChatClient(QObject):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        self.config_panel.setStyleSheet(
-            "QFrame#configPanel { background: palette(window); "
-            "border: 1px solid palette(mid); border-radius: 3px; }"
-        )
+        self.config_panel.setStyleSheet(self._config_panel_stylesheet())
         panel_row.addWidget(self.config_panel, 8)
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row, 1)
@@ -1816,7 +2162,7 @@ class EncryptedChatClient(QObject):
         row += 1
 
         layout.addWidget(QLabel("Preset"), row, 0)
-        self.server_preset_combo = QComboBox()
+        self.server_preset_combo = ThemeComboBox()
         self.server_preset_combo.addItems(list(SERVER_PRESETS.keys()))
         self.server_preset_combo.setCurrentText(str(self.server_preset_var.get()))
         self.server_preset_combo.currentTextChanged.connect(
@@ -1852,6 +2198,20 @@ class EncryptedChatClient(QObject):
 
         layout.addWidget(self._separator(), row, 0, 1, 3)
         row += 1
+        layout.addWidget(self._heading("Appearance"), row, 0, 1, 3)
+        row += 1
+
+        layout.addWidget(QLabel("Themes"), row, 0)
+        self.theme_combo = ThemeComboBox()
+        self.theme_combo.addItems(list(THEMES))
+        self.theme_combo.setCurrentText(str(self.theme_var.get()))
+        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        self.theme_var.bind(self.theme_combo.setCurrentText)
+        layout.addWidget(self.theme_combo, row, 1, 1, 2)
+        row += 1
+
+        layout.addWidget(self._separator(), row, 0, 1, 3)
+        row += 1
         layout.addWidget(
             self._heading("Notifications and rendering"),
             row,
@@ -1869,43 +2229,6 @@ class EncryptedChatClient(QObject):
         self.chime_var.bind(self.chime_checkbox.setChecked)
         layout.addWidget(self.chime_checkbox, row, 0, 1, 3)
         row += 1
-
-        self.anti_alias_checkbox = QCheckBox("Anti-aliased Text")
-        self.anti_alias_checkbox.setChecked(bool(self.anti_alias_var.get()))
-        self.anti_alias_checkbox.toggled.connect(self.anti_alias_var.set)
-        self.anti_alias_var.bind(self.anti_alias_checkbox.setChecked)
-        layout.addWidget(self.anti_alias_checkbox, row, 0, 1, 3)
-        row += 1
-
-        layout.addWidget(self._separator(), row, 0, 1, 3)
-        row += 1
-
-        button_layout = QHBoxLayout()
-        button_layout.addStretch(1)
-        test_button = QPushButton("Test connection")
-        test_button.clicked.connect(self._test_connection)
-        button_layout.addWidget(test_button)
-        layout.addLayout(button_layout, row, 0, 1, 3)
-        row += 1
-
-        apply_note = self._description(
-            "Changes are saved and applied when the Config panel closes."
-        )
-        layout.addWidget(apply_note, row, 0, 1, 3)
-        row += 1
-
-        layout.addWidget(
-            self._description(
-                "Settings, server message cursors, local history, and the hidden "
-                "client identity are saved in a Windows DPAPI-encrypted file tied "
-                "to the current Windows user."
-            ),
-            row,
-            0,
-            1,
-            3,
-        )
-        row += 1
         layout.setRowStretch(row, 1)
 
     def _sync_config_overlay_geometry(self) -> None:
@@ -1916,7 +2239,6 @@ class EncryptedChatClient(QObject):
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
             bool(self.chime_var.get()),
-            bool(self.anti_alias_var.get()),
         )
 
     def _set_config_toggle_checked(self, checked: bool) -> None:
@@ -1969,6 +2291,28 @@ class EncryptedChatClient(QObject):
 
         self._apply_server_preset_state()
 
+    def _on_theme_changed(self, value: Any) -> None:
+        theme = str(value)
+        if theme not in THEMES:
+            theme = DEFAULT_THEME
+
+        self.theme_var.set(theme)
+        self.config_data["theme"] = theme
+        self._apply_theme()
+        self._apply_application_font_strategy()
+        self._apply_active_composer_style()
+        if hasattr(self, "chat_display"):
+            self._rerender_preserving_scroll()
+
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not save theme",
+                str(exc),
+                parent=self.root,
+            )
+
     def _validate_current_settings(self) -> str:
         server_url = normalize_server_url(str(self.server_url_var.get()))
 
@@ -1983,10 +2327,11 @@ class EncryptedChatClient(QObject):
 
         self.config_data["server_preset"] = self.server_preset_var.get()
         self.config_data["server_url"] = server_url
-        self.config_data["chime_enabled"] = bool(self.chime_var.get())
-        self.config_data["anti_aliased_text"] = bool(
-            self.anti_alias_var.get()
+        theme = str(self.theme_var.get())
+        self.config_data["theme"] = (
+            theme if theme in THEMES else DEFAULT_THEME
         )
+        self.config_data["chime_enabled"] = bool(self.chime_var.get())
 
     def _save_and_reconnect(self) -> bool:
         try:
@@ -2001,6 +2346,7 @@ class EncryptedChatClient(QObject):
             return False
 
         self._clear_visible_room()
+        self._apply_theme()
         self._apply_application_font_strategy()
         self._apply_active_composer_style()
         self._load_saved_history_for_current_room()
@@ -2011,39 +2357,6 @@ class EncryptedChatClient(QObject):
         self.reconnect_requested.set()
         self._append_system_message("Configuration saved. Reconnecting.")
         return True
-
-    def _test_connection(self) -> None:
-        try:
-            server_url = self._validate_current_settings()
-        except Exception as exc:
-            messagebox.showerror(
-                "Invalid configuration",
-                str(exc),
-                parent=self.root,
-            )
-            return
-
-        threading.Thread(
-            target=self._test_connection_worker,
-            args=(server_url,),
-            daemon=True,
-        ).start()
-
-    def _test_connection_worker(self, server_url: str) -> None:
-        try:
-            response = requests.get(
-                f"{server_url}/v1/health",
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            payload = response.json()
-
-            if not isinstance(payload, dict):
-                raise ValueError("Health endpoint returned invalid JSON.")
-        except Exception as exc:
-            self.ui_queue.put(("test_failed", str(exc)))
-        else:
-            self.ui_queue.put(("test_ok", server_url))
 
     def _build_draft_message(self, text: str) -> dict[str, Any]:
         profile = self._active_room_profile()
@@ -2128,15 +2441,30 @@ class EncryptedChatClient(QObject):
         self.message_size_bar.setValue(
             min(packet_size, NTFY_MAX_BODY_BYTES)
         )
-        self.message_size_bar.setStyleSheet(
-            "QProgressBar { background-color: #eeeeee; "
-            "border: 1px solid #a8a8a8; color: "
-            + ("#ffffff" if at_or_over_limit else "#202020")
-            + "; text-align: center; } "
-            "QProgressBar::chunk { background: "
-            + ("#303030" if at_or_over_limit else "#b8b8b8")
-            + "; }"
-        )
+        if self._is_windows_classic_theme():
+            self.message_size_bar.setStyleSheet(
+                "QProgressBar { background-color: #ffffff;"
+                " border-top: 2px solid #808080;"
+                " border-left: 2px solid #808080;"
+                " border-right: 2px solid #ffffff;"
+                " border-bottom: 2px solid #ffffff;"
+                " border-radius: 0px; color: "
+                + ("#ffffff" if at_or_over_limit else "#000000")
+                + "; text-align: center; }"
+                " QProgressBar::chunk { background-color: "
+                + ("#800000" if at_or_over_limit else "#007f82")
+                + "; }"
+            )
+        else:
+            self.message_size_bar.setStyleSheet(
+                "QProgressBar { background-color: #eeeeee; "
+                "border: 1px solid #a8a8a8; color: "
+                + ("#ffffff" if at_or_over_limit else "#202020")
+                + "; text-align: center; } "
+                "QProgressBar::chunk { background: "
+                + ("#303030" if at_or_over_limit else "#b8b8b8")
+                + "; }"
+            )
 
         if self.message_size_check_pending:
             self.message_size_bar.setFormat("Calculating...")
@@ -2591,20 +2919,6 @@ class EncryptedChatClient(QObject):
 
                 elif event_type == "decrypt_failures":
                     pass
-
-                elif event_type == "test_ok":
-                    messagebox.showinfo(
-                        "Connection successful",
-                        "The ntfy health endpoint responded successfully.",
-                        parent=self.root,
-                    )
-
-                elif event_type == "test_failed":
-                    messagebox.showerror(
-                        "Connection failed",
-                        payload,
-                        parent=self.root,
-                    )
 
         except queue.Empty:
             pass
@@ -3241,10 +3555,11 @@ class EncryptedChatClient(QObject):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
+        row_selections: list[QTextEdit.ExtraSelection] = []
         previous_timestamp: int | None = None
         first_item = True
 
-        for item in self.message_log:
+        for message_index, item in enumerate(self.message_log):
             current_timestamp = self._display_timestamp_for_item(item)
 
             if (
@@ -3275,9 +3590,15 @@ class EncryptedChatClient(QObject):
                 item,
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
+                background_color=MESSAGE_ROW_BACKGROUNDS[
+                    message_index % len(MESSAGE_ROW_BACKGROUNDS)
+                ],
+                row_selections=row_selections,
             )
             first_item = False
             previous_timestamp = current_timestamp
+
+        self.chat_display.setExtraSelections(row_selections)
 
         if scroll_to_bottom:
             scrollbar = self.chat_display.verticalScrollBar()
@@ -3290,7 +3611,11 @@ class EncryptedChatClient(QObject):
         *,
         muted_ids: set[str],
         collapsed_ids: set[str],
+        background_color: str,
+        row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
+        message_start_position = cursor.position()
+
         message = item["message"]
         timestamp = self._display_timestamp_for_item(item)
         username = str(message["u"])
@@ -3384,6 +3709,30 @@ class EncryptedChatClient(QObject):
                 self._text_format("#b00020", font_name=font_name),
             )
 
+        # Explicit newlines create additional QTextBlocks. A full-width extra
+        # selection paints each block to the viewport edges independently of
+        # the paragraph margins that keep the text itself padded.
+        document = cursor.document()
+        block = document.findBlock(message_start_position)
+        final_block_number = cursor.block().blockNumber()
+        while block.isValid() and block.blockNumber() <= final_block_number:
+            block_cursor = QTextCursor(block)
+            block_format = block.blockFormat()
+            block_format.setLeftMargin(10)
+            block_format.setRightMargin(10)
+            block_cursor.setBlockFormat(block_format)
+
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = block_cursor
+            selection.cursor.clearSelection()
+            selection.format.setBackground(QColor(background_color))
+            selection.format.setProperty(
+                QTextFormat.Property.FullWidthSelection,
+                True,
+            )
+            row_selections.append(selection)
+            block = block.next()
+
     def _append_system_message(
         self,
         text: str,
@@ -3394,6 +3743,11 @@ class EncryptedChatClient(QObject):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         if not self.chat_display.document().isEmpty():
             cursor.insertBlock()
+        system_block = cursor.blockFormat()
+        system_block.setBackground(QColor("#ffffff"))
+        system_block.setLeftMargin(10)
+        system_block.setRightMargin(10)
+        cursor.setBlockFormat(system_block)
         cursor.insertText(
             f"[{display_time}] ",
             self._text_format("#777777"),
@@ -3412,6 +3766,7 @@ class EncryptedChatClient(QObject):
         self.message_log.clear()
         self.rendered_message_items.clear()
         self.rendered_tooltips.clear()
+        self.chat_display.setExtraSelections([])
         self.chat_display.clear()
 
     def _play_chime(self) -> None:
