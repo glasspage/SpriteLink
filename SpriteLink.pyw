@@ -2,7 +2,7 @@
 # Windows + Python 3.10+
 #
 # Required packages:
-#   pip install requests cryptography
+#   pip install PySide6 requests cryptography
 #
 # Default transport:
 #   https://ntfy.sh
@@ -32,11 +32,49 @@ import secrets
 import threading
 import time
 import traceback
+import math
+import sys
 import uuid
 import zlib
-import tkinter as tk
-from tkinter import colorchooser, font as tkfont, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
+try:
+    from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
+    from PySide6.QtGui import (
+        QColor,
+        QFont,
+        QFontMetrics,
+        QTextBlockFormat,
+        QTextCharFormat,
+        QTextCursor,
+        QTextOption,
+    )
+    from PySide6.QtWidgets import (
+        QApplication,
+        QCheckBox,
+        QColorDialog,
+        QComboBox,
+        QFrame,
+        QGridLayout,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QMenu,
+        QMessageBox,
+        QPlainTextEdit,
+        QProgressBar,
+        QPushButton,
+        QSizePolicy,
+        QTabWidget,
+        QTextBrowser,
+        QToolTip,
+        QVBoxLayout,
+        QWidget,
+    )
+except ImportError as exc:
+    raise SystemExit(
+        "Missing dependency: PySide6\n\nInstall it with:\n"
+        "pip install PySide6 requests cryptography"
+    ) from exc
 from typing import Any
 
 try:
@@ -44,7 +82,7 @@ try:
 except ImportError as exc:
     raise SystemExit(
         "Missing dependency: requests\n\nInstall it with:\n"
-        "pip install requests cryptography"
+        "pip install PySide6 requests cryptography"
     ) from exc
 
 try:
@@ -52,7 +90,7 @@ try:
 except ImportError as exc:
     raise SystemExit(
         "Missing dependency: cryptography\n\nInstall it with:\n"
-        "pip install requests cryptography"
+        "pip install PySide6 requests cryptography"
     ) from exc
 
 try:
@@ -488,12 +526,78 @@ def parse_ntfy_ndjson(response: requests.Response) -> list[dict[str, Any]]:
     return records
 
 
-class EncryptedChatClient:
-    def __init__(self, root: tk.Tk) -> None:
+
+class ValueModel:
+    """Small get/set model used to keep network and UI state decoupled."""
+
+    def __init__(self, value: Any) -> None:
+        self._value = value
+        self._listeners: list[Any] = []
+
+    def get(self) -> Any:
+        return self._value
+
+    def set(self, value: Any) -> None:
+        if value == self._value:
+            return
+        self._value = value
+        for listener in tuple(self._listeners):
+            listener(value)
+
+    def bind(self, listener: Any) -> None:
+        self._listeners.append(listener)
+        listener(self._value)
+
+
+class MessageBoxes:
+    @staticmethod
+    def showerror(title: str, text: str, parent: QWidget | None = None) -> None:
+        QMessageBox.critical(parent, title, str(text))
+
+    @staticmethod
+    def showwarning(title: str, text: str, parent: QWidget | None = None) -> None:
+        QMessageBox.warning(parent, title, str(text))
+
+    @staticmethod
+    def showinfo(title: str, text: str, parent: QWidget | None = None) -> None:
+        QMessageBox.information(parent, title, str(text))
+
+
+messagebox = MessageBoxes()
+
+
+class ComposeTextEdit(QPlainTextEdit):
+    send_requested = Signal()
+
+    def keyPressEvent(self, event: Any) -> None:
+        if (
+            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            self.send_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_callback: Any = None
+
+    def closeEvent(self, event: Any) -> None:
+        if self.close_callback is not None:
+            self.close_callback()
+        event.accept()
+
+
+class EncryptedChatClient(QObject):
+    def __init__(self, root: MainWindow) -> None:
+        super().__init__(root)
         self.root = root
-        self.root.title("Encrypted Chat Client")
-        self.root.geometry("840x650")
-        self.root.minsize(670, 500)
+        self.root.setWindowTitle("Encrypted Chat Client")
+        self.root.resize(840, 650)
+        self.root.setMinimumSize(670, 500)
 
         self.config_data = load_config()
         self.session = requests.Session()
@@ -514,376 +618,324 @@ class EncryptedChatClient:
         self.seen_ntfy_message_ids: set[str] = set()
         self.message_log: list[dict[str, Any]] = []
         self.initial_history_pending = True
-        self.tooltip_window: tk.Toplevel | None = None
         self.draft_message_id = uuid.uuid4().hex
         self.current_estimated_packet_size = 0
         self.message_size_check_pending = False
-        self.message_size_check_job: str | None = None
-        self.message_resize_job: str | None = None
-        self.chat_render_job: str | None = None
-        self.username_context_menu: tk.Menu | None = None
+        self.rendered_message_items: dict[str, dict[str, Any]] = {}
+        self.rendered_tooltips: dict[str, str] = {}
+        self._hovered_message_id: str | None = None
+        self._closing = False
 
-        self.server_preset_var = tk.StringVar(
-            value=self.config_data["server_preset"]
+        self.server_preset_var = ValueModel(
+            self.config_data["server_preset"]
         )
-        self.server_url_var = tk.StringVar(
-            value=self.config_data["server_url"]
+        self.server_url_var = ValueModel(
+            self.config_data["server_url"]
         )
-        self.username_var = tk.StringVar(
-            value=self.config_data["username"]
+        self.username_var = ValueModel(
+            self.config_data["username"]
         )
-        self.color_var = tk.StringVar(
-            value=self.config_data["username_color"]
+        self.color_var = ValueModel(
+            self.config_data["username_color"]
         )
-        self.encryption_key_var = tk.StringVar(
-            value=self.config_data["encryption_key"]
+        self.encryption_key_var = ValueModel(
+            self.config_data["encryption_key"]
         )
-        self.chime_var = tk.BooleanVar(
-            value=bool(self.config_data["chime_enabled"])
+        self.chime_var = ValueModel(
+            bool(self.config_data["chime_enabled"])
         )
-        self.show_key_var = tk.BooleanVar(value=False)
-        self.status_var = tk.StringVar(value="Connecting")
-        self.status_detail_var = tk.StringVar(
-            value="Waiting for a room key."
+        self.show_key_var = ValueModel(False)
+        self.status_var = ValueModel("Connecting")
+        self.status_detail_var = ValueModel(
+            "Waiting for a room key."
         )
+
+        self.message_resize_timer = QTimer(self)
+        self.message_resize_timer.setSingleShot(True)
+        self.message_resize_timer.timeout.connect(self._resize_message_entry)
+
+        self.message_size_timer = QTimer(self)
+        self.message_size_timer.setSingleShot(True)
+        self.message_size_timer.timeout.connect(self._run_message_size_check)
+
+        self.chat_render_timer = QTimer(self)
+        self.chat_render_timer.setSingleShot(True)
+        self.chat_render_timer.timeout.connect(self._finish_chat_resize_render)
+
+        self.ui_queue_timer = QTimer(self)
+        self.ui_queue_timer.timeout.connect(self._process_ui_queue)
+        self.ui_queue_timer.start(100)
 
         self._build_ui()
         self._apply_server_preset_state()
         self._update_color_preview()
         self._load_saved_history_for_current_room()
 
-        self.root.after(100, self._process_ui_queue)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
+        self.root.close_callback = self._on_close
         self._start_network_thread()
 
+    @staticmethod
+    def _heading(text: str) -> QLabel:
+        label = QLabel(text)
+        font = QFont("Segoe UI", 10)
+        font.setBold(True)
+        label.setFont(font)
+        return label
+
+    @staticmethod
+    def _separator() -> QFrame:
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        return separator
+
+    @staticmethod
+    def _description(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setWordWrap(True)
+        return label
+
     def _build_ui(self) -> None:
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
 
-        notebook = ttk.Notebook(self.root)
-        notebook.grid(row=0, column=0, sticky="nsew")
+        notebook = QTabWidget()
+        central_layout.addWidget(notebook)
+        self.root.setCentralWidget(central)
 
-        self.chat_tab = ttk.Frame(notebook, padding=10)
-        self.config_tab = ttk.Frame(notebook, padding=14)
-
-        notebook.add(self.chat_tab, text="Chatroom")
-        notebook.add(self.config_tab, text="Config")
+        self.chat_tab = QWidget()
+        self.config_tab = QWidget()
+        notebook.addTab(self.chat_tab, "Chatroom")
+        notebook.addTab(self.config_tab, "Config")
 
         self._build_chat_tab()
         self._build_config_tab()
 
     def _build_chat_tab(self) -> None:
-        self.chat_tab.columnconfigure(0, weight=1)
-        self.chat_tab.rowconfigure(1, weight=1)
+        layout = QVBoxLayout(self.chat_tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(7)
 
-        status_frame = ttk.Frame(self.chat_tab)
-        status_frame.grid(row=0, column=0, sticky="ew", pady=(0, 7))
-        status_frame.columnconfigure(1, weight=1)
+        status_layout = QHBoxLayout()
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.addWidget(QLabel("Status:"))
 
-        ttk.Label(status_frame, text="Status:").grid(
-            row=0, column=0, sticky="w"
-        )
+        self.status_label = QLabel()
+        status_font = QFont("Segoe UI", 9)
+        status_font.setBold(True)
+        self.status_label.setFont(status_font)
+        self.status_var.bind(self.status_label.setText)
+        status_layout.addWidget(self.status_label)
+        status_layout.addStretch(1)
 
-        ttk.Label(
-            status_frame,
-            textvariable=self.status_var,
-            font=("Segoe UI", 9, "bold"),
-        ).grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self.status_detail_label = QLabel()
+        self.status_detail_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.status_detail_var.bind(self.status_detail_label.setText)
+        status_layout.addWidget(self.status_detail_label)
+        layout.addLayout(status_layout)
 
-        ttk.Label(
-            status_frame,
-            textvariable=self.status_detail_var,
-        ).grid(row=0, column=2, sticky="e")
+        self.chat_display = QTextBrowser()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setOpenLinks(False)
+        self.chat_display.setOpenExternalLinks(False)
+        self.chat_display.setUndoRedoEnabled(False)
+        self.chat_display.setFont(QFont("Segoe UI", 10))
+        self.chat_display.setViewportMargins(6, 6, 6, 6)
+        self.chat_display.document().setDocumentMargin(4)
+        text_option = self.chat_display.document().defaultTextOption()
+        text_option.setWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.chat_display.document().setDefaultTextOption(text_option)
+        self.chat_display.viewport().setMouseTracking(True)
+        self.chat_display.viewport().installEventFilter(self)
+        layout.addWidget(self.chat_display, 1)
 
+        compose_layout = QGridLayout()
+        compose_layout.setContentsMargins(0, 1, 0, 0)
+        compose_layout.setHorizontalSpacing(8)
+        compose_layout.setVerticalSpacing(5)
 
-        self.chat_display = ScrolledText(
-            self.chat_tab,
-            wrap="char",
-            state="disabled",
-            font=("Segoe UI", 10),
-            padx=10,
-            pady=10,
-            undo=False,
+        self.message_entry = ComposeTextEdit()
+        self.message_entry.setFont(QFont("Segoe UI", 10))
+        self.message_entry.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.message_entry.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
         )
-        self.chat_display.grid(row=1, column=0, sticky="nsew")
-        self.chat_display.bind(
-            "<Configure>",
-            self._on_chat_display_configure,
-            add="+",
-        )
-        self.chat_display.tag_configure("timestamp", foreground="#777777")
-        self.chat_display.tag_configure("system", foreground="#a06000")
-        self.chat_display.tag_configure("warning", foreground="#b00020")
-        self.chat_display.tag_configure("message", foreground="#202020")
-        self.chat_display.tag_configure(
-            "gap",
-            foreground="#777777",
-            justify="center",
-            spacing1=7,
-            spacing3=7,
-        )
+        self.message_entry.textChanged.connect(self._schedule_composer_update)
+        self.message_entry.send_requested.connect(self._send_current_message)
+        compose_layout.addWidget(self.message_entry, 0, 0)
 
-        compose_frame = ttk.Frame(self.chat_tab)
-        compose_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        compose_frame.columnconfigure(0, weight=1)
+        self.send_button = QPushButton("Send")
+        self.send_button.clicked.connect(self._send_current_message)
+        self.send_button.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Expanding,
+        )
+        compose_layout.addWidget(self.send_button, 0, 1)
 
-        self.message_entry = tk.Text(
-            compose_frame,
-            height=MESSAGE_ENTRY_MIN_LINES,
-            wrap="word",
-            font=("Segoe UI", 10),
-        )
-        self.message_entry.grid(row=0, column=0, sticky="ew")
-        self.message_entry.bind("<Return>", self._handle_enter)
-        self.message_entry.bind("<Shift-Return>", lambda event: None)
-        self.message_entry.bind(
-            "<<Modified>>",
-            self._on_message_entry_modified,
-        )
-        # Fallback for Tk builds where <<Modified>> is inconsistent.
-        self.message_entry.bind(
-            "<KeyRelease>",
-            self._on_message_entry_activity,
-            add="+",
-        )
-        self.message_entry.edit_modified(False)
+        self.message_size_bar = QProgressBar()
+        self.message_size_bar.setRange(0, NTFY_MAX_BODY_BYTES)
+        self.message_size_bar.setTextVisible(True)
+        self.message_size_bar.setFixedHeight(18)
+        compose_layout.addWidget(self.message_size_bar, 1, 0, 1, 2)
+        layout.addLayout(compose_layout)
 
-        self.send_button = ttk.Button(
-            compose_frame,
-            text="Send",
-            command=self._send_current_message,
-        )
-        self.send_button.grid(row=0, column=1, sticky="ns", padx=(8, 0))
-
-        self.message_size_canvas = tk.Canvas(
-            compose_frame,
-            height=18,
-            background="#eeeeee",
-            highlightthickness=1,
-            highlightbackground="#a8a8a8",
-            borderwidth=0,
-        )
-        self.message_size_canvas.grid(
-            row=1,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=(5, 0),
-        )
-        self.message_size_fill = self.message_size_canvas.create_rectangle(
-            0,
-            0,
-            0,
-            18,
-            fill="#b8b8b8",
-            outline="",
-        )
-        self.message_size_label = self.message_size_canvas.create_text(
-            0,
-            9,
-            text="0.0 KB / 4.0 KB",
-            fill="#202020",
-            font=("Segoe UI", 8),
-            anchor="center",
-        )
-        self.message_size_canvas.bind(
-            "<Configure>",
-            lambda _event: self._draw_message_size_bar(),
-        )
+        self._resize_message_entry()
         self._run_message_size_check()
 
     def _build_config_tab(self) -> None:
-        self.config_tab.columnconfigure(1, weight=1)
+        layout = QGridLayout(self.config_tab)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(5)
+        layout.setColumnStretch(1, 1)
         row = 0
 
-        ttk.Label(
-            self.config_tab,
-            text="Server",
-            font=("Segoe UI", 10, "bold"),
-        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        layout.addWidget(self._heading("Server"), row, 0, 1, 3)
         row += 1
 
-        ttk.Label(self.config_tab, text="Preset").grid(
-            row=row, column=0, sticky="w", padx=(0, 10), pady=5
+        layout.addWidget(QLabel("Preset"), row, 0)
+        self.server_preset_combo = QComboBox()
+        self.server_preset_combo.addItems(list(SERVER_PRESETS.keys()))
+        self.server_preset_combo.setCurrentText(str(self.server_preset_var.get()))
+        self.server_preset_combo.currentTextChanged.connect(
+            self.server_preset_var.set
         )
-
-        self.server_preset_combo = ttk.Combobox(
-            self.config_tab,
-            textvariable=self.server_preset_var,
-            values=list(SERVER_PRESETS.keys()),
-            state="readonly",
+        self.server_preset_combo.currentTextChanged.connect(
+            self._on_server_preset_changed
         )
-        self.server_preset_combo.grid(row=row, column=1, sticky="ew", pady=5)
-        self.server_preset_combo.bind(
-            "<<ComboboxSelected>>",
-            self._on_server_preset_changed,
-        )
+        self.server_preset_var.bind(self.server_preset_combo.setCurrentText)
+        layout.addWidget(self.server_preset_combo, row, 1, 1, 2)
         row += 1
 
-        ttk.Label(self.config_tab, text="Server URL").grid(
-            row=row, column=0, sticky="w", padx=(0, 10), pady=5
-        )
-
-        self.server_url_entry = ttk.Entry(
-            self.config_tab,
-            textvariable=self.server_url_var,
-        )
-        self.server_url_entry.grid(
-            row=row,
-            column=1,
-            columnspan=2,
-            sticky="ew",
-            pady=5,
-        )
+        layout.addWidget(QLabel("Server URL"), row, 0)
+        self.server_url_entry = QLineEdit()
+        self.server_url_entry.setText(str(self.server_url_var.get()))
+        self.server_url_entry.textChanged.connect(self.server_url_var.set)
+        self.server_url_var.bind(self.server_url_entry.setText)
+        layout.addWidget(self.server_url_entry, row, 1, 1, 2)
         row += 1
 
-        ttk.Label(
-            self.config_tab,
-            text=(
+        layout.addWidget(
+            self._description(
                 "ntfy.sh is selected by default. On startup, the client requests "
                 "up to 48 hours of cached encrypted history, subject to the server's "
                 "actual retention period."
             ),
-            wraplength=680,
-        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 8))
-        row += 1
-
-        ttk.Separator(self.config_tab).grid(
-            row=row, column=0, columnspan=3, sticky="ew", pady=12
+            row,
+            0,
+            1,
+            3,
         )
         row += 1
 
-        ttk.Label(
-            self.config_tab,
-            text="Identity and appearance",
-            font=("Segoe UI", 10, "bold"),
-        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        layout.addWidget(self._separator(), row, 0, 1, 3)
+        row += 1
+        layout.addWidget(self._heading("Identity and appearance"), row, 0, 1, 3)
         row += 1
 
-        ttk.Label(self.config_tab, text="Username").grid(
-            row=row, column=0, sticky="w", padx=(0, 10), pady=5
-        )
-
-        ttk.Entry(
-            self.config_tab,
-            textvariable=self.username_var,
-        ).grid(
-            row=row,
-            column=1,
-            columnspan=2,
-            sticky="ew",
-            pady=5,
-        )
+        layout.addWidget(QLabel("Username"), row, 0)
+        self.username_entry = QLineEdit()
+        self.username_entry.setText(str(self.username_var.get()))
+        self.username_entry.textChanged.connect(self.username_var.set)
+        self.username_var.bind(self.username_entry.setText)
+        layout.addWidget(self.username_entry, row, 1, 1, 2)
         row += 1
 
-        ttk.Label(self.config_tab, text="Username color").grid(
-            row=row, column=0, sticky="w", padx=(0, 10), pady=5
-        )
+        layout.addWidget(QLabel("Username color"), row, 0)
+        color_layout = QHBoxLayout()
+        self.color_preview = QLabel()
+        self.color_preview.setFixedSize(28, 22)
+        self.color_preview.setFrameShape(QFrame.Shape.Panel)
+        self.color_preview.setFrameShadow(QFrame.Shadow.Sunken)
+        color_layout.addWidget(self.color_preview)
 
-        self.color_preview = tk.Label(
-            self.config_tab,
-            text="   ",
-            relief="sunken",
-            borderwidth=1,
-        )
-        self.color_preview.grid(row=row, column=1, sticky="w", pady=5)
-
-        ttk.Button(
-            self.config_tab,
-            text="Choose color...",
-            command=self._choose_color,
-        ).grid(row=row, column=2, sticky="w", padx=(8, 0), pady=5)
+        choose_color_button = QPushButton("Choose color...")
+        choose_color_button.clicked.connect(self._choose_color)
+        color_layout.addWidget(choose_color_button)
+        color_layout.addStretch(1)
+        layout.addLayout(color_layout, row, 1, 1, 2)
         row += 1
 
-        ttk.Separator(self.config_tab).grid(
-            row=row, column=0, columnspan=3, sticky="ew", pady=12
-        )
+        layout.addWidget(self._separator(), row, 0, 1, 3)
+        row += 1
+        layout.addWidget(self._heading("Encryption"), row, 0, 1, 3)
         row += 1
 
-        ttk.Label(
-            self.config_tab,
-            text="Encryption",
-            font=("Segoe UI", 10, "bold"),
-        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        layout.addWidget(QLabel("Chatroom key"), row, 0)
+        self.key_entry = QLineEdit()
+        self.key_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_entry.setText(str(self.encryption_key_var.get()))
+        self.key_entry.textChanged.connect(self.encryption_key_var.set)
+        self.encryption_key_var.bind(self.key_entry.setText)
+        layout.addWidget(self.key_entry, row, 1)
+
+        self.show_key_checkbox = QCheckBox("Show")
+        self.show_key_checkbox.toggled.connect(self.show_key_var.set)
+        self.show_key_checkbox.toggled.connect(self._toggle_key_visibility)
+        layout.addWidget(self.show_key_checkbox, row, 2)
         row += 1
 
-        ttk.Label(self.config_tab, text="Chatroom key").grid(
-            row=row, column=0, sticky="w", padx=(0, 10), pady=5
-        )
-
-        self.key_entry = ttk.Entry(
-            self.config_tab,
-            textvariable=self.encryption_key_var,
-            show="•",
-        )
-        self.key_entry.grid(row=row, column=1, sticky="ew", pady=5)
-
-        ttk.Checkbutton(
-            self.config_tab,
-            text="Show",
-            variable=self.show_key_var,
-            command=self._toggle_key_visibility,
-        ).grid(row=row, column=2, sticky="w", padx=(8, 0), pady=5)
-        row += 1
-
-        ttk.Label(
-            self.config_tab,
-            text=(
+        layout.addWidget(
+            self._description(
                 "The key determines both the encryption key and an opaque ntfy topic. "
                 "Everyone in the same room must enter exactly the same value."
             ),
-            wraplength=680,
-        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 8))
-        row += 1
-
-        ttk.Checkbutton(
-            self.config_tab,
-            text="Play a chime when another user sends a message",
-            variable=self.chime_var,
-        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=5)
-        row += 1
-
-        ttk.Separator(self.config_tab).grid(
-            row=row, column=0, columnspan=3, sticky="ew", pady=12
+            row,
+            0,
+            1,
+            3,
         )
         row += 1
 
-        button_frame = ttk.Frame(self.config_tab)
-        button_frame.grid(row=row, column=0, columnspan=3, sticky="ew")
-        button_frame.columnconfigure(0, weight=1)
-
-        ttk.Button(
-            button_frame,
-            text="Test connection",
-            command=self._test_connection,
-        ).grid(row=0, column=1, padx=(0, 8))
-
-        ttk.Button(
-            button_frame,
-            text="Save and reconnect",
-            command=self._save_and_reconnect,
-        ).grid(row=0, column=2)
+        self.chime_checkbox = QCheckBox(
+            "Play a chime when another user sends a message"
+        )
+        self.chime_checkbox.setChecked(bool(self.chime_var.get()))
+        self.chime_checkbox.toggled.connect(self.chime_var.set)
+        self.chime_var.bind(self.chime_checkbox.setChecked)
+        layout.addWidget(self.chime_checkbox, row, 0, 1, 3)
         row += 1
 
-        ttk.Label(
-            self.config_tab,
-            text=(
+        layout.addWidget(self._separator(), row, 0, 1, 3)
+        row += 1
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        test_button = QPushButton("Test connection")
+        test_button.clicked.connect(self._test_connection)
+        button_layout.addWidget(test_button)
+        save_button = QPushButton("Save and reconnect")
+        save_button.clicked.connect(self._save_and_reconnect)
+        button_layout.addWidget(save_button)
+        layout.addLayout(button_layout, row, 0, 1, 3)
+        row += 1
+
+        layout.addWidget(
+            self._description(
                 "Settings, server message cursors, local history, and the hidden "
                 "client identity are saved in a Windows DPAPI-encrypted file tied "
                 "to the current Windows user."
             ),
-            wraplength=680,
-        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(14, 0))
+            row,
+            0,
+            1,
+            3,
+        )
+        row += 1
+        layout.setRowStretch(row, 1)
 
     def _apply_server_preset_state(self) -> None:
-        preset = self.server_preset_var.get()
-        self.server_url_entry.configure(
-            state="normal" if preset == "Custom ntfy server" else "readonly"
+        preset = str(self.server_preset_var.get())
+        self.server_url_entry.setReadOnly(
+            preset != "Custom ntfy server"
         )
 
-    def _on_server_preset_changed(self, _event: Any = None) -> None:
-        preset = self.server_preset_var.get()
+    def _on_server_preset_changed(self, _value: Any = None) -> None:
+        preset = str(self.server_preset_var.get())
         preset_url = SERVER_PRESETS.get(preset, "")
 
         if preset != "Custom ntfy server":
@@ -892,35 +944,39 @@ class EncryptedChatClient:
         self._apply_server_preset_state()
 
     def _choose_color(self) -> None:
-        selected = colorchooser.askcolor(
-            color=self.color_var.get(),
-            title="Choose username color",
-            parent=self.root,
+        initial = QColor(str(self.color_var.get()))
+        selected = QColorDialog.getColor(
+            initial if initial.isValid() else QColor("#4ea1ff"),
+            self.root,
+            "Choose username color",
         )
 
-        if selected and selected[1]:
-            self.color_var.set(selected[1])
+        if selected.isValid():
+            self.color_var.set(selected.name())
             self._update_color_preview()
 
     def _update_color_preview(self) -> None:
-        color = self.color_var.get().strip() or "#4ea1ff"
+        color = QColor(str(self.color_var.get()).strip() or "#4ea1ff")
+        if not color.isValid():
+            color = QColor("#4ea1ff")
+            self.color_var.set(color.name())
 
-        try:
-            self.color_preview.configure(background=color)
-        except tk.TclError:
-            self.color_var.set("#4ea1ff")
-            self.color_preview.configure(background="#4ea1ff")
+        self.color_preview.setStyleSheet(
+            f"background-color: {color.name()};"
+        )
 
-    def _toggle_key_visibility(self) -> None:
-        self.key_entry.configure(
-            show="" if self.show_key_var.get() else "•"
+    def _toggle_key_visibility(self, _checked: Any = None) -> None:
+        self.key_entry.setEchoMode(
+            QLineEdit.EchoMode.Normal
+            if bool(self.show_key_var.get())
+            else QLineEdit.EchoMode.Password
         )
 
     def _validate_current_settings(self) -> tuple[str, str, str, str]:
-        server_url = normalize_server_url(self.server_url_var.get())
-        username = self.username_var.get().strip()
-        color = self.color_var.get().strip()
-        encryption_key = self.encryption_key_var.get()
+        server_url = normalize_server_url(str(self.server_url_var.get()))
+        username = str(self.username_var.get()).strip()
+        color = str(self.color_var.get()).strip()
+        encryption_key = str(self.encryption_key_var.get())
 
         if not server_url.startswith(("http://", "https://")):
             raise ValueError(
@@ -936,10 +992,8 @@ class EncryptedChatClient:
         if not encryption_key:
             raise ValueError("The chatroom encryption key cannot be empty.")
 
-        try:
-            self.root.winfo_rgb(color)
-        except tk.TclError as exc:
-            raise ValueError("The username color is invalid.") from exc
+        if not QColor(color).isValid():
+            raise ValueError("The username color is invalid.")
 
         derive_ntfy_topic(encryption_key)
         return server_url, username, color, encryption_key
@@ -1011,8 +1065,8 @@ class EncryptedChatClient:
             self.ui_queue.put(("test_ok", server_url))
 
     def _build_draft_message(self, text: str) -> dict[str, Any]:
-        username = self.username_var.get().strip() or "User"
-        color = self.color_var.get().strip() or "#315f8c"
+        username = str(self.username_var.get()).strip() or "User"
+        color = str(self.color_var.get()).strip() or "#315f8c"
 
         return {
             "v": APP_VERSION,
@@ -1024,92 +1078,51 @@ class EncryptedChatClient:
             "m": text,
         }
 
-    def _on_message_entry_modified(
-        self,
-        _event: tk.Event | None = None,
-    ) -> None:
-        if not self.message_entry.edit_modified():
-            return
-
-        self.message_entry.edit_modified(False)
-        self._schedule_composer_update()
-
-    def _on_message_entry_activity(
-        self,
-        _event: tk.Event | None = None,
-    ) -> None:
-        self._schedule_composer_update()
-
     def _schedule_composer_update(self) -> None:
-        if self.message_resize_job is not None:
-            try:
-                self.root.after_cancel(self.message_resize_job)
-            except tk.TclError:
-                pass
-
-        self.message_resize_job = self.root.after_idle(
-            self._resize_message_entry
-        )
-
-        if self.message_size_check_job is not None:
-            try:
-                self.root.after_cancel(self.message_size_check_job)
-            except tk.TclError:
-                pass
-
+        self.message_resize_timer.start(0)
         self.message_size_check_pending = True
-        self.message_size_check_job = self.root.after(
-            MESSAGE_SIZE_DEBOUNCE_MS,
-            self._run_message_size_check,
-        )
+        self.message_size_timer.start(MESSAGE_SIZE_DEBOUNCE_MS)
 
         # A stale over-limit result should not block a click after the user
         # shortens the message. Send performs its own immediate exact check.
-        self.send_button.configure(state="normal")
+        self.send_button.setEnabled(True)
         self._draw_message_size_bar()
 
     def _resize_message_entry(self) -> None:
-        self.message_resize_job = None
-
-        try:
-            self.message_entry.update_idletasks()
-            counted = self.message_entry.count(
-                "1.0",
-                "end",
-                "displaylines",
-            )
-            display_lines = int(counted[0]) if counted else 1
-        except (tk.TclError, TypeError, ValueError):
-            text = self.message_entry.get("1.0", "end-1c")
-            display_lines = max(1, text.count("\n") + 1)
-
+        document = self.message_entry.document()
+        document.setTextWidth(max(1, self.message_entry.viewport().width()))
+        line_height = max(
+            1,
+            QFontMetrics(self.message_entry.font()).lineSpacing(),
+        )
+        display_lines = max(
+            1,
+            int(math.ceil(document.size().height() / line_height)),
+        )
         visible_lines = max(
             MESSAGE_ENTRY_MIN_LINES,
             min(MESSAGE_ENTRY_MAX_LINES, display_lines),
         )
-
-        if int(self.message_entry.cget("height")) != visible_lines:
-            self.message_entry.configure(height=visible_lines)
-            self.message_entry.update_idletasks()
+        margins = (
+            self.message_entry.frameWidth() * 2
+            + int(document.documentMargin() * 2)
+            + 4
+        )
+        self.message_entry.setFixedHeight(
+            visible_lines * line_height + margins
+        )
 
         if display_lines > MESSAGE_ENTRY_MAX_LINES:
-            self.message_entry.see("end-1c")
-            self.message_entry.yview_moveto(1.0)
+            scrollbar = self.message_entry.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     def _cancel_pending_message_size_check(self) -> None:
-        if self.message_size_check_job is not None:
-            try:
-                self.root.after_cancel(self.message_size_check_job)
-            except tk.TclError:
-                pass
-
-        self.message_size_check_job = None
+        self.message_size_timer.stop()
         self.message_size_check_pending = False
 
     def _run_message_size_check(self) -> None:
-        self.message_size_check_job = None
         self.message_size_check_pending = False
-        text = self.message_entry.get("1.0", "end-1c")
+        text = self.message_entry.toPlainText()
 
         try:
             draft_message = self._build_draft_message(text)
@@ -1122,66 +1135,33 @@ class EncryptedChatClient:
         self._draw_message_size_bar()
 
     def _draw_message_size_bar(self) -> None:
-        if not hasattr(self, "message_size_canvas"):
-            return
-
-        width = max(1, self.message_size_canvas.winfo_width())
-        height = max(1, self.message_size_canvas.winfo_height())
         packet_size = max(0, int(self.current_estimated_packet_size))
-
-        fraction = min(
-            1.0,
-            packet_size / float(NTFY_MAX_BODY_BYTES),
-        )
-        fill_width = int(width * fraction)
         at_or_over_limit = packet_size >= NTFY_MAX_BODY_BYTES
 
-        self.message_size_canvas.coords(
-            self.message_size_fill,
-            0,
-            0,
-            fill_width,
-            height,
+        self.message_size_bar.setValue(
+            min(packet_size, NTFY_MAX_BODY_BYTES)
         )
-        self.message_size_canvas.itemconfigure(
-            self.message_size_fill,
-            fill="#303030" if at_or_over_limit else "#b8b8b8",
+        self.message_size_bar.setStyleSheet(
+            "QProgressBar { text-align: center; } "
+            "QProgressBar::chunk { background: "
+            + ("#303030" if at_or_over_limit else "#b8b8b8")
+            + "; }"
         )
-        self.message_size_canvas.coords(
-            self.message_size_label,
-            width / 2,
-            height / 2,
-        )
+
         if self.message_size_check_pending:
-            label_text = "Calculating..."
-            label_color = "#202020"
+            self.message_size_bar.setFormat("Calculating...")
         else:
-            label_text = (
+            self.message_size_bar.setFormat(
                 f"{packet_size / 1024.0:.1f} KB / "
                 f"{NTFY_MAX_BODY_BYTES / 1024.0:.1f} KB"
             )
-            label_color = "#ffffff" if at_or_over_limit else "#202020"
 
-        self.message_size_canvas.itemconfigure(
-            self.message_size_label,
-            text=label_text,
-            fill=label_color,
+        self.send_button.setEnabled(
+            self.message_size_check_pending or not at_or_over_limit
         )
 
-        if not self.message_size_check_pending and at_or_over_limit:
-            self.send_button.configure(state="disabled")
-        else:
-            self.send_button.configure(state="normal")
-
-    def _handle_enter(self, event: tk.Event) -> str | None:
-        if event.state & 0x0001:
-            return None
-
-        self._send_current_message()
-        return "break"
-
     def _send_current_message(self) -> None:
-        text = self.message_entry.get("1.0", "end-1c")
+        text = self.message_entry.toPlainText()
 
         if not text.strip():
             return
@@ -1225,8 +1205,6 @@ class EncryptedChatClient:
         self._draw_message_size_bar()
 
         if estimated_size >= NTFY_MAX_BODY_BYTES:
-            self.current_estimated_packet_size = estimated_size
-            self._draw_message_size_bar()
             messagebox.showwarning(
                 "Encrypted message too large",
                 (
@@ -1266,8 +1244,7 @@ class EncryptedChatClient:
             "message": message,
         })
 
-        self.message_entry.delete("1.0", "end")
-        self.message_entry.edit_modified(False)
+        self.message_entry.clear()
         self.draft_message_id = uuid.uuid4().hex
         self._resize_message_entry()
         self._run_message_size_check()
@@ -1576,9 +1553,6 @@ class EncryptedChatClient:
 
         except queue.Empty:
             pass
-        finally:
-            if not self.stop_event.is_set():
-                self.root.after(100, self._process_ui_queue)
 
     def _accept_network_message(
         self,
@@ -1868,43 +1842,72 @@ class EncryptedChatClient:
         self._rerender_preserving_scroll()
 
     def _rerender_preserving_scroll(self) -> None:
-        try:
-            current_view = self.chat_display.yview()
-            top_fraction = current_view[0] if current_view else 0.0
-        except tk.TclError:
-            top_fraction = 0.0
-
+        scrollbar = self.chat_display.verticalScrollBar()
+        maximum = max(1, scrollbar.maximum())
+        fraction = scrollbar.value() / maximum
         self._render_message_log(scroll_to_bottom=False)
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(round(fraction * scrollbar.maximum()))
 
-        try:
-            self.chat_display.yview_moveto(top_fraction)
-        except tk.TclError:
-            pass
-
-    def _on_chat_display_configure(
-        self,
-        _event: tk.Event | None = None,
-    ) -> None:
+    def _on_chat_display_configure(self) -> None:
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
-
-        if not muted_ids and not collapsed_ids:
-            return
-
-        if self.chat_render_job is not None:
-            try:
-                self.root.after_cancel(self.chat_render_job)
-            except tk.TclError:
-                pass
-
-        self.chat_render_job = self.root.after(
-            120,
-            self._finish_chat_resize_render,
-        )
+        if muted_ids or collapsed_ids:
+            self.chat_render_timer.start(120)
 
     def _finish_chat_resize_render(self) -> None:
-        self.chat_render_job = None
         self._rerender_preserving_scroll()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.chat_display.viewport():
+            if event.type() == QEvent.Type.Resize:
+                self._on_chat_display_configure()
+
+            elif event.type() == QEvent.Type.MouseMove:
+                anchor = self.chat_display.anchorAt(event.position().toPoint())
+                message_id = self._message_id_from_anchor(anchor)
+
+                if message_id:
+                    self.chat_display.viewport().setCursor(
+                        Qt.CursorShape.PointingHandCursor
+                    )
+                    if message_id != self._hovered_message_id:
+                        self._hovered_message_id = message_id
+                        QToolTip.showText(
+                            event.globalPosition().toPoint(),
+                            self.rendered_tooltips.get(message_id, ""),
+                            self.chat_display.viewport(),
+                        )
+                else:
+                    self._hovered_message_id = None
+                    self.chat_display.viewport().setCursor(
+                        Qt.CursorShape.IBeamCursor
+                    )
+                    QToolTip.hideText()
+
+            elif event.type() == QEvent.Type.Leave:
+                self._hovered_message_id = None
+                QToolTip.hideText()
+
+            elif event.type() == QEvent.Type.ContextMenu:
+                anchor = self.chat_display.anchorAt(event.pos())
+                message_id = self._message_id_from_anchor(anchor)
+                item = self.rendered_message_items.get(message_id or "")
+                if item is not None:
+                    self._show_username_context_menu(
+                        item,
+                        event.globalPos(),
+                    )
+                    return True
+
+        return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _message_id_from_anchor(anchor: str) -> str | None:
+        prefix = "spritelink:"
+        if anchor.startswith(prefix):
+            return anchor[len(prefix):]
+        return None
 
     def _blend_toward_chat_background(
         self,
@@ -1912,28 +1915,20 @@ class EncryptedChatClient:
         amount: float = 0.70,
     ) -> str:
         amount = max(0.0, min(1.0, amount))
+        foreground = QColor(color)
+        background = self.chat_display.palette().color(
+            self.chat_display.backgroundRole()
+        )
 
-        try:
-            foreground_rgb = self.root.winfo_rgb(color)
-            background_rgb = self.root.winfo_rgb(
-                self.chat_display.cget("background")
-            )
-        except tk.TclError:
-            return "#a0a0a0"
+        if not foreground.isValid():
+            foreground = QColor("#a0a0a0")
 
-        blended = []
-
-        for foreground, background in zip(
-            foreground_rgb,
-            background_rgb,
-        ):
-            value_16bit = round(
-                foreground * (1.0 - amount)
-                + background * amount
-            )
-            blended.append(max(0, min(255, value_16bit // 257)))
-
-        return "#{:02x}{:02x}{:02x}".format(*blended)
+        blended = QColor(
+            round(foreground.red() * (1.0 - amount) + background.red() * amount),
+            round(foreground.green() * (1.0 - amount) + background.green() * amount),
+            round(foreground.blue() * (1.0 - amount) + background.blue() * amount),
+        )
+        return blended.name()
 
     def _collapsed_message_preview(
         self,
@@ -1947,56 +1942,48 @@ class EncryptedChatClient:
         if not normalized:
             return "[...]"
 
-        try:
-            body_font = tkfont.Font(font=self.chat_display.cget("font"))
-            username_font = tkfont.Font(
-                family="Segoe UI",
-                size=10,
-                weight="bold",
-            )
+        body_metrics = QFontMetrics(self.chat_display.font())
+        username_font = QFont("Segoe UI", 10)
+        username_font.setBold(True)
+        username_metrics = QFontMetrics(username_font)
+        prefix_width = (
+            username_metrics.horizontalAdvance(username)
+            + body_metrics.horizontalAdvance(status_suffix + ": ")
+            + 36
+        )
+        available_width = max(
+            0,
+            self.chat_display.viewport().width() - prefix_width,
+        )
 
-            widget_width = max(1, self.chat_display.winfo_width())
-            prefix_width = (
-                username_font.measure(username)
-                + body_font.measure(status_suffix + ": ")
-                + 52
-            )
-            available_width = max(0, widget_width - prefix_width)
+        if body_metrics.horizontalAdvance(normalized + ending) <= available_width:
+            return normalized + ending
 
-            if body_font.measure(normalized + ending) <= available_width:
-                return normalized + ending
+        if body_metrics.horizontalAdvance("[...]") > available_width:
+            return "[...]"
 
-            if body_font.measure("[...]") > available_width:
-                return "[...]"
+        low = 0
+        high = len(normalized)
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            candidate = normalized[:midpoint].rstrip() + ending
+            if body_metrics.horizontalAdvance(candidate) <= available_width:
+                low = midpoint
+            else:
+                high = midpoint - 1
 
-            low = 0
-            high = len(normalized)
-
-            while low < high:
-                midpoint = (low + high + 1) // 2
-                candidate = normalized[:midpoint].rstrip() + ending
-
-                if body_font.measure(candidate) <= available_width:
-                    low = midpoint
-                else:
-                    high = midpoint - 1
-
-            if low <= 0:
-                return "[...]"
-
-            return normalized[:low].rstrip() + ending
-
-        except tk.TclError:
-            fallback = normalized[:80].rstrip()
-            return (fallback + ending) if fallback else "[...]"
+        return (
+            normalized[:low].rstrip() + ending
+            if low > 0
+            else "[...]"
+        )
 
     def _show_username_context_menu(
         self,
-        event: tk.Event,
         item: dict[str, Any],
-    ) -> str:
-        self._hide_username_tooltip()
-
+        global_position: Any,
+    ) -> None:
+        QToolTip.hideText()
         message = item["message"]
         client_id = str(message["c"])
         message_id = str(message["i"])
@@ -2004,69 +1991,67 @@ class EncryptedChatClient:
 
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
-
         is_muted = client_id in muted_ids
         is_manually_collapsed = message_id in collapsed_ids
 
-        if self.username_context_menu is not None:
-            try:
-                self.username_context_menu.destroy()
-            except tk.TclError:
-                pass
-
-        menu = tk.Menu(self.root, tearoff=False)
-        self.username_context_menu = menu
-
-        if is_local:
-            menu.add_command(
-                label="Mute User",
-                state="disabled",
-            )
-        else:
-            menu.add_command(
-                label="Unmute User" if is_muted else "Mute User",
-                command=lambda: self._set_user_muted(
-                    client_id,
-                    not is_muted,
-                ),
+        menu = QMenu(self.root)
+        mute_action = menu.addAction(
+            "Unmute User" if is_muted else "Mute User"
+        )
+        mute_action.setEnabled(not is_local)
+        if not is_local:
+            mute_action.triggered.connect(
+                lambda: self._set_user_muted(client_id, not is_muted)
             )
 
-        if is_muted:
-            menu.add_command(
-                label="Expand Message",
-                state="disabled",
-            )
-        else:
-            menu.add_command(
-                label=(
-                    "Expand Message"
-                    if is_manually_collapsed
-                    else "Collapse Message"
-                ),
-                command=lambda: self._set_message_collapsed(
+        collapse_action = menu.addAction(
+            "Expand Message"
+            if is_manually_collapsed
+            else "Collapse Message"
+        )
+        collapse_action.setEnabled(not is_muted)
+        if not is_muted:
+            collapse_action.triggered.connect(
+                lambda: self._set_message_collapsed(
                     message_id,
                     not is_manually_collapsed,
-                ),
+                )
             )
 
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            try:
-                menu.grab_release()
-            except tk.TclError:
-                pass
+        menu.exec(global_position)
 
-        return "break"
+    @staticmethod
+    def _text_format(
+        color: str,
+        *,
+        bold: bool = False,
+        anchor: str | None = None,
+    ) -> QTextCharFormat:
+        formatting = QTextCharFormat()
+        formatting.setForeground(QColor(color))
+        formatting.setFontFamilies(["Segoe UI"])
+        formatting.setFontPointSize(10)
+        formatting.setFontWeight(
+            QFont.Weight.Bold if bold else QFont.Weight.Normal
+        )
+        if anchor:
+            formatting.setAnchor(True)
+            formatting.setAnchorHref(anchor)
+            formatting.setFontUnderline(False)
+        return formatting
 
     def _render_message_log(self, *, scroll_to_bottom: bool) -> None:
-        self._hide_username_tooltip()
-        self.chat_display.configure(state="normal")
-        self.chat_display.delete("1.0", "end")
+        QToolTip.hideText()
+        self.rendered_message_items.clear()
+        self.rendered_tooltips.clear()
+        self.chat_display.clear()
 
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
         previous_timestamp: int | None = None
+        first_item = True
 
         for item in self.message_log:
             current_timestamp = self._display_timestamp_for_item(item)
@@ -2076,28 +2061,40 @@ class EncryptedChatClient:
                 and current_timestamp - previous_timestamp
                 >= GAP_SEPARATOR_SECONDS
             ):
+                if not first_item:
+                    cursor.insertBlock()
                 gap_seconds = current_timestamp - previous_timestamp
                 gap_hours = max(6, int((gap_seconds / 3600.0) + 0.5))
-                self.chat_display.insert(
-                    "end",
-                    f"————— {gap_hours} hours later —————\n",
-                    "gap",
+                gap_block = QTextBlockFormat()
+                gap_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                gap_block.setTopMargin(7)
+                gap_block.setBottomMargin(7)
+                cursor.setBlockFormat(gap_block)
+                cursor.insertText(
+                    f"————— {gap_hours} hours later —————",
+                    self._text_format("#777777"),
                 )
+                cursor.insertBlock()
+                cursor.setBlockFormat(QTextBlockFormat())
+            elif not first_item:
+                cursor.insertBlock()
 
             self._insert_message_item(
+                cursor,
                 item,
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
             )
+            first_item = False
             previous_timestamp = current_timestamp
 
-        self.chat_display.configure(state="disabled")
-
         if scroll_to_bottom:
-            self.chat_display.see("end")
+            scrollbar = self.chat_display.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     def _insert_message_item(
         self,
+        cursor: QTextCursor,
         item: dict[str, Any],
         *,
         muted_ids: set[str],
@@ -2114,112 +2111,55 @@ class EncryptedChatClient:
 
         is_muted = client_id in muted_ids and not item["is_local"]
         is_collapsed = is_muted or message_id in collapsed_ids
-
-        user_tag = (
-            "user_"
-            + hashlib.sha1(
-                (client_id + original_color + str(is_muted)).encode("utf-8")
-            ).hexdigest()[:12]
-        )
-        hover_tag = (
-            "hover_"
-            + hashlib.sha1(
-                message_id.encode("utf-8")
-            ).hexdigest()[:16]
-        )
-        message_tag = (
-            "msg_"
-            + hashlib.sha1(
-                message_id.encode("utf-8")
-            ).hexdigest()[:16]
-        )
-        body_tag = "muted_message" if is_muted else "message"
-        suffix_tag = "muted_suffix" if is_muted else "timestamp"
-
         username_color = (
             self._blend_toward_chat_background(original_color)
             if is_muted
             else original_color
         )
-
-        try:
-            self.chat_display.tag_configure(
-                user_tag,
-                foreground=username_color,
-                font=("Segoe UI", 10, "bold"),
+        if not QColor(username_color).isValid():
+            username_color = (
+                self._blend_toward_chat_background("#4ea1ff")
+                if is_muted
+                else "#4ea1ff"
             )
-        except tk.TclError:
-            self.chat_display.tag_configure(
-                user_tag,
-                foreground=(
-                    self._blend_toward_chat_background("#4ea1ff")
-                    if is_muted
-                    else "#4ea1ff"
-                ),
-                font=("Segoe UI", 10, "bold"),
-            )
-
-        self.chat_display.tag_configure(
-            "muted_message",
-            foreground=self._blend_toward_chat_background("#202020"),
-        )
-        self.chat_display.tag_configure(
-            "muted_suffix",
-            foreground=self._blend_toward_chat_background("#777777"),
-        )
-
-        tooltip_text = (
-            f"{self._format_hover_timestamp(timestamp)}\n"
-            f"Unique ID: {unique_id_preview}"
-        )
-        self.chat_display.tag_bind(
-            hover_tag,
-            "<Enter>",
-            lambda event, value=tooltip_text: self._show_username_tooltip(
-                event,
-                value,
-            ),
-        )
-        self.chat_display.tag_bind(
-            hover_tag,
-            "<Leave>",
-            lambda _event: self._hide_username_tooltip(),
-        )
-        self.chat_display.tag_bind(
-            hover_tag,
-            "<Button-3>",
-            lambda event, value=item: self._show_username_context_menu(
-                event,
-                value,
-            ),
-        )
-
-        start_index = self.chat_display.index("end-1c")
-        self.chat_display.insert(
-            "end",
-            username,
-            (user_tag, hover_tag, message_tag),
-        )
 
         status_suffix = ""
-
         if item["is_local"]:
             status_suffix = " (you)"
         elif is_muted:
             status_suffix = " (muted)"
 
-        if status_suffix:
-            self.chat_display.insert(
-                "end",
-                status_suffix,
-                (suffix_tag, message_tag),
-            )
-
-        self.chat_display.insert(
-            "end",
-            ": ",
-            (body_tag, message_tag),
+        body_color = (
+            self._blend_toward_chat_background("#202020")
+            if is_muted
+            else "#202020"
         )
+        suffix_color = (
+            self._blend_toward_chat_background("#777777")
+            if is_muted
+            else "#777777"
+        )
+
+        self.rendered_message_items[message_id] = item
+        self.rendered_tooltips[message_id] = (
+            f"{self._format_hover_timestamp(timestamp)}\n"
+            f"Unique ID: {unique_id_preview}"
+        )
+
+        cursor.insertText(
+            username,
+            self._text_format(
+                username_color,
+                bold=True,
+                anchor=f"spritelink:{message_id}",
+            ),
+        )
+        if status_suffix:
+            cursor.insertText(
+                status_suffix,
+                self._text_format(suffix_color),
+            )
+        cursor.insertText(": ", self._text_format(body_color))
 
         display_text = (
             self._collapsed_message_preview(
@@ -2230,107 +2170,44 @@ class EncryptedChatClient:
             if is_collapsed
             else text
         )
+        cursor.insertText(display_text, self._text_format(body_color))
 
-        self.chat_display.insert(
-            "end",
-            display_text + "\n",
-            (body_tag, message_tag),
-        )
-
-        if item["warning"] and not is_collapsed:
-            self.chat_display.insert(
-                "end",
-                item["warning"] + "\n",
-                ("warning", message_tag),
+        if item.get("warning") and not is_collapsed:
+            cursor.insertBlock()
+            cursor.insertText(
+                str(item["warning"]),
+                self._text_format("#b00020"),
             )
-
-        end_index = self.chat_display.index("end-1c")
-        self.chat_display.tag_add(message_tag, start_index, end_index)
-
-    def _show_username_tooltip(
-        self,
-        event: tk.Event,
-        text: str,
-    ) -> None:
-        self._hide_username_tooltip(reset_cursor=False)
-
-        try:
-            self.chat_display.configure(cursor="hand2")
-        except tk.TclError:
-            pass
-
-        tooltip = tk.Toplevel(self.root)
-        tooltip.wm_overrideredirect(True)
-        tooltip.wm_attributes("-topmost", True)
-
-        label = tk.Label(
-            tooltip,
-            text=text,
-            justify="left",
-            background="#fffbe8",
-            foreground="#202020",
-            relief="solid",
-            borderwidth=1,
-            padx=7,
-            pady=5,
-            font=("Segoe UI", 9),
-        )
-        label.pack()
-
-        x = int(getattr(event, "x_root", self.root.winfo_pointerx())) + 12
-        y = int(getattr(event, "y_root", self.root.winfo_pointery())) + 16
-        tooltip.wm_geometry(f"+{x}+{y}")
-        self.tooltip_window = tooltip
-
-    def _hide_username_tooltip(self, reset_cursor: bool = True) -> None:
-        if self.tooltip_window is not None:
-            try:
-                self.tooltip_window.destroy()
-            except tk.TclError:
-                pass
-            self.tooltip_window = None
-
-        if reset_cursor:
-            try:
-                self.chat_display.configure(cursor="xterm")
-            except tk.TclError:
-                pass
 
     def _append_system_message(
         self,
         text: str,
         warning: bool = False,
     ) -> None:
-        tag = "warning" if warning else "system"
         display_time = time.strftime("%H:%M:%S")
-
-        self.chat_display.configure(state="normal")
-        self.chat_display.insert(
-            "end",
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not self.chat_display.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertText(
             f"[{display_time}] ",
-            "timestamp",
+            self._text_format("#777777"),
         )
-        self.chat_display.insert("end", text + "\n", tag)
-        self.chat_display.configure(state="disabled")
-        self.chat_display.see("end")
+        cursor.insertText(
+            text,
+            self._text_format("#b00020" if warning else "#a06000"),
+        )
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _clear_visible_room(self) -> None:
-        self._hide_username_tooltip()
-
-        if self.username_context_menu is not None:
-            try:
-                self.username_context_menu.destroy()
-            except tk.TclError:
-                pass
-            self.username_context_menu = None
-
+        QToolTip.hideText()
         self.seen_client_message_ids.clear()
         self.seen_ntfy_message_ids.clear()
         self.message_log.clear()
-
-        self.chat_display.configure(state="normal")
-        self.chat_display.delete("1.0", "end")
-        self.chat_display.configure(state="disabled")
+        self.rendered_message_items.clear()
+        self.rendered_tooltips.clear()
+        self.chat_display.clear()
 
     def _play_chime(self) -> None:
         if winsound is None:
@@ -2342,14 +2219,10 @@ class EncryptedChatClient:
             pass
 
     def _on_close(self) -> None:
-        self._hide_username_tooltip()
-
-        if self.username_context_menu is not None:
-            try:
-                self.username_context_menu.destroy()
-            except tk.TclError:
-                pass
-            self.username_context_menu = None
+        if self._closing:
+            return
+        self._closing = True
+        QToolTip.hideText()
 
         try:
             self._copy_ui_to_config()
@@ -2358,8 +2231,7 @@ class EncryptedChatClient:
             pass
 
         self.stop_event.set()
-        self.root.destroy()
-
+        self.ui_queue_timer.stop()
 
 def _write_crash_log(error_text: str) -> Path | None:
     try:
@@ -2371,18 +2243,11 @@ def _write_crash_log(error_text: str) -> Path | None:
         return None
 
 
-def main() -> None:
-    if os.name != "nt":
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror(
-            "Windows required",
-            "This version uses Windows DPAPI and must be run on Windows.",
-        )
-        root.destroy()
-        return
 
-    root = tk.Tk()
+def main() -> None:
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName("Encrypted Chat Client")
+    root = MainWindow()
 
     def report_callback_exception(
         exc_type: type[BaseException],
@@ -2408,21 +2273,21 @@ def main() -> None:
             parent=root,
         )
 
-    root.report_callback_exception = report_callback_exception
+    sys.excepthook = report_callback_exception
 
-    try:
-        style = ttk.Style(root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-    except Exception:
-        pass
+    if os.name != "nt":
+        messagebox.showerror(
+            "Windows required",
+            "This version uses Windows DPAPI and must be run on Windows.",
+            parent=root,
+        )
+        return
 
     try:
         EncryptedChatClient(root)
     except Exception:
         error_text = traceback.format_exc()
         crash_path = _write_crash_log(error_text)
-        root.withdraw()
         location = (
             f"\n\nThe full traceback was saved to:\n{crash_path}"
             if crash_path is not None
@@ -2433,11 +2298,12 @@ def main() -> None:
             f"The client could not start.{location}\n\n{error_text[-2200:]}",
             parent=root,
         )
-        root.destroy()
         return
 
-    root.mainloop()
+    root.show()
+    app.exec()
 
 
 if __name__ == "__main__":
     main()
+
