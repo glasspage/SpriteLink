@@ -3722,7 +3722,13 @@ class EncryptedChatClient(QObject):
         except ValueError:
             return False
 
-        image = QImage.fromData(gif_data, b"GIF")
+        try:
+            # Let Qt detect GIF from its signature. Some PySide6 Windows
+            # builds reject an explicit format argument despite advertising
+            # that overload.
+            image = QImage.fromData(gif_data)
+        except (TypeError, ValueError):
+            return False
         if image.isNull():
             return False
 
