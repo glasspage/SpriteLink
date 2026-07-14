@@ -63,8 +63,8 @@ try:
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
+        QScrollArea,
         QSizePolicy,
-        QTabWidget,
         QTextBrowser,
         QToolTip,
         QVBoxLayout,
@@ -580,6 +580,29 @@ class ComposeTextEdit(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+class ConfigOverlay(QWidget):
+    dismissed = Signal()
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.panel: QFrame | None = None
+        self.setObjectName("configOverlay")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "QWidget#configOverlay { background-color: rgba(0, 0, 0, 105); }"
+        )
+
+    def mousePressEvent(self, event: Any) -> None:
+        if (
+            self.panel is not None
+            and not self.panel.geometry().contains(event.position().toPoint())
+        ):
+            self.dismissed.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -624,6 +647,7 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
         self.rendered_tooltips: dict[str, str] = {}
         self._hovered_message_id: str | None = None
+        self._config_snapshot_at_open: tuple[Any, ...] | None = None
         self._closing = False
 
         self.server_preset_var = ValueModel(
@@ -699,18 +723,13 @@ class EncryptedChatClient(QObject):
         central = QWidget()
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(0, 0, 0, 0)
-
-        notebook = QTabWidget()
-        central_layout.addWidget(notebook)
         self.root.setCentralWidget(central)
 
         self.chat_tab = QWidget()
-        self.config_tab = QWidget()
-        notebook.addTab(self.chat_tab, "Chatroom")
-        notebook.addTab(self.config_tab, "Config")
+        central_layout.addWidget(self.chat_tab)
 
         self._build_chat_tab()
-        self._build_config_tab()
+        self._build_config_popup()
 
     def _build_chat_tab(self) -> None:
         layout = QVBoxLayout(self.chat_tab)
@@ -735,7 +754,17 @@ class EncryptedChatClient(QObject):
         )
         self.status_detail_var.bind(self.status_detail_label.setText)
         status_layout.addWidget(self.status_detail_label)
+        self.config_toggle = QPushButton("Config")
+        self.config_toggle.setCheckable(True)
+        self.config_toggle.toggled.connect(self._on_config_toggled)
+        status_layout.addWidget(self.config_toggle)
         layout.addLayout(status_layout)
+
+        self.chat_content = QWidget()
+        content_layout = QVBoxLayout(self.chat_content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(7)
+        layout.addWidget(self.chat_content, 1)
 
         self.chat_display = QTextBrowser()
         self.chat_display.setReadOnly(True)
@@ -750,7 +779,7 @@ class EncryptedChatClient(QObject):
         self.chat_display.document().setDefaultTextOption(text_option)
         self.chat_display.viewport().setMouseTracking(True)
         self.chat_display.viewport().installEventFilter(self)
-        layout.addWidget(self.chat_display, 1)
+        content_layout.addWidget(self.chat_display, 1)
 
         compose_layout = QGridLayout()
         compose_layout.setContentsMargins(0, 1, 0, 0)
@@ -781,10 +810,53 @@ class EncryptedChatClient(QObject):
         self.message_size_bar.setTextVisible(True)
         self.message_size_bar.setFixedHeight(18)
         compose_layout.addWidget(self.message_size_bar, 1, 0, 1, 2)
-        layout.addLayout(compose_layout)
+        content_layout.addLayout(compose_layout)
 
         self._resize_message_entry()
         self._run_message_size_check()
+
+    def _build_config_popup(self) -> None:
+        self.config_overlay = ConfigOverlay(self.chat_content)
+        self.config_overlay.dismissed.connect(self._dismiss_config_popup)
+
+        overlay_layout = QVBoxLayout(self.config_overlay)
+        overlay_layout.setContentsMargins(36, 24, 36, 24)
+
+        panel_row = QHBoxLayout()
+        panel_row.addStretch(1)
+
+        self.config_panel = QFrame()
+        self.config_panel.setObjectName("configPanel")
+        self.config_panel.setMaximumWidth(720)
+        self.config_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.config_panel.setStyleSheet(
+            "QFrame#configPanel { background: palette(window); "
+            "border: 1px solid palette(mid); border-radius: 3px; }"
+        )
+        panel_row.addWidget(self.config_panel, 8)
+        panel_row.addStretch(1)
+        overlay_layout.addLayout(panel_row, 1)
+        self.config_overlay.panel = self.config_panel
+
+        panel_layout = QVBoxLayout(self.config_panel)
+        panel_layout.setContentsMargins(10, 10, 10, 10)
+        panel_layout.setSpacing(6)
+        panel_layout.addWidget(self._heading("Config"))
+
+        config_scroll = QScrollArea()
+        config_scroll.setWidgetResizable(True)
+        config_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.config_tab = QWidget()
+        config_scroll.setWidget(self.config_tab)
+        panel_layout.addWidget(config_scroll, 1)
+
+        self._build_config_tab()
+        self.config_overlay.hide()
+        self.chat_content.installEventFilter(self)
+        QTimer.singleShot(0, self._sync_config_overlay_geometry)
 
     def _build_config_tab(self) -> None:
         layout = QGridLayout(self.config_tab)
@@ -908,10 +980,13 @@ class EncryptedChatClient(QObject):
         test_button = QPushButton("Test connection")
         test_button.clicked.connect(self._test_connection)
         button_layout.addWidget(test_button)
-        save_button = QPushButton("Save and reconnect")
-        save_button.clicked.connect(self._save_and_reconnect)
-        button_layout.addWidget(save_button)
         layout.addLayout(button_layout, row, 0, 1, 3)
+        row += 1
+
+        apply_note = self._description(
+            "Changes are saved and applied when the Config panel closes."
+        )
+        layout.addWidget(apply_note, row, 0, 1, 3)
         row += 1
 
         layout.addWidget(
@@ -927,6 +1002,54 @@ class EncryptedChatClient(QObject):
         )
         row += 1
         layout.setRowStretch(row, 1)
+
+    def _sync_config_overlay_geometry(self) -> None:
+        self.config_overlay.setGeometry(self.chat_content.rect())
+
+    def _config_ui_snapshot(self) -> tuple[Any, ...]:
+        return (
+            str(self.server_preset_var.get()),
+            str(self.server_url_var.get()),
+            str(self.username_var.get()),
+            str(self.color_var.get()),
+            str(self.encryption_key_var.get()),
+            bool(self.chime_var.get()),
+        )
+
+    def _set_config_toggle_checked(self, checked: bool) -> None:
+        previous = self.config_toggle.blockSignals(True)
+        self.config_toggle.setChecked(checked)
+        self.config_toggle.blockSignals(previous)
+
+    def _on_config_toggled(self, checked: bool) -> None:
+        if checked:
+            self._config_snapshot_at_open = self._config_ui_snapshot()
+            self._sync_config_overlay_geometry()
+            self.config_overlay.show()
+            self.config_overlay.raise_()
+            self.server_preset_combo.setFocus()
+            return
+
+        self._dismiss_config_popup()
+
+    def _dismiss_config_popup(self) -> bool:
+        if not self.config_overlay.isVisible():
+            self._set_config_toggle_checked(False)
+            return True
+
+        changed = (
+            self._config_snapshot_at_open is not None
+            and self._config_ui_snapshot() != self._config_snapshot_at_open
+        )
+        if changed and not self._save_and_reconnect():
+            self._set_config_toggle_checked(True)
+            return False
+
+        self.config_overlay.hide()
+        self._set_config_toggle_checked(False)
+        self._config_snapshot_at_open = None
+        self.message_entry.setFocus()
+        return True
 
     def _apply_server_preset_state(self) -> None:
         preset = str(self.server_preset_var.get())
@@ -1010,7 +1133,7 @@ class EncryptedChatClient(QObject):
         self.config_data["encryption_key"] = encryption_key
         self.config_data["chime_enabled"] = bool(self.chime_var.get())
 
-    def _save_and_reconnect(self) -> None:
+    def _save_and_reconnect(self) -> bool:
         try:
             self._copy_ui_to_config()
             save_config(self.config_data)
@@ -1020,7 +1143,7 @@ class EncryptedChatClient(QObject):
                 str(exc),
                 parent=self.root,
             )
-            return
+            return False
 
         self._clear_visible_room()
         self._load_saved_history_for_current_room()
@@ -1029,6 +1152,7 @@ class EncryptedChatClient(QObject):
         self.status_detail_var.set("Applying the saved room configuration...")
         self.reconnect_requested.set()
         self._append_system_message("Configuration saved. Reconnecting.")
+        return True
 
     def _test_connection(self) -> None:
         try:
@@ -1859,7 +1983,17 @@ class EncryptedChatClient(QObject):
         self._rerender_preserving_scroll()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self.chat_display.viewport():
+        if (
+            watched is getattr(self, "chat_content", None)
+            and event.type() == QEvent.Type.Resize
+            and hasattr(self, "config_overlay")
+        ):
+            self._sync_config_overlay_geometry()
+
+        if (
+            hasattr(self, "chat_display")
+            and watched is self.chat_display.viewport()
+        ):
             if event.type() == QEvent.Type.Resize:
                 self._on_chat_display_configure()
 
@@ -2306,4 +2440,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
