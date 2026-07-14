@@ -620,6 +620,30 @@ def current_utc_day_number() -> int:
     return int(time.time() // (24 * 60 * 60))
 
 
+def next_utc_midnight_timestamp() -> int:
+    return (current_utc_day_number() + 1) * (24 * 60 * 60)
+
+
+def local_reset_time_label() -> str:
+    local_reset = datetime.fromtimestamp(
+        next_utc_midnight_timestamp()
+    ).astimezone()
+    hour = local_reset.strftime("%I").lstrip("0") or "0"
+    timezone_name = local_reset.tzname() or "local time"
+    if " " in timezone_name:
+        abbreviation = "".join(
+            word[0]
+            for word in timezone_name.split()
+            if word
+        ).upper()
+        if len(abbreviation) >= 2:
+            timezone_name = abbreviation
+    return (
+        f"{hour}:{local_reset.strftime('%M %p')} "
+        f"{timezone_name}"
+    )
+
+
 def default_config() -> dict[str, Any]:
     global_profile = default_room_profile()
     return {
@@ -2545,7 +2569,8 @@ class EncryptedChatClient(QObject):
             f"{NTFY_MAX_BODY_BYTES / 1024.0:.1f} KB\n"
             f"Messages left today: {messages_left}\n\n"
             "The ntfy server only allows 250 messages output per IP per day.\n"
-            "This limit is reset at 12:00 AM UTC."
+            "This limit is reset at 12:00 AM UTC "
+            f"({local_reset_time_label()})."
         )
 
     def _build_config_tab(self) -> None:
@@ -2885,9 +2910,7 @@ class EncryptedChatClient(QObject):
 
     def _schedule_utc_midnight_reset(self) -> None:
         now = time.time()
-        next_midnight = (
-            (int(now // (24 * 60 * 60)) + 1) * (24 * 60 * 60)
-        )
+        next_midnight = next_utc_midnight_timestamp()
         delay_ms = max(1000, int((next_midnight - now) * 1000) + 250)
         self.message_limit_reset_timer.start(delay_ms)
 
