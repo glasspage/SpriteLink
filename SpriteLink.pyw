@@ -2698,7 +2698,13 @@ class EncryptedChatClient(QObject):
         panel_layout.addWidget(self.image_preview_label, 1)
 
         button_row = QHBoxLayout()
-        button_row.addStretch(1)
+        self.image_preview_url_label = QLabel()
+        self.image_preview_url_label.setMinimumWidth(0)
+        self.image_preview_url_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        button_row.addWidget(self.image_preview_url_label, 1)
         open_button = QPushButton("Open in Browser")
         open_button.clicked.connect(self._open_current_image_in_browser)
         button_row.addWidget(open_button)
@@ -2730,6 +2736,7 @@ class EncryptedChatClient(QObject):
         image = self.image_preview_cache.get(url or "")
         if not isinstance(image, QImage) or image.isNull():
             self.image_preview_label.clear()
+            self.image_preview_url_label.clear()
             return
         available_width = max(
             EMBEDDED_IMAGE_MAX_EDGE,
@@ -2745,11 +2752,22 @@ class EncryptedChatClient(QObject):
             Qt.TransformationMode.SmoothTransformation,
         )
         self.image_preview_label.setPixmap(QPixmap.fromImage(preview))
+        label_width = max(1, self.image_preview_url_label.width())
+        self.image_preview_url_label.setText(
+            self.image_preview_url_label.fontMetrics().elidedText(
+                url or "",
+                Qt.TextElideMode.ElideMiddle,
+                label_width,
+            )
+        )
+        self.image_preview_url_label.setToolTip(url or "")
 
     def _hide_image_preview_popup(self) -> None:
         self.image_preview_overlay.hide()
         self.current_image_preview_url = None
         self.image_preview_label.clear()
+        self.image_preview_url_label.clear()
+        self.image_preview_url_label.setToolTip("")
         self.message_entry.setFocus()
 
     def _open_current_image_in_browser(self) -> None:
@@ -4534,6 +4552,12 @@ class EncryptedChatClient(QObject):
                     text[position:start],
                     self._text_format(body_color, font_name=font_name),
                 )
+            if is_direct_image_url(url):
+                self._schedule_image_preview_fetch(url)
+                if url not in image_urls:
+                    image_urls.append(url)
+                position = end
+                continue
             link_color = "#0000ee" if self._is_windows_classic_theme() else "#0066cc"
             if muted:
                 link_color = self._blend_toward_chat_background(link_color)
@@ -4544,10 +4568,6 @@ class EncryptedChatClient(QObject):
             )
             link_format.setFontUnderline(True)
             cursor.insertText(text[start:end], link_format)
-            if is_direct_image_url(url):
-                self._schedule_image_preview_fetch(url)
-                if url not in image_urls:
-                    image_urls.append(url)
             position = end
         if position < len(text):
             cursor.insertText(
