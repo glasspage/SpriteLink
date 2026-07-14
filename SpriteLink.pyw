@@ -162,6 +162,8 @@ AUTO_HISTORY_SECONDS = 48 * 60 * 60
 GAP_SEPARATOR_SECONDS = 6 * 60 * 60
 MAX_MESSAGE_CHARS = 4000
 NTFY_MAX_BODY_BYTES = 4096
+NTFY_DAILY_MESSAGE_LIMIT = 250
+MESSAGE_LIMIT_BAR_THRESHOLD = 50
 PACKET_PADDING_BLOCK = 128
 PROFILE_ICON_SIZE = 16
 PROFILE_ICON_MAX_COLORS = 16
@@ -614,6 +616,34 @@ def dpapi_decrypt(data: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytes:
         kernel32.LocalFree(out_blob.pbData)
 
 
+def current_utc_day_number() -> int:
+    return int(time.time() // (24 * 60 * 60))
+
+
+def next_utc_midnight_timestamp() -> int:
+    return (current_utc_day_number() + 1) * (24 * 60 * 60)
+
+
+def local_reset_time_label() -> str:
+    local_reset = datetime.fromtimestamp(
+        next_utc_midnight_timestamp()
+    ).astimezone()
+    hour = local_reset.strftime("%I").lstrip("0") or "0"
+    timezone_name = local_reset.tzname() or "local time"
+    if " " in timezone_name:
+        abbreviation = "".join(
+            word[0]
+            for word in timezone_name.split()
+            if word
+        ).upper()
+        if len(abbreviation) >= 2:
+            timezone_name = abbreviation
+    return (
+        f"{hour}:{local_reset.strftime('%M %p')} "
+        f"{timezone_name}"
+    )
+
+
 def default_config() -> dict[str, Any]:
     global_profile = default_room_profile()
     return {
@@ -635,6 +665,8 @@ def default_config() -> dict[str, Any]:
         "history": {},
         "muted_users": {},
         "collapsed_messages": {},
+        "sent_message_utc_day": current_utc_day_number(),
+        "sent_messages_today": 0,
     }
 
 
@@ -695,6 +727,26 @@ def load_config() -> dict[str, Any]:
 
     if not isinstance(config.get("collapsed_messages"), dict):
         config["collapsed_messages"] = {}
+
+    today_utc = current_utc_day_number()
+    try:
+        sent_message_utc_day = int(
+            config.get("sent_message_utc_day", today_utc)
+        )
+    except (TypeError, ValueError):
+        sent_message_utc_day = today_utc
+    try:
+        sent_messages_today = max(
+            0,
+            int(config.get("sent_messages_today", 0)),
+        )
+    except (TypeError, ValueError):
+        sent_messages_today = 0
+    if sent_message_utc_day != today_utc:
+        sent_message_utc_day = today_utc
+        sent_messages_today = 0
+    config["sent_message_utc_day"] = sent_message_utc_day
+    config["sent_messages_today"] = sent_messages_today
 
     chatrooms = config.get("chatrooms")
     if not isinstance(chatrooms, list):
@@ -1080,6 +1132,20 @@ class ComposeTextEdit(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+class ClickableProgressBar(QProgressBar):
+    clicked = Signal()
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.rect().contains(event.position().toPoint())
+        ):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class ConfigOverlay(QWidget):
     dismissed = Signal()
 
@@ -1361,6 +1427,12 @@ class EncryptedChatClient(QObject):
         self.message_size_timer.setSingleShot(True)
         self.message_size_timer.timeout.connect(self._run_message_size_check)
 
+        self.message_limit_reset_timer = QTimer(self)
+        self.message_limit_reset_timer.setSingleShot(True)
+        self.message_limit_reset_timer.timeout.connect(
+            self._reset_daily_sent_message_count
+        )
+
         self.chat_render_timer = QTimer(self)
         self.chat_render_timer.setSingleShot(True)
         self.chat_render_timer.timeout.connect(self._finish_chat_resize_render)
@@ -1372,6 +1444,7 @@ class EncryptedChatClient(QObject):
         self._apply_theme()
         self._apply_application_font_strategy()
         self._build_ui()
+        self._schedule_utc_midnight_reset()
         self._apply_server_preset_state()
         self._load_saved_history_for_current_room()
 
@@ -1581,6 +1654,10 @@ class EncryptedChatClient(QObject):
             self.config_panel.setStyleSheet(
                 self._config_panel_stylesheet()
             )
+        if hasattr(self, "message_limit_panel"):
+            self.message_limit_panel.setStyleSheet(
+                self._config_panel_stylesheet()
+            )
         if hasattr(self, "message_size_bar"):
             self._draw_message_size_bar()
         if hasattr(self, "chatrooms_toggle"):
@@ -1618,6 +1695,7 @@ class EncryptedChatClient(QObject):
 
         self._build_chat_tab()
         self._build_config_popup()
+        self._build_message_limit_popup()
 
     def _build_chatroom_sidebar(self, root_layout: QHBoxLayout) -> None:
         self.chatrooms_panel = QWidget()
@@ -2151,10 +2229,15 @@ class EncryptedChatClient(QObject):
         )
         compose_layout.addWidget(self.send_button, 0, 1)
 
-        self.message_size_bar = QProgressBar()
+        self.message_size_bar = ClickableProgressBar()
         self.message_size_bar.setRange(0, NTFY_MAX_BODY_BYTES)
         self.message_size_bar.setTextVisible(True)
         self.message_size_bar.setFixedHeight(18)
+        self.message_size_bar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.message_size_bar.setToolTip("View message and daily limits")
+        self.message_size_bar.clicked.connect(
+            self._show_message_limit_popup
+        )
         compose_layout.addWidget(self.message_size_bar, 1, 0, 1, 2)
         content_layout.addLayout(compose_layout)
 
@@ -2419,6 +2502,76 @@ class EncryptedChatClient(QObject):
         self.config_overlay.hide()
         self.chat_content.installEventFilter(self)
         QTimer.singleShot(0, self._sync_config_overlay_geometry)
+
+    def _build_message_limit_popup(self) -> None:
+        self.message_limit_overlay = ConfigOverlay(self.chat_content)
+        self.message_limit_overlay.dismissed.connect(
+            self._hide_message_limit_popup
+        )
+
+        overlay_layout = QVBoxLayout(self.message_limit_overlay)
+        overlay_layout.setContentsMargins(36, 24, 36, 24)
+        overlay_layout.addStretch(1)
+
+        panel_row = QHBoxLayout()
+        panel_row.addStretch(1)
+        self.message_limit_panel = QFrame()
+        self.message_limit_panel.setObjectName("configPanel")
+        self.message_limit_panel.setMinimumWidth(430)
+        self.message_limit_panel.setMaximumWidth(520)
+        self.message_limit_panel.setStyleSheet(
+            self._config_panel_stylesheet()
+        )
+        panel_row.addWidget(self.message_limit_panel)
+        panel_row.addStretch(1)
+        overlay_layout.addLayout(panel_row)
+        overlay_layout.addStretch(1)
+        self.message_limit_overlay.panel = self.message_limit_panel
+
+        panel_layout = QVBoxLayout(self.message_limit_panel)
+        panel_layout.setContentsMargins(16, 14, 16, 14)
+        panel_layout.setSpacing(12)
+        self.message_limit_info_label = QLabel()
+        self.message_limit_info_label.setWordWrap(True)
+        panel_layout.addWidget(self.message_limit_info_label)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        ok_button = QPushButton("OK")
+        ok_button.setDefault(True)
+        ok_button.clicked.connect(self._hide_message_limit_popup)
+        button_row.addWidget(ok_button)
+        panel_layout.addLayout(button_row)
+
+        self.message_limit_overlay.hide()
+        QTimer.singleShot(0, self._sync_message_limit_overlay_geometry)
+
+    def _sync_message_limit_overlay_geometry(self) -> None:
+        self.message_limit_overlay.setGeometry(self.chat_content.rect())
+
+    def _show_message_limit_popup(self) -> None:
+        self.message_size_timer.stop()
+        self._run_message_size_check()
+        self._update_message_limit_popup()
+        self._sync_message_limit_overlay_geometry()
+        self.message_limit_overlay.show()
+        self.message_limit_overlay.raise_()
+
+    def _hide_message_limit_popup(self) -> None:
+        self.message_limit_overlay.hide()
+        self.message_entry.setFocus()
+
+    def _update_message_limit_popup(self) -> None:
+        packet_size = max(0, int(self.current_estimated_packet_size))
+        messages_left = self._messages_left_today()
+        self.message_limit_info_label.setText(
+            f"Message filesize: {packet_size / 1024.0:.1f} KB / "
+            f"{NTFY_MAX_BODY_BYTES / 1024.0:.1f} KB\n"
+            f"Messages left today: {messages_left}\n\n"
+            "The ntfy server only allows 250 messages output per IP per day.\n"
+            "This limit is reset at 12:00 AM UTC "
+            f"({local_reset_time_label()})."
+        )
 
     def _build_config_tab(self) -> None:
         layout = QGridLayout(self.config_tab)
@@ -2707,6 +2860,76 @@ class EncryptedChatClient(QObject):
 
         self._draw_message_size_bar()
 
+    def _daily_sent_message_count(self) -> int:
+        today_utc = current_utc_day_number()
+        try:
+            stored_day = int(
+                self.config_data.get("sent_message_utc_day", today_utc)
+            )
+        except (TypeError, ValueError):
+            stored_day = today_utc
+            self.config_data["sent_message_utc_day"] = today_utc
+            self.config_data["sent_messages_today"] = 0
+        if stored_day != today_utc:
+            self.config_data["sent_message_utc_day"] = today_utc
+            self.config_data["sent_messages_today"] = 0
+            try:
+                save_config(self.config_data)
+            except Exception:
+                pass
+            return 0
+        try:
+            return max(
+                0,
+                int(self.config_data.get("sent_messages_today", 0)),
+            )
+        except (TypeError, ValueError):
+            self.config_data["sent_messages_today"] = 0
+            return 0
+
+    def _messages_left_today(self) -> int:
+        return max(
+            0,
+            NTFY_DAILY_MESSAGE_LIMIT - self._daily_sent_message_count(),
+        )
+
+    def _record_successful_send(self) -> None:
+        sent_messages = self._daily_sent_message_count() + 1
+        self.config_data["sent_message_utc_day"] = current_utc_day_number()
+        self.config_data["sent_messages_today"] = sent_messages
+        try:
+            save_config(self.config_data)
+        except Exception:
+            pass
+        self._draw_message_size_bar()
+        if (
+            hasattr(self, "message_limit_overlay")
+            and self.message_limit_overlay.isVisible()
+        ):
+            self._update_message_limit_popup()
+
+    def _schedule_utc_midnight_reset(self) -> None:
+        now = time.time()
+        next_midnight = next_utc_midnight_timestamp()
+        delay_ms = max(1000, int((next_midnight - now) * 1000) + 250)
+        self.message_limit_reset_timer.start(delay_ms)
+
+    def _reset_daily_sent_message_count(self) -> None:
+        self.config_data["sent_message_utc_day"] = current_utc_day_number()
+        self.config_data["sent_messages_today"] = 0
+        try:
+            save_config(self.config_data)
+        except Exception:
+            pass
+        if hasattr(self, "message_size_bar"):
+            self._draw_message_size_bar()
+        if (
+            hasattr(self, "message_limit_overlay")
+            and self.message_limit_overlay.isVisible()
+        ):
+            self._update_message_limit_popup()
+        self._schedule_utc_midnight_reset()
+
     def _draw_message_size_bar(self) -> None:
         packet_size = max(0, int(self.current_estimated_packet_size))
         at_or_over_limit = packet_size >= NTFY_MAX_BODY_BYTES
@@ -2739,12 +2962,21 @@ class EncryptedChatClient(QObject):
                 + "; }"
             )
 
+        messages_left = self._messages_left_today()
+        message_limit_suffix = (
+            f"     ({messages_left} messages left)"
+            if messages_left <= MESSAGE_LIMIT_BAR_THRESHOLD
+            else ""
+        )
         if self.message_size_check_pending:
-            self.message_size_bar.setFormat("Calculating...")
+            self.message_size_bar.setFormat(
+                f"Calculating...{message_limit_suffix}"
+            )
         else:
             self.message_size_bar.setFormat(
                 f"{packet_size / 1024.0:.1f} KB / "
                 f"{NTFY_MAX_BODY_BYTES / 1024.0:.1f} KB"
+                f"{message_limit_suffix}"
             )
 
         self.send_button.setEnabled(
@@ -2953,6 +3185,14 @@ class EncryptedChatClient(QObject):
                     "message": outbound["message"],
                     "error": str(exc),
                     "room_id": outbound.get("room_id"),
+                },
+            ))
+        else:
+            self.ui_queue.put((
+                "send_succeeded",
+                {
+                    "room_id": outbound.get("room_id"),
+                    "message_id": outbound["message"].get("i"),
                 },
             ))
 
@@ -3182,6 +3422,9 @@ class EncryptedChatClient(QObject):
                         self.message_log.sort(key=self._message_sort_key)
                         self._persist_local_history()
                         self._render_message_log(scroll_to_bottom=True)
+
+                elif event_type == "send_succeeded":
+                    self._record_successful_send()
 
                 elif event_type == "send_failed":
                     if payload.get("room_id") != self.active_chatroom_id:
@@ -3647,6 +3890,8 @@ class EncryptedChatClient(QObject):
             and hasattr(self, "config_overlay")
         ):
             self._sync_config_overlay_geometry()
+            if hasattr(self, "message_limit_overlay"):
+                self._sync_message_limit_overlay_geometry()
 
         if (
             hasattr(self, "chat_display")
