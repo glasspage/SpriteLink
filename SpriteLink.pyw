@@ -1797,7 +1797,7 @@ class EncryptedChatClient(QObject):
         self.chat_display.setUndoRedoEnabled(False)
         self.chat_display.setFont(self._make_font("Segoe UI", 10))
         self.chat_display.setViewportMargins(0, 0, 0, 0)
-        self.chat_display.document().setDocumentMargin(10)
+        self.chat_display.document().setDocumentMargin(0)
         text_option = self.chat_display.document().defaultTextOption()
         text_option.setWrapMode(QTextOption.WrapMode.WrapAnywhere)
         self.chat_display.document().setDefaultTextOption(text_option)
@@ -3673,13 +3673,19 @@ class EncryptedChatClient(QObject):
 
         # Explicit newlines create additional QTextBlocks. A full-width extra
         # selection paints each block to the viewport edges independently of
-        # the document margin that keeps the text itself padded.
+        # the paragraph margins that keep the text itself padded.
         document = cursor.document()
         block = document.findBlock(message_start_position)
         final_block_number = cursor.block().blockNumber()
         while block.isValid() and block.blockNumber() <= final_block_number:
+            block_cursor = QTextCursor(block)
+            block_format = block.blockFormat()
+            block_format.setLeftMargin(10)
+            block_format.setRightMargin(10)
+            block_cursor.setBlockFormat(block_format)
+
             selection = QTextEdit.ExtraSelection()
-            selection.cursor = QTextCursor(block)
+            selection.cursor = block_cursor
             selection.cursor.clearSelection()
             selection.format.setBackground(QColor(background_color))
             selection.format.setProperty(
@@ -3701,6 +3707,8 @@ class EncryptedChatClient(QObject):
             cursor.insertBlock()
         system_block = cursor.blockFormat()
         system_block.setBackground(QColor("#ffffff"))
+        system_block.setLeftMargin(10)
+        system_block.setRightMargin(10)
         cursor.setBlockFormat(system_block)
         cursor.insertText(
             f"[{display_time}] ",
