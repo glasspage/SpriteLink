@@ -140,6 +140,12 @@ SELECTABLE_MESSAGE_FONTS = (
     "Times New Roman",
     "Segoe UI",
 )
+MESSAGE_FONT_POINT_SIZES = {
+    "Corbel": 16,
+    "Tahoma": 14,
+    "Times New Roman": 16,
+    "Segoe UI": 14,
+}
 # Preserve receive compatibility with messages created by an earlier v11
 # draft, where "System" resolved to the application UI font rather than the
 # legacy Windows bitmap face.
@@ -1017,6 +1023,19 @@ class EncryptedChatClient(QObject):
         font.setStyleStrategy(self._font_style_strategy())
         return font
 
+    def _make_message_font(
+        self,
+        font_name: str,
+        *,
+        bold: bool = False,
+    ) -> QFont:
+        point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
+        return self._make_font(
+            font_name,
+            point_size,
+            bold=bold,
+        )
+
     def _apply_application_font_strategy(self) -> None:
         app = QApplication.instance()
         if app is None:
@@ -1530,7 +1549,7 @@ class EncryptedChatClient(QObject):
         for index, font_name in enumerate(SELECTABLE_MESSAGE_FONTS):
             self.message_font_combo.setItemData(
                 index,
-                self._make_font(font_name, 10),
+                self._make_message_font(font_name),
                 Qt.ItemDataRole.FontRole,
             )
         self.message_font_combo.currentTextChanged.connect(
@@ -1559,7 +1578,7 @@ class EncryptedChatClient(QObject):
 
         self.message_entry = ComposeTextEdit()
         self.message_entry.setFont(
-            self._make_font(DEFAULT_MESSAGE_FONT, 10)
+            self._make_message_font(DEFAULT_MESSAGE_FONT)
         )
         self.message_entry.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.message_entry.setSizePolicy(
@@ -1623,7 +1642,7 @@ class EncryptedChatClient(QObject):
             self.identity_username_entry.setText(profile["username"])
             self.message_font_combo.setCurrentText(profile["font"])
             self.message_font_combo.setFont(
-                self._make_font(profile["font"], 10)
+                self._make_message_font(profile["font"])
             )
             self._set_color_preview(
                 self.identity_color_preview,
@@ -1659,7 +1678,7 @@ class EncryptedChatClient(QObject):
             return
         profile = self._active_room_profile()
         self.message_entry.setFont(
-            self._make_font(profile["font"], 10)
+            self._make_message_font(profile["font"])
         )
         self.message_entry.setStyleSheet(
             f"color: {profile['text_color']};"
@@ -1710,7 +1729,7 @@ class EncryptedChatClient(QObject):
             else DEFAULT_MESSAGE_FONT
         )
         self.message_font_combo.setFont(
-            self._make_font(profile["font"], 10)
+            self._make_message_font(profile["font"])
         )
         self._apply_active_composer_style()
         self._schedule_profile_save()
@@ -3106,8 +3125,8 @@ class EncryptedChatClient(QObject):
         if not normalized:
             return "[...]"
 
-        body_metrics = QFontMetrics(self._make_font(font_name, 10))
-        username_font = self._make_font(font_name, 10, bold=True)
+        body_metrics = QFontMetrics(self._make_message_font(font_name))
+        username_font = self._make_message_font(font_name, bold=True)
         username_metrics = QFontMetrics(username_font)
         prefix_width = (
             username_metrics.horizontalAdvance(username)
@@ -3194,7 +3213,7 @@ class EncryptedChatClient(QObject):
         formatting = QTextCharFormat()
         formatting.setForeground(QColor(color))
         formatting.setFont(
-            self._make_font(font_name, 10, bold=bold)
+            self._make_message_font(font_name, bold=bold)
         )
         if anchor:
             formatting.setAnchor(True)
