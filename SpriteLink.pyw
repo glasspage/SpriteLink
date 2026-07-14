@@ -112,6 +112,8 @@ GLOBAL_CHATROOM_ID = "global"
 GLOBAL_CHATROOM_NICKNAME = "Global"
 GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
 CHATROOM_SIDEBAR_WIDTH = 240
+UNREAD_INDICATOR_COLOR = "#d97706"
+UNREAD_TOGGLE_COLOR = "#f6b85f"
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
@@ -766,6 +768,9 @@ class ChatroomListRow(QWidget):
         layout.addWidget(nickname_label, 1)
 
         unread_label = QLabel(f"({unread_count})")
+        unread_label.setStyleSheet(
+            f"color: {UNREAD_INDICATOR_COLOR};"
+        )
         unread_label.setVisible(unread_count > 0 and not muted)
         layout.addWidget(unread_label)
 
@@ -1017,6 +1022,17 @@ class EncryptedChatClient(QObject):
         active_item: QListWidgetItem | None = None
         muted_ids = self._muted_chatroom_ids()
         unread_counts = self._unread_counts()
+        has_other_unread = any(
+            room_id != self.active_chatroom_id
+            and room_id not in muted_ids
+            and int(unread_count or 0) > 0
+            for room_id, unread_count in unread_counts.items()
+        )
+        self.chatrooms_toggle.setStyleSheet(
+            f"background-color: {UNREAD_TOGGLE_COLOR};"
+            if has_other_unread
+            else ""
+        )
 
         for room in self._chatroom_definitions():
             item = QListWidgetItem()
