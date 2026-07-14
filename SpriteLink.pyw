@@ -1,4 +1,4 @@
-# SpriteLink v11
+# SpriteLink v12
 # Windows + Python 3.10+
 #
 # Required packages:
@@ -69,6 +69,7 @@ try:
         QPushButton,
         QScrollArea,
         QSizePolicy,
+        QStyleFactory,
         QTextBrowser,
         QToolTip,
         QVBoxLayout,
@@ -105,7 +106,7 @@ except ImportError:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 11
+CONFIG_FORMAT_VERSION = 12
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
@@ -119,6 +120,12 @@ SERVER_PRESETS: dict[str, str] = {
     "Local ntfy server": "http://127.0.0.1:8080",
     "Custom ntfy server": "",
 }
+
+DEFAULT_THEME = "Basic (Light)"
+THEMES = (
+    DEFAULT_THEME,
+    "Windows Classic",
+)
 
 POLL_INTERVAL_SECONDS = 6.0
 MIN_POLL_REQUEST_SPACING_SECONDS = 5.0
@@ -160,6 +167,94 @@ MESSAGE_FONT_POINT_SIZES = {
 # draft, where "System" resolved to the application UI font rather than the
 # legacy Windows bitmap face.
 SUPPORTED_MESSAGE_FONTS = SELECTABLE_MESSAGE_FONTS + ("System",)
+
+WINDOWS_CLASSIC_STYLESHEET = """
+QMainWindow, QDialog, QWidget {
+    background-color: #c0c0c0;
+    color: #000000;
+}
+QLabel {
+    background-color: transparent;
+}
+QPushButton {
+    background-color: #c0c0c0;
+    color: #000000;
+    border-top: 2px solid #ffffff;
+    border-left: 2px solid #ffffff;
+    border-right: 2px solid #000000;
+    border-bottom: 2px solid #000000;
+    border-radius: 0px;
+    padding: 3px 8px;
+    min-height: 18px;
+}
+QPushButton:pressed, QPushButton:checked {
+    border-top: 2px solid #000000;
+    border-left: 2px solid #000000;
+    border-right: 2px solid #ffffff;
+    border-bottom: 2px solid #ffffff;
+    padding-top: 4px;
+    padding-left: 9px;
+    padding-right: 7px;
+    padding-bottom: 2px;
+}
+QPushButton:disabled {
+    color: #808080;
+}
+QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
+    background-color: #ffffff;
+    color: #000000;
+    border-top: 2px solid #808080;
+    border-left: 2px solid #808080;
+    border-right: 2px solid #ffffff;
+    border-bottom: 2px solid #ffffff;
+    border-radius: 0px;
+    selection-background-color: #000080;
+    selection-color: #ffffff;
+}
+QComboBox {
+    padding: 2px 4px;
+}
+QComboBox::drop-down {
+    background-color: #c0c0c0;
+    border-left: 1px solid #808080;
+    width: 20px;
+}
+QComboBox QAbstractItemView, QMenu {
+    background-color: #ffffff;
+    color: #000000;
+    border: 1px solid #000000;
+    selection-background-color: #000080;
+    selection-color: #ffffff;
+}
+QListWidget::item:selected, QMenu::item:selected {
+    background-color: #000080;
+    color: #ffffff;
+}
+QCheckBox {
+    spacing: 6px;
+}
+QProgressBar {
+    background-color: #ffffff;
+    color: #000000;
+    border-top: 2px solid #808080;
+    border-left: 2px solid #808080;
+    border-right: 2px solid #ffffff;
+    border-bottom: 2px solid #ffffff;
+    border-radius: 0px;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background-color: #000080;
+}
+QToolTip {
+    background-color: #ffffe1;
+    color: #000000;
+    border: 1px solid #000000;
+}
+QFrame[frameShape="4"], QFrame[frameShape="5"] {
+    color: #808080;
+}
+"""
 
 # Dark, moderately saturated colors that remain readable against the standard
 # light chat background. A color is selected only when a new local
@@ -322,6 +417,7 @@ def default_config() -> dict[str, Any]:
         "config_version": CONFIG_FORMAT_VERSION,
         "server_preset": DEFAULT_SERVER_PRESET,
         "server_url": DEFAULT_SERVER_URL,
+        "theme": DEFAULT_THEME,
         "chime_enabled": True,
         "anti_aliased_text": True,
         "client_id": secrets.token_hex(32),
@@ -481,6 +577,8 @@ def load_config() -> dict[str, Any]:
     config["anti_aliased_text"] = bool(
         config.get("anti_aliased_text", True)
     )
+    theme = str(config.get("theme", DEFAULT_THEME))
+    config["theme"] = theme if theme in THEMES else DEFAULT_THEME
 
     muted_chatrooms = config.get("muted_chatrooms")
     if not isinstance(muted_chatrooms, list):
@@ -914,6 +1012,16 @@ class EncryptedChatClient(QObject):
         self.root.setMinimumSize(670, 500)
 
         self.config_data = load_config()
+        app = QApplication.instance()
+        self._basic_style_name = (
+            app.style().objectName() if app is not None else "Fusion"
+        )
+        self._basic_palette = (
+            QPalette(app.palette()) if app is not None else QPalette()
+        )
+        self._basic_application_stylesheet = (
+            app.styleSheet() if app is not None else ""
+        )
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
@@ -965,6 +1073,9 @@ class EncryptedChatClient(QObject):
         self.server_url_var = ValueModel(
             self.config_data["server_url"]
         )
+        self.theme_var = ValueModel(
+            self.config_data.get("theme", DEFAULT_THEME)
+        )
         self.chime_var = ValueModel(
             bool(self.config_data["chime_enabled"])
         )
@@ -995,6 +1106,7 @@ class EncryptedChatClient(QObject):
         self.ui_queue_timer.timeout.connect(self._process_ui_queue)
         self.ui_queue_timer.start(100)
 
+        self._apply_theme()
         self._apply_application_font_strategy()
         self._build_ui()
         self._apply_server_preset_state()
@@ -1059,6 +1171,99 @@ class EncryptedChatClient(QObject):
             widget_font = QFont(widget.font())
             widget_font.setStyleStrategy(strategy)
             widget.setFont(widget_font)
+
+    def _is_windows_classic_theme(self) -> bool:
+        return self.theme_var.get() == "Windows Classic"
+
+    def _windows_classic_palette(self) -> QPalette:
+        palette = QPalette()
+        colors = {
+            QPalette.ColorRole.Window: "#c0c0c0",
+            QPalette.ColorRole.WindowText: "#000000",
+            QPalette.ColorRole.Base: "#ffffff",
+            QPalette.ColorRole.AlternateBase: "#dfdfdf",
+            QPalette.ColorRole.ToolTipBase: "#ffffe1",
+            QPalette.ColorRole.ToolTipText: "#000000",
+            QPalette.ColorRole.Text: "#000000",
+            QPalette.ColorRole.Button: "#c0c0c0",
+            QPalette.ColorRole.ButtonText: "#000000",
+            QPalette.ColorRole.BrightText: "#ffffff",
+            QPalette.ColorRole.Light: "#ffffff",
+            QPalette.ColorRole.Midlight: "#dfdfdf",
+            QPalette.ColorRole.Mid: "#a0a0a0",
+            QPalette.ColorRole.Dark: "#808080",
+            QPalette.ColorRole.Shadow: "#000000",
+            QPalette.ColorRole.Highlight: "#000080",
+            QPalette.ColorRole.HighlightedText: "#ffffff",
+            QPalette.ColorRole.Link: "#000080",
+            QPalette.ColorRole.LinkVisited: "#800080",
+        }
+        for role, color in colors.items():
+            palette.setColor(role, QColor(color))
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.Text,
+            QColor("#808080"),
+        )
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.ButtonText,
+            QColor("#808080"),
+        )
+        return palette
+
+    def _config_panel_stylesheet(self) -> str:
+        if self._is_windows_classic_theme():
+            return (
+                "QFrame#configPanel { background: #c0c0c0;"
+                " border-top: 2px solid #ffffff;"
+                " border-left: 2px solid #ffffff;"
+                " border-right: 2px solid #000000;"
+                " border-bottom: 2px solid #000000;"
+                " border-radius: 0px; }"
+            )
+        return (
+            "QFrame#configPanel { background: palette(window); "
+            "border: 1px solid palette(mid); border-radius: 3px; }"
+        )
+
+    def _apply_theme(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        if self._is_windows_classic_theme():
+            available_styles = {
+                name.casefold(): name for name in QStyleFactory.keys()
+            }
+            app.setStyle(
+                available_styles.get(
+                    "windows",
+                    available_styles.get("fusion", "Fusion"),
+                )
+            )
+            app.setPalette(self._windows_classic_palette())
+            app.setStyleSheet(WINDOWS_CLASSIC_STYLESHEET)
+        else:
+            available_styles = {
+                name.casefold(): name for name in QStyleFactory.keys()
+            }
+            basic_style = available_styles.get(
+                self._basic_style_name.casefold()
+            )
+            if basic_style is not None:
+                app.setStyle(basic_style)
+            app.setPalette(QPalette(self._basic_palette))
+            app.setStyleSheet(self._basic_application_stylesheet)
+
+        if hasattr(self, "config_panel"):
+            self.config_panel.setStyleSheet(
+                self._config_panel_stylesheet()
+            )
+        if hasattr(self, "message_size_bar"):
+            self._draw_message_size_bar()
+        if hasattr(self, "chatrooms_toggle"):
+            self._update_chatrooms_toggle_unread_style()
 
     def _heading(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -1778,10 +1983,7 @@ class EncryptedChatClient(QObject):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        self.config_panel.setStyleSheet(
-            "QFrame#configPanel { background: palette(window); "
-            "border: 1px solid palette(mid); border-radius: 3px; }"
-        )
+        self.config_panel.setStyleSheet(self._config_panel_stylesheet())
         panel_row.addWidget(self.config_panel, 8)
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row, 1)
@@ -1852,6 +2054,20 @@ class EncryptedChatClient(QObject):
 
         layout.addWidget(self._separator(), row, 0, 1, 3)
         row += 1
+        layout.addWidget(self._heading("Appearance"), row, 0, 1, 3)
+        row += 1
+
+        layout.addWidget(QLabel("Themes"), row, 0)
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(list(THEMES))
+        self.theme_combo.setCurrentText(str(self.theme_var.get()))
+        self.theme_combo.currentTextChanged.connect(self.theme_var.set)
+        self.theme_var.bind(self.theme_combo.setCurrentText)
+        layout.addWidget(self.theme_combo, row, 1, 1, 2)
+        row += 1
+
+        layout.addWidget(self._separator(), row, 0, 1, 3)
+        row += 1
         layout.addWidget(
             self._heading("Notifications and rendering"),
             row,
@@ -1915,6 +2131,7 @@ class EncryptedChatClient(QObject):
         return (
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
+            str(self.theme_var.get()),
             bool(self.chime_var.get()),
             bool(self.anti_alias_var.get()),
         )
@@ -1983,6 +2200,10 @@ class EncryptedChatClient(QObject):
 
         self.config_data["server_preset"] = self.server_preset_var.get()
         self.config_data["server_url"] = server_url
+        theme = str(self.theme_var.get())
+        self.config_data["theme"] = (
+            theme if theme in THEMES else DEFAULT_THEME
+        )
         self.config_data["chime_enabled"] = bool(self.chime_var.get())
         self.config_data["anti_aliased_text"] = bool(
             self.anti_alias_var.get()
@@ -2001,6 +2222,7 @@ class EncryptedChatClient(QObject):
             return False
 
         self._clear_visible_room()
+        self._apply_theme()
         self._apply_application_font_strategy()
         self._apply_active_composer_style()
         self._load_saved_history_for_current_room()
@@ -2128,15 +2350,30 @@ class EncryptedChatClient(QObject):
         self.message_size_bar.setValue(
             min(packet_size, NTFY_MAX_BODY_BYTES)
         )
-        self.message_size_bar.setStyleSheet(
-            "QProgressBar { background-color: #eeeeee; "
-            "border: 1px solid #a8a8a8; color: "
-            + ("#ffffff" if at_or_over_limit else "#202020")
-            + "; text-align: center; } "
-            "QProgressBar::chunk { background: "
-            + ("#303030" if at_or_over_limit else "#b8b8b8")
-            + "; }"
-        )
+        if self._is_windows_classic_theme():
+            self.message_size_bar.setStyleSheet(
+                "QProgressBar { background-color: #ffffff;"
+                " border-top: 2px solid #808080;"
+                " border-left: 2px solid #808080;"
+                " border-right: 2px solid #ffffff;"
+                " border-bottom: 2px solid #ffffff;"
+                " border-radius: 0px; color: "
+                + ("#ffffff" if at_or_over_limit else "#000000")
+                + "; text-align: center; }"
+                " QProgressBar::chunk { background-color: "
+                + ("#800000" if at_or_over_limit else "#000080")
+                + "; }"
+            )
+        else:
+            self.message_size_bar.setStyleSheet(
+                "QProgressBar { background-color: #eeeeee; "
+                "border: 1px solid #a8a8a8; color: "
+                + ("#ffffff" if at_or_over_limit else "#202020")
+                + "; text-align: center; } "
+                "QProgressBar::chunk { background: "
+                + ("#303030" if at_or_over_limit else "#b8b8b8")
+                + "; }"
+            )
 
         if self.message_size_check_pending:
             self.message_size_bar.setFormat("Calculating...")
