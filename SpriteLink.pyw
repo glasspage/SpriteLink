@@ -3519,6 +3519,13 @@ class EncryptedChatClient(QObject):
         except Exception:
             return "Unknown time"
 
+    @staticmethod
+    def _local_datetime(timestamp: int) -> datetime | None:
+        try:
+            return datetime.fromtimestamp(timestamp)
+        except Exception:
+            return None
+
     def _current_room_scope_id(self) -> str | None:
         server_url = normalize_server_url(
             str(self.config_data.get("server_url", ""))
@@ -3674,6 +3681,21 @@ class EncryptedChatClient(QObject):
                 self._hovered_message_id = None
                 QToolTip.hideText()
 
+            elif event.type() in (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseButtonRelease,
+                QEvent.Type.MouseButtonDblClick,
+            ):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    anchor = self.chat_display.anchorAt(
+                        event.position().toPoint()
+                    )
+                    if self._message_id_from_anchor(anchor):
+                        # User links are hover/context targets, not clickable
+                        # navigation. Consuming the click prevents Qt from
+                        # drawing a focus outline around the icon or username.
+                        return True
+
             elif event.type() == QEvent.Type.ContextMenu:
                 anchor = self.chat_display.anchorAt(event.pos())
                 message_id = self._message_id_from_anchor(anchor)
@@ -3683,7 +3705,9 @@ class EncryptedChatClient(QObject):
                         item,
                         event.globalPos(),
                     )
-                    return True
+                # Never show QTextBrowser's generic Copy/Copy Link/Select All
+                # menu in the log viewport.
+                return True
 
         return super().eventFilter(watched, event)
 
@@ -3874,6 +3898,21 @@ class EncryptedChatClient(QObject):
             formatting.setFontUnderline(False)
         return formatting
 
+    def _insert_log_separator(
+        self,
+        cursor: QTextCursor,
+        text: str,
+    ) -> None:
+        cursor.insertBlock()
+        separator_block = QTextBlockFormat()
+        separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        separator_block.setTopMargin(7)
+        separator_block.setBottomMargin(7)
+        cursor.setBlockFormat(separator_block)
+        cursor.insertText(text, self._text_format("#777777"))
+        cursor.insertBlock()
+        cursor.setBlockFormat(QTextBlockFormat())
+
     def _render_message_log(self, *, scroll_to_bottom: bool) -> None:
         QToolTip.hideText()
         self.rendered_message_items.clear()
@@ -3886,31 +3925,43 @@ class EncryptedChatClient(QObject):
         collapsed_ids = self._room_preference_ids("collapsed_messages")
         row_selections: list[QTextEdit.ExtraSelection] = []
         previous_timestamp: int | None = None
+        previous_local_date: Any = None
         first_item = True
 
         for message_index, item in enumerate(self.message_log):
             current_timestamp = self._display_timestamp_for_item(item)
+            current_local_datetime = self._local_datetime(current_timestamp)
+            current_local_date = (
+                current_local_datetime.date()
+                if current_local_datetime is not None
+                else None
+            )
 
             if (
+                not first_item
+                and previous_local_date is not None
+                and current_local_date is not None
+                and current_local_date != previous_local_date
+            ):
+                self._insert_log_separator(
+                    cursor,
+                    "————— "
+                    f"{current_local_datetime.strftime('%b')} "
+                    f"{current_local_datetime.day}, "
+                    f"{current_local_datetime.year}"
+                    " —————",
+                )
+            elif (
                 previous_timestamp is not None
                 and current_timestamp - previous_timestamp
                 >= GAP_SEPARATOR_SECONDS
             ):
-                if not first_item:
-                    cursor.insertBlock()
                 gap_seconds = current_timestamp - previous_timestamp
                 gap_hours = max(6, int((gap_seconds / 3600.0) + 0.5))
-                gap_block = QTextBlockFormat()
-                gap_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                gap_block.setTopMargin(7)
-                gap_block.setBottomMargin(7)
-                cursor.setBlockFormat(gap_block)
-                cursor.insertText(
+                self._insert_log_separator(
+                    cursor,
                     f"————— {gap_hours} hours later —————",
-                    self._text_format("#777777"),
                 )
-                cursor.insertBlock()
-                cursor.setBlockFormat(QTextBlockFormat())
             elif not first_item:
                 cursor.insertBlock()
 
@@ -3926,6 +3977,7 @@ class EncryptedChatClient(QObject):
             )
             first_item = False
             previous_timestamp = current_timestamp
+            previous_local_date = current_local_date
 
         self.chat_display.setExtraSelections(row_selections)
 
