@@ -3904,7 +3904,25 @@ class EncryptedChatClient(QObject):
         text: str,
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
-    ) -> None:
+    ) -> bool:
+        previous_block = cursor.block().previous()
+        if (
+            previous_block.isValid()
+            and previous_block.text().startswith("————— ")
+        ):
+            # Consecutive separators represent the same empty span. Keep only
+            # the newest one without adding another striped row.
+            replacement = QTextCursor(previous_block)
+            replacement.movePosition(
+                QTextCursor.MoveOperation.StartOfBlock
+            )
+            replacement.movePosition(
+                QTextCursor.MoveOperation.EndOfBlock,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            replacement.insertText(text, self._text_format("#777777"))
+            return False
+
         cursor.insertBlock()
         separator_block = QTextBlockFormat()
         separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3925,6 +3943,7 @@ class EncryptedChatClient(QObject):
 
         cursor.insertBlock()
         cursor.setBlockFormat(QTextBlockFormat())
+        return True
 
     def _render_message_log(self, *, scroll_to_bottom: bool) -> None:
         QToolTip.hideText()
@@ -3957,7 +3976,7 @@ class EncryptedChatClient(QObject):
                 and current_local_date is not None
                 and current_local_date != previous_local_date
             ):
-                self._insert_log_separator(
+                if self._insert_log_separator(
                     cursor,
                     "————— "
                     f"{current_local_datetime.strftime('%b')} "
@@ -3968,8 +3987,8 @@ class EncryptedChatClient(QObject):
                         stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
                     ],
                     row_selections,
-                )
-                stripe_index += 1
+                ):
+                    stripe_index += 1
             elif (
                 previous_timestamp is not None
                 and current_timestamp - previous_timestamp
@@ -3977,15 +3996,15 @@ class EncryptedChatClient(QObject):
             ):
                 gap_seconds = current_timestamp - previous_timestamp
                 gap_hours = max(6, int((gap_seconds / 3600.0) + 0.5))
-                self._insert_log_separator(
+                if self._insert_log_separator(
                     cursor,
                     f"————— {gap_hours} hours later —————",
                     MESSAGE_ROW_BACKGROUNDS[
                         stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
                     ],
                     row_selections,
-                )
-                stripe_index += 1
+                ):
+                    stripe_index += 1
             elif not first_item:
                 cursor.insertBlock()
 
