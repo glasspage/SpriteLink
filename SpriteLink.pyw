@@ -36,12 +36,13 @@ import sys
 import uuid
 import zlib
 try:
-    from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
+    from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, Signal
     from PySide6.QtGui import (
         QColor,
         QFont,
         QFontMetrics,
         QPalette,
+        QPolygon,
         QTextBlockFormat,
         QTextCharFormat,
         QTextCursor,
@@ -69,6 +70,8 @@ try:
         QPushButton,
         QScrollArea,
         QSizePolicy,
+        QProxyStyle,
+        QStyle,
         QStyleFactory,
         QTextBrowser,
         QToolTip,
@@ -121,7 +124,8 @@ SERVER_PRESETS: dict[str, str] = {
     "Custom ntfy server": "",
 }
 
-DEFAULT_THEME = "Basic (Light)"
+DEFAULT_THEME = "Modern (Light)"
+LEGACY_BASIC_THEME = "Basic (Light)"
 THEMES = (
     DEFAULT_THEME,
     "Windows Classic",
@@ -218,6 +222,10 @@ QComboBox::drop-down {
     background-color: #c0c0c0;
     border-left: 1px solid #808080;
     width: 20px;
+}
+QComboBox::down-arrow {
+    width: 9px;
+    height: 5px;
 }
 QComboBox QAbstractItemView, QMenu {
     background-color: #ffffff;
@@ -575,6 +583,8 @@ def load_config() -> dict[str, Any]:
 
     config.pop("anti_aliased_text", None)
     theme = str(config.get("theme", DEFAULT_THEME))
+    if theme == LEGACY_BASIC_THEME:
+        theme = DEFAULT_THEME
     config["theme"] = theme if theme in THEMES else DEFAULT_THEME
 
     muted_chatrooms = config.get("muted_chatrooms")
@@ -989,6 +999,32 @@ class ChatroomListRow(QWidget):
             self.setGraphicsEffect(opacity)
 
 
+class WindowsClassicStyle(QProxyStyle):
+    """Keep combo-box arrows visible over the classic drop-down button."""
+
+    def drawPrimitive(
+        self,
+        element: QStyle.PrimitiveElement,
+        option: Any,
+        painter: Any,
+        widget: QWidget | None = None,
+    ) -> None:
+        if element == QStyle.PrimitiveElement.PE_IndicatorArrowDown:
+            center = option.rect.center()
+            arrow = QPolygon([
+                QPoint(center.x() - 4, center.y() - 2),
+                QPoint(center.x() + 4, center.y() - 2),
+                QPoint(center.x(), center.y() + 3),
+            ])
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#000000"))
+            painter.drawPolygon(arrow)
+            painter.restore()
+            return
+        super().drawPrimitive(element, option, painter, widget)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1019,6 +1055,7 @@ class EncryptedChatClient(QObject):
         self._basic_application_stylesheet = (
             app.styleSheet() if app is not None else ""
         )
+        self._classic_proxy_style: WindowsClassicStyle | None = None
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
@@ -1280,12 +1317,14 @@ class EncryptedChatClient(QObject):
             available_styles = {
                 name.casefold(): name for name in QStyleFactory.keys()
             }
-            app.setStyle(
-                available_styles.get(
-                    "windows",
-                    available_styles.get("fusion", "Fusion"),
-                )
+            classic_style_name = available_styles.get(
+                "windows",
+                available_styles.get("fusion", "Fusion"),
             )
+            self._classic_proxy_style = WindowsClassicStyle(
+                classic_style_name
+            )
+            app.setStyle(self._classic_proxy_style)
             app.setPalette(self._windows_classic_palette())
             app.setStyleSheet(WINDOWS_CLASSIC_STYLESHEET)
         else:
@@ -1297,6 +1336,7 @@ class EncryptedChatClient(QObject):
             )
             if basic_style is not None:
                 app.setStyle(basic_style)
+            self._classic_proxy_style = None
             app.setPalette(QPalette(self._basic_palette))
             app.setStyleSheet(self._basic_application_stylesheet)
 
@@ -2116,7 +2156,7 @@ class EncryptedChatClient(QObject):
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(list(THEMES))
         self.theme_combo.setCurrentText(str(self.theme_var.get()))
-        self.theme_combo.currentTextChanged.connect(self.theme_var.set)
+        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
         self.theme_var.bind(self.theme_combo.setCurrentText)
         layout.addWidget(self.theme_combo, row, 1, 1, 2)
         row += 1
@@ -2140,36 +2180,6 @@ class EncryptedChatClient(QObject):
         self.chime_var.bind(self.chime_checkbox.setChecked)
         layout.addWidget(self.chime_checkbox, row, 0, 1, 3)
         row += 1
-
-        layout.addWidget(self._separator(), row, 0, 1, 3)
-        row += 1
-
-        button_layout = QHBoxLayout()
-        button_layout.addStretch(1)
-        test_button = QPushButton("Test connection")
-        test_button.clicked.connect(self._test_connection)
-        button_layout.addWidget(test_button)
-        layout.addLayout(button_layout, row, 0, 1, 3)
-        row += 1
-
-        apply_note = self._description(
-            "Changes are saved and applied when the Config panel closes."
-        )
-        layout.addWidget(apply_note, row, 0, 1, 3)
-        row += 1
-
-        layout.addWidget(
-            self._description(
-                "Settings, server message cursors, local history, and the hidden "
-                "client identity are saved in a Windows DPAPI-encrypted file tied "
-                "to the current Windows user."
-            ),
-            row,
-            0,
-            1,
-            3,
-        )
-        row += 1
         layout.setRowStretch(row, 1)
 
     def _sync_config_overlay_geometry(self) -> None:
@@ -2179,7 +2189,6 @@ class EncryptedChatClient(QObject):
         return (
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
-            str(self.theme_var.get()),
             bool(self.chime_var.get()),
         )
 
@@ -2233,6 +2242,28 @@ class EncryptedChatClient(QObject):
 
         self._apply_server_preset_state()
 
+    def _on_theme_changed(self, value: Any) -> None:
+        theme = str(value)
+        if theme not in THEMES:
+            theme = DEFAULT_THEME
+
+        self.theme_var.set(theme)
+        self.config_data["theme"] = theme
+        self._apply_theme()
+        self._apply_application_font_strategy()
+        self._apply_active_composer_style()
+        if hasattr(self, "chat_display"):
+            self._rerender_preserving_scroll()
+
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not save theme",
+                str(exc),
+                parent=self.root,
+            )
+
     def _validate_current_settings(self) -> str:
         server_url = normalize_server_url(str(self.server_url_var.get()))
 
@@ -2277,39 +2308,6 @@ class EncryptedChatClient(QObject):
         self.reconnect_requested.set()
         self._append_system_message("Configuration saved. Reconnecting.")
         return True
-
-    def _test_connection(self) -> None:
-        try:
-            server_url = self._validate_current_settings()
-        except Exception as exc:
-            messagebox.showerror(
-                "Invalid configuration",
-                str(exc),
-                parent=self.root,
-            )
-            return
-
-        threading.Thread(
-            target=self._test_connection_worker,
-            args=(server_url,),
-            daemon=True,
-        ).start()
-
-    def _test_connection_worker(self, server_url: str) -> None:
-        try:
-            response = requests.get(
-                f"{server_url}/v1/health",
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            payload = response.json()
-
-            if not isinstance(payload, dict):
-                raise ValueError("Health endpoint returned invalid JSON.")
-        except Exception as exc:
-            self.ui_queue.put(("test_failed", str(exc)))
-        else:
-            self.ui_queue.put(("test_ok", server_url))
 
     def _build_draft_message(self, text: str) -> dict[str, Any]:
         profile = self._active_room_profile()
@@ -2872,20 +2870,6 @@ class EncryptedChatClient(QObject):
 
                 elif event_type == "decrypt_failures":
                     pass
-
-                elif event_type == "test_ok":
-                    messagebox.showinfo(
-                        "Connection successful",
-                        "The ntfy health endpoint responded successfully.",
-                        parent=self.root,
-                    )
-
-                elif event_type == "test_failed":
-                    messagebox.showerror(
-                        "Connection failed",
-                        payload,
-                        parent=self.root,
-                    )
 
         except queue.Empty:
             pass
