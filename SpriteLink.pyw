@@ -169,6 +169,7 @@ PROFILE_ICON_SIZE = 16
 PROFILE_ICON_MAX_COLORS = 16
 MAX_PROFILE_ICON_GIF_BYTES = 2048
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
+CHAT_TOOLTIP_HOVER_DELAY_MS = 100
 MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
 DEFAULT_MESSAGE_FONT = "Segoe UI"
@@ -422,6 +423,23 @@ def optimize_profile_icon(source_path: str) -> bytes:
 
 def encode_profile_icon(gif_data: bytes) -> str:
     return base64.urlsafe_b64encode(gif_data).decode("ascii").rstrip("=")
+
+
+@lru_cache(maxsize=128)
+def profile_icon_tooltip_data_uri(encoded_icon: str) -> str:
+    try:
+        gif_data = decode_profile_icon(encoded_icon)
+        with Image.open(io.BytesIO(gif_data)) as icon:
+            preview = icon.convert("RGBA").resize(
+                (64, 64),
+                Image.Resampling.NEAREST,
+            )
+        output = io.BytesIO()
+        preview.save(output, format="PNG", optimize=True)
+        encoded_preview = base64.b64encode(output.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded_preview}"
+    except Exception:
+        return ""
 
 
 def decode_profile_icon(encoded: str) -> bytes:
@@ -1376,6 +1394,8 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
         self.rendered_tooltips: dict[str, str] = {}
         self._hovered_message_id: str | None = None
+        self._pending_tooltip_message_id: str | None = None
+        self._pending_tooltip_global_position = QPoint()
         self._config_snapshot_at_open: tuple[Any, ...] | None = None
         self._loading_profile_controls = False
         self.active_chatroom_id = str(
@@ -1436,6 +1456,12 @@ class EncryptedChatClient(QObject):
         self.chat_render_timer = QTimer(self)
         self.chat_render_timer.setSingleShot(True)
         self.chat_render_timer.timeout.connect(self._finish_chat_resize_render)
+
+        self.chat_tooltip_timer = QTimer(self)
+        self.chat_tooltip_timer.setSingleShot(True)
+        self.chat_tooltip_timer.timeout.connect(
+            self._show_pending_chat_tooltip
+        )
 
         self.ui_queue_timer = QTimer(self)
         self.ui_queue_timer.timeout.connect(self._process_ui_queue)
@@ -3883,6 +3909,48 @@ class EncryptedChatClient(QObject):
     def _finish_chat_resize_render(self) -> None:
         self._rerender_preserving_scroll()
 
+    def _schedule_chat_tooltip(
+        self,
+        message_id: str,
+        global_position: QPoint,
+    ) -> None:
+        if message_id == self._hovered_message_id:
+            if self.chat_tooltip_timer.isActive():
+                self._pending_tooltip_global_position = QPoint(
+                    global_position
+                )
+            return
+
+        self._hide_chat_tooltip()
+        self._hovered_message_id = message_id
+        self._pending_tooltip_message_id = message_id
+        self._pending_tooltip_global_position = QPoint(global_position)
+        self.chat_tooltip_timer.start(CHAT_TOOLTIP_HOVER_DELAY_MS)
+
+    def _show_pending_chat_tooltip(self) -> None:
+        message_id = self._pending_tooltip_message_id
+        self._pending_tooltip_message_id = None
+        if not message_id or message_id != self._hovered_message_id:
+            return
+        tooltip = self.rendered_tooltips.get(message_id, "")
+        if tooltip:
+            QToolTip.showText(
+                self._pending_tooltip_global_position,
+                tooltip,
+                self.chat_display.viewport(),
+            )
+
+    def _hide_chat_tooltip(self) -> None:
+        self.chat_tooltip_timer.stop()
+        self._pending_tooltip_message_id = None
+        self._hovered_message_id = None
+        QToolTip.hideText()
+        app = QApplication.instance()
+        if app is not None:
+            for widget in app.topLevelWidgets():
+                if widget.windowType() == Qt.WindowType.ToolTip:
+                    widget.hide()
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if (
             watched is getattr(self, "chat_content", None)
@@ -3908,23 +3976,18 @@ class EncryptedChatClient(QObject):
                     self.chat_display.viewport().setCursor(
                         Qt.CursorShape.PointingHandCursor
                     )
-                    if message_id != self._hovered_message_id:
-                        self._hovered_message_id = message_id
-                        QToolTip.showText(
-                            event.globalPosition().toPoint(),
-                            self.rendered_tooltips.get(message_id, ""),
-                            self.chat_display.viewport(),
-                        )
+                    self._schedule_chat_tooltip(
+                        message_id,
+                        event.globalPosition().toPoint(),
+                    )
                 else:
-                    self._hovered_message_id = None
                     self.chat_display.viewport().setCursor(
                         Qt.CursorShape.IBeamCursor
                     )
-                    QToolTip.hideText()
+                    self._hide_chat_tooltip()
 
             elif event.type() == QEvent.Type.Leave:
-                self._hovered_message_id = None
-                QToolTip.hideText()
+                self._hide_chat_tooltip()
 
             elif event.type() in (
                 QEvent.Type.MouseButtonPress,
@@ -4191,7 +4254,7 @@ class EncryptedChatClient(QObject):
         return True
 
     def _render_message_log(self, *, scroll_to_bottom: bool) -> None:
-        QToolTip.hideText()
+        self._hide_chat_tooltip()
         self.rendered_message_items.clear()
         self.rendered_tooltips.clear()
         self.chat_display.clear()
@@ -4334,10 +4397,21 @@ class EncryptedChatClient(QObject):
         )
 
         self.rendered_message_items[message_id] = item
-        self.rendered_tooltips[message_id] = (
-            f"{self._format_hover_timestamp(timestamp)}\n"
-            f"Unique ID: {unique_id_preview}"
-        )
+        hover_timestamp = self._format_hover_timestamp(timestamp)
+        tooltip_icon_uri = profile_icon_tooltip_data_uri(profile_icon)
+        if tooltip_icon_uri:
+            self.rendered_tooltips[message_id] = (
+                '<div align="center">'
+                f'<img src="{tooltip_icon_uri}" width="64" height="64">'
+                f"<br>{hover_timestamp}<br>"
+                f"Unique ID: {unique_id_preview}"
+                "</div>"
+            )
+        else:
+            self.rendered_tooltips[message_id] = (
+                f"{hover_timestamp}\n"
+                f"Unique ID: {unique_id_preview}"
+            )
 
         has_profile_icon = self._insert_profile_icon(
             cursor,
@@ -4347,7 +4421,11 @@ class EncryptedChatClient(QObject):
         if has_profile_icon:
             cursor.insertText(
                 " ",
-                self._text_format(body_color, font_name=font_name),
+                self._text_format(
+                    body_color,
+                    anchor=f"spritelink:{message_id}",
+                    font_name=font_name,
+                ),
             )
         cursor.insertText(
             username,
@@ -4442,7 +4520,7 @@ class EncryptedChatClient(QObject):
         scrollbar.setValue(scrollbar.maximum())
 
     def _clear_visible_room(self) -> None:
-        QToolTip.hideText()
+        self._hide_chat_tooltip()
         self.seen_client_message_ids.clear()
         self.seen_ntfy_message_ids.clear()
         self.message_log.clear()
