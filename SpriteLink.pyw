@@ -119,7 +119,8 @@ SERVER_PRESETS: dict[str, str] = {
     "Custom ntfy server": "",
 }
 
-POLL_INTERVAL_SECONDS = 5.25
+POLL_INTERVAL_SECONDS = 6.0
+MIN_POLL_REQUEST_SPACING_SECONDS = 5.0
 BACKGROUND_POLL_INTERVAL_SECONDS = 60.0
 REQUEST_TIMEOUT_SECONDS = 10
 AUTO_HISTORY_SECONDS = 48 * 60 * 60
@@ -946,10 +947,10 @@ class EncryptedChatClient(QObject):
 
     def _on_chatrooms_toggled(self, expanded: bool) -> None:
         width_delta = CHATROOM_SIDEBAR_WIDTH
-        old_x = self.root.x()
-        old_y = self.root.y()
-        old_width = self.root.width()
-        old_height = self.root.height()
+        old_geometry = self.root.geometry()
+        old_frame_geometry = self.root.frameGeometry()
+        frame_offset_x = old_geometry.x() - old_frame_geometry.x()
+        frame_offset_y = old_geometry.y() - old_frame_geometry.y()
         self.chatrooms_toggle.setText("‹" if expanded else "›")
         self.chatrooms_panel.setVisible(expanded)
         self.root.setMinimumWidth(
@@ -959,15 +960,18 @@ class EncryptedChatClient(QObject):
         )
         new_width = max(
             self.root.minimumWidth(),
-            old_width + (
+            old_geometry.width() + (
                 width_delta if expanded else -width_delta
             ),
         )
+        target_frame_x = old_frame_geometry.x() + (
+            -width_delta if expanded else width_delta
+        )
         self.root.setGeometry(
-            old_x + (-width_delta if expanded else width_delta),
-            old_y,
+            target_frame_x + frame_offset_x,
+            old_frame_geometry.y() + frame_offset_y,
             new_width,
-            old_height,
+            old_geometry.height(),
         )
 
     def _chatroom_definitions(self) -> list[dict[str, str]]:
@@ -1829,15 +1833,15 @@ class EncryptedChatClient(QObject):
         self.network_thread.start()
 
     def _network_loop(self) -> None:
-        next_active_poll = 0.0
-        next_background_polls: dict[str, float] = {}
+        last_poll_times: dict[str, float] = {}
+        next_poll_allowed = 0.0
+        force_active_poll = True
 
         while not self.stop_event.is_set():
             if self.reconnect_requested.is_set():
                 self.reconnect_requested.clear()
                 self.connected = False
-                next_active_poll = 0.0
-                next_background_polls.clear()
+                force_active_poll = True
                 self.ui_queue.put((
                     "status",
                     (
@@ -1864,29 +1868,47 @@ class EncryptedChatClient(QObject):
                 rooms[0],
             )
             valid_room_ids = {room["id"] for room in rooms}
-            for room_id in tuple(next_background_polls):
+            for room_id in tuple(last_poll_times):
                 if room_id not in valid_room_ids:
-                    next_background_polls.pop(room_id, None)
+                    last_poll_times.pop(room_id, None)
 
-            if now >= next_active_poll:
-                self._network_poll(active_room, is_active=True)
-                next_active_poll = (
-                    time.monotonic() + POLL_INTERVAL_SECONDS
+            if now >= next_poll_allowed:
+                active_room_id = active_room["id"]
+                active_poll_due = (
+                    force_active_poll
+                    or now - last_poll_times.get(active_room_id, 0.0)
+                    >= POLL_INTERVAL_SECONDS
                 )
+                room_to_poll: dict[str, str] | None = None
+                poll_is_active = False
 
-            now = time.monotonic()
-            for room in rooms:
-                room_id = room["id"]
-                if room_id == active_room["id"]:
-                    next_background_polls.pop(room_id, None)
-                    continue
-                if now < next_background_polls.get(room_id, 0.0):
-                    continue
-                self._network_poll(room, is_active=False)
-                next_background_polls[room_id] = (
-                    time.monotonic() + BACKGROUND_POLL_INTERVAL_SECONDS
-                )
-                break
+                if active_poll_due:
+                    room_to_poll = active_room
+                    poll_is_active = True
+                else:
+                    room_to_poll = next((
+                        room
+                        for room in rooms
+                        if room["id"] != active_room_id
+                        and (
+                            room["id"] not in last_poll_times
+                            or now - last_poll_times[room["id"]]
+                            >= BACKGROUND_POLL_INTERVAL_SECONDS
+                        )
+                    ), None)
+
+                if room_to_poll is not None:
+                    self._network_poll(
+                        room_to_poll,
+                        is_active=poll_is_active,
+                    )
+                    completed_at = time.monotonic()
+                    last_poll_times[room_to_poll["id"]] = completed_at
+                    next_poll_allowed = (
+                        completed_at + MIN_POLL_REQUEST_SPACING_SECONDS
+                    )
+                    if poll_is_active:
+                        force_active_poll = False
 
             self.stop_event.wait(0.08)
 
