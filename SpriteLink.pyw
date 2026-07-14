@@ -41,6 +41,7 @@ try:
         QColor,
         QFont,
         QFontMetrics,
+        QPalette,
         QTextBlockFormat,
         QTextCharFormat,
         QTextCursor,
@@ -133,13 +134,16 @@ MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
 DEFAULT_MESSAGE_FONT = "Segoe UI"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
-SUPPORTED_MESSAGE_FONTS = (
+SELECTABLE_MESSAGE_FONTS = (
     "Corbel",
     "Tahoma",
     "Times New Roman",
     "Segoe UI",
-    "System",
 )
+# Preserve receive compatibility with messages created by an earlier v11
+# draft, where "System" resolved to the application UI font rather than the
+# legacy Windows bitmap face.
+SUPPORTED_MESSAGE_FONTS = SELECTABLE_MESSAGE_FONTS + ("System",)
 
 # Dark, moderately saturated colors that remain readable against the standard
 # light chat background. A color is selected only when a new local
@@ -185,7 +189,7 @@ def normalize_room_profile(
         username_color = QColor(base["username_color"])
 
     font = str(raw.get("font", base["font"]))
-    if font not in SUPPORTED_MESSAGE_FONTS:
+    if font not in SELECTABLE_MESSAGE_FONTS:
         font = base["font"]
 
     text_color = QColor(
@@ -1487,7 +1491,6 @@ class EncryptedChatClient(QObject):
         )
         composer_actions.addWidget(self.font_menu_button)
         composer_actions.addStretch(1)
-        content_layout.addLayout(composer_actions)
 
         self.identity_menu = QFrame()
         self.identity_menu.setFrameShape(QFrame.Shape.StyledPanel)
@@ -1523,7 +1526,13 @@ class EncryptedChatClient(QObject):
         font_layout.setSpacing(7)
         font_layout.addWidget(QLabel("Font"))
         self.message_font_combo = QComboBox()
-        self.message_font_combo.addItems(list(SUPPORTED_MESSAGE_FONTS))
+        self.message_font_combo.addItems(list(SELECTABLE_MESSAGE_FONTS))
+        for index, font_name in enumerate(SELECTABLE_MESSAGE_FONTS):
+            self.message_font_combo.setItemData(
+                index,
+                self._make_font(font_name, 10),
+                Qt.ItemDataRole.FontRole,
+            )
         self.message_font_combo.currentTextChanged.connect(
             self._on_message_font_changed
         )
@@ -1541,6 +1550,7 @@ class EncryptedChatClient(QObject):
         font_layout.addWidget(text_color_button)
         self.font_menu.hide()
         content_layout.addWidget(self.font_menu)
+        content_layout.addLayout(composer_actions)
 
         compose_layout = QGridLayout()
         compose_layout.setContentsMargins(0, 1, 0, 0)
@@ -1612,6 +1622,9 @@ class EncryptedChatClient(QObject):
         try:
             self.identity_username_entry.setText(profile["username"])
             self.message_font_combo.setCurrentText(profile["font"])
+            self.message_font_combo.setFont(
+                self._make_font(profile["font"], 10)
+            )
             self._set_color_preview(
                 self.identity_color_preview,
                 profile["username_color"],
@@ -1624,6 +1637,23 @@ class EncryptedChatClient(QObject):
             self._loading_profile_controls = False
         self._apply_active_composer_style()
 
+    def _update_message_entry_placeholder(self) -> None:
+        if not hasattr(self, "message_entry"):
+            return
+
+        room_name = self._active_chatroom()["nickname"]
+        self.message_entry.setPlaceholderText(f"Chat in {room_name}")
+        placeholder_color = QColor(
+            self._active_room_profile()["text_color"]
+        )
+        placeholder_color.setAlpha(140)
+        palette = self.message_entry.palette()
+        palette.setColor(
+            QPalette.ColorRole.PlaceholderText,
+            placeholder_color,
+        )
+        self.message_entry.setPalette(palette)
+
     def _apply_active_composer_style(self) -> None:
         if not hasattr(self, "message_entry"):
             return
@@ -1634,6 +1664,7 @@ class EncryptedChatClient(QObject):
         self.message_entry.setStyleSheet(
             f"color: {profile['text_color']};"
         )
+        self._update_message_entry_placeholder()
         self._resize_message_entry()
 
     def _on_identity_username_changed(self, value: str) -> None:
@@ -1675,8 +1706,11 @@ class EncryptedChatClient(QObject):
             return
         profile = self._active_room_profile()
         profile["font"] = (
-            value if value in SUPPORTED_MESSAGE_FONTS
+            value if value in SELECTABLE_MESSAGE_FONTS
             else DEFAULT_MESSAGE_FONT
+        )
+        self.message_font_combo.setFont(
+            self._make_font(profile["font"], 10)
         )
         self._apply_active_composer_style()
         self._schedule_profile_save()
