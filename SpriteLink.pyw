@@ -3902,6 +3902,8 @@ class EncryptedChatClient(QObject):
         self,
         cursor: QTextCursor,
         text: str,
+        background_color: str,
+        row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
         cursor.insertBlock()
         separator_block = QTextBlockFormat()
@@ -3910,6 +3912,17 @@ class EncryptedChatClient(QObject):
         separator_block.setBottomMargin(7)
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
+
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = QTextCursor(cursor.block())
+        selection.cursor.clearSelection()
+        selection.format.setBackground(QColor(background_color))
+        selection.format.setProperty(
+            QTextFormat.Property.FullWidthSelection,
+            True,
+        )
+        row_selections.append(selection)
+
         cursor.insertBlock()
         cursor.setBlockFormat(QTextBlockFormat())
 
@@ -3927,8 +3940,9 @@ class EncryptedChatClient(QObject):
         previous_timestamp: int | None = None
         previous_local_date: Any = None
         first_item = True
+        stripe_index = 0
 
-        for message_index, item in enumerate(self.message_log):
+        for item in self.message_log:
             current_timestamp = self._display_timestamp_for_item(item)
             current_local_datetime = self._local_datetime(current_timestamp)
             current_local_date = (
@@ -3950,7 +3964,12 @@ class EncryptedChatClient(QObject):
                     f"{current_local_datetime.day}, "
                     f"{current_local_datetime.year}"
                     " —————",
+                    MESSAGE_ROW_BACKGROUNDS[
+                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                    ],
+                    row_selections,
                 )
+                stripe_index += 1
             elif (
                 previous_timestamp is not None
                 and current_timestamp - previous_timestamp
@@ -3961,7 +3980,12 @@ class EncryptedChatClient(QObject):
                 self._insert_log_separator(
                     cursor,
                     f"————— {gap_hours} hours later —————",
+                    MESSAGE_ROW_BACKGROUNDS[
+                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                    ],
+                    row_selections,
                 )
+                stripe_index += 1
             elif not first_item:
                 cursor.insertBlock()
 
@@ -3971,10 +3995,11 @@ class EncryptedChatClient(QObject):
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
                 background_color=MESSAGE_ROW_BACKGROUNDS[
-                    message_index % len(MESSAGE_ROW_BACKGROUNDS)
+                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
                 ],
                 row_selections=row_selections,
             )
+            stripe_index += 1
             first_item = False
             previous_timestamp = current_timestamp
             previous_local_date = current_local_date
