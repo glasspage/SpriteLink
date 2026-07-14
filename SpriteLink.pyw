@@ -1026,6 +1026,44 @@ class ThemeComboBox(QComboBox):
         painter.end()
 
 
+class MessageLogBrowser(QTextBrowser):
+    """Complete full-width row selections across paragraph left margins."""
+
+    def paintEvent(self, event: Any) -> None:
+        super().paintEvent(event)
+        selections = self.extraSelections()
+        if not selections:
+            return
+
+        painter = QPainter(self.viewport())
+        document_layout = self.document().documentLayout()
+        for selection in selections:
+            if not bool(selection.format.property(
+                QTextFormat.Property.FullWidthSelection
+            )):
+                continue
+            block = selection.cursor.block()
+            if not block.isValid():
+                continue
+            block_cursor = QTextCursor(block)
+            left_width = max(0, self.cursorRect(block_cursor).left())
+            if left_width <= 0:
+                continue
+            top = self.cursorRect(block_cursor).top()
+            height = max(
+                1,
+                round(document_layout.blockBoundingRect(block).height()),
+            )
+            painter.fillRect(
+                0,
+                top,
+                left_width + 1,
+                height + 1,
+                selection.format.background(),
+            )
+        painter.end()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1790,7 +1828,7 @@ class EncryptedChatClient(QObject):
         content_layout.setSpacing(7)
         layout.addWidget(self.chat_content, 1)
 
-        self.chat_display = QTextBrowser()
+        self.chat_display = MessageLogBrowser()
         self.chat_display.setReadOnly(True)
         self.chat_display.setOpenLinks(False)
         self.chat_display.setOpenExternalLinks(False)
