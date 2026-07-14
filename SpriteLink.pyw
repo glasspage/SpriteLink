@@ -1,4 +1,4 @@
-# Encrypted Chat Client v9
+# SpriteLink v9
 # Windows + Python 3.10+
 #
 # Required packages:
@@ -99,7 +99,7 @@ except ImportError:
     winsound = None
 
 
-APP_NAME = "EncryptedChatClient"
+APP_NAME = "SpriteLink"
 APP_VERSION = 1
 CONFIG_FORMAT_VERSION = 9
 
@@ -139,6 +139,7 @@ SAFE_USERNAME_COLORS = (
     "#5f5ab8",
 )
 
+# The former EncryptedChatClient directory is intentionally not migrated.
 APP_DATA_DIR = Path(
     os.environ.get("LOCALAPPDATA")
     or os.environ.get("APPDATA")
@@ -618,7 +619,7 @@ class EncryptedChatClient(QObject):
     def __init__(self, root: MainWindow) -> None:
         super().__init__(root)
         self.root = root
-        self.root.setWindowTitle("Encrypted Chat Client")
+        self.root.setWindowTitle("SpriteLink")
         self.root.resize(840, 650)
         self.root.setMinimumSize(670, 500)
 
@@ -670,9 +671,6 @@ class EncryptedChatClient(QObject):
         )
         self.show_key_var = ValueModel(False)
         self.status_var = ValueModel("Connecting")
-        self.status_detail_var = ValueModel(
-            "Waiting for a room key."
-        )
 
         self.message_resize_timer = QTimer(self)
         self.message_resize_timer.setSingleShot(True)
@@ -748,12 +746,6 @@ class EncryptedChatClient(QObject):
         status_layout.addWidget(self.status_label)
         status_layout.addStretch(1)
 
-        self.status_detail_label = QLabel()
-        self.status_detail_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        self.status_detail_var.bind(self.status_detail_label.setText)
-        status_layout.addWidget(self.status_detail_label)
         self.config_toggle = QPushButton("Config")
         self.config_toggle.setCheckable(True)
         self.config_toggle.toggled.connect(self._on_config_toggled)
@@ -1149,7 +1141,6 @@ class EncryptedChatClient(QObject):
         self._load_saved_history_for_current_room()
         self.initial_history_pending = True
         self.status_var.set("Reconnecting")
-        self.status_detail_var.set("Applying the saved room configuration...")
         self.reconnect_requested.set()
         self._append_system_message("Configuration saved. Reconnecting.")
         return True
@@ -1165,7 +1156,6 @@ class EncryptedChatClient(QObject):
             )
             return
 
-        self.status_detail_var.set("Testing ntfy server...")
         threading.Thread(
             target=self._test_connection_worker,
             args=(server_url,),
@@ -1603,9 +1593,8 @@ class EncryptedChatClient(QObject):
                 event_type, payload = self.ui_queue.get_nowait()
 
                 if event_type == "status":
-                    status, detail = payload
+                    status, _detail = payload
                     self.status_var.set(status)
-                    self.status_detail_var.set(detail)
 
                 elif event_type == "messages":
                     items = payload.get("items", [])
@@ -1626,19 +1615,6 @@ class EncryptedChatClient(QObject):
                         self._persist_local_history()
                         self._render_message_log(scroll_to_bottom=True)
 
-                    if history_scan:
-                        if added:
-                            self.status_detail_var.set(
-                                f"Loaded {added} message"
-                                f"{'s' if added != 1 else ''} from available "
-                                "history within the last 48 hours."
-                            )
-                        else:
-                            self.status_detail_var.set(
-                                "Connected. No additional readable messages were "
-                                "available from the last 48 hours."
-                            )
-
                 elif event_type == "send_failed":
                     message = payload["message"]
                     self._append_system_message(
@@ -1651,16 +1627,9 @@ class EncryptedChatClient(QObject):
                     )
 
                 elif event_type == "decrypt_failures":
-                    count = int(payload)
-                    self.status_detail_var.set(
-                        f"Connected, but skipped {count} unreadable packet"
-                        f"{'s' if count != 1 else ''}."
-                    )
+                    pass
 
                 elif event_type == "test_ok":
-                    self.status_detail_var.set(
-                        f"ntfy server responded: {payload}"
-                    )
                     messagebox.showinfo(
                         "Connection successful",
                         "The ntfy health endpoint responded successfully.",
@@ -1668,7 +1637,6 @@ class EncryptedChatClient(QObject):
                     )
 
                 elif event_type == "test_failed":
-                    self.status_detail_var.set("Server test failed.")
                     messagebox.showerror(
                         "Connection failed",
                         payload,
@@ -2380,7 +2348,7 @@ def _write_crash_log(error_text: str) -> Path | None:
 
 def main() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("Encrypted Chat Client")
+    app.setApplicationName("SpriteLink")
     root = MainWindow()
 
     def report_callback_exception(
@@ -2402,7 +2370,7 @@ def main() -> None:
             else ""
         )
         messagebox.showerror(
-            "Encrypted Chat Client error",
+            "SpriteLink error",
             f"An unexpected error occurred.{location}\n\n{error_text[-2200:]}",
             parent=root,
         )
@@ -2428,7 +2396,7 @@ def main() -> None:
             else ""
         )
         messagebox.showerror(
-            "Encrypted Chat Client startup error",
+            "SpriteLink startup error",
             f"The client could not start.{location}\n\n{error_text[-2200:]}",
             parent=root,
         )
