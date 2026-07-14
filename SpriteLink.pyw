@@ -761,7 +761,6 @@ class EncryptedChatClient(QObject):
         layout.addLayout(status_layout)
 
         self.chat_content = QWidget()
-        self.chat_content.installEventFilter(self)
         content_layout = QVBoxLayout(self.chat_content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(7)
@@ -856,6 +855,7 @@ class EncryptedChatClient(QObject):
 
         self._build_config_tab()
         self.config_overlay.hide()
+        self.chat_content.installEventFilter(self)
         QTimer.singleShot(0, self._sync_config_overlay_geometry)
 
     def _build_config_tab(self) -> None:
@@ -1983,10 +1983,17 @@ class EncryptedChatClient(QObject):
         self._rerender_preserving_scroll()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self.chat_content and event.type() == QEvent.Type.Resize:
+        if (
+            watched is getattr(self, "chat_content", None)
+            and event.type() == QEvent.Type.Resize
+            and hasattr(self, "config_overlay")
+        ):
             self._sync_config_overlay_geometry()
 
-        if watched is self.chat_display.viewport():
+        if (
+            hasattr(self, "chat_display")
+            and watched is self.chat_display.viewport()
+        ):
             if event.type() == QEvent.Type.Resize:
                 self._on_chat_display_configure()
 
