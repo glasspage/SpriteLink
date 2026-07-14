@@ -4598,7 +4598,6 @@ class EncryptedChatClient(QObject):
             resource_url,
             preview,
         )
-        cursor.insertBlock()
         image_format = QTextImageFormat()
         image_format.setName(resource_url.toString())
         image_format.setWidth(preview.width())
