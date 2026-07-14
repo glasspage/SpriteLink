@@ -265,6 +265,13 @@ QListWidget::item:selected, QMenu::item:selected {
     background-color: #007f82;
     color: #000000;
 }
+QMenu::item:disabled {
+    color: #808080;
+}
+QMenu::item:disabled:selected {
+    background-color: #ffffff;
+    color: #808080;
+}
 QCheckBox {
     spacing: 6px;
 }
@@ -3762,6 +3769,7 @@ class EncryptedChatClient(QObject):
         self,
         cursor: QTextCursor,
         encoded_icon: str,
+        message_id: str,
     ) -> bool:
         if not encoded_icon:
             return False
@@ -3795,6 +3803,8 @@ class EncryptedChatClient(QObject):
         image_format.setName(resource_url.toString())
         image_format.setWidth(image.width())
         image_format.setHeight(image.height())
+        image_format.setAnchor(True)
+        image_format.setAnchorHref(f"spritelink:{message_id}")
         # Inline images participate in Qt's automatic line-height calculation,
         # so a short text line expands to the icon's native 16-pixel height.
         image_format.setVerticalAlignment(
@@ -3988,7 +3998,11 @@ class EncryptedChatClient(QObject):
             f"Unique ID: {unique_id_preview}"
         )
 
-        has_profile_icon = self._insert_profile_icon(cursor, profile_icon)
+        has_profile_icon = self._insert_profile_icon(
+            cursor,
+            profile_icon,
+            message_id,
+        )
         if has_profile_icon:
             cursor.insertText(
                 " ",
