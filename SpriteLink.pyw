@@ -424,6 +424,23 @@ def encode_profile_icon(gif_data: bytes) -> str:
     return base64.urlsafe_b64encode(gif_data).decode("ascii").rstrip("=")
 
 
+@lru_cache(maxsize=128)
+def profile_icon_tooltip_data_uri(encoded_icon: str) -> str:
+    try:
+        gif_data = decode_profile_icon(encoded_icon)
+        with Image.open(io.BytesIO(gif_data)) as icon:
+            preview = icon.convert("RGBA").resize(
+                (64, 64),
+                Image.Resampling.NEAREST,
+            )
+        output = io.BytesIO()
+        preview.save(output, format="PNG", optimize=True)
+        encoded_preview = base64.b64encode(output.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded_preview}"
+    except Exception:
+        return ""
+
+
 def decode_profile_icon(encoded: str) -> bytes:
     if not encoded:
         return b""
@@ -4334,10 +4351,21 @@ class EncryptedChatClient(QObject):
         )
 
         self.rendered_message_items[message_id] = item
-        self.rendered_tooltips[message_id] = (
-            f"{self._format_hover_timestamp(timestamp)}\n"
-            f"Unique ID: {unique_id_preview}"
-        )
+        hover_timestamp = self._format_hover_timestamp(timestamp)
+        tooltip_icon_uri = profile_icon_tooltip_data_uri(profile_icon)
+        if tooltip_icon_uri:
+            self.rendered_tooltips[message_id] = (
+                '<div align="center">'
+                f'<img src="{tooltip_icon_uri}" width="64" height="64">'
+                f"<br>{hover_timestamp}<br>"
+                f"Unique ID: {unique_id_preview}"
+                "</div>"
+            )
+        else:
+            self.rendered_tooltips[message_id] = (
+                f"{hover_timestamp}\n"
+                f"Unique ID: {unique_id_preview}"
+            )
 
         has_profile_icon = self._insert_profile_icon(
             cursor,
