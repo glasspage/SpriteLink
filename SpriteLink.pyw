@@ -144,7 +144,7 @@ MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
 DEFAULT_MESSAGE_FONT = "Segoe UI"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
-MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f2f2f2")
+MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
 SELECTABLE_MESSAGE_FONTS = (
     "Arial",
     "Calibri",
@@ -1794,8 +1794,8 @@ class EncryptedChatClient(QObject):
         self.chat_display.setOpenExternalLinks(False)
         self.chat_display.setUndoRedoEnabled(False)
         self.chat_display.setFont(self._make_font("Segoe UI", 10))
-        self.chat_display.setViewportMargins(6, 6, 6, 6)
-        self.chat_display.document().setDocumentMargin(4)
+        self.chat_display.setViewportMargins(0, 0, 0, 0)
+        self.chat_display.document().setDocumentMargin(0)
         text_option = self.chat_display.document().defaultTextOption()
         text_option.setWrapMode(QTextOption.WrapMode.WrapAnywhere)
         self.chat_display.document().setDefaultTextOption(text_option)
