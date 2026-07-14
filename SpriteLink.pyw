@@ -38,7 +38,6 @@ import zlib
 try:
     from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
     from PySide6.QtGui import (
-        QBrush,
         QColor,
         QFont,
         QFontMetrics,
@@ -54,6 +53,7 @@ try:
         QComboBox,
         QDialog,
         QFrame,
+        QGraphicsOpacityEffect,
         QGridLayout,
         QHBoxLayout,
         QLabel,
@@ -119,7 +119,9 @@ SERVER_PRESETS: dict[str, str] = {
     "Custom ntfy server": "",
 }
 
-POLL_INTERVAL_SECONDS = 5.25
+POLL_INTERVAL_SECONDS = 6.0
+MIN_POLL_REQUEST_SPACING_SECONDS = 5.0
+BACKGROUND_POLL_INTERVAL_SECONDS = 60.0
 REQUEST_TIMEOUT_SECONDS = 10
 AUTO_HISTORY_SECONDS = 48 * 60 * 60
 GAP_SEPARATOR_SECONDS = 6 * 60 * 60
@@ -253,6 +255,7 @@ def default_config() -> dict[str, Any]:
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
         "muted_chatrooms": [],
+        "unread_counts": {},
         "room_state": {},
         "identities": {},
         "history": {},
@@ -364,6 +367,22 @@ def load_config() -> dict[str, Any]:
         for room_id in muted_chatrooms
         if str(room_id) in valid_room_ids
     })
+
+    unread_counts = config.get("unread_counts")
+    if not isinstance(unread_counts, dict):
+        unread_counts = {}
+    cleaned_unread_counts: dict[str, int] = {}
+    for room_id in valid_room_ids:
+        try:
+            unread_count = max(
+                0,
+                int(unread_counts.get(room_id, 0) or 0),
+            )
+        except (TypeError, ValueError):
+            continue
+        if unread_count:
+            cleaned_unread_counts[room_id] = unread_count
+    config["unread_counts"] = cleaned_unread_counts
 
     # Chatroom keys now live only in the Chatrooms sidebar. The former single
     # key is deliberately not converted into a custom chatroom.
@@ -727,6 +746,35 @@ class AddChatroomDialog(QDialog):
         return self.key_entry.text()
 
 
+class ChatroomListRow(QWidget):
+    def __init__(
+        self,
+        nickname: str,
+        unread_count: int,
+        muted: bool,
+    ) -> None:
+        super().__init__()
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            True,
+        )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 1, 4, 1)
+        layout.setSpacing(6)
+
+        nickname_label = QLabel(nickname)
+        layout.addWidget(nickname_label, 1)
+
+        unread_label = QLabel(f"({unread_count})")
+        unread_label.setVisible(unread_count > 0 and not muted)
+        layout.addWidget(unread_label)
+
+        if muted:
+            opacity = QGraphicsOpacityEffect(self)
+            opacity.setOpacity(0.45)
+            self.setGraphicsEffect(opacity)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -764,7 +812,6 @@ class EncryptedChatClient(QObject):
         self.seen_client_message_ids: set[str] = set()
         self.seen_ntfy_message_ids: set[str] = set()
         self.message_log: list[dict[str, Any]] = []
-        self.initial_history_pending = True
         self.draft_message_id = uuid.uuid4().hex
         self.current_estimated_packet_size = 0
         self.message_size_check_pending = False
@@ -775,6 +822,21 @@ class EncryptedChatClient(QObject):
         self.active_chatroom_id = str(
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
         )
+        cleared_stale_unread = (
+            self.config_data.setdefault("unread_counts", {}).pop(
+                self.active_chatroom_id,
+                None,
+            )
+            is not None
+        )
+        self.initial_history_pending_rooms = {
+            room["id"] for room in self._chatroom_definitions()
+        }
+        if cleared_stale_unread:
+            try:
+                save_config(self.config_data)
+            except Exception:
+                pass
         self._closing = False
 
         self.server_preset_var = ValueModel(
@@ -854,21 +916,6 @@ class EncryptedChatClient(QObject):
         self._build_config_popup()
 
     def _build_chatroom_sidebar(self, root_layout: QHBoxLayout) -> None:
-        toggle_strip = QWidget()
-        toggle_strip.setFixedWidth(32)
-        toggle_layout = QVBoxLayout(toggle_strip)
-        toggle_layout.setContentsMargins(4, 10, 4, 10)
-        toggle_layout.setSpacing(0)
-
-        self.chatrooms_toggle = QPushButton("›")
-        self.chatrooms_toggle.setCheckable(True)
-        self.chatrooms_toggle.setFixedWidth(24)
-        self.chatrooms_toggle.setToolTip("Chatrooms")
-        self.chatrooms_toggle.toggled.connect(self._on_chatrooms_toggled)
-        toggle_layout.addWidget(self.chatrooms_toggle)
-        toggle_layout.addStretch(1)
-        root_layout.addWidget(toggle_strip)
-
         self.chatrooms_panel = QWidget()
         self.chatrooms_panel.setFixedWidth(CHATROOM_SIDEBAR_WIDTH)
         panel_layout = QVBoxLayout(self.chatrooms_panel)
@@ -900,7 +947,10 @@ class EncryptedChatClient(QObject):
 
     def _on_chatrooms_toggled(self, expanded: bool) -> None:
         width_delta = CHATROOM_SIDEBAR_WIDTH
-        old_width = self.root.width()
+        old_geometry = self.root.geometry()
+        old_frame_geometry = self.root.frameGeometry()
+        frame_offset_x = old_geometry.x() - old_frame_geometry.x()
+        frame_offset_y = old_geometry.y() - old_frame_geometry.y()
         self.chatrooms_toggle.setText("‹" if expanded else "›")
         self.chatrooms_panel.setVisible(expanded)
         self.root.setMinimumWidth(
@@ -908,11 +958,20 @@ class EncryptedChatClient(QObject):
                 width_delta if expanded else -width_delta
             )
         )
-        self.root.resize(
-            max(self.root.minimumWidth(), old_width + (
+        new_width = max(
+            self.root.minimumWidth(),
+            old_geometry.width() + (
                 width_delta if expanded else -width_delta
-            )),
-            self.root.height(),
+            ),
+        )
+        target_frame_x = old_frame_geometry.x() + (
+            -width_delta if expanded else width_delta
+        )
+        self.root.setGeometry(
+            target_frame_x + frame_offset_x,
+            old_frame_geometry.y() + frame_offset_y,
+            new_width,
+            old_geometry.height(),
         )
 
     def _chatroom_definitions(self) -> list[dict[str, str]]:
@@ -957,22 +1016,41 @@ class EncryptedChatClient(QObject):
         self.chatrooms_list.clear()
         active_item: QListWidgetItem | None = None
         muted_ids = self._muted_chatroom_ids()
+        unread_counts = self._unread_counts()
 
         for room in self._chatroom_definitions():
-            item = QListWidgetItem(room["nickname"])
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, room["id"])
-            if room["id"] in muted_ids:
-                muted_color = self.chatrooms_list.palette().color(
-                    self.chatrooms_list.foregroundRole()
-                )
-                muted_color.setAlpha(95)
-                item.setForeground(QBrush(muted_color))
             self.chatrooms_list.addItem(item)
+            row = ChatroomListRow(
+                room["nickname"],
+                unread_counts.get(room["id"], 0),
+                room["id"] in muted_ids,
+            )
+            item.setSizeHint(row.sizeHint())
+            self.chatrooms_list.setItemWidget(item, row)
             if room["id"] == self.active_chatroom_id:
                 active_item = item
 
         if active_item is not None:
             self.chatrooms_list.setCurrentItem(active_item)
+
+    def _unread_counts(self) -> dict[str, int]:
+        unread_counts = self.config_data.setdefault("unread_counts", {})
+        if not isinstance(unread_counts, dict):
+            unread_counts = {}
+            self.config_data["unread_counts"] = unread_counts
+        return unread_counts
+
+    def _mark_chatroom_read(self, room_id: str) -> None:
+        unread_counts = self._unread_counts()
+        if room_id not in unread_counts:
+            return
+        unread_counts.pop(room_id, None)
+        try:
+            save_config(self.config_data)
+        except Exception:
+            pass
 
     def _add_chatroom(self) -> None:
         dialog = AddChatroomDialog(self.root)
@@ -1009,10 +1087,12 @@ class EncryptedChatClient(QObject):
             "nickname": nickname,
             "key": key,
         })
+        self.initial_history_pending_rooms.add(room_id)
         try:
             save_config(self.config_data)
         except Exception as exc:
             self.config_data["chatrooms"].pop()
+            self.initial_history_pending_rooms.discard(room_id)
             messagebox.showerror(
                 "Could not save chatroom",
                 str(exc),
@@ -1087,6 +1167,8 @@ class EncryptedChatClient(QObject):
         muted_ids = self._muted_chatroom_ids()
         muted_ids.discard(room_id)
         self.config_data["muted_chatrooms"] = sorted(muted_ids)
+        self._unread_counts().pop(room_id, None)
+        self.initial_history_pending_rooms.discard(room_id)
 
         if self.active_chatroom_id == room_id:
             self.active_chatroom_id = GLOBAL_CHATROOM_ID
@@ -1100,7 +1182,11 @@ class EncryptedChatClient(QObject):
         self._refresh_chatroom_list()
 
     def _activate_chatroom(self, room_id: str) -> None:
-        if room_id == self.active_chatroom_id or self._find_chatroom(room_id) is None:
+        if self._find_chatroom(room_id) is None:
+            return
+        self._mark_chatroom_read(room_id)
+        if room_id == self.active_chatroom_id:
+            self._refresh_chatroom_list()
             return
         self._persist_local_history()
         self.active_chatroom_id = room_id
@@ -1108,13 +1194,13 @@ class EncryptedChatClient(QObject):
         self._switch_active_chatroom()
 
     def _switch_active_chatroom(self) -> None:
+        self._unread_counts().pop(self.active_chatroom_id, None)
         try:
             save_config(self.config_data)
         except Exception:
             pass
         self._clear_visible_room()
         self._load_saved_history_for_current_room()
-        self.initial_history_pending = True
         self.connected = False
         self.status_var.set("Connecting")
         self.reconnect_requested.set()
@@ -1129,6 +1215,15 @@ class EncryptedChatClient(QObject):
 
         status_layout = QHBoxLayout()
         status_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.chatrooms_toggle = QPushButton("›")
+        self.chatrooms_toggle.setCheckable(True)
+        self.chatrooms_toggle.setFixedWidth(24)
+        self.chatrooms_toggle.setToolTip("Chatrooms")
+        self.chatrooms_toggle.setAccessibleName("Toggle chatrooms menu")
+        self.chatrooms_toggle.toggled.connect(self._on_chatrooms_toggled)
+        status_layout.addWidget(self.chatrooms_toggle)
+
         status_layout.addWidget(QLabel("Status:"))
 
         self.status_label = QLabel()
@@ -1487,7 +1582,9 @@ class EncryptedChatClient(QObject):
 
         self._clear_visible_room()
         self._load_saved_history_for_current_room()
-        self.initial_history_pending = True
+        self.initial_history_pending_rooms.update(
+            room["id"] for room in self._chatroom_definitions()
+        )
         self.status_var.set("Reconnecting")
         self.reconnect_requested.set()
         self._append_system_message("Configuration saved. Reconnecting.")
@@ -1736,14 +1833,15 @@ class EncryptedChatClient(QObject):
         self.network_thread.start()
 
     def _network_loop(self) -> None:
-        next_poll = 0.0
+        last_poll_times: dict[str, float] = {}
+        next_poll_allowed = 0.0
+        force_active_poll = True
 
         while not self.stop_event.is_set():
             if self.reconnect_requested.is_set():
                 self.reconnect_requested.clear()
                 self.connected = False
-                self.initial_history_pending = True
-                next_poll = 0.0
+                force_active_poll = True
                 self.ui_queue.put((
                     "status",
                     (
@@ -1760,11 +1858,57 @@ class EncryptedChatClient(QObject):
                     break
                 self._network_send(outbound)
 
-
             now = time.monotonic()
-            if now >= next_poll:
-                self._network_poll()
-                next_poll = now + POLL_INTERVAL_SECONDS
+            rooms = self._chatroom_definitions()
+            active_room = next(
+                (
+                    room for room in rooms
+                    if room["id"] == self.active_chatroom_id
+                ),
+                rooms[0],
+            )
+            valid_room_ids = {room["id"] for room in rooms}
+            for room_id in tuple(last_poll_times):
+                if room_id not in valid_room_ids:
+                    last_poll_times.pop(room_id, None)
+
+            if now >= next_poll_allowed:
+                active_room_id = active_room["id"]
+                active_poll_due = (
+                    force_active_poll
+                    or now - last_poll_times.get(active_room_id, 0.0)
+                    >= POLL_INTERVAL_SECONDS
+                )
+                room_to_poll: dict[str, str] | None = None
+                poll_is_active = False
+
+                if active_poll_due:
+                    room_to_poll = active_room
+                    poll_is_active = True
+                else:
+                    room_to_poll = next((
+                        room
+                        for room in rooms
+                        if room["id"] != active_room_id
+                        and (
+                            room["id"] not in last_poll_times
+                            or now - last_poll_times[room["id"]]
+                            >= BACKGROUND_POLL_INTERVAL_SECONDS
+                        )
+                    ), None)
+
+                if room_to_poll is not None:
+                    self._network_poll(
+                        room_to_poll,
+                        is_active=poll_is_active,
+                    )
+                    completed_at = time.monotonic()
+                    last_poll_times[room_to_poll["id"]] = completed_at
+                    next_poll_allowed = (
+                        completed_at + MIN_POLL_REQUEST_SPACING_SECONDS
+                    )
+                    if poll_is_active:
+                        force_active_poll = False
 
             self.stop_event.wait(0.08)
 
@@ -1795,8 +1939,9 @@ class EncryptedChatClient(QObject):
     def _current_poll_since(
         self,
         state: dict[str, Any],
+        room_id: str,
     ) -> str:
-        if self.initial_history_pending:
+        if room_id in self.initial_history_pending_rooms:
             return f"{AUTO_HISTORY_SECONDS}s"
 
         newest_id = state.get("newest_ntfy_id")
@@ -1805,22 +1950,25 @@ class EncryptedChatClient(QObject):
 
         return f"{AUTO_HISTORY_SECONDS}s"
 
-    def _network_poll(self) -> None:
+    def _network_poll(
+        self,
+        room: dict[str, str],
+        *,
+        is_active: bool,
+    ) -> None:
         server_url = normalize_server_url(
             str(self.config_data.get("server_url", ""))
         )
-        active_room = self._active_chatroom()
-        room_id = active_room["id"]
-        encryption_key = active_room["key"]
+        room_id = room["id"]
+        encryption_key = room["key"]
 
         if not server_url or not encryption_key:
-            if self.connected:
+            if is_active and room_id == self.active_chatroom_id:
                 self.connected = False
-
-            self.ui_queue.put((
-                "status",
-                ("Disconnected", "No chatroom is selected.", room_id),
-            ))
+                self.ui_queue.put((
+                    "status",
+                    ("Disconnected", "No chatroom is selected.", room_id),
+                ))
             return
 
         try:
@@ -1830,8 +1978,10 @@ class EncryptedChatClient(QObject):
                 scope_id,
                 {},
             )
-            was_initial_history_scan = self.initial_history_pending
-            since_value = self._current_poll_since(state)
+            was_initial_history_scan = (
+                room_id in self.initial_history_pending_rooms
+            )
+            since_value = self._current_poll_since(state, room_id)
 
             response = self.session.get(
                 f"{server_url}/{topic}/json",
@@ -1843,9 +1993,9 @@ class EncryptedChatClient(QObject):
             )
             response.raise_for_status()
             records = parse_ntfy_ndjson(response)
-            if room_id != self.active_chatroom_id:
+            if self._find_chatroom(room_id) is None:
                 return
-            self.initial_history_pending = False
+            self.initial_history_pending_rooms.discard(room_id)
 
             if was_initial_history_scan:
                 completed_at = int(time.time())
@@ -1898,7 +2048,11 @@ class EncryptedChatClient(QObject):
                 except Exception:
                     pass
 
-            if not self.connected:
+            if (
+                is_active
+                and room_id == self.active_chatroom_id
+                and not self.connected
+            ):
                 self.connected = True
                 self.ui_queue.put((
                     "status",
@@ -1922,13 +2076,12 @@ class EncryptedChatClient(QObject):
                 ))
 
         except Exception as exc:
-            if room_id != self.active_chatroom_id:
-                return
-            self.connected = False
-            self.ui_queue.put((
-                "status",
-                ("Disconnected", str(exc), room_id),
-            ))
+            if is_active and room_id == self.active_chatroom_id:
+                self.connected = False
+                self.ui_queue.put((
+                    "status",
+                    ("Disconnected", str(exc), room_id),
+                ))
 
     @staticmethod
     def _validate_decrypted_message(message: dict[str, Any]) -> None:
@@ -1967,10 +2120,16 @@ class EncryptedChatClient(QObject):
                         self.status_var.set(status)
 
                 elif event_type == "messages":
-                    if payload.get("room_id") != self.active_chatroom_id:
-                        continue
+                    room_id = str(payload.get("room_id", ""))
                     items = payload.get("items", [])
                     history_scan = bool(payload.get("history_scan", False))
+                    if room_id != self.active_chatroom_id:
+                        self._accept_background_messages(
+                            room_id,
+                            items,
+                            history_scan=history_scan,
+                        )
+                        continue
                     added = 0
 
                     for item in items:
@@ -2020,6 +2179,112 @@ class EncryptedChatClient(QObject):
         except queue.Empty:
             pass
 
+    def _accept_background_messages(
+        self,
+        room_id: str,
+        items: list[dict[str, Any]],
+        *,
+        history_scan: bool,
+    ) -> None:
+        room = self._find_chatroom(room_id)
+        if room is None:
+            return
+
+        server_url = normalize_server_url(
+            str(self.config_data.get("server_url", ""))
+        )
+        encryption_key = room["key"]
+        if not server_url or not encryption_key:
+            return
+
+        try:
+            scope_id = room_scope_id(server_url, encryption_key)
+        except Exception:
+            return
+
+        all_history = self.config_data.setdefault("history", {})
+        history = all_history.get(scope_id, [])
+        if not isinstance(history, list):
+            history = []
+
+        seen_ntfy_ids = {
+            str(entry.get("ntfy_id"))
+            for entry in history
+            if isinstance(entry, dict)
+            and isinstance(entry.get("ntfy_id"), str)
+            and entry.get("ntfy_id")
+        }
+        seen_client_message_ids = {
+            str(entry["message"].get("i"))
+            for entry in history
+            if isinstance(entry, dict)
+            and isinstance(entry.get("message"), dict)
+            and isinstance(entry["message"].get("i"), str)
+        }
+        muted_user_ids = self._room_preference_ids_for_key(
+            "muted_users",
+            encryption_key,
+        )
+        added = 0
+        unread_added = 0
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ntfy_id = item.get("ntfy_id")
+            message = item.get("message")
+            if not isinstance(ntfy_id, str) or not isinstance(message, dict):
+                continue
+            client_message_id = message.get("i")
+            if not isinstance(client_message_id, str):
+                continue
+            if ntfy_id in seen_ntfy_ids:
+                continue
+            if client_message_id in seen_client_message_ids:
+                seen_ntfy_ids.add(ntfy_id)
+                continue
+
+            seen_ntfy_ids.add(ntfy_id)
+            seen_client_message_ids.add(client_message_id)
+            warning = self._observe_identity(message, encryption_key)
+            is_local = message.get("c") == self.config_data["client_id"]
+            history.append({
+                "message": message,
+                "warning": warning,
+                "ntfy_id": ntfy_id,
+                "ntfy_time": int(
+                    item.get("ntfy_time", message.get("t", 0)) or 0
+                ),
+            })
+            added += 1
+
+            if not history_scan and not is_local:
+                unread_added += 1
+                if (
+                    self.chime_var.get()
+                    and not self._is_chatroom_muted(room_id)
+                    and str(message.get("c", "")) not in muted_user_ids
+                ):
+                    self._play_chime()
+
+        if not added:
+            return
+
+        history.sort(key=self._message_sort_key)
+        all_history[scope_id] = history[-1000:]
+        if unread_added:
+            unread_counts = self._unread_counts()
+            unread_counts[room_id] = (
+                int(unread_counts.get(room_id, 0) or 0) + unread_added
+            )
+
+        try:
+            save_config(self.config_data)
+        except Exception:
+            pass
+        if unread_added:
+            self._refresh_chatroom_list()
+
     def _accept_network_message(
         self,
         item: dict[str, Any],
@@ -2066,9 +2331,14 @@ class EncryptedChatClient(QObject):
 
         return True
 
-    def _observe_identity(self, message: dict[str, Any]) -> str | None:
+    def _observe_identity(
+        self,
+        message: dict[str, Any],
+        encryption_key: str | None = None,
+    ) -> str | None:
         server_url = str(self.config_data.get("server_url", ""))
-        encryption_key = self._active_chatroom()["key"]
+        if encryption_key is None:
+            encryption_key = self._active_chatroom()["key"]
 
         if not server_url or not encryption_key:
             return None
@@ -2241,8 +2511,25 @@ class EncryptedChatClient(QObject):
             return None
 
     def _room_preference_ids(self, category: str) -> set[str]:
-        scope_id = self._current_room_scope_id()
-        if scope_id is None:
+        return self._room_preference_ids_for_key(
+            category,
+            self._active_chatroom()["key"],
+        )
+
+    def _room_preference_ids_for_key(
+        self,
+        category: str,
+        encryption_key: str,
+    ) -> set[str]:
+        server_url = normalize_server_url(
+            str(self.config_data.get("server_url", ""))
+        )
+        if not server_url or not encryption_key:
+            return set()
+
+        try:
+            scope_id = room_scope_id(server_url, encryption_key)
+        except Exception:
             return set()
 
         category_map = self.config_data.setdefault(category, {})
