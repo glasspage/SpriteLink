@@ -1243,7 +1243,7 @@ class MessageLogBrowser(QTextBrowser):
             painter.fillRect(
                 0,
                 top,
-                left_width + 1,
+                left_width,
                 height + 1,
                 selection.format.background(),
             )
