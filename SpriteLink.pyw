@@ -2,7 +2,7 @@
 # Windows + Python 3.10+
 #
 # Required packages:
-#   pip install PySide6 requests cryptography
+#   pip install PySide6 requests cryptography Pillow
 #
 # Default transport:
 #   https://ntfy.sh
@@ -24,6 +24,7 @@ from ctypes import wintypes
 from functools import lru_cache
 from datetime import datetime
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -36,18 +37,29 @@ import sys
 import uuid
 import zlib
 try:
-    from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, Signal
+    from PySide6.QtCore import (
+        QEvent,
+        QObject,
+        QPoint,
+        QTimer,
+        Qt,
+        QUrl,
+        Signal,
+    )
     from PySide6.QtGui import (
         QColor,
         QFont,
         QFontMetrics,
+        QImage,
         QPainter,
         QPalette,
         QPolygon,
         QTextBlockFormat,
         QTextCharFormat,
         QTextCursor,
+        QTextDocument,
         QTextFormat,
+        QTextImageFormat,
         QTextOption,
     )
     from PySide6.QtWidgets import (
@@ -57,6 +69,7 @@ try:
         QComboBox,
         QDialog,
         QFrame,
+        QFileDialog,
         QGraphicsOpacityEffect,
         QGridLayout,
         QHBoxLayout,
@@ -82,7 +95,7 @@ try:
 except ImportError as exc:
     raise SystemExit(
         "Missing dependency: PySide6\n\nInstall it with:\n"
-        "pip install PySide6 requests cryptography"
+        "pip install PySide6 requests cryptography Pillow"
     ) from exc
 from typing import Any
 
@@ -91,7 +104,7 @@ try:
 except ImportError as exc:
     raise SystemExit(
         "Missing dependency: requests\n\nInstall it with:\n"
-        "pip install PySide6 requests cryptography"
+        "pip install PySide6 requests cryptography Pillow"
     ) from exc
 
 try:
@@ -99,7 +112,15 @@ try:
 except ImportError as exc:
     raise SystemExit(
         "Missing dependency: cryptography\n\nInstall it with:\n"
-        "pip install PySide6 requests cryptography"
+        "pip install PySide6 requests cryptography Pillow"
+    ) from exc
+
+try:
+    from PIL import Image
+except ImportError as exc:
+    raise SystemExit(
+        "Missing dependency: Pillow\n\nInstall it with:\n"
+        "pip install PySide6 requests cryptography Pillow"
     ) from exc
 
 try:
@@ -141,6 +162,9 @@ GAP_SEPARATOR_SECONDS = 6 * 60 * 60
 MAX_MESSAGE_CHARS = 4000
 NTFY_MAX_BODY_BYTES = 4096
 PACKET_PADDING_BLOCK = 128
+PROFILE_ICON_SIZE = 16
+PROFILE_ICON_MAX_COLORS = 16
+MAX_PROFILE_ICON_GIF_BYTES = 2048
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
@@ -283,12 +307,167 @@ SAFE_USERNAME_COLORS = (
 )
 
 
+def optimize_profile_icon(source_path: str) -> bytes:
+    """Convert a PNG to a compact, single-frame 16x16 palette GIF."""
+    with Image.open(source_path) as source:
+        if source.format != "PNG":
+            raise ValueError("Profile icons must be PNG images.")
+        source.load()
+        icon = source.convert("RGBA")
+
+    icon.thumbnail(
+        (PROFILE_ICON_SIZE, PROFILE_ICON_SIZE),
+        Image.Resampling.NEAREST,
+    )
+    canvas = Image.new(
+        "RGBA",
+        (PROFILE_ICON_SIZE, PROFILE_ICON_SIZE),
+        (0, 0, 0, 0),
+    )
+    offset = (
+        (PROFILE_ICON_SIZE - icon.width) // 2,
+        (PROFILE_ICON_SIZE - icon.height) // 2,
+    )
+    canvas.alpha_composite(icon, offset)
+
+    # GIF supports one transparent palette entry, so normalize partial alpha
+    # before counting and quantizing colors.
+    normalized_pixels = [
+        (red, green, blue, 255)
+        if alpha >= 128
+        else (0, 0, 0, 0)
+        for red, green, blue, alpha in canvas.getdata()
+    ]
+    has_transparency = any(alpha == 0 for *_rgb, alpha in normalized_pixels)
+    opaque_pixels = [
+        (red, green, blue)
+        for red, green, blue, alpha in normalized_pixels
+        if alpha == 255
+    ]
+    max_opaque_colors = PROFILE_ICON_MAX_COLORS - int(has_transparency)
+
+    exact_colors = list(dict.fromkeys(opaque_pixels))
+    if len(exact_colors) <= max_opaque_colors:
+        palette_colors = exact_colors
+        color_to_index = {
+            color: index for index, color in enumerate(palette_colors)
+        }
+        opaque_indices = [color_to_index[color] for color in opaque_pixels]
+    else:
+        sample = Image.new("RGB", (len(opaque_pixels), 1))
+        sample.putdata(opaque_pixels)
+        quantized = sample.quantize(
+            colors=max_opaque_colors,
+            method=Image.Quantize.MEDIANCUT,
+            dither=Image.Dither.NONE,
+        )
+        quantized_indices = list(quantized.getdata())
+        used_indices = list(dict.fromkeys(quantized_indices))
+        remap = {
+            old_index: new_index
+            for new_index, old_index in enumerate(used_indices)
+        }
+        raw_palette = quantized.getpalette() or []
+        palette_colors = [
+            tuple(raw_palette[index * 3:index * 3 + 3])
+            for index in used_indices
+        ]
+        opaque_indices = [remap[index] for index in quantized_indices]
+
+    transparency_index = len(palette_colors) if has_transparency else None
+    pixel_indices: list[int] = []
+    opaque_position = 0
+    for _red, _green, _blue, alpha in normalized_pixels:
+        if alpha == 0:
+            pixel_indices.append(int(transparency_index or 0))
+        else:
+            pixel_indices.append(opaque_indices[opaque_position])
+            opaque_position += 1
+
+    stored_palette = list(palette_colors)
+    if has_transparency:
+        stored_palette.append((0, 0, 0))
+    if not stored_palette:
+        stored_palette.append((0, 0, 0))
+    flat_palette = [component for color in stored_palette for component in color]
+    flat_palette.extend([0] * (768 - len(flat_palette)))
+
+    indexed = Image.new("P", (PROFILE_ICON_SIZE, PROFILE_ICON_SIZE))
+    indexed.putpalette(flat_palette)
+    indexed.putdata(pixel_indices)
+    output = io.BytesIO()
+    save_options: dict[str, Any] = {
+        "format": "GIF",
+        "optimize": True,
+    }
+    if transparency_index is not None:
+        save_options["transparency"] = transparency_index
+        save_options["disposal"] = 2
+    indexed.save(output, **save_options)
+    gif_data = output.getvalue()
+    if len(gif_data) > MAX_PROFILE_ICON_GIF_BYTES:
+        raise ValueError("The optimized profile icon is unexpectedly large.")
+    return gif_data
+
+
+def encode_profile_icon(gif_data: bytes) -> str:
+    return base64.urlsafe_b64encode(gif_data).decode("ascii").rstrip("=")
+
+
+def decode_profile_icon(encoded: str) -> bytes:
+    if not encoded:
+        return b""
+    if len(encoded) > ((MAX_PROFILE_ICON_GIF_BYTES * 4 + 2) // 3) + 4:
+        raise ValueError("Profile icon data is too large.")
+    padding = "=" * ((4 - len(encoded) % 4) % 4)
+    try:
+        gif_data = base64.b64decode(
+            encoded + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+    except Exception as exc:
+        raise ValueError("Profile icon data is not valid Base64.") from exc
+    if len(gif_data) > MAX_PROFILE_ICON_GIF_BYTES:
+        raise ValueError("Profile icon data is too large.")
+    if gif_data[:6] not in (b"GIF87a", b"GIF89a"):
+        raise ValueError("Profile icon data is not a GIF image.")
+
+    try:
+        with Image.open(io.BytesIO(gif_data)) as icon:
+            if icon.format != "GIF" or icon.size != (
+                PROFILE_ICON_SIZE,
+                PROFILE_ICON_SIZE,
+            ):
+                raise ValueError("Profile icons must be 16x16 GIF images.")
+            if int(getattr(icon, "n_frames", 1)) != 1:
+                raise ValueError("Animated profile icons are not supported.")
+            rgba = icon.convert("RGBA")
+            if len(set(rgba.getdata())) > PROFILE_ICON_MAX_COLORS:
+                raise ValueError("Profile icons may use at most 16 colors.")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Profile icon GIF data is invalid.") from exc
+    return gif_data
+
+
+def normalize_profile_icon(value: Any, fallback: str = "") -> str:
+    encoded = value if isinstance(value, str) else fallback
+    try:
+        decode_profile_icon(encoded)
+    except ValueError:
+        return fallback
+    return encoded
+
+
 def default_room_profile() -> dict[str, str]:
     return {
         "username": "User",
         "username_color": secrets.choice(SAFE_USERNAME_COLORS),
         "font": DEFAULT_MESSAGE_FONT,
         "text_color": DEFAULT_MESSAGE_TEXT_COLOR,
+        "profile_icon": "",
     }
 
 
@@ -319,11 +498,17 @@ def normalize_room_profile(
     if not text_color.isValid():
         text_color = QColor(base["text_color"])
 
+    profile_icon = normalize_profile_icon(
+        raw.get("profile_icon", base.get("profile_icon", "")),
+        str(base.get("profile_icon", "")),
+    )
+
     return {
         "username": username[:32],
         "username_color": username_color.name(),
         "font": font,
         "text_color": text_color.name(),
+        "profile_icon": profile_icon,
     }
 
 # The former EncryptedChatClient directory is intentionally not migrated.
@@ -1884,6 +2069,11 @@ class EncryptedChatClient(QObject):
         identity_color_button = QPushButton("Choose...")
         identity_color_button.clicked.connect(self._choose_identity_color)
         identity_layout.addWidget(identity_color_button)
+        identity_layout.addSpacing(8)
+        identity_layout.addWidget(QLabel("Profile icon"))
+        profile_icon_button = QPushButton("Browse...")
+        profile_icon_button.clicked.connect(self._choose_profile_icon)
+        identity_layout.addWidget(profile_icon_button)
         self.identity_menu.hide()
         content_layout.addWidget(self.identity_menu)
 
@@ -2077,6 +2267,31 @@ class EncryptedChatClient(QObject):
             self.identity_color_preview,
             selected.name(),
         )
+        self._schedule_profile_save()
+
+    def _choose_profile_icon(self) -> None:
+        source_path, _selected_filter = QFileDialog.getOpenFileName(
+            self.root,
+            "Choose profile icon",
+            "",
+            "PNG images (*.png)",
+        )
+        if not source_path:
+            return
+
+        try:
+            gif_data = optimize_profile_icon(source_path)
+            encoded_icon = encode_profile_icon(gif_data)
+            decode_profile_icon(encoded_icon)
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not use profile icon",
+                str(exc),
+                parent=self.root,
+            )
+            return
+
+        self._active_room_profile()["profile_icon"] = encoded_icon
         self._schedule_profile_save()
 
     def _on_message_font_changed(self, value: str) -> None:
@@ -2361,7 +2576,7 @@ class EncryptedChatClient(QObject):
     def _build_draft_message(self, text: str) -> dict[str, Any]:
         profile = self._active_room_profile()
 
-        return {
+        message = {
             "v": APP_VERSION,
             "i": self.draft_message_id,
             "c": self.config_data["client_id"],
@@ -2372,6 +2587,9 @@ class EncryptedChatClient(QObject):
             "t": int(time.time()),
             "m": text,
         }
+        if profile["profile_icon"]:
+            message["p"] = profile["profile_icon"]
+        return message
 
     def _schedule_composer_update(self) -> None:
         self.message_resize_timer.start(0)
@@ -2866,6 +3084,12 @@ class EncryptedChatClient(QObject):
         text_color = message.get("o", DEFAULT_MESSAGE_TEXT_COLOR)
         if not isinstance(text_color, str) or not QColor(text_color).isValid():
             raise ValueError("Message text color is invalid.")
+
+        profile_icon = message.get("p", "")
+        if not isinstance(profile_icon, str):
+            raise ValueError("Message profile icon has the wrong type.")
+        if profile_icon:
+            decode_profile_icon(profile_icon)
 
     def _process_ui_queue(self) -> None:
         try:
@@ -3442,6 +3666,7 @@ class EncryptedChatClient(QObject):
         status_suffix: str,
         text: str,
         font_name: str,
+        has_profile_icon: bool,
     ) -> str:
         normalized = " ".join(text.split())
         ending = " [...]"
@@ -3456,6 +3681,7 @@ class EncryptedChatClient(QObject):
             username_metrics.horizontalAdvance(username)
             + body_metrics.horizontalAdvance(status_suffix + ": ")
             + 36
+            + (20 if has_profile_icon else 0)
         )
         available_width = max(
             0,
@@ -3483,6 +3709,42 @@ class EncryptedChatClient(QObject):
             if low > 0
             else "[...]"
         )
+
+    def _insert_profile_icon(
+        self,
+        cursor: QTextCursor,
+        encoded_icon: str,
+    ) -> bool:
+        if not encoded_icon:
+            return False
+        try:
+            gif_data = decode_profile_icon(encoded_icon)
+        except ValueError:
+            return False
+
+        image = QImage.fromData(gif_data, b"GIF")
+        if image.isNull():
+            return False
+
+        resource_name = (
+            "spritelink-profile-icon:"
+            + hashlib.sha256(gif_data).hexdigest()
+        )
+        resource_url = QUrl(resource_name)
+        cursor.document().addResource(
+            QTextDocument.ResourceType.ImageResource,
+            resource_url,
+            image,
+        )
+        image_format = QTextImageFormat()
+        image_format.setName(resource_url.toString())
+        image_format.setWidth(PROFILE_ICON_SIZE)
+        image_format.setHeight(PROFILE_ICON_SIZE)
+        image_format.setVerticalAlignment(
+            QTextCharFormat.VerticalAlignment.AlignMiddle
+        )
+        cursor.insertImage(image_format)
+        return True
 
     def _show_username_context_menu(
         self,
@@ -3624,6 +3886,7 @@ class EncryptedChatClient(QObject):
         original_text_color = str(
             message.get("o", DEFAULT_MESSAGE_TEXT_COLOR)
         )
+        profile_icon = str(message.get("p", ""))
         text = str(message["m"])
         message_id = str(message["i"])
         client_id = str(message["c"])
@@ -3668,6 +3931,12 @@ class EncryptedChatClient(QObject):
             f"Unique ID: {unique_id_preview}"
         )
 
+        has_profile_icon = self._insert_profile_icon(cursor, profile_icon)
+        if has_profile_icon:
+            cursor.insertText(
+                " ",
+                self._text_format(body_color, font_name=font_name),
+            )
         cursor.insertText(
             username,
             self._text_format(
@@ -3693,6 +3962,7 @@ class EncryptedChatClient(QObject):
                 status_suffix,
                 text,
                 font_name,
+                has_profile_icon,
             )
             if is_collapsed
             else text
