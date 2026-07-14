@@ -766,6 +766,9 @@ class ChatroomListRow(QWidget):
         layout.addWidget(nickname_label, 1)
 
         unread_label = QLabel(f"({unread_count})")
+        unread_label.setStyleSheet(
+            "color: #d97706; font-weight: 600;"
+        )
         unread_label.setVisible(unread_count > 0 and not muted)
         layout.addWidget(unread_label)
 
@@ -1034,6 +1037,32 @@ class EncryptedChatClient(QObject):
 
         if active_item is not None:
             self.chatrooms_list.setCurrentItem(active_item)
+        self._update_chatrooms_toggle_unread_style()
+
+    def _update_chatrooms_toggle_unread_style(self) -> None:
+        if not hasattr(self, "chatrooms_toggle"):
+            return
+
+        muted_ids = self._muted_chatroom_ids()
+        has_visible_unread = any(
+            room_id != self.active_chatroom_id
+            and room_id not in muted_ids
+            and int(unread_count or 0) > 0
+            for room_id, unread_count in self._unread_counts().items()
+        )
+        if has_visible_unread:
+            self.chatrooms_toggle.setStyleSheet(
+                "QPushButton {"
+                " background-color: #f8d8ad;"
+                " color: #8a4b08;"
+                " border: 1px solid #dca15d;"
+                " border-radius: 3px;"
+                "}"
+                "QPushButton:hover { background-color: #f3c78d; }"
+                "QPushButton:pressed { background-color: #efb968; }"
+            )
+        else:
+            self.chatrooms_toggle.setStyleSheet("")
 
     def _unread_counts(self) -> dict[str, int]:
         unread_counts = self.config_data.setdefault("unread_counts", {})
@@ -1223,6 +1252,7 @@ class EncryptedChatClient(QObject):
         self.chatrooms_toggle.setAccessibleName("Toggle chatrooms menu")
         self.chatrooms_toggle.toggled.connect(self._on_chatrooms_toggled)
         status_layout.addWidget(self.chatrooms_toggle)
+        self._update_chatrooms_toggle_unread_style()
 
         status_layout.addWidget(QLabel("Status:"))
 
