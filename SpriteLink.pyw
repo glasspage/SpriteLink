@@ -1,4 +1,4 @@
-# SpriteLink v10
+# SpriteLink v11
 # Windows + Python 3.10+
 #
 # Required packages:
@@ -41,6 +41,7 @@ try:
         QColor,
         QFont,
         QFontMetrics,
+        QPalette,
         QTextBlockFormat,
         QTextCharFormat,
         QTextCursor,
@@ -104,7 +105,7 @@ except ImportError:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 10
+CONFIG_FORMAT_VERSION = 11
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
@@ -131,6 +132,34 @@ PACKET_PADDING_BLOCK = 128
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
+DEFAULT_MESSAGE_FONT = "Segoe UI"
+DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
+SELECTABLE_MESSAGE_FONTS = (
+    "Arial",
+    "Bahnschrift",
+    "Calibri",
+    "Comic Sans MS",
+    "Consolas",
+    "Corbel",
+    "Segoe UI",
+    "Times New Roman",
+    "Tahoma",
+)
+MESSAGE_FONT_POINT_SIZES = {
+    "Arial": 13,
+    "Bahnschrift": 13,
+    "Calibri": 14,
+    "Comic Sans MS": 12,
+    "Consolas": 14,
+    "Corbel": 14,
+    "Segoe UI": 13,
+    "Times New Roman": 14,
+    "Tahoma": 12,
+}
+# Preserve receive compatibility with messages created by an earlier v11
+# draft, where "System" resolved to the application UI font rather than the
+# legacy Windows bitmap face.
+SUPPORTED_MESSAGE_FONTS = SELECTABLE_MESSAGE_FONTS + ("System",)
 
 # Dark, moderately saturated colors that remain readable against the standard
 # light chat background. A color is selected only when a new local
@@ -147,6 +176,50 @@ SAFE_USERNAME_COLORS = (
     "#67523a",
     "#5f5ab8",
 )
+
+
+def default_room_profile() -> dict[str, str]:
+    return {
+        "username": "User",
+        "username_color": secrets.choice(SAFE_USERNAME_COLORS),
+        "font": DEFAULT_MESSAGE_FONT,
+        "text_color": DEFAULT_MESSAGE_TEXT_COLOR,
+    }
+
+
+def normalize_room_profile(
+    profile: Any,
+    fallback: dict[str, str] | None = None,
+) -> dict[str, str]:
+    base = dict(fallback or default_room_profile())
+    raw = profile if isinstance(profile, dict) else {}
+
+    username = str(raw.get("username", base["username"])).strip()
+    if not username:
+        username = base["username"]
+
+    username_color = QColor(
+        str(raw.get("username_color", base["username_color"]))
+    )
+    if not username_color.isValid():
+        username_color = QColor(base["username_color"])
+
+    font = str(raw.get("font", base["font"]))
+    if font not in SELECTABLE_MESSAGE_FONTS:
+        font = base["font"]
+
+    text_color = QColor(
+        str(raw.get("text_color", base["text_color"]))
+    )
+    if not text_color.isValid():
+        text_color = QColor(base["text_color"])
+
+    return {
+        "username": username[:32],
+        "username_color": username_color.name(),
+        "font": font,
+        "text_color": text_color.name(),
+    }
 
 # The former EncryptedChatClient directory is intentionally not migrated.
 APP_DATA_DIR = Path(
@@ -244,16 +317,19 @@ def dpapi_decrypt(data: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytes:
 
 
 def default_config() -> dict[str, Any]:
+    global_profile = default_room_profile()
     return {
         "config_version": CONFIG_FORMAT_VERSION,
         "server_preset": DEFAULT_SERVER_PRESET,
         "server_url": DEFAULT_SERVER_URL,
-        "username": "User",
-        "username_color": secrets.choice(SAFE_USERNAME_COLORS),
         "chime_enabled": True,
+        "anti_aliased_text": True,
         "client_id": secrets.token_hex(32),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
+        "room_profiles": {
+            GLOBAL_CHATROOM_ID: global_profile,
+        },
         "muted_chatrooms": [],
         "unread_counts": {},
         "room_state": {},
@@ -298,6 +374,11 @@ def load_config() -> dict[str, Any]:
             config.update(loaded)
         except Exception:
             pass
+
+    try:
+        previous_config_version = int(config.get("config_version", 0) or 0)
+    except (TypeError, ValueError):
+        previous_config_version = 0
 
     if not isinstance(config.get("client_id"), str) or len(config["client_id"]) < 32:
         config["client_id"] = secrets.token_hex(32)
@@ -359,6 +440,48 @@ def load_config() -> dict[str, Any]:
         active_chatroom_id = GLOBAL_CHATROOM_ID
     config["active_chatroom_id"] = active_chatroom_id
 
+    raw_profiles = config.get("room_profiles")
+    if not isinstance(raw_profiles, dict):
+        raw_profiles = {}
+
+    if previous_config_version < 11:
+        legacy_username = config.get("username", "User")
+        legacy_username_color = config.get(
+            "username_color",
+            secrets.choice(SAFE_USERNAME_COLORS),
+        )
+        if previous_config_version < 3:
+            if legacy_username == "Anonymous":
+                legacy_username = "User"
+            if legacy_username_color == "#4ea1ff":
+                legacy_username_color = secrets.choice(SAFE_USERNAME_COLORS)
+        raw_profiles = dict(raw_profiles)
+        raw_profiles[GLOBAL_CHATROOM_ID] = {
+            "username": legacy_username,
+            "username_color": legacy_username_color,
+            "font": DEFAULT_MESSAGE_FONT,
+            "text_color": DEFAULT_MESSAGE_TEXT_COLOR,
+        }
+
+    global_profile = normalize_room_profile(
+        raw_profiles.get(GLOBAL_CHATROOM_ID)
+    )
+    cleaned_profiles = {
+        GLOBAL_CHATROOM_ID: global_profile,
+    }
+    for room_id in valid_room_ids - {GLOBAL_CHATROOM_ID}:
+        cleaned_profiles[room_id] = normalize_room_profile(
+            raw_profiles.get(room_id),
+            global_profile,
+        )
+    config["room_profiles"] = cleaned_profiles
+    config.pop("username", None)
+    config.pop("username_color", None)
+
+    config["anti_aliased_text"] = bool(
+        config.get("anti_aliased_text", True)
+    )
+
     muted_chatrooms = config.get("muted_chatrooms")
     if not isinstance(muted_chatrooms, list):
         muted_chatrooms = []
@@ -397,13 +520,6 @@ def load_config() -> dict[str, Any]:
     ):
         config["server_preset"] = DEFAULT_SERVER_PRESET
         config["server_url"] = DEFAULT_SERVER_URL
-
-    previous_config_version = int(config.get("config_version", 0) or 0)
-    if previous_config_version < 3:
-        if config.get("username") == "Anonymous":
-            config["username"] = "User"
-        if config.get("username_color") == "#4ea1ff":
-            config["username_color"] = secrets.choice(SAFE_USERNAME_COLORS)
 
     # Old numeric-cursor state is not compatible with ntfy message IDs.
     config.pop("server_cursors", None)
@@ -822,6 +938,7 @@ class EncryptedChatClient(QObject):
         self.rendered_tooltips: dict[str, str] = {}
         self._hovered_message_id: str | None = None
         self._config_snapshot_at_open: tuple[Any, ...] | None = None
+        self._loading_profile_controls = False
         self.active_chatroom_id = str(
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
         )
@@ -848,16 +965,19 @@ class EncryptedChatClient(QObject):
         self.server_url_var = ValueModel(
             self.config_data["server_url"]
         )
-        self.username_var = ValueModel(
-            self.config_data["username"]
-        )
-        self.color_var = ValueModel(
-            self.config_data["username_color"]
-        )
         self.chime_var = ValueModel(
             bool(self.config_data["chime_enabled"])
         )
+        self.anti_alias_var = ValueModel(
+            bool(self.config_data.get("anti_aliased_text", True))
+        )
         self.status_var = ValueModel("Connecting")
+
+        self.profile_save_timer = QTimer(self)
+        self.profile_save_timer.setSingleShot(True)
+        self.profile_save_timer.timeout.connect(
+            self._persist_profile_changes
+        )
 
         self.message_resize_timer = QTimer(self)
         self.message_resize_timer.setSingleShot(True)
@@ -875,20 +995,74 @@ class EncryptedChatClient(QObject):
         self.ui_queue_timer.timeout.connect(self._process_ui_queue)
         self.ui_queue_timer.start(100)
 
+        self._apply_application_font_strategy()
         self._build_ui()
         self._apply_server_preset_state()
-        self._update_color_preview()
         self._load_saved_history_for_current_room()
 
         self.root.close_callback = self._on_close
         self._start_network_thread()
 
-    @staticmethod
-    def _heading(text: str) -> QLabel:
+    def _font_style_strategy(self) -> QFont.StyleStrategy:
+        return (
+            QFont.StyleStrategy.PreferDefault
+            if self.anti_alias_var.get()
+            else QFont.StyleStrategy.NoAntialias
+        )
+
+    def _resolved_font_family(self, font_name: str) -> str:
+        if font_name == "System":
+            app = QApplication.instance()
+            if app is not None:
+                return app.font().family()
+        return (
+            font_name
+            if font_name in SUPPORTED_MESSAGE_FONTS
+            else DEFAULT_MESSAGE_FONT
+        )
+
+    def _make_font(
+        self,
+        font_name: str,
+        point_size: int,
+        *,
+        bold: bool = False,
+    ) -> QFont:
+        font = QFont(self._resolved_font_family(font_name), point_size)
+        font.setBold(bold)
+        font.setStyleStrategy(self._font_style_strategy())
+        return font
+
+    def _make_message_font(
+        self,
+        font_name: str,
+        *,
+        bold: bool = False,
+    ) -> QFont:
+        point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
+        return self._make_font(
+            font_name,
+            point_size,
+            bold=bold,
+        )
+
+    def _apply_application_font_strategy(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        strategy = self._font_style_strategy()
+        application_font = QFont(app.font())
+        application_font.setStyleStrategy(strategy)
+        app.setFont(application_font)
+        for widget in app.allWidgets():
+            widget_font = QFont(widget.font())
+            widget_font.setStyleStrategy(strategy)
+            widget.setFont(widget_font)
+
+    def _heading(self, text: str) -> QLabel:
         label = QLabel(text)
-        font = QFont("Segoe UI", 10)
-        font.setBold(True)
-        label.setFont(font)
+        label.setFont(self._make_font("Segoe UI", 10, bold=True))
         return label
 
     @staticmethod
@@ -1006,6 +1180,39 @@ class EncryptedChatClient(QObject):
         self.config_data["active_chatroom_id"] = GLOBAL_CHATROOM_ID
         return self._chatroom_definitions()[0]
 
+    def _room_profile(self, room_id: str) -> dict[str, str]:
+        profiles = self.config_data.setdefault("room_profiles", {})
+        if not isinstance(profiles, dict):
+            profiles = {}
+            self.config_data["room_profiles"] = profiles
+
+        global_profile = normalize_room_profile(
+            profiles.get(GLOBAL_CHATROOM_ID)
+        )
+        profiles[GLOBAL_CHATROOM_ID] = global_profile
+        if room_id == GLOBAL_CHATROOM_ID:
+            return global_profile
+
+        profile = normalize_room_profile(
+            profiles.get(room_id),
+            global_profile,
+        )
+        profiles[room_id] = profile
+        return profile
+
+    def _active_room_profile(self) -> dict[str, str]:
+        return self._room_profile(self.active_chatroom_id)
+
+    def _persist_profile_changes(self) -> None:
+        try:
+            save_config(self.config_data)
+        except Exception:
+            pass
+
+    def _schedule_profile_save(self) -> None:
+        self.profile_save_timer.start(250)
+        self._run_message_size_check()
+
     def _muted_chatroom_ids(self) -> set[str]:
         return {
             str(room_id)
@@ -1116,11 +1323,15 @@ class EncryptedChatClient(QObject):
             "nickname": nickname,
             "key": key,
         })
+        self.config_data.setdefault("room_profiles", {})[room_id] = dict(
+            self._room_profile(GLOBAL_CHATROOM_ID)
+        )
         self.initial_history_pending_rooms.add(room_id)
         try:
             save_config(self.config_data)
         except Exception as exc:
             self.config_data["chatrooms"].pop()
+            self.config_data.get("room_profiles", {}).pop(room_id, None)
             self.initial_history_pending_rooms.discard(room_id)
             messagebox.showerror(
                 "Could not save chatroom",
@@ -1197,6 +1408,7 @@ class EncryptedChatClient(QObject):
         muted_ids.discard(room_id)
         self.config_data["muted_chatrooms"] = sorted(muted_ids)
         self._unread_counts().pop(room_id, None)
+        self.config_data.get("room_profiles", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
 
         if self.active_chatroom_id == room_id:
@@ -1229,6 +1441,7 @@ class EncryptedChatClient(QObject):
         except Exception:
             pass
         self._clear_visible_room()
+        self._load_active_room_profile_into_controls()
         self._load_saved_history_for_current_room()
         self.connected = False
         self.status_var.set("Connecting")
@@ -1257,9 +1470,9 @@ class EncryptedChatClient(QObject):
         status_layout.addWidget(QLabel("Status:"))
 
         self.status_label = QLabel()
-        status_font = QFont("Segoe UI", 9)
-        status_font.setBold(True)
-        self.status_label.setFont(status_font)
+        self.status_label.setFont(
+            self._make_font("Segoe UI", 9, bold=True)
+        )
         self.status_var.bind(self.status_label.setText)
         status_layout.addWidget(self.status_label)
         status_layout.addStretch(1)
@@ -1281,7 +1494,7 @@ class EncryptedChatClient(QObject):
         self.chat_display.setOpenLinks(False)
         self.chat_display.setOpenExternalLinks(False)
         self.chat_display.setUndoRedoEnabled(False)
-        self.chat_display.setFont(QFont("Segoe UI", 10))
+        self.chat_display.setFont(self._make_font("Segoe UI", 10))
         self.chat_display.setViewportMargins(6, 6, 6, 6)
         self.chat_display.document().setDocumentMargin(4)
         text_option = self.chat_display.document().defaultTextOption()
@@ -1291,13 +1504,92 @@ class EncryptedChatClient(QObject):
         self.chat_display.viewport().installEventFilter(self)
         content_layout.addWidget(self.chat_display, 1)
 
+        composer_actions = QHBoxLayout()
+        composer_actions.setContentsMargins(0, 0, 0, 0)
+        composer_actions.setSpacing(6)
+        self.identity_menu_button = QPushButton("Identity")
+        self.identity_menu_button.setCheckable(True)
+        self.identity_menu_button.toggled.connect(
+            self._on_identity_menu_toggled
+        )
+        composer_actions.addWidget(self.identity_menu_button)
+        self.font_menu_button = QPushButton("Font")
+        self.font_menu_button.setCheckable(True)
+        self.font_menu_button.toggled.connect(
+            self._on_font_menu_toggled
+        )
+        composer_actions.addWidget(self.font_menu_button)
+        composer_actions.addStretch(1)
+
+        self.identity_menu = QFrame()
+        self.identity_menu.setFrameShape(QFrame.Shape.StyledPanel)
+        identity_layout = QHBoxLayout(self.identity_menu)
+        identity_layout.setContentsMargins(8, 5, 8, 5)
+        identity_layout.setSpacing(7)
+        identity_layout.addWidget(QLabel("Username"))
+        self.identity_username_entry = QLineEdit()
+        self.identity_username_entry.setMaxLength(32)
+        self.identity_username_entry.textChanged.connect(
+            self._on_identity_username_changed
+        )
+        self.identity_username_entry.editingFinished.connect(
+            self._normalize_identity_username_entry
+        )
+        identity_layout.addWidget(self.identity_username_entry, 1)
+        identity_layout.addWidget(QLabel("Username color"))
+        self.identity_color_preview = QLabel()
+        self.identity_color_preview.setFixedSize(26, 22)
+        self.identity_color_preview.setFrameShape(QFrame.Shape.Panel)
+        self.identity_color_preview.setFrameShadow(QFrame.Shadow.Sunken)
+        identity_layout.addWidget(self.identity_color_preview)
+        identity_color_button = QPushButton("Choose...")
+        identity_color_button.clicked.connect(self._choose_identity_color)
+        identity_layout.addWidget(identity_color_button)
+        self.identity_menu.hide()
+        content_layout.addWidget(self.identity_menu)
+
+        self.font_menu = QFrame()
+        self.font_menu.setFrameShape(QFrame.Shape.StyledPanel)
+        font_layout = QHBoxLayout(self.font_menu)
+        font_layout.setContentsMargins(8, 5, 8, 5)
+        font_layout.setSpacing(7)
+        font_layout.addWidget(QLabel("Font"))
+        self.message_font_combo = QComboBox()
+        self.message_font_combo.addItems(list(SELECTABLE_MESSAGE_FONTS))
+        for index, font_name in enumerate(SELECTABLE_MESSAGE_FONTS):
+            self.message_font_combo.setItemData(
+                index,
+                self._make_message_font(font_name),
+                Qt.ItemDataRole.FontRole,
+            )
+        self.message_font_combo.currentTextChanged.connect(
+            self._on_message_font_changed
+        )
+        font_layout.addWidget(self.message_font_combo, 1)
+        font_layout.addWidget(QLabel("Text color"))
+        self.message_text_color_preview = QLabel()
+        self.message_text_color_preview.setFixedSize(26, 22)
+        self.message_text_color_preview.setFrameShape(QFrame.Shape.Panel)
+        self.message_text_color_preview.setFrameShadow(
+            QFrame.Shadow.Sunken
+        )
+        font_layout.addWidget(self.message_text_color_preview)
+        text_color_button = QPushButton("Choose...")
+        text_color_button.clicked.connect(self._choose_message_text_color)
+        font_layout.addWidget(text_color_button)
+        self.font_menu.hide()
+        content_layout.addWidget(self.font_menu)
+        content_layout.addLayout(composer_actions)
+
         compose_layout = QGridLayout()
         compose_layout.setContentsMargins(0, 1, 0, 0)
         compose_layout.setHorizontalSpacing(8)
         compose_layout.setVerticalSpacing(5)
 
         self.message_entry = ComposeTextEdit()
-        self.message_entry.setFont(QFont("Segoe UI", 10))
+        self.message_entry.setFont(
+            self._make_message_font(DEFAULT_MESSAGE_FONT)
+        )
         self.message_entry.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.message_entry.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -1322,8 +1614,152 @@ class EncryptedChatClient(QObject):
         compose_layout.addWidget(self.message_size_bar, 1, 0, 1, 2)
         content_layout.addLayout(compose_layout)
 
+        self._load_active_room_profile_into_controls()
         self._resize_message_entry()
         self._run_message_size_check()
+
+    @staticmethod
+    def _set_button_checked(button: QPushButton, checked: bool) -> None:
+        previous = button.blockSignals(True)
+        button.setChecked(checked)
+        button.blockSignals(previous)
+
+    def _on_identity_menu_toggled(self, checked: bool) -> None:
+        self.identity_menu.setVisible(checked)
+        if checked:
+            self._set_button_checked(self.font_menu_button, False)
+            self.font_menu.hide()
+            self.identity_username_entry.setFocus()
+
+    def _on_font_menu_toggled(self, checked: bool) -> None:
+        self.font_menu.setVisible(checked)
+        if checked:
+            self._set_button_checked(self.identity_menu_button, False)
+            self.identity_menu.hide()
+            self.message_font_combo.setFocus()
+
+    @staticmethod
+    def _set_color_preview(preview: QLabel, color: str) -> None:
+        preview.setStyleSheet(f"background-color: {color};")
+
+    def _load_active_room_profile_into_controls(self) -> None:
+        if not hasattr(self, "identity_username_entry"):
+            return
+
+        profile = self._active_room_profile()
+        self._loading_profile_controls = True
+        try:
+            self.identity_username_entry.setText(profile["username"])
+            self.message_font_combo.setCurrentText(profile["font"])
+            self.message_font_combo.setFont(
+                self._make_message_font(profile["font"])
+            )
+            self._set_color_preview(
+                self.identity_color_preview,
+                profile["username_color"],
+            )
+            self._set_color_preview(
+                self.message_text_color_preview,
+                profile["text_color"],
+            )
+        finally:
+            self._loading_profile_controls = False
+        self._apply_active_composer_style()
+
+    def _update_message_entry_placeholder(self) -> None:
+        if not hasattr(self, "message_entry"):
+            return
+
+        room_name = self._active_chatroom()["nickname"]
+        self.message_entry.setPlaceholderText(f"Chat in {room_name}")
+        placeholder_color = QColor(
+            self._active_room_profile()["text_color"]
+        )
+        placeholder_color.setAlpha(140)
+        palette = self.message_entry.palette()
+        palette.setColor(
+            QPalette.ColorRole.PlaceholderText,
+            placeholder_color,
+        )
+        self.message_entry.setPalette(palette)
+
+    def _apply_active_composer_style(self) -> None:
+        if not hasattr(self, "message_entry"):
+            return
+        profile = self._active_room_profile()
+        self.message_entry.setFont(
+            self._make_message_font(profile["font"])
+        )
+        self.message_entry.setStyleSheet(
+            f"color: {profile['text_color']};"
+        )
+        self._update_message_entry_placeholder()
+        self._resize_message_entry()
+
+    def _on_identity_username_changed(self, value: str) -> None:
+        if self._loading_profile_controls:
+            return
+        self._active_room_profile()["username"] = (
+            value.strip()[:32] or "User"
+        )
+        self._schedule_profile_save()
+
+    def _normalize_identity_username_entry(self) -> None:
+        profile = self._active_room_profile()
+        normalized = profile["username"]
+        if self.identity_username_entry.text() != normalized:
+            self._loading_profile_controls = True
+            try:
+                self.identity_username_entry.setText(normalized)
+            finally:
+                self._loading_profile_controls = False
+
+    def _choose_identity_color(self) -> None:
+        profile = self._active_room_profile()
+        selected = QColorDialog.getColor(
+            QColor(profile["username_color"]),
+            self.root,
+            "Choose username color",
+        )
+        if not selected.isValid():
+            return
+        profile["username_color"] = selected.name()
+        self._set_color_preview(
+            self.identity_color_preview,
+            selected.name(),
+        )
+        self._schedule_profile_save()
+
+    def _on_message_font_changed(self, value: str) -> None:
+        if self._loading_profile_controls:
+            return
+        profile = self._active_room_profile()
+        profile["font"] = (
+            value if value in SELECTABLE_MESSAGE_FONTS
+            else DEFAULT_MESSAGE_FONT
+        )
+        self.message_font_combo.setFont(
+            self._make_message_font(profile["font"])
+        )
+        self._apply_active_composer_style()
+        self._schedule_profile_save()
+
+    def _choose_message_text_color(self) -> None:
+        profile = self._active_room_profile()
+        selected = QColorDialog.getColor(
+            QColor(profile["text_color"]),
+            self.root,
+            "Choose message text color",
+        )
+        if not selected.isValid():
+            return
+        profile["text_color"] = selected.name()
+        self._set_color_preview(
+            self.message_text_color_preview,
+            selected.name(),
+        )
+        self._apply_active_composer_style()
+        self._schedule_profile_save()
 
     def _build_config_popup(self) -> None:
         self.config_overlay = ConfigOverlay(self.chat_content)
@@ -1416,30 +1852,13 @@ class EncryptedChatClient(QObject):
 
         layout.addWidget(self._separator(), row, 0, 1, 3)
         row += 1
-        layout.addWidget(self._heading("Identity and appearance"), row, 0, 1, 3)
-        row += 1
-
-        layout.addWidget(QLabel("Username"), row, 0)
-        self.username_entry = QLineEdit()
-        self.username_entry.setText(str(self.username_var.get()))
-        self.username_entry.textChanged.connect(self.username_var.set)
-        self.username_var.bind(self.username_entry.setText)
-        layout.addWidget(self.username_entry, row, 1, 1, 2)
-        row += 1
-
-        layout.addWidget(QLabel("Username color"), row, 0)
-        color_layout = QHBoxLayout()
-        self.color_preview = QLabel()
-        self.color_preview.setFixedSize(28, 22)
-        self.color_preview.setFrameShape(QFrame.Shape.Panel)
-        self.color_preview.setFrameShadow(QFrame.Shadow.Sunken)
-        color_layout.addWidget(self.color_preview)
-
-        choose_color_button = QPushButton("Choose color...")
-        choose_color_button.clicked.connect(self._choose_color)
-        color_layout.addWidget(choose_color_button)
-        color_layout.addStretch(1)
-        layout.addLayout(color_layout, row, 1, 1, 2)
+        layout.addWidget(
+            self._heading("Notifications and rendering"),
+            row,
+            0,
+            1,
+            3,
+        )
         row += 1
 
         self.chime_checkbox = QCheckBox(
@@ -1449,6 +1868,13 @@ class EncryptedChatClient(QObject):
         self.chime_checkbox.toggled.connect(self.chime_var.set)
         self.chime_var.bind(self.chime_checkbox.setChecked)
         layout.addWidget(self.chime_checkbox, row, 0, 1, 3)
+        row += 1
+
+        self.anti_alias_checkbox = QCheckBox("Anti-aliased Text")
+        self.anti_alias_checkbox.setChecked(bool(self.anti_alias_var.get()))
+        self.anti_alias_checkbox.toggled.connect(self.anti_alias_var.set)
+        self.anti_alias_var.bind(self.anti_alias_checkbox.setChecked)
+        layout.addWidget(self.anti_alias_checkbox, row, 0, 1, 3)
         row += 1
 
         layout.addWidget(self._separator(), row, 0, 1, 3)
@@ -1489,9 +1915,8 @@ class EncryptedChatClient(QObject):
         return (
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
-            str(self.username_var.get()),
-            str(self.color_var.get()),
             bool(self.chime_var.get()),
+            bool(self.anti_alias_var.get()),
         )
 
     def _set_config_toggle_checked(self, checked: bool) -> None:
@@ -1544,59 +1969,24 @@ class EncryptedChatClient(QObject):
 
         self._apply_server_preset_state()
 
-    def _choose_color(self) -> None:
-        initial = QColor(str(self.color_var.get()))
-        selected = QColorDialog.getColor(
-            initial if initial.isValid() else QColor("#4ea1ff"),
-            self.root,
-            "Choose username color",
-        )
-
-        if selected.isValid():
-            self.color_var.set(selected.name())
-            self._update_color_preview()
-
-    def _update_color_preview(self) -> None:
-        color = QColor(str(self.color_var.get()).strip() or "#4ea1ff")
-        if not color.isValid():
-            color = QColor("#4ea1ff")
-            self.color_var.set(color.name())
-
-        self.color_preview.setStyleSheet(
-            f"background-color: {color.name()};"
-        )
-
-    def _validate_current_settings(self) -> tuple[str, str, str]:
+    def _validate_current_settings(self) -> str:
         server_url = normalize_server_url(str(self.server_url_var.get()))
-        username = str(self.username_var.get()).strip()
-        color = str(self.color_var.get()).strip()
 
         if not server_url.startswith(("http://", "https://")):
             raise ValueError(
                 "The server URL must begin with http:// or https://."
             )
-
-        if not username:
-            raise ValueError("The username cannot be empty.")
-
-        if len(username) > 32:
-            raise ValueError("The username must be 32 characters or fewer.")
-
-        if not QColor(color).isValid():
-            raise ValueError("The username color is invalid.")
-
-        return server_url, username, color
+        return server_url
 
     def _copy_ui_to_config(self) -> None:
-        server_url, username, color = (
-            self._validate_current_settings()
-        )
+        server_url = self._validate_current_settings()
 
         self.config_data["server_preset"] = self.server_preset_var.get()
         self.config_data["server_url"] = server_url
-        self.config_data["username"] = username
-        self.config_data["username_color"] = color
         self.config_data["chime_enabled"] = bool(self.chime_var.get())
+        self.config_data["anti_aliased_text"] = bool(
+            self.anti_alias_var.get()
+        )
 
     def _save_and_reconnect(self) -> bool:
         try:
@@ -1611,6 +2001,8 @@ class EncryptedChatClient(QObject):
             return False
 
         self._clear_visible_room()
+        self._apply_application_font_strategy()
+        self._apply_active_composer_style()
         self._load_saved_history_for_current_room()
         self.initial_history_pending_rooms.update(
             room["id"] for room in self._chatroom_definitions()
@@ -1622,7 +2014,7 @@ class EncryptedChatClient(QObject):
 
     def _test_connection(self) -> None:
         try:
-            server_url, _, _ = self._validate_current_settings()
+            server_url = self._validate_current_settings()
         except Exception as exc:
             messagebox.showerror(
                 "Invalid configuration",
@@ -1654,15 +2046,16 @@ class EncryptedChatClient(QObject):
             self.ui_queue.put(("test_ok", server_url))
 
     def _build_draft_message(self, text: str) -> dict[str, Any]:
-        username = str(self.username_var.get()).strip() or "User"
-        color = str(self.color_var.get()).strip() or "#315f8c"
+        profile = self._active_room_profile()
 
         return {
             "v": APP_VERSION,
             "i": self.draft_message_id,
             "c": self.config_data["client_id"],
-            "u": username[:32],
-            "k": color,
+            "u": profile["username"],
+            "k": profile["username_color"],
+            "f": profile["font"],
+            "o": profile["text_color"],
             "t": int(time.time()),
             "m": text,
         }
@@ -1772,9 +2165,7 @@ class EncryptedChatClient(QObject):
             return
 
         try:
-            server_url, username, color = (
-                self._validate_current_settings()
-            )
+            server_url = self._validate_current_settings()
         except Exception as exc:
             messagebox.showerror(
                 "Cannot send message",
@@ -1794,8 +2185,6 @@ class EncryptedChatClient(QObject):
             return
 
         message = self._build_draft_message(text)
-        message["u"] = username
-        message["k"] = color
         message["t"] = int(time.time())
 
         self._cancel_pending_message_size_check()
@@ -2138,6 +2527,17 @@ class EncryptedChatClient(QObject):
             raise ValueError("Username is too long.")
         if len(message["m"]) > MAX_MESSAGE_CHARS:
             raise ValueError("Message text is too long.")
+
+        font_name = message.get("f", DEFAULT_MESSAGE_FONT)
+        if (
+            not isinstance(font_name, str)
+            or font_name not in SUPPORTED_MESSAGE_FONTS
+        ):
+            raise ValueError("Message font is unsupported.")
+
+        text_color = message.get("o", DEFAULT_MESSAGE_TEXT_COLOR)
+        if not isinstance(text_color, str) or not QColor(text_color).isValid():
+            raise ValueError("Message text color is invalid.")
 
     def _process_ui_queue(self) -> None:
         try:
@@ -2727,6 +3127,7 @@ class EncryptedChatClient(QObject):
         username: str,
         status_suffix: str,
         text: str,
+        font_name: str,
     ) -> str:
         normalized = " ".join(text.split())
         ending = " [...]"
@@ -2734,9 +3135,8 @@ class EncryptedChatClient(QObject):
         if not normalized:
             return "[...]"
 
-        body_metrics = QFontMetrics(self.chat_display.font())
-        username_font = QFont("Segoe UI", 10)
-        username_font.setBold(True)
+        body_metrics = QFontMetrics(self._make_message_font(font_name))
+        username_font = self._make_message_font(font_name, bold=True)
         username_metrics = QFontMetrics(username_font)
         prefix_width = (
             username_metrics.horizontalAdvance(username)
@@ -2812,19 +3212,18 @@ class EncryptedChatClient(QObject):
 
         menu.exec(global_position)
 
-    @staticmethod
     def _text_format(
+        self,
         color: str,
         *,
         bold: bool = False,
         anchor: str | None = None,
+        font_name: str = DEFAULT_MESSAGE_FONT,
     ) -> QTextCharFormat:
         formatting = QTextCharFormat()
         formatting.setForeground(QColor(color))
-        formatting.setFontFamilies(["Segoe UI"])
-        formatting.setFontPointSize(10)
-        formatting.setFontWeight(
-            QFont.Weight.Bold if bold else QFont.Weight.Normal
+        formatting.setFont(
+            self._make_message_font(font_name, bold=bold)
         )
         if anchor:
             formatting.setAnchor(True)
@@ -2896,6 +3295,10 @@ class EncryptedChatClient(QObject):
         timestamp = self._display_timestamp_for_item(item)
         username = str(message["u"])
         original_color = str(message["k"])
+        font_name = str(message.get("f", DEFAULT_MESSAGE_FONT))
+        original_text_color = str(
+            message.get("o", DEFAULT_MESSAGE_TEXT_COLOR)
+        )
         text = str(message["m"])
         message_id = str(message["i"])
         client_id = str(message["c"])
@@ -2921,10 +3324,12 @@ class EncryptedChatClient(QObject):
         elif is_muted:
             status_suffix = " (muted)"
 
+        if not QColor(original_text_color).isValid():
+            original_text_color = DEFAULT_MESSAGE_TEXT_COLOR
         body_color = (
-            self._blend_toward_chat_background("#202020")
+            self._blend_toward_chat_background(original_text_color)
             if is_muted
-            else "#202020"
+            else original_text_color
         )
         suffix_color = (
             self._blend_toward_chat_background("#777777")
@@ -2944,31 +3349,39 @@ class EncryptedChatClient(QObject):
                 username_color,
                 bold=True,
                 anchor=f"spritelink:{message_id}",
+                font_name=font_name,
             ),
         )
         if status_suffix:
             cursor.insertText(
                 status_suffix,
-                self._text_format(suffix_color),
+                self._text_format(suffix_color, font_name=font_name),
             )
-        cursor.insertText(": ", self._text_format(body_color))
+        cursor.insertText(
+            ": ",
+            self._text_format(body_color, font_name=font_name),
+        )
 
         display_text = (
             self._collapsed_message_preview(
                 username,
                 status_suffix,
                 text,
+                font_name,
             )
             if is_collapsed
             else text
         )
-        cursor.insertText(display_text, self._text_format(body_color))
+        cursor.insertText(
+            display_text,
+            self._text_format(body_color, font_name=font_name),
+        )
 
         if item.get("warning") and not is_collapsed:
             cursor.insertBlock()
             cursor.insertText(
                 str(item["warning"]),
-                self._text_format("#b00020"),
+                self._text_format("#b00020", font_name=font_name),
             )
 
     def _append_system_message(
