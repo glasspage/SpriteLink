@@ -135,16 +135,26 @@ MESSAGE_ENTRY_MAX_LINES = 6
 DEFAULT_MESSAGE_FONT = "Segoe UI"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 SELECTABLE_MESSAGE_FONTS = (
+    "Arial",
+    "Bahnschrift",
+    "Calibri",
+    "Comic Sans MS",
+    "Consolas",
     "Corbel",
-    "Tahoma",
-    "Times New Roman",
     "Segoe UI",
+    "Times New Roman",
+    "Tahoma",
 )
 MESSAGE_FONT_POINT_SIZES = {
-    "Corbel": 16,
-    "Tahoma": 14,
-    "Times New Roman": 16,
-    "Segoe UI": 14,
+    "Arial": 13,
+    "Bahnschrift": 13,
+    "Calibri": 14,
+    "Comic Sans MS": 12,
+    "Consolas": 14,
+    "Corbel": 14,
+    "Segoe UI": 13,
+    "Times New Roman": 14,
+    "Tahoma": 12,
 }
 # Preserve receive compatibility with messages created by an earlier v11
 # draft, where "System" resolved to the application UI font rather than the
