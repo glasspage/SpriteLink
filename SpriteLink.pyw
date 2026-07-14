@@ -1,4 +1,4 @@
-# SpriteLink v9
+# SpriteLink v10
 # Windows + Python 3.10+
 #
 # Required packages:
@@ -38,6 +38,7 @@ import zlib
 try:
     from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
     from PySide6.QtGui import (
+        QBrush,
         QColor,
         QFont,
         QFontMetrics,
@@ -51,11 +52,14 @@ try:
         QCheckBox,
         QColorDialog,
         QComboBox,
+        QDialog,
         QFrame,
         QGridLayout,
         QHBoxLayout,
         QLabel,
         QLineEdit,
+        QListWidget,
+        QListWidgetItem,
         QMainWindow,
         QMenu,
         QMessageBox,
@@ -100,10 +104,14 @@ except ImportError:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 9
+CONFIG_FORMAT_VERSION = 10
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
+GLOBAL_CHATROOM_ID = "global"
+GLOBAL_CHATROOM_NICKNAME = "Global"
+GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
+CHATROOM_SIDEBAR_WIDTH = 240
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
@@ -123,7 +131,7 @@ MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
 
 # Dark, moderately saturated colors that remain readable against the standard
-# light Tkinter text background. A color is selected only when a new local
+# light chat background. A color is selected only when a new local
 # configuration is first created.
 SAFE_USERNAME_COLORS = (
     "#2f6bff",
@@ -240,9 +248,11 @@ def default_config() -> dict[str, Any]:
         "server_url": DEFAULT_SERVER_URL,
         "username": "User",
         "username_color": secrets.choice(SAFE_USERNAME_COLORS),
-        "encryption_key": "",
         "chime_enabled": True,
         "client_id": secrets.token_hex(32),
+        "chatrooms": [],
+        "active_chatroom_id": GLOBAL_CHATROOM_ID,
+        "muted_chatrooms": [],
         "room_state": {},
         "identities": {},
         "history": {},
@@ -303,6 +313,61 @@ def load_config() -> dict[str, Any]:
 
     if not isinstance(config.get("collapsed_messages"), dict):
         config["collapsed_messages"] = {}
+
+    chatrooms = config.get("chatrooms")
+    if not isinstance(chatrooms, list):
+        config["chatrooms"] = []
+    else:
+        cleaned_chatrooms = []
+        seen_ids: set[str] = set()
+        seen_keys = {GLOBAL_CHATROOM_KEY}
+        for room in chatrooms:
+            if not isinstance(room, dict):
+                continue
+            room_id = str(room.get("id", "")).strip()
+            nickname = str(room.get("nickname", "")).strip()
+            key = str(room.get("key", ""))
+            if (
+                not room_id
+                or room_id == GLOBAL_CHATROOM_ID
+                or room_id in seen_ids
+                or not nickname
+                or not key
+                or key in seen_keys
+            ):
+                continue
+            seen_ids.add(room_id)
+            seen_keys.add(key)
+            cleaned_chatrooms.append({
+                "id": room_id,
+                "nickname": nickname[:64],
+                "key": key,
+            })
+        config["chatrooms"] = cleaned_chatrooms
+
+    valid_room_ids = {
+        GLOBAL_CHATROOM_ID,
+        *(room["id"] for room in config["chatrooms"]),
+    }
+    active_chatroom_id = str(
+        config.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
+    )
+    if active_chatroom_id not in valid_room_ids:
+        active_chatroom_id = GLOBAL_CHATROOM_ID
+    config["active_chatroom_id"] = active_chatroom_id
+
+    muted_chatrooms = config.get("muted_chatrooms")
+    if not isinstance(muted_chatrooms, list):
+        muted_chatrooms = []
+    config["muted_chatrooms"] = sorted({
+        str(room_id)
+        for room_id in muted_chatrooms
+        if str(room_id) in valid_room_ids
+    })
+
+    # Chatroom keys now live only in the Chatrooms sidebar. The former single
+    # key is deliberately not converted into a custom chatroom.
+    config.pop("encryption_key", None)
 
     # Migrate the exact default from v1 to the public ntfy server.
     old_preset = str(config.get("server_preset", ""))
@@ -603,6 +668,65 @@ class ConfigOverlay(QWidget):
         super().mousePressEvent(event)
 
 
+class AddChatroomDialog(QDialog):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add Chatroom")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+
+        layout = QVBoxLayout(self)
+        form = QGridLayout()
+        form.setColumnStretch(1, 1)
+
+        form.addWidget(QLabel("Nickname"), 0, 0)
+        self.nickname_entry = QLineEdit()
+        self.nickname_entry.setMaxLength(64)
+        form.addWidget(self.nickname_entry, 0, 1, 1, 2)
+
+        form.addWidget(QLabel("Key"), 1, 0)
+        self.key_entry = QLineEdit()
+        self.key_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addWidget(self.key_entry, 1, 1)
+        show_key = QCheckBox("Show")
+        show_key.toggled.connect(
+            lambda checked: self.key_entry.setEchoMode(
+                QLineEdit.EchoMode.Normal
+                if checked
+                else QLineEdit.EchoMode.Password
+            )
+        )
+        form.addWidget(show_key, 1, 2)
+
+        key_hint = QLabel(
+            "32+ characters recommended. Only share this key with others "
+            "you want in the chatroom!"
+        )
+        key_hint.setWordWrap(True)
+        key_hint.setStyleSheet("color: #777777; font-size: 8pt;")
+        form.addWidget(key_hint, 2, 1, 1, 2)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(cancel_button)
+        add_button = QPushButton("Add Chatroom")
+        add_button.setDefault(True)
+        add_button.clicked.connect(self.accept)
+        buttons.addWidget(add_button)
+        layout.addLayout(buttons)
+
+        self.nickname_entry.setFocus()
+
+    def nickname(self) -> str:
+        return self.nickname_entry.text().strip()
+
+    def chatroom_key(self) -> str:
+        return self.key_entry.text()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -648,6 +772,9 @@ class EncryptedChatClient(QObject):
         self.rendered_tooltips: dict[str, str] = {}
         self._hovered_message_id: str | None = None
         self._config_snapshot_at_open: tuple[Any, ...] | None = None
+        self.active_chatroom_id = str(
+            self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
+        )
         self._closing = False
 
         self.server_preset_var = ValueModel(
@@ -662,13 +789,9 @@ class EncryptedChatClient(QObject):
         self.color_var = ValueModel(
             self.config_data["username_color"]
         )
-        self.encryption_key_var = ValueModel(
-            self.config_data["encryption_key"]
-        )
         self.chime_var = ValueModel(
             bool(self.config_data["chime_enabled"])
         )
-        self.show_key_var = ValueModel(False)
         self.status_var = ValueModel("Connecting")
 
         self.message_resize_timer = QTimer(self)
@@ -718,15 +841,286 @@ class EncryptedChatClient(QObject):
 
     def _build_ui(self) -> None:
         central = QWidget()
-        central_layout = QVBoxLayout(central)
+        central_layout = QHBoxLayout(central)
         central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
         self.root.setCentralWidget(central)
 
+        self._build_chatroom_sidebar(central_layout)
         self.chat_tab = QWidget()
-        central_layout.addWidget(self.chat_tab)
+        central_layout.addWidget(self.chat_tab, 1)
 
         self._build_chat_tab()
         self._build_config_popup()
+
+    def _build_chatroom_sidebar(self, root_layout: QHBoxLayout) -> None:
+        toggle_strip = QWidget()
+        toggle_strip.setFixedWidth(32)
+        toggle_layout = QVBoxLayout(toggle_strip)
+        toggle_layout.setContentsMargins(4, 10, 4, 10)
+        toggle_layout.setSpacing(0)
+
+        self.chatrooms_toggle = QPushButton("›")
+        self.chatrooms_toggle.setCheckable(True)
+        self.chatrooms_toggle.setFixedWidth(24)
+        self.chatrooms_toggle.setToolTip("Chatrooms")
+        self.chatrooms_toggle.toggled.connect(self._on_chatrooms_toggled)
+        toggle_layout.addWidget(self.chatrooms_toggle)
+        toggle_layout.addStretch(1)
+        root_layout.addWidget(toggle_strip)
+
+        self.chatrooms_panel = QWidget()
+        self.chatrooms_panel.setFixedWidth(CHATROOM_SIDEBAR_WIDTH)
+        panel_layout = QVBoxLayout(self.chatrooms_panel)
+        panel_layout.setContentsMargins(6, 10, 8, 10)
+        panel_layout.setSpacing(7)
+        panel_layout.addWidget(self._heading("Chatrooms"))
+
+        self.chatrooms_list = QListWidget()
+        self.chatrooms_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.chatrooms_list.itemClicked.connect(
+            lambda item: self._activate_chatroom(
+                str(item.data(Qt.ItemDataRole.UserRole))
+            )
+        )
+        self.chatrooms_list.customContextMenuRequested.connect(
+            self._show_chatroom_context_menu
+        )
+        panel_layout.addWidget(self.chatrooms_list, 1)
+
+        add_chatroom_button = QPushButton("Add Chatroom")
+        add_chatroom_button.clicked.connect(self._add_chatroom)
+        panel_layout.addWidget(add_chatroom_button)
+
+        self.chatrooms_panel.hide()
+        root_layout.addWidget(self.chatrooms_panel)
+        self._refresh_chatroom_list()
+
+    def _on_chatrooms_toggled(self, expanded: bool) -> None:
+        width_delta = CHATROOM_SIDEBAR_WIDTH
+        old_width = self.root.width()
+        self.chatrooms_toggle.setText("‹" if expanded else "›")
+        self.chatrooms_panel.setVisible(expanded)
+        self.root.setMinimumWidth(
+            self.root.minimumWidth() + (
+                width_delta if expanded else -width_delta
+            )
+        )
+        self.root.resize(
+            max(self.root.minimumWidth(), old_width + (
+                width_delta if expanded else -width_delta
+            )),
+            self.root.height(),
+        )
+
+    def _chatroom_definitions(self) -> list[dict[str, str]]:
+        rooms = [{
+            "id": GLOBAL_CHATROOM_ID,
+            "nickname": GLOBAL_CHATROOM_NICKNAME,
+            "key": GLOBAL_CHATROOM_KEY,
+        }]
+        for room in self.config_data.get("chatrooms", []):
+            if isinstance(room, dict):
+                rooms.append({
+                    "id": str(room["id"]),
+                    "nickname": str(room["nickname"]),
+                    "key": str(room["key"]),
+                })
+        return rooms
+
+    def _find_chatroom(self, room_id: str) -> dict[str, str] | None:
+        for room in self._chatroom_definitions():
+            if room["id"] == room_id:
+                return room
+        return None
+
+    def _active_chatroom(self) -> dict[str, str]:
+        room = self._find_chatroom(self.active_chatroom_id)
+        if room is not None:
+            return room
+        self.active_chatroom_id = GLOBAL_CHATROOM_ID
+        self.config_data["active_chatroom_id"] = GLOBAL_CHATROOM_ID
+        return self._chatroom_definitions()[0]
+
+    def _muted_chatroom_ids(self) -> set[str]:
+        return {
+            str(room_id)
+            for room_id in self.config_data.get("muted_chatrooms", [])
+        }
+
+    def _is_chatroom_muted(self, room_id: str) -> bool:
+        return room_id in self._muted_chatroom_ids()
+
+    def _refresh_chatroom_list(self) -> None:
+        self.chatrooms_list.clear()
+        active_item: QListWidgetItem | None = None
+        muted_ids = self._muted_chatroom_ids()
+
+        for room in self._chatroom_definitions():
+            item = QListWidgetItem(room["nickname"])
+            item.setData(Qt.ItemDataRole.UserRole, room["id"])
+            if room["id"] in muted_ids:
+                muted_color = self.chatrooms_list.palette().color(
+                    self.chatrooms_list.foregroundRole()
+                )
+                muted_color.setAlpha(95)
+                item.setForeground(QBrush(muted_color))
+            self.chatrooms_list.addItem(item)
+            if room["id"] == self.active_chatroom_id:
+                active_item = item
+
+        if active_item is not None:
+            self.chatrooms_list.setCurrentItem(active_item)
+
+    def _add_chatroom(self) -> None:
+        dialog = AddChatroomDialog(self.root)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        nickname = dialog.nickname()
+        key = dialog.chatroom_key()
+        if not nickname:
+            messagebox.showerror(
+                "Cannot add chatroom",
+                "The chatroom nickname cannot be empty.",
+                parent=self.root,
+            )
+            return
+        if not key:
+            messagebox.showerror(
+                "Cannot add chatroom",
+                "The chatroom key cannot be empty.",
+                parent=self.root,
+            )
+            return
+        if any(room["key"] == key for room in self._chatroom_definitions()):
+            messagebox.showerror(
+                "Cannot add chatroom",
+                "That chatroom key is already in your list.",
+                parent=self.root,
+            )
+            return
+
+        room_id = uuid.uuid4().hex
+        self.config_data.setdefault("chatrooms", []).append({
+            "id": room_id,
+            "nickname": nickname,
+            "key": key,
+        })
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            self.config_data["chatrooms"].pop()
+            messagebox.showerror(
+                "Could not save chatroom",
+                str(exc),
+                parent=self.root,
+            )
+            return
+
+        self._refresh_chatroom_list()
+        self._activate_chatroom(room_id)
+
+    def _show_chatroom_context_menu(self, position: Any) -> None:
+        item = self.chatrooms_list.itemAt(position)
+        if item is None:
+            return
+
+        room_id = str(item.data(Qt.ItemDataRole.UserRole))
+        is_muted = self._is_chatroom_muted(room_id)
+        menu = QMenu(self.root)
+        mute_action = menu.addAction("Unmute" if is_muted else "Mute")
+        mute_action.triggered.connect(
+            lambda: self._set_chatroom_muted(room_id, not is_muted)
+        )
+        remove_action = menu.addAction("Remove")
+        remove_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
+        if room_id != GLOBAL_CHATROOM_ID:
+            remove_action.triggered.connect(
+                lambda: self._remove_chatroom(room_id)
+            )
+        menu.exec(self.chatrooms_list.mapToGlobal(position))
+
+    def _set_chatroom_muted(self, room_id: str, muted: bool) -> None:
+        muted_ids = self._muted_chatroom_ids()
+        if muted:
+            muted_ids.add(room_id)
+        else:
+            muted_ids.discard(room_id)
+        self.config_data["muted_chatrooms"] = sorted(muted_ids)
+        try:
+            save_config(self.config_data)
+        except Exception:
+            pass
+        self._refresh_chatroom_list()
+
+    def _remove_chatroom(self, room_id: str) -> None:
+        if room_id == GLOBAL_CHATROOM_ID:
+            return
+
+        confirmation = QMessageBox(self.root)
+        confirmation.setIcon(QMessageBox.Icon.Warning)
+        confirmation.setWindowTitle("Remove Chatroom")
+        confirmation.setText(
+            "This chatroom will be removed from your view; existing messages "
+            "will stay there for other participants."
+        )
+        remove_button = confirmation.addButton(
+            "Remove!",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        confirmation.addButton(
+            "Cancel",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        confirmation.exec()
+        if confirmation.clickedButton() is not remove_button:
+            return
+
+        rooms = self.config_data.get("chatrooms", [])
+        self.config_data["chatrooms"] = [
+            room for room in rooms
+            if isinstance(room, dict) and str(room.get("id")) != room_id
+        ]
+        muted_ids = self._muted_chatroom_ids()
+        muted_ids.discard(room_id)
+        self.config_data["muted_chatrooms"] = sorted(muted_ids)
+
+        if self.active_chatroom_id == room_id:
+            self.active_chatroom_id = GLOBAL_CHATROOM_ID
+            self.config_data["active_chatroom_id"] = GLOBAL_CHATROOM_ID
+            self._switch_active_chatroom()
+        else:
+            try:
+                save_config(self.config_data)
+            except Exception:
+                pass
+        self._refresh_chatroom_list()
+
+    def _activate_chatroom(self, room_id: str) -> None:
+        if room_id == self.active_chatroom_id or self._find_chatroom(room_id) is None:
+            return
+        self._persist_local_history()
+        self.active_chatroom_id = room_id
+        self.config_data["active_chatroom_id"] = room_id
+        self._switch_active_chatroom()
+
+    def _switch_active_chatroom(self) -> None:
+        try:
+            save_config(self.config_data)
+        except Exception:
+            pass
+        self._clear_visible_room()
+        self._load_saved_history_for_current_room()
+        self.initial_history_pending = True
+        self.connected = False
+        self.status_var.set("Connecting")
+        self.reconnect_requested.set()
+        self.message_entry.clear()
+        self._run_message_size_check()
+        self._refresh_chatroom_list()
 
     def _build_chat_tab(self) -> None:
         layout = QVBoxLayout(self.chat_tab)
@@ -923,37 +1317,6 @@ class EncryptedChatClient(QObject):
         layout.addLayout(color_layout, row, 1, 1, 2)
         row += 1
 
-        layout.addWidget(self._separator(), row, 0, 1, 3)
-        row += 1
-        layout.addWidget(self._heading("Encryption"), row, 0, 1, 3)
-        row += 1
-
-        layout.addWidget(QLabel("Chatroom key"), row, 0)
-        self.key_entry = QLineEdit()
-        self.key_entry.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_entry.setText(str(self.encryption_key_var.get()))
-        self.key_entry.textChanged.connect(self.encryption_key_var.set)
-        self.encryption_key_var.bind(self.key_entry.setText)
-        layout.addWidget(self.key_entry, row, 1)
-
-        self.show_key_checkbox = QCheckBox("Show")
-        self.show_key_checkbox.toggled.connect(self.show_key_var.set)
-        self.show_key_checkbox.toggled.connect(self._toggle_key_visibility)
-        layout.addWidget(self.show_key_checkbox, row, 2)
-        row += 1
-
-        layout.addWidget(
-            self._description(
-                "The key determines both the encryption key and an opaque ntfy topic. "
-                "Everyone in the same room must enter exactly the same value."
-            ),
-            row,
-            0,
-            1,
-            3,
-        )
-        row += 1
-
         self.chime_checkbox = QCheckBox(
             "Play a chime when another user sends a message"
         )
@@ -1003,7 +1366,6 @@ class EncryptedChatClient(QObject):
             str(self.server_url_var.get()),
             str(self.username_var.get()),
             str(self.color_var.get()),
-            str(self.encryption_key_var.get()),
             bool(self.chime_var.get()),
         )
 
@@ -1079,18 +1441,10 @@ class EncryptedChatClient(QObject):
             f"background-color: {color.name()};"
         )
 
-    def _toggle_key_visibility(self, _checked: Any = None) -> None:
-        self.key_entry.setEchoMode(
-            QLineEdit.EchoMode.Normal
-            if bool(self.show_key_var.get())
-            else QLineEdit.EchoMode.Password
-        )
-
-    def _validate_current_settings(self) -> tuple[str, str, str, str]:
+    def _validate_current_settings(self) -> tuple[str, str, str]:
         server_url = normalize_server_url(str(self.server_url_var.get()))
         username = str(self.username_var.get()).strip()
         color = str(self.color_var.get()).strip()
-        encryption_key = str(self.encryption_key_var.get())
 
         if not server_url.startswith(("http://", "https://")):
             raise ValueError(
@@ -1103,17 +1457,13 @@ class EncryptedChatClient(QObject):
         if len(username) > 32:
             raise ValueError("The username must be 32 characters or fewer.")
 
-        if not encryption_key:
-            raise ValueError("The chatroom encryption key cannot be empty.")
-
         if not QColor(color).isValid():
             raise ValueError("The username color is invalid.")
 
-        derive_ntfy_topic(encryption_key)
-        return server_url, username, color, encryption_key
+        return server_url, username, color
 
     def _copy_ui_to_config(self) -> None:
-        server_url, username, color, encryption_key = (
+        server_url, username, color = (
             self._validate_current_settings()
         )
 
@@ -1121,7 +1471,6 @@ class EncryptedChatClient(QObject):
         self.config_data["server_url"] = server_url
         self.config_data["username"] = username
         self.config_data["username_color"] = color
-        self.config_data["encryption_key"] = encryption_key
         self.config_data["chime_enabled"] = bool(self.chime_var.get())
 
     def _save_and_reconnect(self) -> bool:
@@ -1146,7 +1495,7 @@ class EncryptedChatClient(QObject):
 
     def _test_connection(self) -> None:
         try:
-            server_url, _, _, _ = self._validate_current_settings()
+            server_url, _, _ = self._validate_current_settings()
         except Exception as exc:
             messagebox.showerror(
                 "Invalid configuration",
@@ -1296,7 +1645,7 @@ class EncryptedChatClient(QObject):
             return
 
         try:
-            server_url, username, color, encryption_key = (
+            server_url, username, color = (
                 self._validate_current_settings()
             )
         except Exception as exc:
@@ -1306,6 +1655,8 @@ class EncryptedChatClient(QObject):
                 parent=self.root,
             )
             return
+
+        encryption_key = self._active_chatroom()["key"]
 
         if not self.connected:
             messagebox.showwarning(
@@ -1361,6 +1712,7 @@ class EncryptedChatClient(QObject):
         self.send_queue.put({
             "server_url": server_url,
             "encryption_key": encryption_key,
+            "room_id": self.active_chatroom_id,
             "packet": packet,
             "message": message,
         })
@@ -1378,7 +1730,7 @@ class EncryptedChatClient(QObject):
 
         self.network_thread = threading.Thread(
             target=self._network_loop,
-            name="EncryptedChatNetwork",
+            name="SpriteLinkNetwork",
             daemon=True,
         )
         self.network_thread.start()
@@ -1394,7 +1746,11 @@ class EncryptedChatClient(QObject):
                 next_poll = 0.0
                 self.ui_queue.put((
                     "status",
-                    ("Connecting", "Applying saved configuration..."),
+                    (
+                        "Connecting",
+                        "Applying saved configuration...",
+                        self.active_chatroom_id,
+                    ),
                 ))
 
             while True:
@@ -1432,6 +1788,7 @@ class EncryptedChatClient(QObject):
                 {
                     "message": outbound["message"],
                     "error": str(exc),
+                    "room_id": outbound.get("room_id"),
                 },
             ))
 
@@ -1452,9 +1809,9 @@ class EncryptedChatClient(QObject):
         server_url = normalize_server_url(
             str(self.config_data.get("server_url", ""))
         )
-        encryption_key = str(
-            self.config_data.get("encryption_key", "")
-        )
+        active_room = self._active_chatroom()
+        room_id = active_room["id"]
+        encryption_key = active_room["key"]
 
         if not server_url or not encryption_key:
             if self.connected:
@@ -1462,7 +1819,7 @@ class EncryptedChatClient(QObject):
 
             self.ui_queue.put((
                 "status",
-                ("Disconnected", "Enter and save a chatroom key."),
+                ("Disconnected", "No chatroom is selected.", room_id),
             ))
             return
 
@@ -1486,6 +1843,8 @@ class EncryptedChatClient(QObject):
             )
             response.raise_for_status()
             records = parse_ntfy_ndjson(response)
+            if room_id != self.active_chatroom_id:
+                return
             self.initial_history_pending = False
 
             if was_initial_history_scan:
@@ -1543,7 +1902,7 @@ class EncryptedChatClient(QObject):
                 self.connected = True
                 self.ui_queue.put((
                     "status",
-                    ("Connected", server_url),
+                    ("Connected", server_url, room_id),
                 ))
 
             if decoded_messages or was_initial_history_scan:
@@ -1552,6 +1911,7 @@ class EncryptedChatClient(QObject):
                     {
                         "items": decoded_messages,
                         "history_scan": was_initial_history_scan,
+                        "room_id": room_id,
                     },
                 ))
 
@@ -1562,10 +1922,12 @@ class EncryptedChatClient(QObject):
                 ))
 
         except Exception as exc:
+            if room_id != self.active_chatroom_id:
+                return
             self.connected = False
             self.ui_queue.put((
                 "status",
-                ("Disconnected", str(exc)),
+                ("Disconnected", str(exc), room_id),
             ))
 
     @staticmethod
@@ -1600,10 +1962,13 @@ class EncryptedChatClient(QObject):
                 event_type, payload = self.ui_queue.get_nowait()
 
                 if event_type == "status":
-                    status, _detail = payload
-                    self.status_var.set(status)
+                    status, _detail, room_id = payload
+                    if room_id == self.active_chatroom_id:
+                        self.status_var.set(status)
 
                 elif event_type == "messages":
+                    if payload.get("room_id") != self.active_chatroom_id:
+                        continue
                     items = payload.get("items", [])
                     history_scan = bool(payload.get("history_scan", False))
                     added = 0
@@ -1623,6 +1988,8 @@ class EncryptedChatClient(QObject):
                         self._render_message_log(scroll_to_bottom=True)
 
                 elif event_type == "send_failed":
+                    if payload.get("room_id") != self.active_chatroom_id:
+                        continue
                     message = payload["message"]
                     self._append_system_message(
                         f"Message could not be uploaded: {payload['error']}",
@@ -1692,6 +2059,7 @@ class EncryptedChatClient(QObject):
             play_chime
             and not is_local
             and self.chime_var.get()
+            and not self._is_chatroom_muted(self.active_chatroom_id)
             and not self._is_user_muted(str(message["c"]))
         ):
             self._play_chime()
@@ -1700,7 +2068,7 @@ class EncryptedChatClient(QObject):
 
     def _observe_identity(self, message: dict[str, Any]) -> str | None:
         server_url = str(self.config_data.get("server_url", ""))
-        encryption_key = str(self.config_data.get("encryption_key", ""))
+        encryption_key = self._active_chatroom()["key"]
 
         if not server_url or not encryption_key:
             return None
@@ -1764,7 +2132,7 @@ class EncryptedChatClient(QObject):
 
     def _load_saved_history_for_current_room(self) -> None:
         server_url = normalize_server_url(str(self.config_data.get("server_url", "")))
-        encryption_key = str(self.config_data.get("encryption_key", ""))
+        encryption_key = self._active_chatroom()["key"]
 
         if not server_url or not encryption_key:
             return
@@ -1816,7 +2184,7 @@ class EncryptedChatClient(QObject):
 
     def _persist_local_history(self) -> None:
         server_url = normalize_server_url(str(self.config_data.get("server_url", "")))
-        encryption_key = str(self.config_data.get("encryption_key", ""))
+        encryption_key = self._active_chatroom()["key"]
 
         if not server_url or not encryption_key:
             return
@@ -1862,9 +2230,7 @@ class EncryptedChatClient(QObject):
         server_url = normalize_server_url(
             str(self.config_data.get("server_url", ""))
         )
-        encryption_key = str(
-            self.config_data.get("encryption_key", "")
-        )
+        encryption_key = self._active_chatroom()["key"]
 
         if not server_url or not encryption_key:
             return None
