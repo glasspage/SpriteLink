@@ -53,6 +53,7 @@ try:
         QImage,
         QPainter,
         QPalette,
+        QPixmap,
         QPolygon,
         QTextBlockFormat,
         QTextCharFormat,
@@ -2070,7 +2071,19 @@ class EncryptedChatClient(QObject):
         identity_color_button.clicked.connect(self._choose_identity_color)
         identity_layout.addWidget(identity_color_button)
         identity_layout.addSpacing(8)
-        identity_layout.addWidget(QLabel("Profile icon"))
+        identity_layout.addWidget(QLabel("User icon (16x16)"))
+        self.profile_icon_preview = QLabel()
+        self.profile_icon_preview.setFixedSize(26, 22)
+        self.profile_icon_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.profile_icon_preview.setFrameShape(QFrame.Shape.Panel)
+        self.profile_icon_preview.setFrameShadow(QFrame.Shadow.Sunken)
+        self.profile_icon_preview.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.profile_icon_preview.customContextMenuRequested.connect(
+            self._show_profile_icon_context_menu
+        )
+        identity_layout.addWidget(self.profile_icon_preview)
         profile_icon_button = QPushButton("Browse...")
         profile_icon_button.clicked.connect(self._choose_profile_icon)
         identity_layout.addWidget(profile_icon_button)
@@ -2201,6 +2214,7 @@ class EncryptedChatClient(QObject):
                 self.message_text_color_preview,
                 profile["text_color"],
             )
+            self._update_profile_icon_preview()
         finally:
             self._loading_profile_controls = False
         self._apply_active_composer_style()
@@ -2292,6 +2306,40 @@ class EncryptedChatClient(QObject):
             return
 
         self._active_room_profile()["profile_icon"] = encoded_icon
+        self._update_profile_icon_preview()
+        self._schedule_profile_save()
+
+    def _update_profile_icon_preview(self) -> None:
+        if not hasattr(self, "profile_icon_preview"):
+            return
+        self.profile_icon_preview.clear()
+        encoded_icon = self._active_room_profile().get("profile_icon", "")
+        if not encoded_icon:
+            return
+        try:
+            gif_data = decode_profile_icon(str(encoded_icon))
+        except ValueError:
+            return
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(gif_data):
+            return
+        pixmap.setDevicePixelRatio(1.0)
+        self.profile_icon_preview.setPixmap(pixmap)
+
+    def _show_profile_icon_context_menu(self, position: Any) -> None:
+        menu = QMenu(self.profile_icon_preview)
+        remove_action = menu.addAction("Remove")
+        has_icon = bool(
+            self._active_room_profile().get("profile_icon", "")
+        )
+        remove_action.setEnabled(has_icon)
+        if has_icon:
+            remove_action.triggered.connect(self._remove_profile_icon)
+        menu.exec(self.profile_icon_preview.mapToGlobal(position))
+
+    def _remove_profile_icon(self) -> None:
+        self._active_room_profile()["profile_icon"] = ""
+        self._update_profile_icon_preview()
         self._schedule_profile_save()
 
     def _on_message_font_changed(self, value: str) -> None:
@@ -3731,6 +3779,7 @@ class EncryptedChatClient(QObject):
             return False
         if image.isNull():
             return False
+        image.setDevicePixelRatio(1.0)
 
         resource_name = (
             "spritelink-profile-icon:"
@@ -3744,8 +3793,10 @@ class EncryptedChatClient(QObject):
         )
         image_format = QTextImageFormat()
         image_format.setName(resource_url.toString())
-        image_format.setWidth(PROFILE_ICON_SIZE)
-        image_format.setHeight(PROFILE_ICON_SIZE)
+        image_format.setWidth(image.width())
+        image_format.setHeight(image.height())
+        # Inline images participate in Qt's automatic line-height calculation,
+        # so a short text line expands to the icon's native 16-pixel height.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignMiddle
         )
