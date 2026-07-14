@@ -1254,13 +1254,16 @@ class EncryptedChatClient(QObject):
             set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
             if self._is_windows_classic_theme():
                 border = "#000000"
-                caption = "#007f82"
-                text = "#000000"
+                caption = "#000080"
+                text = "#ffffff"
+                corner_preference = 1  # DWMWCP_DONOTROUND
             else:
                 border = "#d0d0d0"
                 caption = "#f0f0f0"
                 text = "#000000"
+                corner_preference = 0  # DWMWCP_DEFAULT
 
+            set_attribute(33, corner_preference)  # DWMWA_WINDOW_CORNER_PREFERENCE
             set_attribute(34, self._windows_colorref(border))
             set_attribute(35, self._windows_colorref(caption))
             set_attribute(36, self._windows_colorref(text))
