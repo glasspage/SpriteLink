@@ -1,6 +1,15 @@
 name: Windows package
 
 on:
+  pull_request:
+    paths:
+      - "SpriteLink.pyw"
+      - "SL.ico"
+      - "sounds/**"
+      - "requirements*.txt"
+      - "SpriteLink.spec"
+      - "packaging/windows/**"
+      - ".github/workflows/windows-package.yml"
   push:
     tags:
       - "v[0-9]*.[0-9]*.[0-9]*"
@@ -23,8 +32,8 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
-    permissions:
-      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Check out repository
@@ -36,8 +45,10 @@ jobs:
         run: |
           if ("${{ github.event_name }}" -eq "push") {
             $version = "${{ github.ref_name }}".TrimStart("v")
-          } else {
+          } elseif ("${{ github.event_name }}" -eq "workflow_dispatch") {
             $version = "${{ inputs.version }}".Trim().TrimStart("v")
+          } else {
+            $version = "0.0.0"
           }
           if ($version -notmatch '^\d+\.\d+\.\d+$') {
             throw "Version must use the form 0.1.0. Received: $version"
@@ -89,18 +100,33 @@ jobs:
             ${{ steps.package.outputs.checksum }}
           if-no-files-found: error
 
+  publish-release:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: SpriteLink-Windows-${{ needs.build-windows.outputs.version }}
+          path: release
+
       - name: Publish GitHub Release
-        if: github.event_name == 'push' || inputs.publish_release
-        shell: pwsh
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = "${{ steps.version.outputs.version }}"
-          $tag = "v$version"
-          gh release create $tag `
-            "${{ steps.package.outputs.installer }}" `
-            "${{ steps.package.outputs.checksum }}" `
-            --target "${{ github.sha }}" `
-            --title "SpriteLink $version" `
+          version="${{ needs.build-windows.outputs.version }}"
+          tag="v${version}"
+          gh release create "$tag" \
+            "release/SpriteLink-Setup-${version}.exe" \
+            "release/SpriteLink-Setup-${version}.exe.sha256" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "SpriteLink ${version}" \
             --generate-notes
-
