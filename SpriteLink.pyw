@@ -143,7 +143,7 @@ except ImportError:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 14
+CONFIG_FORMAT_VERSION = 15
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
@@ -152,6 +152,22 @@ GLOBAL_CHATROOM_NICKNAME = "Global"
 GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
 CHATROOM_SIDEBAR_WIDTH = 180
 CONFIG_POPUP_MAX_WIDTH = 720
+DEFAULT_MESSAGE_SOUND = "Chime"
+MESSAGE_SOUND_OPTIONS = (
+    "Disabled",
+    "Chime Soft",
+    "Chime",
+    "Chime Glassy",
+    "Blip",
+    "Custom",
+)
+BUILTIN_MESSAGE_SOUND_FILES = {
+    "Chime Soft": "chime_soft.wav",
+    "Chime": "chime.wav",
+    "Chime Glassy": "chime_glassy.wav",
+    "Blip": "blip.wav",
+}
+CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
@@ -842,7 +858,8 @@ def default_config() -> dict[str, Any]:
         "server_preset": DEFAULT_SERVER_PRESET,
         "server_url": DEFAULT_SERVER_URL,
         "theme": DEFAULT_THEME,
-        "chime_enabled": True,
+        "message_sound": DEFAULT_MESSAGE_SOUND,
+        "custom_message_sound_path": "",
         "client_id": secrets.token_hex(32),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
@@ -901,6 +918,31 @@ def load_config() -> dict[str, Any]:
         previous_config_version = int(config.get("config_version", 0) or 0)
     except (TypeError, ValueError):
         previous_config_version = 0
+
+    if previous_config_version < 15:
+        config["message_sound"] = (
+            DEFAULT_MESSAGE_SOUND
+            if bool(config.get("chime_enabled", True))
+            else "Disabled"
+        )
+    message_sound = str(
+        config.get("message_sound", DEFAULT_MESSAGE_SOUND)
+    )
+    config["message_sound"] = (
+        message_sound
+        if message_sound in MESSAGE_SOUND_OPTIONS
+        else DEFAULT_MESSAGE_SOUND
+    )
+    custom_message_sound_path = config.get(
+        "custom_message_sound_path",
+        "",
+    )
+    config["custom_message_sound_path"] = (
+        custom_message_sound_path
+        if isinstance(custom_message_sound_path, str)
+        else ""
+    )
+    config.pop("chime_enabled", None)
 
     if not isinstance(config.get("client_id"), str) or len(config["client_id"]) < 32:
         config["client_id"] = secrets.token_hex(32)
@@ -2038,8 +2080,11 @@ class EncryptedChatClient(QObject):
         self.theme_var = ValueModel(
             self.config_data.get("theme", DEFAULT_THEME)
         )
-        self.chime_var = ValueModel(
-            bool(self.config_data["chime_enabled"])
+        self.message_sound_var = ValueModel(
+            str(self.config_data["message_sound"])
+        )
+        self.custom_message_sound_path_var = ValueModel(
+            str(self.config_data["custom_message_sound_path"])
         )
         self.status_var = ValueModel("Connecting")
 
@@ -2061,6 +2106,12 @@ class EncryptedChatClient(QObject):
         self.message_limit_reset_timer.setSingleShot(True)
         self.message_limit_reset_timer.timeout.connect(
             self._reset_daily_sent_message_count
+        )
+
+        self.message_sound_stop_timer = QTimer(self)
+        self.message_sound_stop_timer.setSingleShot(True)
+        self.message_sound_stop_timer.timeout.connect(
+            self._stop_message_sound
         )
 
         self.chat_tooltip_timer = QTimer(self)
@@ -3705,13 +3756,19 @@ class EncryptedChatClient(QObject):
         )
         row += 1
 
-        self.chime_checkbox = QCheckBox(
-            "Play a chime when another user sends a message"
+        layout.addWidget(QLabel("Message Sound"), row, 0)
+        self.message_sound_combo = ThemeComboBox()
+        self.message_sound_combo.addItems(list(MESSAGE_SOUND_OPTIONS))
+        self.message_sound_combo.setCurrentText(
+            str(self.message_sound_var.get())
         )
-        self.chime_checkbox.setChecked(bool(self.chime_var.get()))
-        self.chime_checkbox.toggled.connect(self.chime_var.set)
-        self.chime_var.bind(self.chime_checkbox.setChecked)
-        layout.addWidget(self.chime_checkbox, row, 0, 1, 3)
+        self.message_sound_combo.textActivated.connect(
+            self._on_message_sound_selected
+        )
+        self.message_sound_var.bind(
+            self.message_sound_combo.setCurrentText
+        )
+        layout.addWidget(self.message_sound_combo, row, 1, 1, 2)
         row += 1
 
         layout.addWidget(self._separator(), row, 0, 1, 3)
@@ -3804,6 +3861,35 @@ class EncryptedChatClient(QObject):
         )
         self.advanced_config_content.setVisible(expanded)
 
+    def _on_message_sound_selected(self, value: str) -> None:
+        selected_sound = str(value)
+        if selected_sound not in MESSAGE_SOUND_OPTIONS:
+            return
+
+        previous_sound = str(self.message_sound_var.get())
+        if selected_sound == "Custom":
+            dialog = QFileDialog(self.root, "Choose message sound")
+            dialog.setOption(
+                QFileDialog.Option.DontUseNativeDialog,
+                True,
+            )
+            dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+            dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+            dialog.setNameFilter("WAV audio (*.wav)")
+            self._apply_window_titlebar_theme(dialog)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self.message_sound_combo.setCurrentText(previous_sound)
+                return
+            selected_files = dialog.selectedFiles()
+            custom_path = selected_files[0] if selected_files else ""
+            if not custom_path:
+                self.message_sound_combo.setCurrentText(previous_sound)
+                return
+            self.custom_message_sound_path_var.set(custom_path)
+
+        self.message_sound_var.set(selected_sound)
+        self._play_message_sound(report_errors=True)
+
     def _sync_config_overlay_geometry(self) -> None:
         self.config_overlay.setGeometry(self.chat_content.rect())
 
@@ -3811,7 +3897,8 @@ class EncryptedChatClient(QObject):
         return (
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
-            bool(self.chime_var.get()),
+            str(self.message_sound_var.get()),
+            str(self.custom_message_sound_path_var.get()),
         )
 
     def _set_config_toggle_checked(self, checked: bool) -> None:
@@ -3904,7 +3991,16 @@ class EncryptedChatClient(QObject):
         self.config_data["theme"] = (
             theme if theme in THEMES else DEFAULT_THEME
         )
-        self.config_data["chime_enabled"] = bool(self.chime_var.get())
+        message_sound = str(self.message_sound_var.get())
+        self.config_data["message_sound"] = (
+            message_sound
+            if message_sound in MESSAGE_SOUND_OPTIONS
+            else DEFAULT_MESSAGE_SOUND
+        )
+        self.config_data["custom_message_sound_path"] = str(
+            self.custom_message_sound_path_var.get()
+        )
+        self.config_data.pop("chime_enabled", None)
 
     def _save_and_reconnect(self) -> bool:
         try:
@@ -4746,11 +4842,11 @@ class EncryptedChatClient(QObject):
             if not history_scan and not is_local:
                 unread_added += 1
                 if (
-                    self.chime_var.get()
+                    self._should_play_message_sound(room_id)
                     and not self._is_chatroom_muted(room_id)
                     and str(message.get("c", "")) not in muted_user_ids
                 ):
-                    self._play_chime()
+                    self._play_message_sound()
 
         if not added:
             return
@@ -4808,11 +4904,11 @@ class EncryptedChatClient(QObject):
         if (
             play_chime
             and not is_local
-            and self.chime_var.get()
+            and self._should_play_message_sound(self.active_chatroom_id)
             and not self._is_chatroom_muted(self.active_chatroom_id)
             and not self._is_user_muted(str(message["c"]))
         ):
-            self._play_chime()
+            self._play_message_sound()
 
         return True
 
@@ -6083,20 +6179,72 @@ class EncryptedChatClient(QObject):
         self.chat_display.setExtraSelections([])
         self.chat_display.clear()
 
-    def _play_chime(self) -> None:
+    def _should_play_message_sound(self, room_id: str) -> bool:
+        return (
+            str(self.message_sound_var.get()) != "Disabled"
+            and (
+                room_id != self.active_chatroom_id
+                or not self.window_focused_event.is_set()
+            )
+        )
+
+    def _message_sound_path(self, sound_name: str) -> Path | None:
+        if sound_name == "Custom":
+            custom_path = str(
+                self.custom_message_sound_path_var.get()
+            ).strip()
+            return Path(custom_path) if custom_path else None
+
+        filename = BUILTIN_MESSAGE_SOUND_FILES.get(sound_name)
+        if filename is None:
+            return None
+        return Path(__file__).resolve().parent / "sounds" / filename
+
+    def _stop_message_sound(self) -> None:
         if winsound is None:
             return
 
         try:
-            winsound.MessageBeep(winsound.MB_OK)
+            winsound.PlaySound(None, 0)
         except Exception:
             pass
+
+    def _play_message_sound(self, *, report_errors: bool = False) -> None:
+        if winsound is None:
+            return
+
+        sound_name = str(self.message_sound_var.get())
+        self.message_sound_stop_timer.stop()
+        self._stop_message_sound()
+        sound_path = self._message_sound_path(sound_name)
+        if sound_path is None:
+            return
+        try:
+            winsound.PlaySound(
+                str(sound_path),
+                winsound.SND_FILENAME
+                | winsound.SND_ASYNC
+                | winsound.SND_NODEFAULT,
+            )
+            if sound_name == "Custom":
+                self.message_sound_stop_timer.start(
+                    CUSTOM_MESSAGE_SOUND_MAX_MS
+                )
+        except Exception as exc:
+            if report_errors:
+                messagebox.showerror(
+                    "Could not play message sound",
+                    str(exc),
+                    parent=self.root,
+                )
 
     def _on_close(self) -> None:
         if self._closing:
             return
         self._closing = True
         QToolTip.hideText()
+        self.message_sound_stop_timer.stop()
+        self._stop_message_sound()
 
         try:
             self._copy_ui_to_config()
