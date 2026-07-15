@@ -4431,6 +4431,8 @@ class EncryptedChatClient(QObject):
         cursor: QTextCursor,
         encoded_icon: str,
         message_id: str,
+        *,
+        align_top: bool = False,
     ) -> bool:
         if not encoded_icon:
             return False
@@ -4469,7 +4471,9 @@ class EncryptedChatClient(QObject):
         # Inline images participate in Qt's automatic line-height calculation,
         # so a short text line expands to the icon's native 16-pixel height.
         image_format.setVerticalAlignment(
-            QTextCharFormat.VerticalAlignment.AlignMiddle
+            QTextCharFormat.VerticalAlignment.AlignTop
+            if align_top
+            else QTextCharFormat.VerticalAlignment.AlignMiddle
         )
         cursor.insertImage(image_format)
         return True
@@ -4523,6 +4527,7 @@ class EncryptedChatClient(QObject):
         bold: bool = False,
         anchor: str | None = None,
         font_name: str = DEFAULT_MESSAGE_FONT,
+        align_top: bool = False,
     ) -> QTextCharFormat:
         formatting = QTextCharFormat()
         formatting.setForeground(QColor(color))
@@ -4533,6 +4538,10 @@ class EncryptedChatClient(QObject):
             formatting.setAnchor(True)
             formatting.setAnchorHref(anchor)
             formatting.setFontUnderline(False)
+        if align_top:
+            formatting.setVerticalAlignment(
+                QTextCharFormat.VerticalAlignment.AlignTop
+            )
         return formatting
 
     def _insert_message_text_with_links(
@@ -4543,6 +4552,7 @@ class EncryptedChatClient(QObject):
         font_name: str,
         *,
         muted: bool,
+        align_top: bool,
     ) -> list[str]:
         image_urls: list[str] = []
         position = 0
@@ -4550,7 +4560,11 @@ class EncryptedChatClient(QObject):
             if start > position:
                 cursor.insertText(
                     text[position:start],
-                    self._text_format(body_color, font_name=font_name),
+                    self._text_format(
+                        body_color,
+                        font_name=font_name,
+                        align_top=align_top,
+                    ),
                 )
             if is_direct_image_url(url):
                 self._schedule_image_preview_fetch(url)
@@ -4565,6 +4579,7 @@ class EncryptedChatClient(QObject):
                 link_color,
                 anchor=url,
                 font_name=font_name,
+                align_top=align_top,
             )
             link_format.setFontUnderline(True)
             cursor.insertText(text[start:end], link_format)
@@ -4572,7 +4587,11 @@ class EncryptedChatClient(QObject):
         if position < len(text):
             cursor.insertText(
                 text[position:],
-                self._text_format(body_color, font_name=font_name),
+                self._text_format(
+                    body_color,
+                    font_name=font_name,
+                    align_top=align_top,
+                ),
             )
         return image_urls
 
@@ -4818,10 +4837,23 @@ class EncryptedChatClient(QObject):
                 f"Unique ID: {unique_id_preview}"
             )
 
+        align_message_top = False
+        if not is_collapsed:
+            for _start, _end, url in message_url_spans(display_text):
+                cached_image = self.image_preview_cache.get(url)
+                if (
+                    is_direct_image_url(url)
+                    and isinstance(cached_image, QImage)
+                    and not cached_image.isNull()
+                ):
+                    align_message_top = True
+                    break
+
         has_profile_icon = self._insert_profile_icon(
             cursor,
             profile_icon,
             message_id,
+            align_top=align_message_top,
         )
         if has_profile_icon:
             cursor.insertText(
@@ -4830,6 +4862,7 @@ class EncryptedChatClient(QObject):
                     body_color,
                     anchor=f"spritelink:{message_id}",
                     font_name=font_name,
+                    align_top=align_message_top,
                 ),
             )
         cursor.insertText(
@@ -4839,16 +4872,25 @@ class EncryptedChatClient(QObject):
                 bold=True,
                 anchor=f"spritelink:{message_id}",
                 font_name=font_name,
+                align_top=align_message_top,
             ),
         )
         if status_suffix:
             cursor.insertText(
                 status_suffix,
-                self._text_format(suffix_color, font_name=font_name),
+                self._text_format(
+                    suffix_color,
+                    font_name=font_name,
+                    align_top=align_message_top,
+                ),
             )
         cursor.insertText(
             ": ",
-            self._text_format(body_color, font_name=font_name),
+            self._text_format(
+                body_color,
+                font_name=font_name,
+                align_top=align_message_top,
+            ),
         )
 
         display_text = (
@@ -4866,7 +4908,11 @@ class EncryptedChatClient(QObject):
         if is_collapsed:
             cursor.insertText(
                 display_text,
-                self._text_format(body_color, font_name=font_name),
+                self._text_format(
+                    body_color,
+                    font_name=font_name,
+                    align_top=align_message_top,
+                ),
             )
         else:
             image_urls = self._insert_message_text_with_links(
@@ -4875,6 +4921,7 @@ class EncryptedChatClient(QObject):
                 body_color,
                 font_name,
                 muted=is_muted,
+                align_top=align_message_top,
             )
         for image_url in image_urls:
             self._insert_embedded_image_preview(cursor, image_url)
