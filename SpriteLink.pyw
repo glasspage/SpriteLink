@@ -132,6 +132,11 @@ from spritelink_update import (
 )
 
 try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 except ImportError as exc:
     raise SystemExit(
@@ -149,7 +154,7 @@ except ImportError as exc:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 19
+CONFIG_FORMAT_VERSION = 20
 WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
 
@@ -246,6 +251,12 @@ MAX_REMOTE_IMAGE_PIXELS = 16 * 1024 * 1024
 IMAGE_PREVIEW_CACHE_LIMIT = 128
 MAX_UNCOMPRESSED_MESSAGE_BYTES = 32 * 1024
 MAX_ENCRYPTED_PACKET_CHARS = NTFY_MAX_BODY_BYTES - 1
+MESSAGE_AUTH_VERSION = 1
+ED25519_PRIVATE_KEY_BYTES = 32
+ED25519_PUBLIC_KEY_BYTES = 32
+ED25519_SIGNATURE_BYTES = 64
+VISIBLE_USER_ID_CHARS = 8
+SIGNED_MESSAGE_CONTEXT = "SpriteLink signed message v1"
 TRUSTED_EXTENSIONLESS_IMAGE_HOSTS = (
     "images.unsplash.com",
     "pbs.twimg.com",
@@ -976,6 +987,167 @@ def direct_image_urls_in_message(text: str) -> list[str]:
     return image_urls
 
 
+def _encode_identity_bytes(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _decode_identity_bytes(
+    value: str,
+    expected_length: int,
+    description: str,
+) -> bytes:
+    if not isinstance(value, str):
+        raise ValueError(f"{description} has the wrong type.")
+    padding = "=" * ((4 - len(value) % 4) % 4)
+    try:
+        decoded = base64.b64decode(
+            value + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+    except Exception as exc:
+        raise ValueError(f"{description} is not valid Base64.") from exc
+    if len(decoded) != expected_length:
+        raise ValueError(f"{description} has the wrong length.")
+    return decoded
+
+
+def generate_identity_private_key() -> str:
+    private_key = Ed25519PrivateKey.generate()
+    raw_private_key = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return _encode_identity_bytes(raw_private_key)
+
+
+def normalize_identity_private_key(value: Any) -> str:
+    try:
+        raw_private_key = _decode_identity_bytes(
+            value,
+            ED25519_PRIVATE_KEY_BYTES,
+            "Identity private key",
+        )
+        Ed25519PrivateKey.from_private_bytes(raw_private_key)
+    except Exception:
+        return generate_identity_private_key()
+    return str(value)
+
+
+def identity_public_key_bytes(encoded_private_key: str) -> bytes:
+    raw_private_key = _decode_identity_bytes(
+        encoded_private_key,
+        ED25519_PRIVATE_KEY_BYTES,
+        "Identity private key",
+    )
+    private_key = Ed25519PrivateKey.from_private_bytes(raw_private_key)
+    return private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+def client_id_from_public_key(public_key: bytes) -> str:
+    if len(public_key) != ED25519_PUBLIC_KEY_BYTES:
+        raise ValueError("Identity public key has the wrong length.")
+    return hashlib.sha256(
+        b"SpriteLink client identity v1\0" + public_key
+    ).hexdigest()
+
+
+def identity_client_id(encoded_private_key: str) -> str:
+    return client_id_from_public_key(
+        identity_public_key_bytes(encoded_private_key)
+    )
+
+
+def visible_user_id(client_id: str) -> str:
+    return str(client_id)[:VISIBLE_USER_ID_CHARS].upper()
+
+
+def _signed_message_payload(
+    message: dict[str, Any],
+    encryption_key: str,
+) -> bytes:
+    values = [
+        SIGNED_MESSAGE_CONTEXT,
+        derive_ntfy_topic(encryption_key),
+        message["a"],
+        message["v"],
+        message["i"],
+        message["c"],
+        message["q"],
+        message["u"],
+        message["k"],
+        message.get("f", DEFAULT_MESSAGE_FONT),
+        message.get("o", DEFAULT_MESSAGE_TEXT_COLOR),
+        message.get("p", ""),
+        message["t"],
+        message["m"],
+    ]
+    return json.dumps(
+        values,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def sign_message_identity(
+    message: dict[str, Any],
+    encryption_key: str,
+    encoded_private_key: str,
+) -> dict[str, Any]:
+    raw_private_key = _decode_identity_bytes(
+        encoded_private_key,
+        ED25519_PRIVATE_KEY_BYTES,
+        "Identity private key",
+    )
+    private_key = Ed25519PrivateKey.from_private_bytes(raw_private_key)
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    message["a"] = MESSAGE_AUTH_VERSION
+    message["q"] = _encode_identity_bytes(public_key)
+    message["c"] = client_id_from_public_key(public_key)
+    message.pop("s", None)
+    message["s"] = _encode_identity_bytes(
+        private_key.sign(
+            _signed_message_payload(message, encryption_key)
+        )
+    )
+    return message
+
+
+def verify_message_identity(
+    message: dict[str, Any],
+    encryption_key: str,
+) -> None:
+    if message.get("a") != MESSAGE_AUTH_VERSION:
+        raise ValueError("Message authentication version is unsupported.")
+    public_key = _decode_identity_bytes(
+        message.get("q"),
+        ED25519_PUBLIC_KEY_BYTES,
+        "Identity public key",
+    )
+    expected_client_id = client_id_from_public_key(public_key)
+    if not secrets.compare_digest(
+        str(message.get("c", "")),
+        expected_client_id,
+    ):
+        raise ValueError("Message client ID does not match its public key.")
+    signature = _decode_identity_bytes(
+        message.get("s"),
+        ED25519_SIGNATURE_BYTES,
+        "Message signature",
+    )
+    Ed25519PublicKey.from_public_bytes(public_key).verify(
+        signature,
+        _signed_message_payload(message, encryption_key),
+    )
+
+
 def default_config() -> dict[str, Any]:
     global_profile = default_room_profile()
     default_preset = default_identity_preset()
@@ -989,7 +1161,7 @@ def default_config() -> dict[str, Any]:
         "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
         "custom_message_sound_path": "",
         "automatic_update_checks": True,
-        "client_id": secrets.token_hex(32),
+        "identity_private_key": generate_identity_private_key(),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
         "room_profiles": {
@@ -999,7 +1171,6 @@ def default_config() -> dict[str, Any]:
         "muted_chatrooms": [],
         "unread_counts": {},
         "room_state": {},
-        "identities": {},
         "history": {},
         "muted_users": {},
         "trusted_image_users": {},
@@ -1088,14 +1259,14 @@ def load_config() -> dict[str, Any]:
     )
     config.pop("chime_enabled", None)
 
-    if not isinstance(config.get("client_id"), str) or len(config["client_id"]) < 32:
-        config["client_id"] = secrets.token_hex(32)
+    config["identity_private_key"] = normalize_identity_private_key(
+        config.get("identity_private_key")
+    )
+    config.pop("client_id", None)
+    config.pop("identities", None)
 
     if not isinstance(config.get("room_state"), dict):
         config["room_state"] = {}
-
-    if not isinstance(config.get("identities"), dict):
-        config["identities"] = {}
 
     if not isinstance(config.get("history"), dict):
         config["history"] = {}
@@ -2190,6 +2361,9 @@ class EncryptedChatClient(QObject):
         self.root.installEventFilter(self)
 
         self.config_data = load_config()
+        # Persist a newly generated or migrated signing identity before any
+        # messages are created so the authenticated ID survives a crash.
+        save_config(self.config_data)
         app = QApplication.instance()
         self._basic_style_name = (
             app.style().objectName() if app is not None else "Fusion"
@@ -2704,6 +2878,16 @@ class EncryptedChatClient(QObject):
         self.active_chatroom_id = GLOBAL_CHATROOM_ID
         self.config_data["active_chatroom_id"] = GLOBAL_CHATROOM_ID
         return self._chatroom_definitions()[0]
+
+    def _identity_private_key(self) -> str:
+        normalized = normalize_identity_private_key(
+            self.config_data.get("identity_private_key")
+        )
+        self.config_data["identity_private_key"] = normalized
+        return normalized
+
+    def _authenticated_client_id(self) -> str:
+        return identity_client_id(self._identity_private_key())
 
     def _update_window_title(self) -> None:
         room_name = self._active_chatroom()["nickname"]
@@ -4616,7 +4800,6 @@ class EncryptedChatClient(QObject):
         message = {
             "v": APP_VERSION,
             "i": self.draft_message_id,
-            "c": self.config_data["client_id"],
             "u": profile["username"],
             "k": profile["username_color"],
             "f": profile["font"],
@@ -4626,7 +4809,11 @@ class EncryptedChatClient(QObject):
         }
         if profile["profile_icon"]:
             message["p"] = profile["profile_icon"]
-        return message
+        return sign_message_identity(
+            message,
+            self._active_chatroom()["key"],
+            self._identity_private_key(),
+        )
 
     def _schedule_composer_update(self) -> None:
         self.message_resize_timer.start(0)
@@ -4848,6 +5035,11 @@ class EncryptedChatClient(QObject):
 
         message = self._build_draft_message(text)
         message["t"] = int(time.time())
+        sign_message_identity(
+            message,
+            encryption_key,
+            self._identity_private_key(),
+        )
 
         self._cancel_pending_message_size_check()
         estimated_size = estimate_opaque_packet_size(message)
@@ -5161,7 +5353,10 @@ class EncryptedChatClient(QObject):
 
                 try:
                     message = open_opaque_packet(packet, encryption_key)
-                    self._validate_decrypted_message(message)
+                    self._validate_decrypted_message(
+                        message,
+                        encryption_key,
+                    )
                 except Exception:
                     failed_decryptions += 1
                     continue
@@ -5218,10 +5413,17 @@ class EncryptedChatClient(QObject):
                 ))
 
     @staticmethod
-    def _validate_decrypted_message(message: dict[str, Any]) -> None:
+    def _validate_decrypted_message(
+        message: dict[str, Any],
+        encryption_key: str,
+    ) -> None:
         required = {
+            "a": int,
+            "v": int,
             "i": str,
             "c": str,
+            "q": str,
+            "s": str,
             "u": str,
             "k": str,
             "t": int,
@@ -5234,14 +5436,18 @@ class EncryptedChatClient(QObject):
                     f"Message field {key!r} has the wrong type."
                 )
 
+        if message["v"] != APP_VERSION:
+            raise ValueError("Message version is unsupported.")
         if len(message["i"]) > 128:
             raise ValueError("Message ID is too long.")
-        if len(message["c"]) > 256:
-            raise ValueError("Client ID is too long.")
+        if not re.fullmatch(r"[0-9a-f]{64}", message["c"]):
+            raise ValueError("Client ID is invalid.")
         if len(message["u"]) > 32:
             raise ValueError("Username is too long.")
         if len(message["m"]) > MAX_MESSAGE_CHARS:
             raise ValueError("Message text is too long.")
+        if not QColor(message["k"]).isValid():
+            raise ValueError("Username color is invalid.")
 
         font_name = message.get("f", DEFAULT_MESSAGE_FONT)
         if (
@@ -5259,6 +5465,8 @@ class EncryptedChatClient(QObject):
             raise ValueError("Message profile icon has the wrong type.")
         if profile_icon:
             decode_profile_icon(profile_icon)
+
+        verify_message_identity(message, encryption_key)
 
     def _process_ui_queue(self) -> None:
         try:
@@ -5421,11 +5629,10 @@ class EncryptedChatClient(QObject):
 
             seen_ntfy_ids.add(ntfy_id)
             seen_client_message_ids.add(client_message_id)
-            warning = self._observe_identity(message, encryption_key)
-            is_local = message.get("c") == self.config_data["client_id"]
+            is_local = message.get("c") == self._authenticated_client_id()
             history.append({
                 "message": message,
-                "warning": warning,
+                "warning": None,
                 "ntfy_id": ntfy_id,
                 "ntfy_time": int(
                     item.get("ntfy_time", message.get("t", 0)) or 0
@@ -5482,13 +5689,12 @@ class EncryptedChatClient(QObject):
         self.seen_ntfy_message_ids.add(ntfy_id)
         self.seen_client_message_ids.add(client_message_id)
 
-        warning = self._observe_identity(message)
-        is_local = message["c"] == self.config_data["client_id"]
+        is_local = message["c"] == self._authenticated_client_id()
 
         self._add_message_to_log(
             message,
             is_local=is_local,
-            warning=warning,
+            warning=None,
             ntfy_id=ntfy_id,
             ntfy_time=item["ntfy_time"],
             persist=persist,
@@ -5505,41 +5711,6 @@ class EncryptedChatClient(QObject):
             self._play_message_sound()
 
         return True
-
-    def _observe_identity(
-        self,
-        message: dict[str, Any],
-        encryption_key: str | None = None,
-    ) -> str | None:
-        server_url = str(self.config_data.get("server_url", ""))
-        if encryption_key is None:
-            encryption_key = self._active_chatroom()["key"]
-
-        if not server_url or not encryption_key:
-            return None
-
-        scope_id = room_scope_id(server_url, encryption_key)
-        all_identities = self.config_data.setdefault("identities", {})
-        identities = all_identities.setdefault(scope_id, {})
-
-        username = message["u"]
-        client_id = message["c"]
-        known = identities.get(username)
-        warning = None
-
-        if isinstance(known, str) and known != client_id:
-            warning = (
-                f'Identity warning: "{username}" is using a different hidden '
-                "client ID than previously observed."
-            )
-        elif known is None:
-            identities[username] = client_id
-            try:
-                save_config(self.config_data)
-            except Exception:
-                pass
-
-        return warning
 
     @staticmethod
     def _message_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
@@ -5600,7 +5771,10 @@ class EncryptedChatClient(QObject):
                 continue
 
             try:
-                self._validate_decrypted_message(message)
+                self._validate_decrypted_message(
+                    message,
+                    encryption_key,
+                )
             except Exception:
                 continue
 
@@ -5617,8 +5791,10 @@ class EncryptedChatClient(QObject):
             self.seen_client_message_ids.add(client_message_id)
             self.message_log.append({
                 "message": message,
-                "is_local": message["c"] == self.config_data["client_id"],
-                "warning": item.get("warning") if isinstance(item.get("warning"), str) else None,
+                "is_local": (
+                    message["c"] == self._authenticated_client_id()
+                ),
+                "warning": None,
                 "ntfy_id": ntfy_id,
                 "ntfy_time": int(item.get("ntfy_time", message.get("t", 0)) or 0),
             })
@@ -6558,7 +6734,7 @@ class EncryptedChatClient(QObject):
         text = str(message["m"])
         message_id = str(message["i"])
         client_id = str(message["c"])
-        unique_id_preview = client_id[:5]
+        user_id_preview = visible_user_id(client_id)
 
         is_muted = client_id in muted_ids and not item["is_local"]
         is_collapsed = is_muted or message_id in collapsed_ids
@@ -6638,13 +6814,13 @@ class EncryptedChatClient(QObject):
                 '<div align="center">'
                 f'<img src="{tooltip_icon_uri}" width="64" height="64">'
                 f"<br>{hover_timestamp}<br>"
-                f"Unique ID: {unique_id_preview}"
+                f"User ID: {user_id_preview}"
                 "</div>"
             )
         else:
             self.rendered_tooltips[message_id] = (
                 f"{hover_timestamp}\n"
-                f"Unique ID: {unique_id_preview}"
+                f"User ID: {user_id_preview}"
             )
 
         top_align_height = 0
