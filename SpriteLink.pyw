@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from ctypes import wintypes
 from functools import lru_cache
@@ -29,6 +30,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import secrets
 import threading
 import time
@@ -36,6 +38,7 @@ import traceback
 import sys
 import uuid
 import zlib
+from urllib.parse import urlsplit
 try:
     from PySide6.QtCore import (
         QEvent,
@@ -48,6 +51,7 @@ try:
     )
     from PySide6.QtGui import (
         QColor,
+        QDesktopServices,
         QFont,
         QFontMetrics,
         QImage,
@@ -140,6 +144,7 @@ GLOBAL_CHATROOM_ID = "global"
 GLOBAL_CHATROOM_NICKNAME = "Global"
 GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
 CHATROOM_SIDEBAR_WIDTH = 240
+CONFIG_POPUP_MAX_WIDTH = 720
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
@@ -170,6 +175,23 @@ PROFILE_ICON_MAX_COLORS = 16
 MAX_PROFILE_ICON_GIF_BYTES = 2048
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
+EMBEDDED_IMAGE_MAX_EDGE = 96
+TOP_ALIGNED_PROFILE_ICON_PADDING = 3
+IMAGE_PREVIEW_MAX_WIDTH = CONFIG_POPUP_MAX_WIDTH - 32
+IMAGE_PREVIEW_MAX_HEIGHT = 480
+MAX_REMOTE_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_REMOTE_IMAGE_PIXELS = 16 * 1024 * 1024
+IMAGE_PREVIEW_CACHE_LIMIT = 128
+IMAGE_LINK_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".jfif",
+)
+MESSAGE_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
 DEFAULT_MESSAGE_FONT = "Segoe UI"
@@ -660,6 +682,61 @@ def local_reset_time_label() -> str:
         f"{hour}:{local_reset.strftime('%M %p')} "
         f"{timezone_name}"
     )
+
+
+def message_url_spans(text: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    for match in MESSAGE_URL_PATTERN.finditer(text):
+        start, end = match.span()
+        url = match.group(0)
+        while url and url[-1] in ".,!?;:":
+            url = url[:-1]
+            end -= 1
+        for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
+            while url.endswith(closing) and url.count(closing) > url.count(opening):
+                url = url[:-1]
+                end -= 1
+        if url:
+            spans.append((start, end, url))
+    return spans
+
+
+def is_direct_image_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.casefold() in {"http", "https"}
+        and parsed.path.casefold().endswith(IMAGE_LINK_EXTENSIONS)
+    )
+
+
+def message_contains_only_image_links(text: str) -> bool:
+    return (
+        bool(direct_image_urls_in_message(text))
+        and not message_text_without_image_links(text).strip()
+    )
+
+
+def message_text_without_image_links(text: str) -> str:
+    visible_parts: list[str] = []
+    position = 0
+    for start, end, url in message_url_spans(text):
+        visible_parts.append(text[position:start])
+        if not is_direct_image_url(url):
+            visible_parts.append(text[start:end])
+        position = end
+    visible_parts.append(text[position:])
+    return "".join(visible_parts)
+
+
+def direct_image_urls_in_message(text: str) -> list[str]:
+    image_urls: list[str] = []
+    for _start, _end, url in message_url_spans(text):
+        if is_direct_image_url(url) and url not in image_urls:
+            image_urls.append(url)
+    return image_urls
 
 
 def default_config() -> dict[str, Any]:
@@ -1393,6 +1470,14 @@ class EncryptedChatClient(QObject):
         self.message_size_check_pending = False
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
         self.rendered_tooltips: dict[str, str] = {}
+        self.rendered_image_links: dict[str, str] = {}
+        self.image_preview_cache: dict[str, QImage | None] = {}
+        self.pending_image_previews: set[str] = set()
+        self.current_image_preview_url: str | None = None
+        self.image_fetch_executor = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="SpriteLinkImage",
+        )
         self._hovered_message_id: str | None = None
         self._pending_tooltip_message_id: str | None = None
         self._pending_tooltip_global_position = QPoint()
@@ -1684,6 +1769,10 @@ class EncryptedChatClient(QObject):
             self.message_limit_panel.setStyleSheet(
                 self._config_panel_stylesheet()
             )
+        if hasattr(self, "image_preview_panel"):
+            self.image_preview_panel.setStyleSheet(
+                self._config_panel_stylesheet()
+            )
         if hasattr(self, "message_size_bar"):
             self._draw_message_size_bar()
         if hasattr(self, "chatrooms_toggle"):
@@ -1722,6 +1811,7 @@ class EncryptedChatClient(QObject):
         self._build_chat_tab()
         self._build_config_popup()
         self._build_message_limit_popup()
+        self._build_image_preview_popup()
 
     def _build_chatroom_sidebar(self, root_layout: QHBoxLayout) -> None:
         self.chatrooms_panel = QWidget()
@@ -2501,7 +2591,7 @@ class EncryptedChatClient(QObject):
 
         self.config_panel = QFrame()
         self.config_panel.setObjectName("configPanel")
-        self.config_panel.setMaximumWidth(720)
+        self.config_panel.setMaximumWidth(CONFIG_POPUP_MAX_WIDTH)
         self.config_panel.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
@@ -2598,6 +2688,119 @@ class EncryptedChatClient(QObject):
             "This limit is reset at 12:00 AM UTC "
             f"({local_reset_time_label()})."
         )
+
+    def _build_image_preview_popup(self) -> None:
+        self.image_preview_overlay = ConfigOverlay(self.chat_content)
+        self.image_preview_overlay.dismissed.connect(
+            self._hide_image_preview_popup
+        )
+
+        overlay_layout = QVBoxLayout(self.image_preview_overlay)
+        overlay_layout.setContentsMargins(36, 24, 36, 24)
+        overlay_layout.addStretch(1)
+
+        panel_row = QHBoxLayout()
+        panel_row.addStretch(1)
+        self.image_preview_panel = QFrame()
+        self.image_preview_panel.setObjectName("configPanel")
+        self.image_preview_panel.setMaximumWidth(CONFIG_POPUP_MAX_WIDTH)
+        self.image_preview_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.image_preview_panel.setStyleSheet(
+            self._config_panel_stylesheet()
+        )
+        panel_row.addWidget(self.image_preview_panel, 8)
+        panel_row.addStretch(1)
+        overlay_layout.addLayout(panel_row)
+        overlay_layout.addStretch(1)
+        self.image_preview_overlay.panel = self.image_preview_panel
+
+        panel_layout = QVBoxLayout(self.image_preview_panel)
+        panel_layout.setContentsMargins(16, 14, 16, 14)
+        panel_layout.setSpacing(12)
+        self.image_preview_label = QLabel()
+        self.image_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_preview_label.setMinimumHeight(96)
+        panel_layout.addWidget(self.image_preview_label, 1)
+
+        button_row = QHBoxLayout()
+        self.image_preview_url_label = QLabel()
+        self.image_preview_url_label.setMinimumWidth(0)
+        self.image_preview_url_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        button_row.addWidget(self.image_preview_url_label, 1)
+        open_button = QPushButton("Open in Browser")
+        open_button.clicked.connect(self._open_current_image_in_browser)
+        button_row.addWidget(open_button)
+        dismiss_button = QPushButton("Dismiss")
+        dismiss_button.clicked.connect(self._hide_image_preview_popup)
+        button_row.addWidget(dismiss_button)
+        panel_layout.addLayout(button_row)
+
+        self.image_preview_overlay.hide()
+        QTimer.singleShot(0, self._sync_image_preview_overlay_geometry)
+
+    def _sync_image_preview_overlay_geometry(self) -> None:
+        self.image_preview_overlay.setGeometry(self.chat_content.rect())
+
+    def _show_image_preview_popup(self, url: str) -> None:
+        image = self.image_preview_cache.get(url)
+        if not isinstance(image, QImage) or image.isNull():
+            return
+        self._hide_chat_tooltip()
+        self.current_image_preview_url = url
+        self._sync_image_preview_overlay_geometry()
+        self.image_preview_overlay.show()
+        self.image_preview_overlay.raise_()
+        self._update_image_preview_popup()
+        QTimer.singleShot(0, self._update_image_preview_popup)
+
+    def _update_image_preview_popup(self) -> None:
+        url = self.current_image_preview_url
+        image = self.image_preview_cache.get(url or "")
+        if not isinstance(image, QImage) or image.isNull():
+            self.image_preview_label.clear()
+            self.image_preview_url_label.clear()
+            return
+        available_width = max(
+            EMBEDDED_IMAGE_MAX_EDGE,
+            min(
+                IMAGE_PREVIEW_MAX_WIDTH,
+                self.image_preview_panel.width() - 32,
+            ),
+        )
+        preview = image.scaled(
+            available_width,
+            IMAGE_PREVIEW_MAX_HEIGHT,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.image_preview_label.setPixmap(QPixmap.fromImage(preview))
+        label_width = max(1, self.image_preview_url_label.width())
+        self.image_preview_url_label.setText(
+            self.image_preview_url_label.fontMetrics().elidedText(
+                url or "",
+                Qt.TextElideMode.ElideMiddle,
+                label_width,
+            )
+        )
+        self.image_preview_url_label.setToolTip(url or "")
+
+    def _hide_image_preview_popup(self) -> None:
+        self.image_preview_overlay.hide()
+        self.current_image_preview_url = None
+        self.image_preview_label.clear()
+        self.image_preview_url_label.clear()
+        self.image_preview_url_label.setToolTip("")
+        self.message_entry.setFocus()
+
+    def _open_current_image_in_browser(self) -> None:
+        if self.current_image_preview_url:
+            self._open_url_in_browser(self.current_image_preview_url)
 
     def _build_config_tab(self) -> None:
         layout = QGridLayout(self.config_tab)
@@ -3465,6 +3668,30 @@ class EncryptedChatClient(QObject):
                         warning=True,
                     )
 
+                elif event_type == "image_preview_loaded":
+                    url = str(payload.get("url", ""))
+                    data = payload.get("data")
+                    self.pending_image_previews.discard(url)
+                    image: QImage | None = None
+                    if isinstance(data, bytes) and data:
+                        candidate = QImage.fromData(data)
+                        if not candidate.isNull():
+                            candidate.setDevicePixelRatio(1.0)
+                            image = candidate
+                    self.image_preview_cache[url] = image
+                    while (
+                        len(self.image_preview_cache)
+                        > IMAGE_PREVIEW_CACHE_LIMIT
+                    ):
+                        oldest_url = next(iter(self.image_preview_cache))
+                        self.image_preview_cache.pop(oldest_url, None)
+                    if image is not None and any(
+                        url in str(item.get("message", {}).get("m", ""))
+                        for item in self.message_log
+                        if isinstance(item, dict)
+                    ):
+                        self._rerender_preserving_scroll()
+
                 elif event_type == "decrypt_failures":
                     pass
 
@@ -3951,6 +4178,111 @@ class EncryptedChatClient(QObject):
                 if widget.windowType() == Qt.WindowType.ToolTip:
                     widget.hide()
 
+    @staticmethod
+    def _open_url_in_browser(url: str) -> None:
+        parsed = QUrl(url)
+        if parsed.isValid() and parsed.scheme().casefold() in {"http", "https"}:
+            QDesktopServices.openUrl(parsed)
+
+    def _image_url_from_anchor(self, anchor: str) -> str | None:
+        prefix = "spritelink-image:"
+        if not anchor.startswith(prefix):
+            return None
+        return self.rendered_image_links.get(anchor[len(prefix):])
+
+    def _link_url_from_anchor(self, anchor: str) -> str | None:
+        image_url = self._image_url_from_anchor(anchor)
+        if image_url:
+            return image_url
+        parsed = QUrl(anchor)
+        if parsed.isValid() and parsed.scheme().casefold() in {"http", "https"}:
+            return anchor
+        return None
+
+    def _show_link_context_menu(
+        self,
+        url: str,
+        global_position: QPoint,
+    ) -> None:
+        menu = QMenu(self.root)
+        copy_action = menu.addAction("Copy Link")
+        copy_action.triggered.connect(
+            lambda: QApplication.clipboard().setText(url)
+        )
+        menu.exec(global_position)
+
+    def _schedule_image_preview_fetch(self, url: str) -> None:
+        if (
+            url in self.image_preview_cache
+            or url in self.pending_image_previews
+            or self._closing
+        ):
+            return
+        self.pending_image_previews.add(url)
+        try:
+            self.image_fetch_executor.submit(
+                self._fetch_remote_image_preview,
+                url,
+            )
+        except RuntimeError:
+            self.pending_image_previews.discard(url)
+
+    def _fetch_remote_image_preview(self, url: str) -> None:
+        image_data: bytes | None = None
+        try:
+            with requests.get(
+                url,
+                headers={
+                    "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
+                    "Accept": "image/*",
+                },
+                stream=True,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            ) as response:
+                response.raise_for_status()
+                content_type = response.headers.get(
+                    "Content-Type",
+                    "",
+                ).split(";", 1)[0].strip().casefold()
+                if content_type and not content_type.startswith("image/"):
+                    raise ValueError("The link did not return an image.")
+                content_length = response.headers.get("Content-Length")
+                if (
+                    content_length
+                    and int(content_length) > MAX_REMOTE_IMAGE_BYTES
+                ):
+                    raise ValueError("The linked image is too large.")
+
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_content(64 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_REMOTE_IMAGE_BYTES:
+                        raise ValueError("The linked image is too large.")
+                    chunks.append(chunk)
+                candidate = b"".join(chunks)
+
+            with Image.open(io.BytesIO(candidate)) as remote_image:
+                width, height = remote_image.size
+                if (
+                    width <= 0
+                    or height <= 0
+                    or width * height > MAX_REMOTE_IMAGE_PIXELS
+                ):
+                    raise ValueError("The linked image dimensions are too large.")
+                remote_image.verify()
+            image_data = candidate
+        except Exception:
+            image_data = None
+
+        if not self._closing:
+            self.ui_queue.put((
+                "image_preview_loaded",
+                {"url": url, "data": image_data},
+            ))
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if (
             watched is getattr(self, "chat_content", None)
@@ -3960,6 +4292,10 @@ class EncryptedChatClient(QObject):
             self._sync_config_overlay_geometry()
             if hasattr(self, "message_limit_overlay"):
                 self._sync_message_limit_overlay_geometry()
+            if hasattr(self, "image_preview_overlay"):
+                self._sync_image_preview_overlay_geometry()
+                if self.image_preview_overlay.isVisible():
+                    self._update_image_preview_popup()
 
         if (
             hasattr(self, "chat_display")
@@ -3972,14 +4308,17 @@ class EncryptedChatClient(QObject):
                 anchor = self.chat_display.anchorAt(event.position().toPoint())
                 message_id = self._message_id_from_anchor(anchor)
 
-                if message_id:
+                if anchor:
                     self.chat_display.viewport().setCursor(
                         Qt.CursorShape.PointingHandCursor
                     )
-                    self._schedule_chat_tooltip(
-                        message_id,
-                        event.globalPosition().toPoint(),
-                    )
+                    if message_id:
+                        self._schedule_chat_tooltip(
+                            message_id,
+                            event.globalPosition().toPoint(),
+                        )
+                    else:
+                        self._hide_chat_tooltip()
                 else:
                     self.chat_display.viewport().setCursor(
                         Qt.CursorShape.IBeamCursor
@@ -4003,6 +4342,16 @@ class EncryptedChatClient(QObject):
                         # navigation. Consuming the click prevents Qt from
                         # drawing a focus outline around the icon or username.
                         return True
+                    image_url = self._image_url_from_anchor(anchor)
+                    if image_url:
+                        if event.type() == QEvent.Type.MouseButtonRelease:
+                            self._show_image_preview_popup(image_url)
+                        return True
+                    link_url = self._link_url_from_anchor(anchor)
+                    if link_url:
+                        if event.type() == QEvent.Type.MouseButtonRelease:
+                            self._open_url_in_browser(link_url)
+                        return True
 
             elif event.type() == QEvent.Type.ContextMenu:
                 anchor = self.chat_display.anchorAt(event.pos())
@@ -4013,6 +4362,14 @@ class EncryptedChatClient(QObject):
                         item,
                         event.globalPos(),
                     )
+                else:
+                    link_url = self._link_url_from_anchor(anchor)
+                    if link_url:
+                        self._hide_chat_tooltip()
+                        self._show_link_context_menu(
+                            link_url,
+                            event.globalPos(),
+                        )
                 # Never show QTextBrowser's generic Copy/Copy Link/Select All
                 # menu in the log viewport.
                 return True
@@ -4102,6 +4459,8 @@ class EncryptedChatClient(QObject):
         cursor: QTextCursor,
         encoded_icon: str,
         message_id: str,
+        *,
+        align_top: bool = False,
     ) -> bool:
         if not encoded_icon:
             return False
@@ -4121,26 +4480,49 @@ class EncryptedChatClient(QObject):
             return False
         image.setDevicePixelRatio(1.0)
 
+        displayed_image = image
+        resource_suffix = ""
+        if align_top:
+            padded_image = QImage(
+                image.width(),
+                image.height() + TOP_ALIGNED_PROFILE_ICON_PADDING,
+                QImage.Format.Format_ARGB32,
+            )
+            padded_image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(padded_image)
+            painter.drawImage(
+                0,
+                TOP_ALIGNED_PROFILE_ICON_PADDING,
+                image,
+            )
+            painter.end()
+            padded_image.setDevicePixelRatio(1.0)
+            displayed_image = padded_image
+            resource_suffix = "-top-padded"
+
         resource_name = (
             "spritelink-profile-icon:"
             + hashlib.sha256(gif_data).hexdigest()
+            + resource_suffix
         )
         resource_url = QUrl(resource_name)
         cursor.document().addResource(
             QTextDocument.ResourceType.ImageResource,
             resource_url,
-            image,
+            displayed_image,
         )
         image_format = QTextImageFormat()
         image_format.setName(resource_url.toString())
-        image_format.setWidth(image.width())
-        image_format.setHeight(image.height())
+        image_format.setWidth(displayed_image.width())
+        image_format.setHeight(displayed_image.height())
         image_format.setAnchor(True)
         image_format.setAnchorHref(f"spritelink:{message_id}")
         # Inline images participate in Qt's automatic line-height calculation,
         # so a short text line expands to the icon's native 16-pixel height.
         image_format.setVerticalAlignment(
-            QTextCharFormat.VerticalAlignment.AlignMiddle
+            QTextCharFormat.VerticalAlignment.AlignTop
+            if align_top
+            else QTextCharFormat.VerticalAlignment.AlignMiddle
         )
         cursor.insertImage(image_format)
         return True
@@ -4194,6 +4576,8 @@ class EncryptedChatClient(QObject):
         bold: bool = False,
         anchor: str | None = None,
         font_name: str = DEFAULT_MESSAGE_FONT,
+        align_top: bool = False,
+        top_align_height: int = 0,
     ) -> QTextCharFormat:
         formatting = QTextCharFormat()
         formatting.setForeground(QColor(color))
@@ -4204,7 +4588,100 @@ class EncryptedChatClient(QObject):
             formatting.setAnchor(True)
             formatting.setAnchorHref(anchor)
             formatting.setFontUnderline(False)
+        if align_top and top_align_height > 0:
+            font_height = max(1, QFontMetrics(formatting.font()).height())
+            upward_pixels = max(
+                0.0,
+                (top_align_height - font_height) / 2.0,
+            )
+            formatting.setBaselineOffset(
+                upward_pixels * 100.0 / font_height
+            )
         return formatting
+
+    def _insert_message_text_with_links(
+        self,
+        cursor: QTextCursor,
+        text: str,
+        body_color: str,
+        font_name: str,
+        *,
+        muted: bool,
+        align_top: bool,
+        top_align_height: int,
+    ) -> None:
+        position = 0
+        for start, end, url in message_url_spans(text):
+            if start > position:
+                cursor.insertText(
+                    text[position:start],
+                    self._text_format(
+                        body_color,
+                        font_name=font_name,
+                        align_top=align_top,
+                        top_align_height=top_align_height,
+                    ),
+                )
+            if is_direct_image_url(url):
+                position = end
+                continue
+            link_color = "#0000ee" if self._is_windows_classic_theme() else "#0066cc"
+            if muted:
+                link_color = self._blend_toward_chat_background(link_color)
+            link_format = self._text_format(
+                link_color,
+                anchor=url,
+                font_name=font_name,
+                align_top=align_top,
+                top_align_height=top_align_height,
+            )
+            link_format.setFontUnderline(True)
+            cursor.insertText(text[start:end], link_format)
+            position = end
+        if position < len(text):
+            cursor.insertText(
+                text[position:],
+                self._text_format(
+                    body_color,
+                    font_name=font_name,
+                    align_top=align_top,
+                    top_align_height=top_align_height,
+                ),
+            )
+
+    def _insert_embedded_image_preview(
+        self,
+        cursor: QTextCursor,
+        url: str,
+    ) -> bool:
+        image = self.image_preview_cache.get(url)
+        if not isinstance(image, QImage) or image.isNull():
+            return False
+        preview = image.scaled(
+            EMBEDDED_IMAGE_MAX_EDGE,
+            EMBEDDED_IMAGE_MAX_EDGE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        token = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        self.rendered_image_links[token] = url
+        resource_url = QUrl(f"spritelink-chat-image-resource:{token}")
+        cursor.document().addResource(
+            QTextDocument.ResourceType.ImageResource,
+            resource_url,
+            preview,
+        )
+        image_format = QTextImageFormat()
+        image_format.setName(resource_url.toString())
+        image_format.setWidth(preview.width())
+        image_format.setHeight(preview.height())
+        image_format.setVerticalAlignment(
+            QTextCharFormat.VerticalAlignment.AlignTop
+        )
+        image_format.setAnchor(True)
+        image_format.setAnchorHref(f"spritelink-image:{token}")
+        cursor.insertImage(image_format)
+        return True
 
     def _insert_log_separator(
         self,
@@ -4257,6 +4734,7 @@ class EncryptedChatClient(QObject):
         self._hide_chat_tooltip()
         self.rendered_message_items.clear()
         self.rendered_tooltips.clear()
+        self.rendered_image_links.clear()
         self.chat_display.clear()
 
         cursor = self.chat_display.textCursor()
@@ -4413,10 +4891,35 @@ class EncryptedChatClient(QObject):
                 f"Unique ID: {unique_id_preview}"
             )
 
+        top_align_height = 0
+        if (
+            not is_collapsed
+            and message_contains_only_image_links(text)
+        ):
+            for _start, _end, url in message_url_spans(text):
+                cached_image = self.image_preview_cache.get(url)
+                if (
+                    is_direct_image_url(url)
+                    and isinstance(cached_image, QImage)
+                    and not cached_image.isNull()
+                ):
+                    embedded_preview = cached_image.scaled(
+                        EMBEDDED_IMAGE_MAX_EDGE,
+                        EMBEDDED_IMAGE_MAX_EDGE,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    top_align_height = max(
+                        top_align_height,
+                        embedded_preview.height(),
+                    )
+        align_message_top = top_align_height > 0
+
         has_profile_icon = self._insert_profile_icon(
             cursor,
             profile_icon,
             message_id,
+            align_top=align_message_top,
         )
         if has_profile_icon:
             cursor.insertText(
@@ -4425,6 +4928,8 @@ class EncryptedChatClient(QObject):
                     body_color,
                     anchor=f"spritelink:{message_id}",
                     font_name=font_name,
+                    align_top=align_message_top,
+                    top_align_height=top_align_height,
                 ),
             )
         cursor.insertText(
@@ -4434,16 +4939,28 @@ class EncryptedChatClient(QObject):
                 bold=True,
                 anchor=f"spritelink:{message_id}",
                 font_name=font_name,
+                align_top=align_message_top,
+                top_align_height=top_align_height,
             ),
         )
         if status_suffix:
             cursor.insertText(
                 status_suffix,
-                self._text_format(suffix_color, font_name=font_name),
+                self._text_format(
+                    suffix_color,
+                    font_name=font_name,
+                    align_top=align_message_top,
+                    top_align_height=top_align_height,
+                ),
             )
         cursor.insertText(
             ": ",
-            self._text_format(body_color, font_name=font_name),
+            self._text_format(
+                body_color,
+                font_name=font_name,
+                align_top=align_message_top,
+                top_align_height=top_align_height,
+            ),
         )
 
         display_text = (
@@ -4457,10 +4974,48 @@ class EncryptedChatClient(QObject):
             if is_collapsed
             else text
         )
-        cursor.insertText(
-            display_text,
-            self._text_format(body_color, font_name=font_name),
+        image_urls = (
+            []
+            if is_collapsed
+            else direct_image_urls_in_message(display_text)
         )
+        visible_text_without_images = message_text_without_image_links(
+            display_text
+        )
+        add_image_line_break = (
+            bool(image_urls)
+            and bool(visible_text_without_images.strip())
+            and not visible_text_without_images.rstrip(" \t").endswith(
+                ("\n", "\r")
+            )
+        )
+        for image_url in image_urls:
+            self._schedule_image_preview_fetch(image_url)
+        if is_collapsed:
+            cursor.insertText(
+                display_text,
+                self._text_format(
+                    body_color,
+                    font_name=font_name,
+                    align_top=align_message_top,
+                    top_align_height=top_align_height,
+                ),
+            )
+        else:
+            self._insert_message_text_with_links(
+                cursor,
+                display_text,
+                body_color,
+                font_name,
+                muted=is_muted,
+                align_top=align_message_top,
+                top_align_height=top_align_height,
+            )
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        if add_image_line_break:
+            cursor.insertBlock()
+        for image_url in image_urls:
+            self._insert_embedded_image_preview(cursor, image_url)
 
         if item.get("warning") and not is_collapsed:
             cursor.insertBlock()
@@ -4521,11 +5076,14 @@ class EncryptedChatClient(QObject):
 
     def _clear_visible_room(self) -> None:
         self._hide_chat_tooltip()
+        if self.image_preview_overlay.isVisible():
+            self._hide_image_preview_popup()
         self.seen_client_message_ids.clear()
         self.seen_ntfy_message_ids.clear()
         self.message_log.clear()
         self.rendered_message_items.clear()
         self.rendered_tooltips.clear()
+        self.rendered_image_links.clear()
         self.chat_display.setExtraSelections([])
         self.chat_display.clear()
 
@@ -4552,6 +5110,10 @@ class EncryptedChatClient(QObject):
 
         self.stop_event.set()
         self.ui_queue_timer.stop()
+        self.image_fetch_executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
 
 def _write_crash_log(error_text: str) -> Path | None:
     try:
