@@ -216,6 +216,7 @@ MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
 DEFAULT_MESSAGE_FONT = "Segoe UI"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
+MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
 SELECTABLE_MESSAGE_FONTS = (
     "Arial",
@@ -5177,7 +5178,7 @@ class EncryptedChatClient(QObject):
     def _blend_toward_chat_background(
         self,
         color: str,
-        amount: float = 0.70,
+        amount: float = 1.0 - MUTED_CONTENT_OPACITY,
     ) -> str:
         amount = max(0.0, min(1.0, amount))
         foreground = QColor(color)
@@ -5222,6 +5223,7 @@ class EncryptedChatClient(QObject):
         message_id: str,
         *,
         align_top: bool = False,
+        opacity: float = 1.0,
     ) -> bool:
         if not encoded_icon:
             return False
@@ -5260,6 +5262,22 @@ class EncryptedChatClient(QObject):
             padded_image.setDevicePixelRatio(1.0)
             displayed_image = padded_image
             resource_suffix = "-top-padded"
+
+        opacity = max(0.0, min(1.0, opacity))
+        if opacity < 1.0:
+            faded_image = QImage(
+                displayed_image.width(),
+                displayed_image.height(),
+                QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            faded_image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(faded_image)
+            painter.setOpacity(opacity)
+            painter.drawImage(0, 0, displayed_image)
+            painter.end()
+            faded_image.setDevicePixelRatio(1.0)
+            displayed_image = faded_image
+            resource_suffix += f"-opacity-{round(opacity * 100)}"
 
         resource_name = (
             "spritelink-profile-icon:"
@@ -5723,6 +5741,7 @@ class EncryptedChatClient(QObject):
             profile_icon,
             message_id,
             align_top=align_message_top,
+            opacity=MUTED_CONTENT_OPACITY if is_muted else 1.0,
         )
         if has_profile_icon:
             cursor.insertText(
