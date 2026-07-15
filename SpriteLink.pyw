@@ -4602,6 +4602,9 @@ class EncryptedChatClient(QObject):
         image_format.setName(resource_url.toString())
         image_format.setWidth(preview.width())
         image_format.setHeight(preview.height())
+        image_format.setVerticalAlignment(
+            QTextCharFormat.VerticalAlignment.AlignTop
+        )
         image_format.setAnchor(True)
         image_format.setAnchorHref(f"spritelink-image:{token}")
         cursor.insertImage(image_format)
