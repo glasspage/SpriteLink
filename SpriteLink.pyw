@@ -1979,12 +1979,12 @@ class EncryptedChatClient(QObject):
             | (qt_color.blue() << 16)
         )
 
-    def _apply_titlebar_theme(self) -> None:
+    def _apply_window_titlebar_theme(self, window: QWidget) -> None:
         if os.name != "nt" or not hasattr(ctypes, "windll"):
             return
 
         try:
-            hwnd = wintypes.HWND(int(self.root.winId()))
+            hwnd = wintypes.HWND(int(window.winId()))
             dwmapi = ctypes.windll.dwmapi
 
             def set_attribute(attribute: int, value: int) -> None:
@@ -2017,6 +2017,9 @@ class EncryptedChatClient(QObject):
         except Exception:
             # Older Windows versions do not expose the color attributes.
             pass
+
+    def _apply_titlebar_theme(self) -> None:
+        self._apply_window_titlebar_theme(self.root)
 
     def _apply_theme(self) -> None:
         app = QApplication.instance()
@@ -2947,12 +2950,19 @@ class EncryptedChatClient(QObject):
 
     def _choose_identity_color(self) -> None:
         preset = self._active_identity_preset()
-        selected = QColorDialog.getColor(
+        dialog = QColorDialog(
             QColor(preset["username_color"]),
             self.root,
-            "Choose name color",
-            QColorDialog.ColorDialogOption.DontUseNativeDialog,
         )
+        dialog.setWindowTitle("Choose name color")
+        dialog.setOption(
+            QColorDialog.ColorDialogOption.DontUseNativeDialog,
+            True,
+        )
+        self._apply_window_titlebar_theme(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dialog.currentColor()
         if not selected.isValid():
             return
         preset["username_color"] = selected.name()
@@ -2963,14 +2973,19 @@ class EncryptedChatClient(QObject):
         self._commit_identity_preset_changes(preset)
 
     def _choose_profile_icon(self) -> None:
-        source_path, _selected_filter = QFileDialog.getOpenFileName(
-            self.root,
-            "Choose icon",
-            "",
-            "PNG images (*.png)",
-            "",
+        dialog = QFileDialog(self.root, "Choose icon")
+        dialog.setOption(
             QFileDialog.Option.DontUseNativeDialog,
+            True,
         )
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setNameFilter("PNG images (*.png)")
+        self._apply_window_titlebar_theme(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected_files = dialog.selectedFiles()
+        source_path = selected_files[0] if selected_files else ""
         if not source_path:
             return
 
