@@ -1505,6 +1505,12 @@ class ChatroomListWidget(QListWidget):
             return
         super().mouseMoveEvent(event)
 
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
 
 class ThemeComboBox(QComboBox):
     """Draw a guaranteed-visible Classic arrow above Qt's styled control."""
