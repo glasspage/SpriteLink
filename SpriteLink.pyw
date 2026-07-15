@@ -22,6 +22,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from ctypes import wintypes
+from dataclasses import dataclass
 from functools import lru_cache
 from datetime import datetime
 import hashlib
@@ -42,7 +43,10 @@ import zlib
 from urllib.parse import parse_qs, urlsplit
 try:
     from PySide6.QtCore import (
+        QBuffer,
+        QByteArray,
         QEvent,
+        QIODevice,
         QObject,
         QPoint,
         QSize,
@@ -62,6 +66,7 @@ try:
         QIcon,
         QImage,
         QLinearGradient,
+        QMovie,
         QPainter,
         QPalette,
         QPixmap,
@@ -74,7 +79,12 @@ try:
         QTextImageFormat,
         QTextOption,
     )
-    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QSoundEffect
+    from PySide6.QtMultimedia import (
+        QAudioOutput,
+        QMediaPlayer,
+        QSoundEffect,
+        QVideoSink,
+    )
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -152,7 +162,7 @@ except ImportError as exc:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 21
+CONFIG_FORMAT_VERSION = 22
 WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
 
@@ -246,7 +256,12 @@ IMAGE_PREVIEW_MAX_WIDTH = CONFIG_POPUP_MAX_WIDTH - 32
 IMAGE_PREVIEW_MAX_HEIGHT = 480
 MAX_REMOTE_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_REMOTE_IMAGE_PIXELS = 16 * 1024 * 1024
+MAX_ANIMATED_IMAGE_PIXELS = 4 * 1024 * 1024
+MAX_ANIMATED_IMAGE_FRAMES = 500
 IMAGE_PREVIEW_CACHE_LIMIT = 128
+MAX_REMOTE_MEDIA_CACHE_BYTES = 64 * 1024 * 1024
+MAX_ACTIVE_ANIMATED_MEDIA = 12
+MIN_INLINE_ANIMATION_FRAME_MS = 75
 MAX_UNCOMPRESSED_MESSAGE_BYTES = 32 * 1024
 MAX_ENCRYPTED_PACKET_CHARS = NTFY_MAX_BODY_BYTES - 1
 MESSAGE_AUTH_VERSION = 1
@@ -259,6 +274,9 @@ TRUSTED_EXTENSIONLESS_IMAGE_HOSTS = (
     "images.unsplash.com",
     "pbs.twimg.com",
     "cdn.bsky.app",
+    "res.cloudinary.com",
+    "images.ctfassets.net",
+    "cdn.sanity.io",
 )
 TRUSTED_IMAGE_HOST_PATTERNS = (
     "cdn.discordapp.com",
@@ -271,8 +289,21 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "images.pexels.com",
     "cdn.bsky.app",
     "media.tenor.com",
+    "c.tenor.com",
     "media.giphy.com",
+    "media0.giphy.com",
+    "media1.giphy.com",
+    "media2.giphy.com",
+    "media3.giphy.com",
+    "media4.giphy.com",
     "i.giphy.com",
+    "klipy.com",
+    "*.klipy.com",
+    "res.cloudinary.com",
+    "images.ctfassets.net",
+    "cdn.sanity.io",
+    "live.staticflickr.com",
+    "cdn.pixabay.com",
     "static.wikia.nocookie.net",
     "avatars.githubusercontent.com",
     "user-images.githubusercontent.com",
@@ -280,6 +311,22 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "steamuserimages-a.akamaihd.net",
     "image.tmdb.org",
     "cdn.myanimelist.net",
+    "e621.net",
+    "*.e621.net",
+    "gelbooru.com",
+    "*.gelbooru.com",
+    "nhentai.net",
+    "*.nhentai.net",
+    "redgifs.com",
+    "*.redgifs.com",
+    "rule34.paheal.net",
+    "*.paheal.net",
+    "rule34.xxx",
+    "*.rule34.xxx",
+    "xbooru.com",
+    "*.xbooru.com",
+    "yande.re",
+    "*.yande.re",
 )
 IMAGE_LINK_EXTENSIONS = (
     ".png",
@@ -290,12 +337,20 @@ IMAGE_LINK_EXTENSIONS = (
     ".bmp",
     ".jfif",
 )
+TENOR_MEDIA_HOSTS = (
+    "media.tenor.com",
+    "c.tenor.com",
+)
+TENOR_VIDEO_EXTENSIONS = (
+    ".mp4",
+    ".webm",
+)
 LIKELY_NSFW_IMAGE_DOMAINS = (
     "e621.net",
     "gelbooru.com",
     "nhentai.net",
     "redgifs.com",
-    "rule34.paheal.net",
+    "paheal.net",
     "rule34.xxx",
     "xbooru.com",
     "yande.re",
@@ -900,7 +955,34 @@ def _image_hostname_matches_pattern(
         prefix = pattern[:-1]
         suffix = hostname[len(prefix):] if hostname.startswith(prefix) else ""
         return bool(suffix) and "." not in suffix
+    if pattern.startswith("*."):
+        return hostname.endswith(pattern[1:])
     return hostname == pattern
+
+
+def is_tenor_video_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    query_format = (
+        parse_qs(parsed.query).get("format", [""])[0]
+        .strip()
+        .casefold()
+    )
+    return (
+        parsed.scheme.casefold() in {"http", "https"}
+        and hostname in TENOR_MEDIA_HOSTS
+        and (
+            parsed.path.casefold().endswith(TENOR_VIDEO_EXTENSIONS)
+            or f".{query_format}" in TENOR_VIDEO_EXTENSIONS
+        )
+    )
+
+
+def is_embeddable_media_url(url: str) -> bool:
+    return is_direct_image_url(url) or is_tenor_video_url(url)
 
 
 def is_trusted_image_url(url: str) -> bool:
@@ -964,7 +1046,7 @@ def message_text_without_image_links(
     for start, end, url in message_url_spans(text):
         visible_parts.append(text[position:start])
         should_remove = (
-            is_direct_image_url(url)
+            is_embeddable_media_url(url)
             and (
                 embedded_image_urls is None
                 or url in embedded_image_urls
@@ -980,9 +1062,25 @@ def message_text_without_image_links(
 def direct_image_urls_in_message(text: str) -> list[str]:
     image_urls: list[str] = []
     for _start, _end, url in message_url_spans(text):
-        if is_direct_image_url(url) and url not in image_urls:
+        if is_embeddable_media_url(url) and url not in image_urls:
             image_urls.append(url)
     return image_urls
+
+
+def message_text_with_untrusted_images_hidden(
+    text: str,
+    untrusted_urls: set[str],
+) -> str:
+    visible_text = message_text_without_image_links(
+        text,
+        untrusted_urls,
+    )
+    visible_text = re.sub(r"[ \t]+", " ", visible_text).strip()
+    return (
+        f"[untrusted image] {visible_text}"
+        if visible_text
+        else "[untrusted image]"
+    )
 
 
 def _encode_identity_bytes(value: bytes) -> str:
@@ -2346,6 +2444,98 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+@dataclass
+class RemoteMediaPreview:
+    data: bytes
+    kind: str
+    frame: QImage | None
+
+
+class AnimatedMediaController(QObject):
+    frame_ready = Signal(str, object)
+
+    def __init__(
+        self,
+        url: str,
+        media: RemoteMediaPreview,
+        parent: QObject,
+    ) -> None:
+        super().__init__(parent)
+        self.url = url
+        self.media = media
+        self._buffer = QBuffer(self)
+        self._buffer.setData(QByteArray(media.data))
+        self._buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        self._movie: QMovie | None = None
+        self._player: QMediaPlayer | None = None
+        self._video_sink: QVideoSink | None = None
+
+    def start(self) -> None:
+        if self.media.kind == "animated_gif":
+            self._start_gif()
+        elif self.media.kind == "tenor_video":
+            self._start_video()
+
+    def _start_gif(self) -> None:
+        movie = QMovie(self._buffer, QByteArray(), self)
+        movie.setCacheMode(QMovie.CacheMode.CacheNone)
+        movie.frameChanged.connect(self._on_movie_frame_changed)
+        movie.finished.connect(self._restart_gif)
+        self._movie = movie
+        movie.start()
+
+    def _restart_gif(self) -> None:
+        movie = self._movie
+        if movie is None:
+            return
+        movie.stop()
+        self._buffer.seek(0)
+        movie.start()
+
+    def _on_movie_frame_changed(self, _frame_number: int) -> None:
+        movie = self._movie
+        if movie is not None:
+            self._emit_frame(movie.currentImage())
+
+    def _start_video(self) -> None:
+        video_sink = QVideoSink(self)
+        video_sink.videoFrameChanged.connect(self._on_video_frame_changed)
+        player = QMediaPlayer(self)
+        player.setVideoSink(video_sink)
+        player.setLoops(QMediaPlayer.Loops.Infinite)
+        player.setSourceDevice(self._buffer, QUrl(self.url))
+        self._video_sink = video_sink
+        self._player = player
+        player.play()
+
+    def _on_video_frame_changed(self, video_frame: Any) -> None:
+        self._emit_frame(video_frame.toImage())
+
+    def _emit_frame(self, frame: QImage) -> None:
+        if (
+            frame.isNull()
+            or frame.width() <= 0
+            or frame.height() <= 0
+            or frame.width() * frame.height() > MAX_REMOTE_IMAGE_PIXELS
+        ):
+            return
+        preview = frame.scaled(
+            IMAGE_PREVIEW_MAX_WIDTH,
+            IMAGE_PREVIEW_MAX_HEIGHT,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        preview.setDevicePixelRatio(1.0)
+        self.frame_ready.emit(self.url, preview.copy())
+
+    def stop(self) -> None:
+        if self._movie is not None:
+            self._movie.stop()
+        if self._player is not None:
+            self._player.stop()
+        self._buffer.close()
+
+
 class EncryptedChatClient(QObject):
     def __init__(self, root: MainWindow) -> None:
         super().__init__(root)
@@ -2394,8 +2584,14 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
         self.rendered_tooltips: dict[str, str] = {}
         self.rendered_image_links: dict[str, str] = {}
-        self.image_preview_cache: dict[str, QImage | None] = {}
+        self.rendered_image_positions: dict[str, list[int]] = {}
+        self.image_preview_cache: dict[str, RemoteMediaPreview | None] = {}
         self.pending_image_previews: set[str] = set()
+        self.animated_media_controllers: dict[
+            str,
+            AnimatedMediaController,
+        ] = {}
+        self.last_inline_animation_frame_at: dict[str, float] = {}
         self.current_image_preview_url: str | None = None
         self.recent_chatroom_switch_times: list[float] = []
         self.image_fetch_executor = ThreadPoolExecutor(
@@ -4076,25 +4272,75 @@ class EncryptedChatClient(QObject):
     def _sync_image_preview_overlay_geometry(self) -> None:
         self.image_preview_overlay.setGeometry(self.chat_content.rect())
 
-    def _show_image_preview_popup(self, url: str) -> None:
-        image = self.image_preview_cache.get(url)
-        if not isinstance(image, QImage) or image.isNull():
+    def _ensure_animated_media_controller(
+        self,
+        url: str,
+        media: RemoteMediaPreview,
+    ) -> None:
+        if media.kind not in {"animated_gif", "tenor_video"}:
             return
-        self._hide_chat_tooltip()
-        self.current_image_preview_url = url
-        self._sync_image_preview_overlay_geometry()
-        self.image_preview_overlay.show()
-        self.image_preview_overlay.raise_()
-        self._update_image_preview_popup()
-        QTimer.singleShot(0, self._update_image_preview_popup)
+        if url in self.animated_media_controllers:
+            return
 
-    def _update_image_preview_popup(self) -> None:
-        url = self.current_image_preview_url
-        image = self.image_preview_cache.get(url or "")
-        if not isinstance(image, QImage) or image.isNull():
-            self.image_preview_label.clear()
-            self.image_preview_url_label.clear()
+        while (
+            len(self.animated_media_controllers)
+            >= MAX_ACTIVE_ANIMATED_MEDIA
+        ):
+            oldest_url = next(iter(self.animated_media_controllers))
+            controller = self.animated_media_controllers.pop(oldest_url)
+            controller.stop()
+            controller.deleteLater()
+            self.last_inline_animation_frame_at.pop(oldest_url, None)
+
+        controller = AnimatedMediaController(url, media, self)
+        controller.frame_ready.connect(self._on_animated_media_frame)
+        self.animated_media_controllers[url] = controller
+        controller.start()
+
+    def _on_animated_media_frame(
+        self,
+        url: str,
+        frame_value: object,
+    ) -> None:
+        if not isinstance(frame_value, QImage) or frame_value.isNull():
             return
+        media = self.image_preview_cache.get(url)
+        if not isinstance(media, RemoteMediaPreview):
+            return
+        media.frame = frame_value
+
+        if self.current_image_preview_url == url:
+            self._set_large_image_preview_frame(frame_value)
+
+        if is_likely_nsfw_image_url(url):
+            return
+        image_positions = self.rendered_image_positions.get(url, [])
+        if not image_positions:
+            return
+
+        now = time.monotonic()
+        last_frame_at = self.last_inline_animation_frame_at.get(url, 0.0)
+        if (now - last_frame_at) * 1000.0 < MIN_INLINE_ANIMATION_FRAME_MS:
+            return
+        self.last_inline_animation_frame_at[url] = now
+
+        preview = self._scaled_inline_media_frame(
+            media,
+            frame_value,
+        )
+        token = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        resource_url = QUrl(f"spritelink-chat-image-resource:{token}")
+        document = self.chat_display.document()
+        document.addResource(
+            QTextDocument.ResourceType.ImageResource,
+            resource_url,
+            preview,
+        )
+        for position in image_positions:
+            document.markContentsDirty(position, 1)
+        self.chat_display.viewport().update()
+
+    def _set_large_image_preview_frame(self, image: QImage) -> None:
         available_width = max(
             EMBEDDED_IMAGE_MAX_EDGE,
             min(
@@ -4108,7 +4354,35 @@ class EncryptedChatClient(QObject):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+        self.image_preview_label.clear()
         self.image_preview_label.setPixmap(QPixmap.fromImage(preview))
+
+    def _show_image_preview_popup(self, url: str) -> None:
+        media = self.image_preview_cache.get(url)
+        if not isinstance(media, RemoteMediaPreview):
+            return
+        self._hide_chat_tooltip()
+        self.current_image_preview_url = url
+        self._ensure_animated_media_controller(url, media)
+        self._sync_image_preview_overlay_geometry()
+        self.image_preview_overlay.show()
+        self.image_preview_overlay.raise_()
+        self._update_image_preview_popup()
+        QTimer.singleShot(0, self._update_image_preview_popup)
+
+    def _update_image_preview_popup(self) -> None:
+        url = self.current_image_preview_url
+        media = self.image_preview_cache.get(url or "")
+        if not isinstance(media, RemoteMediaPreview):
+            self.image_preview_label.clear()
+            self.image_preview_url_label.clear()
+            return
+        self._ensure_animated_media_controller(url or "", media)
+        if isinstance(media.frame, QImage) and not media.frame.isNull():
+            self._set_large_image_preview_frame(media.frame)
+        else:
+            self.image_preview_label.setPixmap(QPixmap())
+            self.image_preview_label.setText("Loading...")
         label_width = max(1, self.image_preview_url_label.width())
         self.image_preview_url_label.setText(
             self.image_preview_url_label.fontMetrics().elidedText(
@@ -4120,11 +4394,18 @@ class EncryptedChatClient(QObject):
         self.image_preview_url_label.setToolTip(url or "")
 
     def _hide_image_preview_popup(self) -> None:
+        url = self.current_image_preview_url
         self.image_preview_overlay.hide()
         self.current_image_preview_url = None
         self.image_preview_label.clear()
         self.image_preview_url_label.clear()
         self.image_preview_url_label.setToolTip("")
+        if url and url not in self.rendered_image_positions:
+            controller = self.animated_media_controllers.pop(url, None)
+            if controller is not None:
+                controller.stop()
+                controller.deleteLater()
+            self.last_inline_animation_frame_at.pop(url, None)
         self.message_entry.setFocus()
 
     def _open_current_image_in_browser(self) -> None:
@@ -5434,21 +5715,48 @@ class EncryptedChatClient(QObject):
                 elif event_type == "image_preview_loaded":
                     url = str(payload.get("url", ""))
                     data = payload.get("data")
+                    kind = str(payload.get("kind", ""))
                     self.pending_image_previews.discard(url)
-                    image: QImage | None = None
+                    media: RemoteMediaPreview | None = None
                     if isinstance(data, bytes) and data:
-                        candidate = QImage.fromData(data)
-                        if not candidate.isNull():
-                            candidate.setDevicePixelRatio(1.0)
-                            image = candidate
-                    self.image_preview_cache[url] = image
+                        if kind == "tenor_video":
+                            media = RemoteMediaPreview(data, kind, None)
+                        elif kind in {"static_image", "animated_gif"}:
+                            candidate = QImage.fromData(data)
+                            if not candidate.isNull():
+                                candidate.setDevicePixelRatio(1.0)
+                                media = RemoteMediaPreview(
+                                    data,
+                                    kind,
+                                    candidate,
+                                )
+                    self.image_preview_cache[url] = media
                     while (
                         len(self.image_preview_cache)
                         > IMAGE_PREVIEW_CACHE_LIMIT
+                        or sum(
+                            len(cached.data)
+                            for cached in self.image_preview_cache.values()
+                            if isinstance(cached, RemoteMediaPreview)
+                        )
+                        > MAX_REMOTE_MEDIA_CACHE_BYTES
                     ):
                         oldest_url = next(iter(self.image_preview_cache))
                         self.image_preview_cache.pop(oldest_url, None)
-                    if image is not None and any(
+                        controller = (
+                            self.animated_media_controllers.pop(
+                                oldest_url,
+                                None,
+                            )
+                        )
+                        if controller is not None:
+                            controller.stop()
+                            controller.deleteLater()
+                        self.last_inline_animation_frame_at.pop(
+                            oldest_url,
+                            None,
+                        )
+                    if media is not None and any(
                         url in str(item.get("message", {}).get("m", ""))
                         for item in self.message_log
                         if isinstance(item, dict)
@@ -5980,12 +6288,14 @@ class EncryptedChatClient(QObject):
 
     def _fetch_remote_image_preview(self, url: str) -> None:
         image_data: bytes | None = None
+        media_kind: str | None = None
+        tenor_video = is_tenor_video_url(url)
         try:
             with requests.get(
                 url,
                 headers={
                     "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
-                    "Accept": "image/*",
+                    "Accept": "image/*, video/mp4, video/webm;q=0.9",
                 },
                 stream=True,
                 timeout=REQUEST_TIMEOUT_SECONDS,
@@ -5996,14 +6306,23 @@ class EncryptedChatClient(QObject):
                     "Content-Type",
                     "",
                 ).split(";", 1)[0].strip().casefold()
-                if content_type and not content_type.startswith("image/"):
+                if tenor_video:
+                    if content_type and content_type not in {
+                        "video/mp4",
+                        "video/webm",
+                        "application/octet-stream",
+                    }:
+                        raise ValueError(
+                            "The Tenor link did not return supported video."
+                        )
+                elif content_type and not content_type.startswith("image/"):
                     raise ValueError("The link did not return an image.")
                 content_length = response.headers.get("Content-Length")
                 if (
                     content_length
                     and int(content_length) > MAX_REMOTE_IMAGE_BYTES
                 ):
-                    raise ValueError("The linked image is too large.")
+                    raise ValueError("The linked media is too large.")
 
                 chunks: list[bytes] = []
                 total = 0
@@ -6012,27 +6331,79 @@ class EncryptedChatClient(QObject):
                         continue
                     total += len(chunk)
                     if total > MAX_REMOTE_IMAGE_BYTES:
-                        raise ValueError("The linked image is too large.")
+                        raise ValueError("The linked media is too large.")
                     chunks.append(chunk)
                 candidate = b"".join(chunks)
 
-            with Image.open(io.BytesIO(candidate)) as remote_image:
-                width, height = remote_image.size
-                if (
-                    width <= 0
-                    or height <= 0
-                    or width * height > MAX_REMOTE_IMAGE_PIXELS
-                ):
-                    raise ValueError("The linked image dimensions are too large.")
-                remote_image.verify()
+            if tenor_video:
+                parsed_url = urlsplit(url)
+                query_format = (
+                    parse_qs(parsed_url.query).get("format", [""])[0]
+                    .strip()
+                    .casefold()
+                )
+                is_webm = (
+                    parsed_url.path.casefold().endswith(".webm")
+                    or query_format == "webm"
+                    or content_type == "video/webm"
+                )
+                if is_webm:
+                    valid_container = candidate.startswith(
+                        b"\x1a\x45\xdf\xa3"
+                    )
+                else:
+                    valid_container = (
+                        len(candidate) >= 12
+                        and candidate[4:8] == b"ftyp"
+                    )
+                if not valid_container:
+                    raise ValueError("The Tenor video container is invalid.")
+                media_kind = "tenor_video"
+            else:
+                with Image.open(io.BytesIO(candidate)) as remote_image:
+                    width, height = remote_image.size
+                    if (
+                        width <= 0
+                        or height <= 0
+                        or width * height > MAX_REMOTE_IMAGE_PIXELS
+                    ):
+                        raise ValueError(
+                            "The linked image dimensions are too large."
+                        )
+                    frame_count = int(
+                        getattr(remote_image, "n_frames", 1)
+                    )
+                    is_animated_gif = (
+                        remote_image.format == "GIF"
+                        and bool(getattr(remote_image, "is_animated", False))
+                        and frame_count > 1
+                    )
+                    if is_animated_gif and (
+                        width * height > MAX_ANIMATED_IMAGE_PIXELS
+                        or frame_count > MAX_ANIMATED_IMAGE_FRAMES
+                    ):
+                        raise ValueError(
+                            "The animated image is too large."
+                        )
+                    remote_image.verify()
+                media_kind = (
+                    "animated_gif"
+                    if is_animated_gif
+                    else "static_image"
+                )
             image_data = candidate
         except Exception:
             image_data = None
+            media_kind = None
 
         if not self._closing:
             self.ui_queue.put((
                 "image_preview_loaded",
-                {"url": url, "data": image_data},
+                {
+                    "url": url,
+                    "data": image_data,
+                    "kind": media_kind,
+                },
             ))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
@@ -6411,23 +6782,57 @@ class EncryptedChatClient(QObject):
                 ),
             )
 
+    @staticmethod
+    def _scaled_inline_media_frame(
+        media: RemoteMediaPreview,
+        frame: QImage,
+    ) -> QImage:
+        preview = frame.scaled(
+            EMBEDDED_IMAGE_MAX_EDGE,
+            EMBEDDED_IMAGE_MAX_EDGE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        if media.kind != "tenor_video":
+            return preview
+
+        canvas = QImage(
+            EMBEDDED_IMAGE_MAX_EDGE,
+            EMBEDDED_IMAGE_MAX_EDGE,
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.drawImage(
+            (canvas.width() - preview.width()) // 2,
+            (canvas.height() - preview.height()) // 2,
+            preview,
+        )
+        painter.end()
+        return canvas
+
+    def _embedded_media_preview(
+        self,
+        url: str,
+        media: RemoteMediaPreview,
+    ) -> QImage:
+        if is_likely_nsfw_image_url(url):
+            return self._likely_nsfw_image_placeholder()
+        if isinstance(media.frame, QImage) and not media.frame.isNull():
+            return self._scaled_inline_media_frame(media, media.frame)
+        return self._animated_media_loading_placeholder()
+
     def _insert_embedded_image_preview(
         self,
         cursor: QTextCursor,
         url: str,
     ) -> bool:
-        image = self.image_preview_cache.get(url)
-        if not isinstance(image, QImage) or image.isNull():
+        media = self.image_preview_cache.get(url)
+        if not isinstance(media, RemoteMediaPreview):
             return False
-        if is_likely_nsfw_image_url(url):
-            preview = self._likely_nsfw_image_placeholder()
-        else:
-            preview = image.scaled(
-                EMBEDDED_IMAGE_MAX_EDGE,
-                EMBEDDED_IMAGE_MAX_EDGE,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+        if not is_likely_nsfw_image_url(url):
+            self._ensure_animated_media_controller(url, media)
+        preview = self._embedded_media_preview(url, media)
         token = hashlib.sha256(url.encode("utf-8")).hexdigest()
         self.rendered_image_links[token] = url
         resource_url = QUrl(f"spritelink-chat-image-resource:{token}")
@@ -6445,8 +6850,36 @@ class EncryptedChatClient(QObject):
         )
         image_format.setAnchor(True)
         image_format.setAnchorHref(f"spritelink-image:{token}")
+        image_position = cursor.position()
         cursor.insertImage(image_format)
+        self.rendered_image_positions.setdefault(url, []).append(
+            image_position
+        )
         return True
+
+    def _animated_media_loading_placeholder(self) -> QImage:
+        placeholder = QImage(
+            EMBEDDED_IMAGE_MAX_EDGE,
+            EMBEDDED_IMAGE_MAX_EDGE,
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        placeholder.fill(QColor("#ececec"))
+        painter = QPainter(placeholder)
+        painter.setRenderHint(
+            QPainter.RenderHint.TextAntialiasing,
+            not self._is_windows_classic_theme(),
+        )
+        painter.setPen(QColor("#aaaaaa"))
+        painter.drawRect(placeholder.rect().adjusted(0, 0, -1, -1))
+        painter.setPen(QColor("#555555"))
+        painter.setFont(self._make_font("Segoe UI", 8, bold=True))
+        painter.drawText(
+            placeholder.rect().adjusted(4, 4, -4, -4),
+            Qt.AlignmentFlag.AlignCenter,
+            "Loading...",
+        )
+        painter.end()
+        return placeholder
 
     def _likely_nsfw_image_placeholder(self) -> QImage:
         placeholder = QImage(
@@ -6525,6 +6958,7 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items.clear()
         self.rendered_tooltips.clear()
         self.rendered_image_links.clear()
+        self.rendered_image_positions.clear()
         self.chat_display.clear()
         self.chat_display.row_background_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
@@ -6615,6 +7049,17 @@ class EncryptedChatClient(QObject):
         self.chat_display.setExtraSelections(row_selections)
         self.chat_display.horizontalScrollBar().setValue(0)
 
+        active_animated_urls = set(self.rendered_image_positions)
+        if self.current_image_preview_url:
+            active_animated_urls.add(self.current_image_preview_url)
+        for url in list(self.animated_media_controllers):
+            if url in active_animated_urls:
+                continue
+            controller = self.animated_media_controllers.pop(url)
+            controller.stop()
+            controller.deleteLater()
+            self.last_inline_animation_frame_at.pop(url, None)
+
         if scroll_to_bottom:
             scrollbar = self.chat_display.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
@@ -6664,23 +7109,32 @@ class EncryptedChatClient(QObject):
                 trusted_image_user_ids,
             )
         }
-        has_untrusted_image = any(
-            url not in embedded_image_url_set
+        untrusted_image_urls = {
+            url
             for url in candidate_image_urls
-        )
-        display_text = (
-            self._collapsed_message_preview(text)
-            if is_collapsed
-            else text
-        )
-        if has_untrusted_image:
-            display_text = "[untrusted image] " + display_text
+            if url not in embedded_image_url_set
+        }
+        has_untrusted_image = bool(untrusted_image_urls)
+        if is_collapsed:
+            display_text = self._collapsed_message_preview(text)
+            if has_untrusted_image:
+                display_text = (
+                    "[untrusted image] "
+                    + display_text
+                )
+        elif has_untrusted_image:
+            display_text = message_text_with_untrusted_images_hidden(
+                text,
+                untrusted_image_urls,
+            )
+        else:
+            display_text = text
         image_urls = (
             []
             if is_collapsed
             else [
                 url
-                for url in direct_image_urls_in_message(display_text)
+                for url in candidate_image_urls
                 if url in embedded_image_url_set
             ]
         )
@@ -6743,21 +7197,16 @@ class EncryptedChatClient(QObject):
             ).strip()
         ):
             for url in image_urls:
-                cached_image = self.image_preview_cache.get(url)
-                if (
-                    isinstance(cached_image, QImage)
-                    and not cached_image.isNull()
-                ):
-                    if is_likely_nsfw_image_url(url):
-                        preview_height = NSFW_IMAGE_PLACEHOLDER_SIZE
-                    else:
-                        preview_height = cached_image.scaled(
-                            EMBEDDED_IMAGE_MAX_EDGE,
-                            EMBEDDED_IMAGE_MAX_EDGE,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation,
-                        ).height()
-                    top_align_height = max(top_align_height, preview_height)
+                cached_media = self.image_preview_cache.get(url)
+                if isinstance(cached_media, RemoteMediaPreview):
+                    preview_height = self._embedded_media_preview(
+                        url,
+                        cached_media,
+                    ).height()
+                    top_align_height = max(
+                        top_align_height,
+                        preview_height,
+                    )
         align_message_top = top_align_height > 0
 
         has_profile_icon = self._insert_profile_icon(
@@ -6923,6 +7372,7 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items.clear()
         self.rendered_tooltips.clear()
         self.rendered_image_links.clear()
+        self.rendered_image_positions.clear()
         self.chat_display.row_background_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
         self.chat_display.setExtraSelections([])
@@ -7158,6 +7608,10 @@ class EncryptedChatClient(QObject):
 
         self.stop_event.set()
         self.ui_queue_timer.stop()
+        for controller in self.animated_media_controllers.values():
+            controller.stop()
+        self.animated_media_controllers.clear()
+        self.last_inline_animation_frame_at.clear()
         self.image_fetch_executor.shutdown(
             wait=False,
             cancel_futures=True,
