@@ -712,6 +712,21 @@ def is_direct_image_url(url: str) -> bool:
     )
 
 
+def message_contains_only_image_links(text: str) -> bool:
+    visible_parts: list[str] = []
+    position = 0
+    found_image_link = False
+    for start, end, url in message_url_spans(text):
+        visible_parts.append(text[position:start])
+        if is_direct_image_url(url):
+            found_image_link = True
+        else:
+            visible_parts.append(text[start:end])
+        position = end
+    visible_parts.append(text[position:])
+    return found_image_link and not "".join(visible_parts).strip()
+
+
 def default_config() -> dict[str, Any]:
     global_profile = default_room_profile()
     return {
@@ -4870,7 +4885,10 @@ class EncryptedChatClient(QObject):
             )
 
         top_align_height = 0
-        if not is_collapsed:
+        if (
+            not is_collapsed
+            and message_contains_only_image_links(text)
+        ):
             for _start, _end, url in message_url_spans(text):
                 cached_image = self.image_preview_cache.get(url)
                 if (
