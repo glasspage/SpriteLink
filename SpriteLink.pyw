@@ -44,6 +44,7 @@ try:
         QEvent,
         QObject,
         QPoint,
+        QSize,
         QTimer,
         Qt,
         QUrl,
@@ -1523,6 +1524,12 @@ class IdentityPresetSelector(QPushButton):
 
         self.preset_list = QListWidget()
         self.preset_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.preset_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.preset_list.setIconSize(QSize(16, 16))
+        self.preset_list.setSpacing(0)
+        self.preset_list.setUniformItemSizes(True)
         self.preset_list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
@@ -1559,6 +1566,7 @@ class IdentityPresetSelector(QPushButton):
         selected_preset: dict[str, str] | None = None
         for preset in presets:
             item = QListWidgetItem(preset.get("username", "User"))
+            item.setSizeHint(QSize(0, self._preset_row_height()))
             preset_icon = self._preset_icon(
                 preset.get("profile_icon", "")
             )
@@ -1586,6 +1594,15 @@ class IdentityPresetSelector(QPushButton):
         self.setStyleSheet(
             f"color: {selected_preset['username_color']};"
         )
+        if self.popup.isVisible():
+            self._resize_popup_to_contents()
+
+    def _preset_row_height(self) -> int:
+        return max(
+            20,
+            self.preset_list.fontMetrics().height() + 4,
+            self.preset_list.iconSize().height() + 4,
+        )
 
     def _toggle_popup(self) -> None:
         if self._suppress_next_open:
@@ -1598,15 +1615,7 @@ class IdentityPresetSelector(QPushButton):
         self._show_popup()
 
     def _show_popup(self) -> None:
-        row_count = max(1, min(7, self.preset_list.count()))
-        fallback_row_height = self.preset_list.fontMetrics().height() + 4
-        list_height = self.preset_list.frameWidth() * 2
-        for row in range(row_count):
-            row_height = self.preset_list.sizeHintForRow(row)
-            list_height += max(1, row_height, fallback_row_height)
-        self.preset_list.setFixedHeight(list_height)
-        self.popup.setFixedWidth(max(230, self.width()))
-        self.popup.adjustSize()
+        self._resize_popup_to_contents()
         popup_position = self.mapToGlobal(QPoint(0, self.height()))
         screen = QApplication.screenAt(popup_position)
         if (
@@ -1620,6 +1629,16 @@ class IdentityPresetSelector(QPushButton):
         self.popup.move(popup_position)
         self.popup.show()
         self.popup.raise_()
+
+    def _resize_popup_to_contents(self) -> None:
+        row_count = max(1, min(7, self.preset_list.count()))
+        list_height = (
+            self.preset_list.frameWidth() * 2
+            + row_count * self._preset_row_height()
+        )
+        self.preset_list.setFixedHeight(list_height)
+        self.popup.setFixedWidth(max(230, self.width()))
+        self.popup.adjustSize()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self.popup and event.type() == QEvent.Type.Hide:
@@ -1641,8 +1660,10 @@ class IdentityPresetSelector(QPushButton):
         remove_action = menu.addAction("Remove")
         selected = menu.exec(self.preset_list.mapToGlobal(position))
         if selected is remove_action:
-            self.popup.hide()
             self.removeRequested.emit(preset_id)
+            self._suppress_next_open = False
+            if not self.popup.isVisible():
+                self._show_popup()
 
     def _request_new_identity(self) -> None:
         self.popup.hide()
@@ -2657,7 +2678,7 @@ class EncryptedChatClient(QObject):
         identity_color_button.clicked.connect(self._choose_identity_color)
         identity_layout.addWidget(identity_color_button)
         identity_layout.addSpacing(8)
-        identity_layout.addWidget(QLabel("Icon"))
+        identity_layout.addWidget(QLabel("Icon (16x16)"))
         self.profile_icon_preview = QLabel()
         self.profile_icon_preview.setFixedSize(26, 22)
         self.profile_icon_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2929,7 +2950,8 @@ class EncryptedChatClient(QObject):
         selected = QColorDialog.getColor(
             QColor(preset["username_color"]),
             self.root,
-            "Choose username color",
+            "Choose name color",
+            QColorDialog.ColorDialogOption.DontUseNativeDialog,
         )
         if not selected.isValid():
             return
@@ -2943,9 +2965,11 @@ class EncryptedChatClient(QObject):
     def _choose_profile_icon(self) -> None:
         source_path, _selected_filter = QFileDialog.getOpenFileName(
             self.root,
-            "Choose profile icon",
+            "Choose icon",
             "",
             "PNG images (*.png)",
+            "",
+            QFileDialog.Option.DontUseNativeDialog,
         )
         if not source_path:
             return
