@@ -4,16 +4,29 @@ import os
 
 
 version_file = os.environ.get("SPRITELINK_VERSION_FILE")
+generated_module_directory = os.environ.get(
+    "SPRITELINK_GENERATED_MODULE_DIRECTORY"
+)
+generated_module_paths = (
+    [generated_module_directory]
+    if generated_module_directory
+    else []
+)
+generated_hidden_imports = (
+    ["spritelink_build_version"]
+    if generated_module_directory
+    else []
+)
 
 a = Analysis(
     ["SpriteLink.pyw"],
-    pathex=[],
+    pathex=generated_module_paths,
     binaries=[],
     datas=[
         ("SL.ico", "."),
         ("sounds", "sounds"),
     ],
-    hiddenimports=[],
+    hiddenimports=generated_hidden_imports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -48,4 +61,3 @@ coll = COLLECT(
     upx_exclude=[],
     name="SpriteLink",
 )
-

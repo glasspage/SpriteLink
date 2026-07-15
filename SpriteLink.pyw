@@ -32,6 +32,7 @@ from pathlib import Path
 import queue
 import re
 import secrets
+import subprocess
 import threading
 import time
 import traceback
@@ -121,6 +122,15 @@ except ImportError as exc:
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
 
+from spritelink_update import (
+    ReleaseInfo,
+    UpdateError,
+    download_release_installer,
+    fetch_latest_release,
+    parse_semantic_version,
+    release_is_newer,
+)
+
 try:
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 except ImportError as exc:
@@ -139,9 +149,33 @@ except ImportError as exc:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 17
+CONFIG_FORMAT_VERSION = 18
 WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
+
+try:
+    from spritelink_build_version import VERSION as RUNNING_VERSION
+except ImportError:
+    RUNNING_VERSION = "Development"
+
+UPDATE_REPOSITORY = "QuestCraftEnjoyer/SpriteLink"
+UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
+UPDATE_DIRECTORY = Path(
+    os.environ.get("LOCALAPPDATA")
+    or os.environ.get("APPDATA")
+    or Path.home()
+) / APP_NAME / "updates"
+
+NOTIFICATION_BUTTON_STYLESHEET = (
+    "QPushButton {"
+    " background-color: #f8d8ad;"
+    " color: #8a4b08;"
+    " border: 1px solid #dca15d;"
+    " border-radius: 3px;"
+    "}"
+    "QPushButton:hover { background-color: #f3c78d; }"
+    "QPushButton:pressed { background-color: #efb968; }"
+)
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
@@ -861,6 +895,7 @@ def default_config() -> dict[str, Any]:
         "message_sound": DEFAULT_MESSAGE_SOUND,
         "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
         "custom_message_sound_path": "",
+        "automatic_update_checks": True,
         "client_id": secrets.token_hex(32),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
@@ -953,6 +988,9 @@ def load_config() -> dict[str, Any]:
         custom_message_sound_path
         if isinstance(custom_message_sound_path, str)
         else ""
+    )
+    config["automatic_update_checks"] = bool(
+        config.get("automatic_update_checks", True)
     )
     config.pop("chime_enabled", None)
 
@@ -1412,6 +1450,17 @@ class MessageBoxes:
     @staticmethod
     def showinfo(title: str, text: str, parent: QWidget | None = None) -> None:
         QMessageBox.information(parent, title, str(text))
+
+    @staticmethod
+    def askyesno(title: str, text: str, parent: QWidget | None = None) -> bool:
+        return QMessageBox.question(
+            parent,
+            title,
+            str(text),
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
 
 
 messagebox = MessageBoxes()
@@ -2082,6 +2131,10 @@ class EncryptedChatClient(QObject):
             except Exception:
                 pass
         self._closing = False
+        self.available_update: ReleaseInfo | None = None
+        self._update_check_in_progress = False
+        self._update_download_in_progress = False
+        self._last_update_check_started_at = 0.0
 
         self.server_preset_var = ValueModel(
             self.config_data["server_preset"]
@@ -2100,6 +2153,9 @@ class EncryptedChatClient(QObject):
         )
         self.custom_message_sound_path_var = ValueModel(
             str(self.config_data["custom_message_sound_path"])
+        )
+        self.automatic_update_checks_var = ValueModel(
+            bool(self.config_data.get("automatic_update_checks", True))
         )
         self.status_var = ValueModel("Connecting")
 
@@ -2127,6 +2183,12 @@ class EncryptedChatClient(QObject):
         self.message_sound_stop_timer.setSingleShot(True)
         self.message_sound_stop_timer.timeout.connect(
             self._stop_message_sound
+        )
+
+        self.update_check_timer = QTimer(self)
+        self.update_check_timer.setInterval(UPDATE_CHECK_INTERVAL_MS)
+        self.update_check_timer.timeout.connect(
+            self._maybe_check_for_updates
         )
         self.message_sound_effects: dict[str, QSoundEffect] = {}
         self.active_message_sound_effect: QSoundEffect | None = None
@@ -2163,6 +2225,8 @@ class EncryptedChatClient(QObject):
 
         self.root.close_callback = self._on_close
         QTimer.singleShot(0, self._apply_titlebar_theme)
+        QTimer.singleShot(3000, self._maybe_check_for_updates)
+        self.update_check_timer.start()
         self._start_network_thread()
 
     def _font_style_strategy(self) -> QFont.StyleStrategy:
@@ -2382,6 +2446,8 @@ class EncryptedChatClient(QObject):
             self._draw_message_size_bar()
         if hasattr(self, "chatrooms_toggle"):
             self._update_chatrooms_toggle_unread_style()
+        if hasattr(self, "config_toggle"):
+            self._update_config_toggle_update_style()
         self._apply_titlebar_theme()
 
     def _heading(self, text: str) -> QLabel:
@@ -2699,17 +2765,24 @@ class EncryptedChatClient(QObject):
         )
         if has_visible_unread:
             self.chatrooms_toggle.setStyleSheet(
-                "QPushButton {"
-                " background-color: #f8d8ad;"
-                " color: #8a4b08;"
-                " border: 1px solid #dca15d;"
-                " border-radius: 3px;"
-                "}"
-                "QPushButton:hover { background-color: #f3c78d; }"
-                "QPushButton:pressed { background-color: #efb968; }"
+                NOTIFICATION_BUTTON_STYLESHEET
             )
         else:
             self.chatrooms_toggle.setStyleSheet("")
+
+    def _update_config_toggle_update_style(self) -> None:
+        if not hasattr(self, "config_toggle"):
+            return
+        if self.available_update is not None:
+            self.config_toggle.setStyleSheet(
+                NOTIFICATION_BUTTON_STYLESHEET
+            )
+            self.config_toggle.setToolTip(
+                f"SpriteLink {self.available_update.version} is available."
+            )
+        else:
+            self.config_toggle.setStyleSheet("")
+            self.config_toggle.setToolTip("")
 
     def _unread_counts(self) -> dict[str, int]:
         unread_counts = self.config_data.setdefault("unread_counts", {})
@@ -3048,6 +3121,7 @@ class EncryptedChatClient(QObject):
         self.config_toggle = QPushButton("Config")
         self.config_toggle.setCheckable(True)
         self.config_toggle.toggled.connect(self._on_config_toggled)
+        self._update_config_toggle_update_style()
         status_layout.addWidget(self.config_toggle)
         layout.addLayout(status_layout)
 
@@ -3844,6 +3918,64 @@ class EncryptedChatClient(QObject):
 
         layout.addWidget(self._separator(), row, 0, 1, 3)
         row += 1
+        layout.addWidget(self._heading("Version"), row, 0, 1, 3)
+        row += 1
+
+        layout.addWidget(QLabel("Current Version"), row, 0)
+        self.current_version_label = QLabel(RUNNING_VERSION)
+        layout.addWidget(self.current_version_label, row, 1, 1, 2)
+        row += 1
+
+        layout.addWidget(QLabel("Update Checks"), row, 0)
+        self.automatic_update_checks_checkbox = QCheckBox(
+            "Check automatically"
+        )
+        self.automatic_update_checks_checkbox.setChecked(
+            bool(self.automatic_update_checks_var.get())
+        )
+        self.automatic_update_checks_checkbox.toggled.connect(
+            self._on_automatic_update_checks_toggled
+        )
+        self.automatic_update_checks_var.bind(
+            self.automatic_update_checks_checkbox.setChecked
+        )
+        layout.addWidget(
+            self.automatic_update_checks_checkbox,
+            row,
+            1,
+            1,
+            2,
+        )
+        row += 1
+
+        layout.addWidget(QLabel("Status"), row, 0)
+        self.version_status_label = QLabel(
+            "Not checked yet."
+            if parse_semantic_version(RUNNING_VERSION) is not None
+            else "Update checks require a packaged build."
+        )
+        self.version_status_label.setWordWrap(True)
+        layout.addWidget(self.version_status_label, row, 1, 1, 2)
+        row += 1
+
+        version_button_row = QHBoxLayout()
+        version_button_row.addStretch(1)
+        self.check_for_updates_button = QPushButton("Check for Updates")
+        self.check_for_updates_button.clicked.connect(
+            lambda: self._check_for_updates(manual=True)
+        )
+        version_button_row.addWidget(self.check_for_updates_button)
+        self.update_now_button = QPushButton("Update Now")
+        self.update_now_button.clicked.connect(
+            self._on_update_now_clicked
+        )
+        self.update_now_button.hide()
+        version_button_row.addWidget(self.update_now_button)
+        layout.addLayout(version_button_row, row, 0, 1, 3)
+        row += 1
+
+        layout.addWidget(self._separator(), row, 0, 1, 3)
+        row += 1
 
         self.advanced_config_toggle = QPushButton("Advanced ▶")
         self.advanced_config_toggle.setCheckable(True)
@@ -3980,6 +4112,214 @@ class EncryptedChatClient(QObject):
             )
         self._play_message_sound(report_errors=True)
 
+    def _on_automatic_update_checks_toggled(self, checked: bool) -> None:
+        self.automatic_update_checks_var.set(bool(checked))
+        if checked and self.available_update is None:
+            QTimer.singleShot(0, self._maybe_check_for_updates)
+
+    def _maybe_check_for_updates(self) -> None:
+        if not bool(self.automatic_update_checks_var.get()):
+            return
+        if time.monotonic() - self._last_update_check_started_at < 300:
+            return
+        self._check_for_updates(manual=False)
+
+    def _check_for_updates(self, *, manual: bool) -> None:
+        if self._closing or self._update_check_in_progress:
+            return
+        if parse_semantic_version(RUNNING_VERSION) is None:
+            self.version_status_label.setText(
+                "Update checks require a packaged build."
+            )
+            return
+
+        self._update_check_in_progress = True
+        self._last_update_check_started_at = time.monotonic()
+        self.update_check_timer.start()
+        self.check_for_updates_button.setEnabled(False)
+        self.version_status_label.setStyleSheet("")
+        self.version_status_label.setToolTip("")
+        self.version_status_label.setText("Checking for updates...")
+        threading.Thread(
+            target=self._check_for_updates_worker,
+            args=(manual,),
+            daemon=True,
+            name="SpriteLinkUpdateCheck",
+        ).start()
+
+    def _check_for_updates_worker(self, manual: bool) -> None:
+        try:
+            release = fetch_latest_release(
+                UPDATE_REPOSITORY,
+                current_version=RUNNING_VERSION,
+            )
+        except Exception as exc:
+            error = str(exc) or "The update check failed."
+            self.ui_queue.put((
+                "update_check_result",
+                {
+                    "error": error,
+                    "manual": manual,
+                },
+            ))
+            return
+
+        self.ui_queue.put((
+            "update_check_result",
+            {
+                "release": release,
+                "manual": manual,
+            },
+        ))
+
+    def _handle_update_check_result(self, payload: dict[str, Any]) -> None:
+        self._update_check_in_progress = False
+        self.check_for_updates_button.setEnabled(
+            not self._update_download_in_progress
+        )
+
+        error = str(payload.get("error", "")).strip()
+        if error:
+            if self.available_update is None:
+                self.version_status_label.setText(
+                    "Could not check for updates."
+                )
+                self.version_status_label.setStyleSheet("color: #b00020;")
+            else:
+                self.version_status_label.setText(
+                    f"SpriteLink {self.available_update.version} is available."
+                )
+                self.version_status_label.setStyleSheet(
+                    "color: #d97706; font-weight: 600;"
+                )
+            self.version_status_label.setToolTip(error)
+            return
+
+        release = payload.get("release")
+        if not isinstance(release, ReleaseInfo):
+            self.version_status_label.setText(
+                "GitHub returned an invalid update response."
+            )
+            self.version_status_label.setStyleSheet("color: #b00020;")
+            return
+
+        self.version_status_label.setToolTip(release.page_url)
+        if release_is_newer(RUNNING_VERSION, release.version):
+            self.available_update = release
+            self.version_status_label.setText(
+                f"SpriteLink {release.version} is available."
+            )
+            self.version_status_label.setStyleSheet(
+                "color: #d97706; font-weight: 600;"
+            )
+            self.update_now_button.setText(
+                f"Update to {release.version}"
+            )
+            self.update_now_button.setToolTip(release.notes.strip())
+            self.update_now_button.show()
+            self._update_config_toggle_update_style()
+            if self.config_overlay.isVisible():
+                self.update_now_button.setFocus()
+            return
+
+        self.available_update = None
+        self.version_status_label.setText("SpriteLink is up to date.")
+        self.version_status_label.setStyleSheet("")
+        self.update_now_button.hide()
+        self.update_now_button.setToolTip("")
+        self._update_config_toggle_update_style()
+
+    def _on_update_now_clicked(self) -> None:
+        release = self.available_update
+        if release is None or self._update_download_in_progress:
+            return
+        if not messagebox.askyesno(
+            "Update SpriteLink",
+            f"Download and install SpriteLink {release.version} now?\n\n"
+            "SpriteLink will close and reopen after the update.",
+            parent=self.root,
+        ):
+            return
+        if not self._save_settings():
+            return
+
+        self._update_download_in_progress = True
+        self.update_now_button.setEnabled(False)
+        self.check_for_updates_button.setEnabled(False)
+        self.version_status_label.setStyleSheet("")
+        self.version_status_label.setText(
+            f"Downloading SpriteLink {release.version}..."
+        )
+        threading.Thread(
+            target=self._download_update_worker,
+            args=(release,),
+            daemon=True,
+            name="SpriteLinkUpdateDownload",
+        ).start()
+
+    def _download_update_worker(self, release: ReleaseInfo) -> None:
+        try:
+            installer_path = download_release_installer(
+                release,
+                UPDATE_DIRECTORY,
+            )
+        except Exception as exc:
+            self.ui_queue.put((
+                "update_download_failed",
+                str(exc) or "The update download failed.",
+            ))
+            return
+        self.ui_queue.put((
+            "update_download_ready",
+            {
+                "path": str(installer_path),
+                "version": release.version,
+            },
+        ))
+
+    def _handle_update_download_failed(self, error: str) -> None:
+        self._update_download_in_progress = False
+        self.update_now_button.setEnabled(True)
+        self.check_for_updates_button.setEnabled(True)
+        self.version_status_label.setText("The update could not be installed.")
+        self.version_status_label.setStyleSheet("color: #b00020;")
+        self.version_status_label.setToolTip(error)
+        messagebox.showerror(
+            "Could not update SpriteLink",
+            error,
+            parent=self.root,
+        )
+
+    def _launch_downloaded_update(self, payload: dict[str, Any]) -> None:
+        installer_path = Path(str(payload.get("path", "")))
+        version = str(payload.get("version", ""))
+        if not installer_path.is_file():
+            self._handle_update_download_failed(
+                "The downloaded installer could not be found."
+            )
+            return
+
+        try:
+            subprocess.Popen(
+                [
+                    str(installer_path),
+                    "/SP-",
+                    "/VERYSILENT",
+                    "/SUPPRESSMSGBOXES",
+                    "/NORESTART",
+                    "/CLOSEAPPLICATIONS",
+                ],
+                cwd=str(installer_path.parent),
+            )
+        except OSError as exc:
+            self._handle_update_download_failed(str(exc))
+            return
+
+        self.version_status_label.setText(
+            f"Installing SpriteLink {version}..."
+        )
+        QTimer.singleShot(250, self.root.close)
+
     def _sync_config_overlay_geometry(self) -> None:
         self.config_overlay.setGeometry(self.chat_content.rect())
 
@@ -3990,6 +4330,7 @@ class EncryptedChatClient(QObject):
             str(self.message_sound_var.get()),
             int(self.message_sound_volume_var.get()),
             str(self.custom_message_sound_path_var.get()),
+            bool(self.automatic_update_checks_var.get()),
         )
 
     def _set_config_toggle_checked(self, checked: bool) -> None:
@@ -4003,7 +4344,11 @@ class EncryptedChatClient(QObject):
             self._sync_config_overlay_geometry()
             self.config_overlay.show()
             self.config_overlay.raise_()
-            self.theme_combo.setFocus()
+            (
+                self.update_now_button
+                if self.available_update is not None
+                else self.theme_combo
+            ).setFocus()
             return
 
         self._dismiss_config_popup()
@@ -4103,6 +4448,9 @@ class EncryptedChatClient(QObject):
         )
         self.config_data["custom_message_sound_path"] = str(
             self.custom_message_sound_path_var.get()
+        )
+        self.config_data["automatic_update_checks"] = bool(
+            self.automatic_update_checks_var.get()
         )
         self.config_data.pop("chime_enabled", None)
 
@@ -4861,6 +5209,17 @@ class EncryptedChatClient(QObject):
                         if isinstance(item, dict)
                     ):
                         self._rerender_preserving_scroll()
+
+                elif event_type == "update_check_result":
+                    if isinstance(payload, dict):
+                        self._handle_update_check_result(payload)
+
+                elif event_type == "update_download_failed":
+                    self._handle_update_download_failed(str(payload))
+
+                elif event_type == "update_download_ready":
+                    if isinstance(payload, dict):
+                        self._launch_downloaded_update(payload)
 
                 elif event_type == "decrypt_failures":
                     pass
@@ -6505,6 +6864,7 @@ class EncryptedChatClient(QObject):
             return
         self._closing = True
         QToolTip.hideText()
+        self.update_check_timer.stop()
         self.message_sound_stop_timer.stop()
         self._stop_message_sound()
 

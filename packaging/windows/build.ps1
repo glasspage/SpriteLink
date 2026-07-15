@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidatePattern('^\d+\.\d+\.\d+$')]
+    [ValidatePattern('^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')]
     [string] $Version = "0.1.0"
 )
 
@@ -10,6 +10,12 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $versionInfoPath = Join-Path ([System.IO.Path]::GetTempPath()) (
     "spritelink-version-{0}.txt" -f $PID
 )
+$generatedModuleDirectory = Join-Path (
+    [System.IO.Path]::GetTempPath()
+) ("spritelink-build-{0}" -f $PID)
+$generatedVersionModulePath = Join-Path (
+    $generatedModuleDirectory
+) "spritelink_build_version.py"
 
 $versionParts = @($Version.Split(".") | ForEach-Object { [int] $_ })
 $versionTuple = @($versionParts[0], $versionParts[1], $versionParts[2], 0)
@@ -54,6 +60,15 @@ Push-Location $projectRoot
 try {
     Set-Content -Path $versionInfoPath -Value $versionInfo -Encoding utf8
     $env:SPRITELINK_VERSION_FILE = $versionInfoPath
+    New-Item -ItemType Directory -Force -Path (
+        $generatedModuleDirectory
+    ) | Out-Null
+    Set-Content -Path $generatedVersionModulePath `
+        -Value "VERSION = `"$Version`"" `
+        -Encoding utf8
+    $env:SPRITELINK_GENERATED_MODULE_DIRECTORY = (
+        $generatedModuleDirectory
+    )
 
     python -m PyInstaller --noconfirm --clean SpriteLink.spec
     if ($LASTEXITCODE -ne 0) {
@@ -85,6 +100,9 @@ try {
 } finally {
     Pop-Location
     Remove-Item Env:SPRITELINK_VERSION_FILE -ErrorAction SilentlyContinue
+    Remove-Item Env:SPRITELINK_GENERATED_MODULE_DIRECTORY `
+        -ErrorAction SilentlyContinue
     Remove-Item $versionInfoPath -ErrorAction SilentlyContinue
+    Remove-Item $generatedModuleDirectory -Recurse -Force `
+        -ErrorAction SilentlyContinue
 }
-
