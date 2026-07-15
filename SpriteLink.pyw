@@ -139,7 +139,7 @@ except ImportError as exc:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 16
+CONFIG_FORMAT_VERSION = 17
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
@@ -939,7 +939,7 @@ def load_config() -> dict[str, Any]:
     except (TypeError, ValueError):
         message_sound_volume = DEFAULT_MESSAGE_SOUND_VOLUME
     config["message_sound_volume"] = max(
-        0,
+        10,
         min(100, ((message_sound_volume + 5) // 10) * 10),
     )
     custom_message_sound_path = config.get(
@@ -3804,7 +3804,7 @@ class EncryptedChatClient(QObject):
         self.message_sound_volume_slider = QSlider(
             Qt.Orientation.Horizontal
         )
-        self.message_sound_volume_slider.setRange(0, 10)
+        self.message_sound_volume_slider.setRange(1, 10)
         self.message_sound_volume_slider.setSingleStep(1)
         self.message_sound_volume_slider.setPageStep(1)
         self.message_sound_volume_slider.setMinimumWidth(120)
@@ -3952,7 +3952,7 @@ class EncryptedChatClient(QObject):
         self._play_message_sound(report_errors=True)
 
     def _on_message_sound_volume_changed(self, slider_value: int) -> None:
-        volume_percent = max(0, min(10, int(slider_value))) * 10
+        volume_percent = max(1, min(10, int(slider_value))) * 10
         self.message_sound_volume_var.set(volume_percent)
         self.message_sound_volume_label.setText(
             f"Volume: {volume_percent}%"
@@ -3998,13 +3998,22 @@ class EncryptedChatClient(QObject):
             self._set_config_toggle_checked(False)
             return True
 
-        changed = (
-            self._config_snapshot_at_open is not None
-            and self._config_ui_snapshot() != self._config_snapshot_at_open
-        )
-        if changed and not self._save_and_reconnect():
-            self._set_config_toggle_checked(True)
-            return False
+        current_snapshot = self._config_ui_snapshot()
+        if self._config_snapshot_at_open is not None:
+            changed = current_snapshot != self._config_snapshot_at_open
+            server_changed = (
+                current_snapshot[:2]
+                != self._config_snapshot_at_open[:2]
+            )
+            if changed:
+                save_succeeded = (
+                    self._save_and_reconnect()
+                    if server_changed
+                    else self._save_settings()
+                )
+                if not save_succeeded:
+                    self._set_config_toggle_checked(True)
+                    return False
 
         self.config_overlay.hide()
         self._set_config_toggle_checked(False)
@@ -4074,7 +4083,7 @@ class EncryptedChatClient(QObject):
             else DEFAULT_MESSAGE_SOUND
         )
         self.config_data["message_sound_volume"] = max(
-            0,
+            10,
             min(100, int(self.message_sound_volume_var.get())),
         )
         self.config_data["custom_message_sound_path"] = str(
@@ -4082,7 +4091,7 @@ class EncryptedChatClient(QObject):
         )
         self.config_data.pop("chime_enabled", None)
 
-    def _save_and_reconnect(self) -> bool:
+    def _save_settings(self) -> bool:
         try:
             self._copy_ui_to_config()
             save_config(self.config_data)
@@ -4092,6 +4101,11 @@ class EncryptedChatClient(QObject):
                 str(exc),
                 parent=self.root,
             )
+            return False
+        return True
+
+    def _save_and_reconnect(self) -> bool:
+        if not self._save_settings():
             return False
 
         self._clear_visible_room()
