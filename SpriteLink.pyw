@@ -713,18 +713,22 @@ def is_direct_image_url(url: str) -> bool:
 
 
 def message_contains_only_image_links(text: str) -> bool:
+    return (
+        bool(direct_image_urls_in_message(text))
+        and not message_text_without_image_links(text).strip()
+    )
+
+
+def message_text_without_image_links(text: str) -> str:
     visible_parts: list[str] = []
     position = 0
-    found_image_link = False
     for start, end, url in message_url_spans(text):
         visible_parts.append(text[position:start])
-        if is_direct_image_url(url):
-            found_image_link = True
-        else:
+        if not is_direct_image_url(url):
             visible_parts.append(text[start:end])
         position = end
     visible_parts.append(text[position:])
-    return found_image_link and not "".join(visible_parts).strip()
+    return "".join(visible_parts)
 
 
 def direct_image_urls_in_message(text: str) -> list[str]:
@@ -4975,6 +4979,16 @@ class EncryptedChatClient(QObject):
             if is_collapsed
             else direct_image_urls_in_message(display_text)
         )
+        visible_text_without_images = message_text_without_image_links(
+            display_text
+        )
+        add_image_line_break = (
+            bool(image_urls)
+            and bool(visible_text_without_images.strip())
+            and not visible_text_without_images.rstrip(" \t").endswith(
+                ("\n", "\r")
+            )
+        )
         for image_url in image_urls:
             self._schedule_image_preview_fetch(image_url)
         if is_collapsed:
@@ -4998,6 +5012,8 @@ class EncryptedChatClient(QObject):
                 top_align_height=top_align_height,
             )
         cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        if add_image_line_break:
+            cursor.insertBlock()
         for image_url in image_urls:
             self._insert_embedded_image_preview(cursor, image_url)
 
