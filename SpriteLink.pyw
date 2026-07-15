@@ -176,6 +176,7 @@ MAX_PROFILE_ICON_GIF_BYTES = 2048
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
 EMBEDDED_IMAGE_MAX_EDGE = 96
+TOP_ALIGNED_PROFILE_ICON_PADDING = 3
 IMAGE_PREVIEW_MAX_WIDTH = CONFIG_POPUP_MAX_WIDTH - 32
 IMAGE_PREVIEW_MAX_HEIGHT = 480
 MAX_REMOTE_IMAGE_BYTES = 8 * 1024 * 1024
@@ -4452,20 +4453,41 @@ class EncryptedChatClient(QObject):
             return False
         image.setDevicePixelRatio(1.0)
 
+        displayed_image = image
+        resource_suffix = ""
+        if align_top:
+            padded_image = QImage(
+                image.width(),
+                image.height() + TOP_ALIGNED_PROFILE_ICON_PADDING,
+                QImage.Format.Format_ARGB32,
+            )
+            padded_image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(padded_image)
+            painter.drawImage(
+                0,
+                TOP_ALIGNED_PROFILE_ICON_PADDING,
+                image,
+            )
+            painter.end()
+            padded_image.setDevicePixelRatio(1.0)
+            displayed_image = padded_image
+            resource_suffix = "-top-padded"
+
         resource_name = (
             "spritelink-profile-icon:"
             + hashlib.sha256(gif_data).hexdigest()
+            + resource_suffix
         )
         resource_url = QUrl(resource_name)
         cursor.document().addResource(
             QTextDocument.ResourceType.ImageResource,
             resource_url,
-            image,
+            displayed_image,
         )
         image_format = QTextImageFormat()
         image_format.setName(resource_url.toString())
-        image_format.setWidth(image.width())
-        image_format.setHeight(image.height())
+        image_format.setWidth(displayed_image.width())
+        image_format.setHeight(displayed_image.height())
         image_format.setAnchor(True)
         image_format.setAnchorHref(f"spritelink:{message_id}")
         # Inline images participate in Qt's automatic line-height calculation,
@@ -4528,6 +4550,7 @@ class EncryptedChatClient(QObject):
         anchor: str | None = None,
         font_name: str = DEFAULT_MESSAGE_FONT,
         align_top: bool = False,
+        top_align_height: int = 0,
     ) -> QTextCharFormat:
         formatting = QTextCharFormat()
         formatting.setForeground(QColor(color))
@@ -4538,9 +4561,14 @@ class EncryptedChatClient(QObject):
             formatting.setAnchor(True)
             formatting.setAnchorHref(anchor)
             formatting.setFontUnderline(False)
-        if align_top:
-            formatting.setVerticalAlignment(
-                QTextCharFormat.VerticalAlignment.AlignTop
+        if align_top and top_align_height > 0:
+            font_height = max(1, QFontMetrics(formatting.font()).height())
+            upward_pixels = max(
+                0.0,
+                (top_align_height - font_height) / 2.0,
+            )
+            formatting.setBaselineOffset(
+                upward_pixels * 100.0 / font_height
             )
         return formatting
 
@@ -4553,6 +4581,7 @@ class EncryptedChatClient(QObject):
         *,
         muted: bool,
         align_top: bool,
+        top_align_height: int,
     ) -> list[str]:
         image_urls: list[str] = []
         position = 0
@@ -4564,6 +4593,7 @@ class EncryptedChatClient(QObject):
                         body_color,
                         font_name=font_name,
                         align_top=align_top,
+                        top_align_height=top_align_height,
                     ),
                 )
             if is_direct_image_url(url):
@@ -4580,6 +4610,7 @@ class EncryptedChatClient(QObject):
                 anchor=url,
                 font_name=font_name,
                 align_top=align_top,
+                top_align_height=top_align_height,
             )
             link_format.setFontUnderline(True)
             cursor.insertText(text[start:end], link_format)
@@ -4591,6 +4622,7 @@ class EncryptedChatClient(QObject):
                     body_color,
                     font_name=font_name,
                     align_top=align_top,
+                    top_align_height=top_align_height,
                 ),
             )
         return image_urls
@@ -4837,7 +4869,7 @@ class EncryptedChatClient(QObject):
                 f"Unique ID: {unique_id_preview}"
             )
 
-        align_message_top = False
+        top_align_height = 0
         if not is_collapsed:
             for _start, _end, url in message_url_spans(text):
                 cached_image = self.image_preview_cache.get(url)
@@ -4846,8 +4878,17 @@ class EncryptedChatClient(QObject):
                     and isinstance(cached_image, QImage)
                     and not cached_image.isNull()
                 ):
-                    align_message_top = True
-                    break
+                    embedded_preview = cached_image.scaled(
+                        EMBEDDED_IMAGE_MAX_EDGE,
+                        EMBEDDED_IMAGE_MAX_EDGE,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    top_align_height = max(
+                        top_align_height,
+                        embedded_preview.height(),
+                    )
+        align_message_top = top_align_height > 0
 
         has_profile_icon = self._insert_profile_icon(
             cursor,
@@ -4863,6 +4904,7 @@ class EncryptedChatClient(QObject):
                     anchor=f"spritelink:{message_id}",
                     font_name=font_name,
                     align_top=align_message_top,
+                    top_align_height=top_align_height,
                 ),
             )
         cursor.insertText(
@@ -4873,6 +4915,7 @@ class EncryptedChatClient(QObject):
                 anchor=f"spritelink:{message_id}",
                 font_name=font_name,
                 align_top=align_message_top,
+                top_align_height=top_align_height,
             ),
         )
         if status_suffix:
@@ -4882,6 +4925,7 @@ class EncryptedChatClient(QObject):
                     suffix_color,
                     font_name=font_name,
                     align_top=align_message_top,
+                    top_align_height=top_align_height,
                 ),
             )
         cursor.insertText(
@@ -4890,6 +4934,7 @@ class EncryptedChatClient(QObject):
                 body_color,
                 font_name=font_name,
                 align_top=align_message_top,
+                top_align_height=top_align_height,
             ),
         )
 
@@ -4912,6 +4957,7 @@ class EncryptedChatClient(QObject):
                     body_color,
                     font_name=font_name,
                     align_top=align_message_top,
+                    top_align_height=top_align_height,
                 ),
             )
         else:
@@ -4922,6 +4968,7 @@ class EncryptedChatClient(QObject):
                 font_name,
                 muted=is_muted,
                 align_top=align_message_top,
+                top_align_height=top_align_height,
             )
         for image_url in image_urls:
             self._insert_embedded_image_preview(cursor, image_url)
