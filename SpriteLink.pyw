@@ -54,6 +54,7 @@ try:
         QDesktopServices,
         QFont,
         QFontMetrics,
+        QIcon,
         QImage,
         QPainter,
         QPalette,
@@ -136,7 +137,7 @@ except ImportError:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 13
+CONFIG_FORMAT_VERSION = 14
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
@@ -176,6 +177,7 @@ PACKET_PADDING_BLOCK = 128
 PROFILE_ICON_SIZE = 16
 PROFILE_ICON_MAX_COLORS = 16
 MAX_PROFILE_ICON_GIF_BYTES = 2048
+MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
 EMBEDDED_IMAGE_MAX_EDGE = 96
@@ -524,6 +526,59 @@ def default_room_profile() -> dict[str, str]:
     }
 
 
+def default_identity_preset() -> dict[str, str]:
+    return {
+        "id": uuid.uuid4().hex,
+        "username": "User",
+        "username_color": secrets.choice(SAFE_USERNAME_COLORS),
+        "profile_icon": "",
+    }
+
+
+def normalize_identity_preset(value: Any) -> dict[str, str]:
+    fallback = default_identity_preset()
+    raw = value if isinstance(value, dict) else {}
+    preset_id = str(raw.get("id", fallback["id"])).strip()
+    if not preset_id:
+        preset_id = fallback["id"]
+    username = str(raw.get("username", fallback["username"])).strip()
+    if not username:
+        username = fallback["username"]
+    username_color = QColor(
+        str(raw.get("username_color", fallback["username_color"]))
+    )
+    if not username_color.isValid():
+        username_color = QColor(fallback["username_color"])
+    profile_icon = normalize_profile_icon(
+        raw.get("profile_icon", ""),
+        "",
+    )
+    return {
+        "id": preset_id[:64],
+        "username": username[:32],
+        "username_color": username_color.name(),
+        "profile_icon": profile_icon,
+    }
+
+
+def identity_signature(value: dict[str, str]) -> tuple[str, str, str]:
+    return (
+        str(value.get("username", "User")),
+        str(value.get("username_color", "#000000")).casefold(),
+        str(value.get("profile_icon", "")),
+    )
+
+
+def apply_identity_preset_to_profile(
+    profile: dict[str, str],
+    preset: dict[str, str],
+) -> None:
+    profile["identity_preset_id"] = preset["id"]
+    profile["username"] = preset["username"]
+    profile["username_color"] = preset["username_color"]
+    profile["profile_icon"] = preset["profile_icon"]
+
+
 def normalize_room_profile(
     profile: Any,
     fallback: dict[str, str] | None = None,
@@ -555,6 +610,12 @@ def normalize_room_profile(
         raw.get("profile_icon", base.get("profile_icon", "")),
         str(base.get("profile_icon", "")),
     )
+    identity_preset_id = str(
+        raw.get(
+            "identity_preset_id",
+            base.get("identity_preset_id", ""),
+        )
+    ).strip()[:64]
 
     return {
         "username": username[:32],
@@ -562,6 +623,7 @@ def normalize_room_profile(
         "font": font,
         "text_color": text_color.name(),
         "profile_icon": profile_icon,
+        "identity_preset_id": identity_preset_id,
     }
 
 # The former EncryptedChatClient directory is intentionally not migrated.
@@ -744,6 +806,8 @@ def direct_image_urls_in_message(text: str) -> list[str]:
 
 def default_config() -> dict[str, Any]:
     global_profile = default_room_profile()
+    default_preset = default_identity_preset()
+    apply_identity_preset_to_profile(global_profile, default_preset)
     return {
         "config_version": CONFIG_FORMAT_VERSION,
         "server_preset": DEFAULT_SERVER_PRESET,
@@ -756,6 +820,7 @@ def default_config() -> dict[str, Any]:
         "room_profiles": {
             GLOBAL_CHATROOM_ID: global_profile,
         },
+        "identity_presets": [default_preset],
         "muted_chatrooms": [],
         "unread_counts": {},
         "room_state": {},
@@ -922,7 +987,60 @@ def load_config() -> dict[str, Any]:
             raw_profiles.get(room_id),
             global_profile,
         )
+
+    raw_identity_presets = (
+        config.get("identity_presets", [])
+        if previous_config_version >= 14
+        else []
+    )
+    if not isinstance(raw_identity_presets, list):
+        raw_identity_presets = []
+    identity_presets: list[dict[str, str]] = []
+    seen_preset_ids: set[str] = set()
+    for raw_preset in raw_identity_presets:
+        preset = normalize_identity_preset(raw_preset)
+        if preset["id"] in seen_preset_ids:
+            continue
+        seen_preset_ids.add(preset["id"])
+        identity_presets.append(preset)
+        if len(identity_presets) >= MAX_IDENTITY_PRESETS:
+            break
+
+    ordered_room_ids = [
+        GLOBAL_CHATROOM_ID,
+        *sorted(valid_room_ids - {GLOBAL_CHATROOM_ID}),
+    ]
+    for room_id in ordered_room_ids:
+        profile = cleaned_profiles[room_id]
+        selected_id = profile.get("identity_preset_id", "")
+        selected_preset = next((
+            preset for preset in identity_presets
+            if preset["id"] == selected_id
+        ), None)
+        if selected_preset is None:
+            signature = identity_signature(profile)
+            selected_preset = next((
+                preset for preset in identity_presets
+                if identity_signature(preset) == signature
+            ), None)
+        if (
+            selected_preset is None
+            and len(identity_presets) < MAX_IDENTITY_PRESETS
+        ):
+            selected_preset = normalize_identity_preset({
+                "username": profile["username"],
+                "username_color": profile["username_color"],
+                "profile_icon": profile["profile_icon"],
+            })
+            identity_presets.append(selected_preset)
+        if selected_preset is None:
+            if not identity_presets:
+                identity_presets.append(default_identity_preset())
+            selected_preset = identity_presets[0]
+        apply_identity_preset_to_profile(profile, selected_preset)
+
     config["room_profiles"] = cleaned_profiles
+    config["identity_presets"] = identity_presets
     config.pop("username", None)
     config.pop("username_color", None)
 
@@ -1381,6 +1499,127 @@ class ThemeComboBox(QComboBox):
         painter.setBrush(QColor("#000000"))
         painter.drawPolygon(arrow)
         painter.end()
+
+
+class IdentityPresetSelector(QPushButton):
+    presetSelected = Signal(str)
+    removeRequested = Signal(str)
+    newRequested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumWidth(130)
+        self.clicked.connect(self._show_popup)
+
+        self.popup = QFrame(self, Qt.WindowType.Popup)
+        self.popup.setFrameShape(QFrame.Shape.StyledPanel)
+        popup_layout = QVBoxLayout(self.popup)
+        popup_layout.setContentsMargins(4, 4, 4, 4)
+        popup_layout.setSpacing(4)
+
+        self.preset_list = QListWidget()
+        self.preset_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.preset_list.itemClicked.connect(self._select_item)
+        self.preset_list.customContextMenuRequested.connect(
+            self._show_item_context_menu
+        )
+        popup_layout.addWidget(self.preset_list)
+
+        new_button = QPushButton("New Identity")
+        new_button.clicked.connect(self._request_new_identity)
+        popup_layout.addWidget(new_button)
+
+    @staticmethod
+    def _preset_icon(encoded_icon: str) -> QIcon:
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        if encoded_icon:
+            try:
+                gif_data = decode_profile_icon(encoded_icon)
+            except ValueError:
+                gif_data = b""
+            loaded = QPixmap()
+            if gif_data and loaded.loadFromData(gif_data):
+                loaded.setDevicePixelRatio(1.0)
+                pixmap = loaded
+        return QIcon(pixmap)
+
+    def set_presets(
+        self,
+        presets: list[dict[str, str]],
+        selected_id: str,
+    ) -> None:
+        self.preset_list.clear()
+        selected_preset: dict[str, str] | None = None
+        for preset in presets:
+            item = QListWidgetItem(
+                self._preset_icon(preset.get("profile_icon", "")),
+                preset.get("username", "User"),
+            )
+            item.setData(Qt.ItemDataRole.UserRole, preset["id"])
+            item.setForeground(QColor(preset["username_color"]))
+            self.preset_list.addItem(item)
+            if preset["id"] == selected_id:
+                selected_preset = preset
+                self.preset_list.setCurrentItem(item)
+
+        if selected_preset is None and presets:
+            selected_preset = presets[0]
+        if selected_preset is None:
+            self.setText("Identity ▼")
+            self.setIcon(QIcon())
+            self.setStyleSheet("")
+            return
+        self.setText(f"{selected_preset['username']} ▼")
+        self.setIcon(self._preset_icon(
+            selected_preset.get("profile_icon", "")
+        ))
+        self.setStyleSheet(
+            f"color: {selected_preset['username_color']};"
+        )
+
+    def _show_popup(self) -> None:
+        row_count = max(1, min(7, self.preset_list.count()))
+        self.preset_list.setFixedHeight(row_count * 24 + 4)
+        self.popup.setFixedWidth(max(230, self.width()))
+        self.popup.adjustSize()
+        popup_position = self.mapToGlobal(QPoint(0, self.height()))
+        screen = QApplication.screenAt(popup_position)
+        if (
+            screen is not None
+            and popup_position.y() + self.popup.height()
+            > screen.availableGeometry().bottom()
+        ):
+            popup_position = self.mapToGlobal(
+                QPoint(0, -self.popup.height())
+            )
+        self.popup.move(popup_position)
+        self.popup.show()
+        self.popup.raise_()
+        self.preset_list.setFocus()
+
+    def _select_item(self, item: QListWidgetItem) -> None:
+        preset_id = str(item.data(Qt.ItemDataRole.UserRole))
+        self.popup.hide()
+        self.presetSelected.emit(preset_id)
+
+    def _show_item_context_menu(self, position: QPoint) -> None:
+        item = self.preset_list.itemAt(position)
+        if item is None:
+            return
+        preset_id = str(item.data(Qt.ItemDataRole.UserRole))
+        menu = QMenu(self.popup)
+        remove_action = menu.addAction("Remove")
+        selected = menu.exec(self.preset_list.mapToGlobal(position))
+        if selected is remove_action:
+            self.popup.hide()
+            self.removeRequested.emit(preset_id)
+
+    def _request_new_identity(self) -> None:
+        self.popup.hide()
+        self.newRequested.emit()
 
 
 class MessageLogBrowser(QTextBrowser):
@@ -1912,6 +2151,48 @@ class EncryptedChatClient(QObject):
         room_name = self._active_chatroom()["nickname"]
         self.root.setWindowTitle(f"{APP_NAME} ({room_name})")
 
+    def _identity_presets(self) -> list[dict[str, str]]:
+        raw_presets = self.config_data.get("identity_presets", [])
+        if not isinstance(raw_presets, list):
+            raw_presets = []
+        presets: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+        for raw_preset in raw_presets:
+            preset = normalize_identity_preset(raw_preset)
+            if preset["id"] in seen_ids:
+                continue
+            presets.append(preset)
+            seen_ids.add(preset["id"])
+            if len(presets) >= MAX_IDENTITY_PRESETS:
+                break
+        if not presets:
+            presets.append(default_identity_preset())
+        self.config_data["identity_presets"] = presets
+        return presets
+
+    def _identity_preset_by_id(
+        self,
+        preset_id: str,
+    ) -> dict[str, str] | None:
+        return next((
+            preset for preset in self._identity_presets()
+            if preset["id"] == preset_id
+        ), None)
+
+    def _sync_identity_preset_to_profiles(
+        self,
+        preset: dict[str, str],
+    ) -> None:
+        profiles = self.config_data.setdefault("room_profiles", {})
+        if not isinstance(profiles, dict):
+            return
+        for profile in profiles.values():
+            if (
+                isinstance(profile, dict)
+                and profile.get("identity_preset_id") == preset["id"]
+            ):
+                apply_identity_preset_to_profile(profile, preset)
+
     def _room_profile(self, room_id: str) -> dict[str, str]:
         profiles = self.config_data.setdefault("room_profiles", {})
         if not isinstance(profiles, dict):
@@ -1921,6 +2202,10 @@ class EncryptedChatClient(QObject):
         global_profile = normalize_room_profile(
             profiles.get(GLOBAL_CHATROOM_ID)
         )
+        global_preset = self._identity_preset_by_id(
+            global_profile.get("identity_preset_id", "")
+        ) or self._identity_presets()[0]
+        apply_identity_preset_to_profile(global_profile, global_preset)
         profiles[GLOBAL_CHATROOM_ID] = global_profile
         if room_id == GLOBAL_CHATROOM_ID:
             return global_profile
@@ -1929,11 +2214,25 @@ class EncryptedChatClient(QObject):
             profiles.get(room_id),
             global_profile,
         )
+        selected_preset = self._identity_preset_by_id(
+            profile.get("identity_preset_id", "")
+        ) or global_preset
+        apply_identity_preset_to_profile(profile, selected_preset)
         profiles[room_id] = profile
         return profile
 
     def _active_room_profile(self) -> dict[str, str]:
         return self._room_profile(self.active_chatroom_id)
+
+    def _active_identity_preset(self) -> dict[str, str]:
+        profile = self._active_room_profile()
+        preset = self._identity_preset_by_id(
+            profile.get("identity_preset_id", "")
+        )
+        if preset is None:
+            preset = self._identity_presets()[0]
+            apply_identity_preset_to_profile(profile, preset)
+        return preset
 
     def _persist_profile_changes(self) -> None:
         try:
@@ -1943,6 +2242,15 @@ class EncryptedChatClient(QObject):
 
     def _schedule_profile_save(self) -> None:
         self.profile_save_timer.start(250)
+        self._run_message_size_check()
+
+    def _commit_identity_preset_changes(
+        self,
+        preset: dict[str, str],
+    ) -> None:
+        self._sync_identity_preset_to_profiles(preset)
+        self._refresh_identity_preset_selector()
+        self._persist_profile_changes()
         self._run_message_size_check()
 
     def _muted_chatroom_ids(self) -> set[str]:
@@ -2289,6 +2597,19 @@ class EncryptedChatClient(QObject):
         identity_layout = QHBoxLayout(self.identity_menu)
         identity_layout.setContentsMargins(8, 5, 8, 5)
         identity_layout.setSpacing(7)
+        self.identity_preset_selector = IdentityPresetSelector(
+            self.identity_menu
+        )
+        self.identity_preset_selector.presetSelected.connect(
+            self._select_identity_preset
+        )
+        self.identity_preset_selector.removeRequested.connect(
+            self._remove_identity_preset
+        )
+        self.identity_preset_selector.newRequested.connect(
+            self._new_identity_preset
+        )
+        identity_layout.addWidget(self.identity_preset_selector)
         identity_layout.addWidget(QLabel("Username"))
         self.identity_username_entry = QLineEdit()
         self.identity_username_entry.setMaxLength(32)
@@ -2437,6 +2758,73 @@ class EncryptedChatClient(QObject):
                 self._make_message_font(current_font)
             )
 
+    def _refresh_identity_preset_selector(self) -> None:
+        if not hasattr(self, "identity_preset_selector"):
+            return
+        profile = self._active_room_profile()
+        self.identity_preset_selector.set_presets(
+            self._identity_presets(),
+            profile.get("identity_preset_id", ""),
+        )
+
+    def _select_identity_preset(self, preset_id: str) -> None:
+        preset = self._identity_preset_by_id(preset_id)
+        if preset is None:
+            return
+        apply_identity_preset_to_profile(
+            self._active_room_profile(),
+            preset,
+        )
+        self._load_active_room_profile_into_controls()
+        self._persist_profile_changes()
+        self._run_message_size_check()
+
+    def _new_identity_preset(self) -> None:
+        presets = self._identity_presets()
+        if len(presets) >= MAX_IDENTITY_PRESETS:
+            messagebox.showwarning(
+                "Identity preset limit",
+                f"SpriteLink supports up to {MAX_IDENTITY_PRESETS} identities.",
+                parent=self.root,
+            )
+            return
+        preset = default_identity_preset()
+        presets.append(preset)
+        self.config_data["identity_presets"] = presets
+        apply_identity_preset_to_profile(
+            self._active_room_profile(),
+            preset,
+        )
+        self._load_active_room_profile_into_controls()
+        self._persist_profile_changes()
+        self._run_message_size_check()
+        self.identity_username_entry.setFocus()
+        self.identity_username_entry.selectAll()
+
+    def _remove_identity_preset(self, preset_id: str) -> None:
+        presets = self._identity_presets()
+        remaining = [
+            preset for preset in presets
+            if preset["id"] != preset_id
+        ]
+        if len(remaining) == len(presets):
+            return
+        if not remaining:
+            remaining.append(default_identity_preset())
+        fallback = remaining[0]
+        self.config_data["identity_presets"] = remaining
+        profiles = self.config_data.setdefault("room_profiles", {})
+        if isinstance(profiles, dict):
+            for profile in profiles.values():
+                if (
+                    isinstance(profile, dict)
+                    and profile.get("identity_preset_id") == preset_id
+                ):
+                    apply_identity_preset_to_profile(profile, fallback)
+        self._load_active_room_profile_into_controls()
+        self._persist_profile_changes()
+        self._run_message_size_check()
+
     def _load_active_room_profile_into_controls(self) -> None:
         if not hasattr(self, "identity_username_entry"):
             return
@@ -2444,6 +2832,7 @@ class EncryptedChatClient(QObject):
         profile = self._active_room_profile()
         self._loading_profile_controls = True
         try:
+            self._refresh_identity_preset_selector()
             self.identity_username_entry.setText(profile["username"])
             self.message_font_combo.setCurrentText(profile["font"])
             self.message_font_combo.setFont(
@@ -2495,14 +2884,12 @@ class EncryptedChatClient(QObject):
     def _on_identity_username_changed(self, value: str) -> None:
         if self._loading_profile_controls:
             return
-        self._active_room_profile()["username"] = (
-            value.strip()[:32] or "User"
-        )
-        self._schedule_profile_save()
+        preset = self._active_identity_preset()
+        preset["username"] = value.strip()[:32] or "User"
+        self._commit_identity_preset_changes(preset)
 
     def _normalize_identity_username_entry(self) -> None:
-        profile = self._active_room_profile()
-        normalized = profile["username"]
+        normalized = self._active_identity_preset()["username"]
         if self.identity_username_entry.text() != normalized:
             self._loading_profile_controls = True
             try:
@@ -2511,20 +2898,20 @@ class EncryptedChatClient(QObject):
                 self._loading_profile_controls = False
 
     def _choose_identity_color(self) -> None:
-        profile = self._active_room_profile()
+        preset = self._active_identity_preset()
         selected = QColorDialog.getColor(
-            QColor(profile["username_color"]),
+            QColor(preset["username_color"]),
             self.root,
             "Choose username color",
         )
         if not selected.isValid():
             return
-        profile["username_color"] = selected.name()
+        preset["username_color"] = selected.name()
         self._set_color_preview(
             self.identity_color_preview,
             selected.name(),
         )
-        self._schedule_profile_save()
+        self._commit_identity_preset_changes(preset)
 
     def _choose_profile_icon(self) -> None:
         source_path, _selected_filter = QFileDialog.getOpenFileName(
@@ -2548,15 +2935,19 @@ class EncryptedChatClient(QObject):
             )
             return
 
-        self._active_room_profile()["profile_icon"] = encoded_icon
+        preset = self._active_identity_preset()
+        preset["profile_icon"] = encoded_icon
         self._update_profile_icon_preview()
-        self._schedule_profile_save()
+        self._commit_identity_preset_changes(preset)
 
     def _update_profile_icon_preview(self) -> None:
         if not hasattr(self, "profile_icon_preview"):
             return
         self.profile_icon_preview.clear()
-        encoded_icon = self._active_room_profile().get("profile_icon", "")
+        encoded_icon = self._active_identity_preset().get(
+            "profile_icon",
+            "",
+        )
         if not encoded_icon:
             return
         try:
@@ -2573,7 +2964,7 @@ class EncryptedChatClient(QObject):
         menu = QMenu(self.profile_icon_preview)
         remove_action = menu.addAction("Remove")
         has_icon = bool(
-            self._active_room_profile().get("profile_icon", "")
+            self._active_identity_preset().get("profile_icon", "")
         )
         remove_action.setEnabled(has_icon)
         if has_icon:
@@ -2581,9 +2972,10 @@ class EncryptedChatClient(QObject):
         menu.exec(self.profile_icon_preview.mapToGlobal(position))
 
     def _remove_profile_icon(self) -> None:
-        self._active_room_profile()["profile_icon"] = ""
+        preset = self._active_identity_preset()
+        preset["profile_icon"] = ""
         self._update_profile_icon_preview()
-        self._schedule_profile_save()
+        self._commit_identity_preset_changes(preset)
 
     def _on_message_font_changed(self, value: str) -> None:
         if self._loading_profile_controls:
