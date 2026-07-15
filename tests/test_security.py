@@ -210,6 +210,53 @@ class ImageEmbeddingTests(unittest.TestCase):
         self.assertIn("_set_large_image_preview_frame", preview_source)
         self.assertIn("document.addResource", preview_source)
 
+    def test_animated_frames_keep_native_playback_timing(self) -> None:
+        controller_source = inspect.getsource(
+            SPRITELINK.AnimatedMediaController._emit_frame
+        )
+        self.assertIn("emitted_frame = frame.copy()", controller_source)
+        self.assertNotIn("IMAGE_PREVIEW_MAX_WIDTH", controller_source)
+        inline_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_animated_media_frame
+        )
+        self.assertNotIn("MIN_INLINE_ANIMATION_FRAME_MS", inline_source)
+        self.assertNotIn("time.monotonic()", inline_source)
+
+    def test_small_inline_media_is_not_upscaled(self) -> None:
+        frame = SPRITELINK.QImage(
+            48,
+            32,
+            SPRITELINK.QImage.Format.Format_ARGB32,
+        )
+        media = SPRITELINK.RemoteMediaPreview(
+            source_url="https://example.com/small.gif",
+            data=b"",
+            kind="animated_gif",
+            frame=frame,
+        )
+        preview = SPRITELINK.EncryptedChatClient._scaled_inline_media_frame(
+            media,
+            frame,
+        )
+        self.assertEqual((preview.width(), preview.height()), (48, 32))
+
+        video_media = SPRITELINK.RemoteMediaPreview(
+            source_url="https://example.com/small.mp4",
+            data=b"",
+            kind="looping_video",
+            frame=frame,
+        )
+        video_preview = (
+            SPRITELINK.EncryptedChatClient._scaled_inline_media_frame(
+                video_media,
+                frame,
+            )
+        )
+        self.assertEqual(
+            (video_preview.width(), video_preview.height()),
+            (48, 32),
+        )
+
     def test_untrusted_image_link_is_omitted_from_display_text(self) -> None:
         url = "https://example.com/private-image.png"
         display_text = (
