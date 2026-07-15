@@ -1388,9 +1388,17 @@ class ConfigOverlay(QWidget):
 
 
 class AddChatroomDialog(QDialog):
-    def __init__(self, parent: QWidget) -> None:
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        title: str = "Add Chatroom",
+        submit_label: str = "Add Chatroom",
+        nickname: str = "",
+        chatroom_key: str = "",
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Add Chatroom")
+        self.setWindowTitle(title)
         self.setModal(True)
         self.setMinimumWidth(430)
 
@@ -1401,11 +1409,13 @@ class AddChatroomDialog(QDialog):
         form.addWidget(QLabel("Nickname"), 0, 0)
         self.nickname_entry = QLineEdit()
         self.nickname_entry.setMaxLength(64)
+        self.nickname_entry.setText(nickname)
         form.addWidget(self.nickname_entry, 0, 1, 1, 2)
 
         form.addWidget(QLabel("Key"), 1, 0)
         self.key_entry = QLineEdit()
         self.key_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_entry.setText(chatroom_key)
         form.addWidget(self.key_entry, 1, 1)
         show_key = QCheckBox("Show")
         show_key.toggled.connect(
@@ -1431,10 +1441,10 @@ class AddChatroomDialog(QDialog):
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
         buttons.addWidget(cancel_button)
-        add_button = QPushButton("Add Chatroom")
-        add_button.setDefault(True)
-        add_button.clicked.connect(self.accept)
-        buttons.addWidget(add_button)
+        submit_button = QPushButton(submit_label)
+        submit_button.setDefault(True)
+        submit_button.clicked.connect(self.accept)
+        buttons.addWidget(submit_button)
         layout.addLayout(buttons)
 
         self.nickname_entry.setFocus()
@@ -2415,6 +2425,7 @@ class EncryptedChatClient(QObject):
 
     def _add_chatroom(self) -> None:
         dialog = AddChatroomDialog(self.root)
+        self._apply_window_titlebar_theme(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -2468,6 +2479,92 @@ class EncryptedChatClient(QObject):
         self._refresh_chatroom_list()
         self._activate_chatroom(room_id)
 
+    def _edit_chatroom(self, room_id: str) -> None:
+        if room_id == GLOBAL_CHATROOM_ID:
+            return
+        room = next(
+            (
+                candidate
+                for candidate in self.config_data.get("chatrooms", [])
+                if isinstance(candidate, dict)
+                and str(candidate.get("id", "")) == room_id
+            ),
+            None,
+        )
+        if room is None:
+            return
+
+        old_nickname = str(room.get("nickname", ""))
+        old_key = str(room.get("key", ""))
+        dialog = AddChatroomDialog(
+            self.root,
+            title="Edit Chatroom",
+            submit_label="Save",
+            nickname=old_nickname,
+            chatroom_key=old_key,
+        )
+        self._apply_window_titlebar_theme(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        nickname = dialog.nickname()
+        key = dialog.chatroom_key()
+        if not nickname:
+            messagebox.showerror(
+                "Cannot edit chatroom",
+                "The chatroom nickname cannot be empty.",
+                parent=self.root,
+            )
+            return
+        if not key:
+            messagebox.showerror(
+                "Cannot edit chatroom",
+                "The chatroom key cannot be empty.",
+                parent=self.root,
+            )
+            return
+        if any(
+            candidate["id"] != room_id and candidate["key"] == key
+            for candidate in self._chatroom_definitions()
+        ):
+            messagebox.showerror(
+                "Cannot edit chatroom",
+                "That chatroom key is already in your list.",
+                parent=self.root,
+            )
+            return
+
+        key_changed = key != old_key
+        was_initial_history_pending = (
+            room_id in self.initial_history_pending_rooms
+        )
+        if key_changed and room_id == self.active_chatroom_id:
+            self._persist_local_history()
+        room["nickname"] = nickname
+        room["key"] = key
+        if key_changed:
+            self.initial_history_pending_rooms.add(room_id)
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            room["nickname"] = old_nickname
+            room["key"] = old_key
+            if not was_initial_history_pending:
+                self.initial_history_pending_rooms.discard(room_id)
+            messagebox.showerror(
+                "Could not save chatroom",
+                str(exc),
+                parent=self.root,
+            )
+            return
+
+        if room_id == self.active_chatroom_id and key_changed:
+            self._switch_active_chatroom()
+        else:
+            if room_id == self.active_chatroom_id:
+                self._update_window_title()
+            self._refresh_chatroom_list()
+
     def _show_chatroom_context_menu(self, position: Any) -> None:
         item = self.chatrooms_list.itemAt(position)
         if item is None:
@@ -2480,6 +2577,12 @@ class EncryptedChatClient(QObject):
         mute_action.triggered.connect(
             lambda: self._set_chatroom_muted(room_id, not is_muted)
         )
+        edit_action = menu.addAction("Edit")
+        edit_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
+        if room_id != GLOBAL_CHATROOM_ID:
+            edit_action.triggered.connect(
+                lambda: self._edit_chatroom(room_id)
+            )
         remove_action = menu.addAction("Remove")
         remove_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
         if room_id != GLOBAL_CHATROOM_ID:
