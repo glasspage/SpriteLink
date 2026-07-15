@@ -51,6 +51,7 @@ try:
     )
     from PySide6.QtGui import (
         QColor,
+        QCursor,
         QDesktopServices,
         QFont,
         QFontMetrics,
@@ -1509,15 +1510,19 @@ class IdentityPresetSelector(QPushButton):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMinimumWidth(130)
-        self.clicked.connect(self._show_popup)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._suppress_next_open = False
+        self.clicked.connect(self._toggle_popup)
 
         self.popup = QFrame(self, Qt.WindowType.Popup)
+        self.popup.installEventFilter(self)
         self.popup.setFrameShape(QFrame.Shape.StyledPanel)
         popup_layout = QVBoxLayout(self.popup)
         popup_layout.setContentsMargins(4, 4, 4, 4)
         popup_layout.setSpacing(4)
 
         self.preset_list = QListWidget()
+        self.preset_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.preset_list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
@@ -1532,18 +1537,17 @@ class IdentityPresetSelector(QPushButton):
         popup_layout.addWidget(new_button)
 
     @staticmethod
-    def _preset_icon(encoded_icon: str) -> QIcon:
-        pixmap = QPixmap(16, 16)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        if encoded_icon:
-            try:
-                gif_data = decode_profile_icon(encoded_icon)
-            except ValueError:
-                gif_data = b""
-            loaded = QPixmap()
-            if gif_data and loaded.loadFromData(gif_data):
-                loaded.setDevicePixelRatio(1.0)
-                pixmap = loaded
+    def _preset_icon(encoded_icon: str) -> QIcon | None:
+        if not encoded_icon:
+            return None
+        try:
+            gif_data = decode_profile_icon(encoded_icon)
+        except ValueError:
+            return None
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(gif_data):
+            return None
+        pixmap.setDevicePixelRatio(1.0)
         return QIcon(pixmap)
 
     def set_presets(
@@ -1554,10 +1558,12 @@ class IdentityPresetSelector(QPushButton):
         self.preset_list.clear()
         selected_preset: dict[str, str] | None = None
         for preset in presets:
-            item = QListWidgetItem(
-                self._preset_icon(preset.get("profile_icon", "")),
-                preset.get("username", "User"),
+            item = QListWidgetItem(preset.get("username", "User"))
+            preset_icon = self._preset_icon(
+                preset.get("profile_icon", "")
             )
+            if preset_icon is not None:
+                item.setIcon(preset_icon)
             item.setData(Qt.ItemDataRole.UserRole, preset["id"])
             item.setForeground(QColor(preset["username_color"]))
             self.preset_list.addItem(item)
@@ -1573,16 +1579,32 @@ class IdentityPresetSelector(QPushButton):
             self.setStyleSheet("")
             return
         self.setText(f"{selected_preset['username']} ▼")
-        self.setIcon(self._preset_icon(
+        selected_icon = self._preset_icon(
             selected_preset.get("profile_icon", "")
-        ))
+        )
+        self.setIcon(selected_icon or QIcon())
         self.setStyleSheet(
             f"color: {selected_preset['username_color']};"
         )
 
+    def _toggle_popup(self) -> None:
+        if self._suppress_next_open:
+            self._suppress_next_open = False
+            return
+        if self.popup.isVisible():
+            self.popup.hide()
+            self._suppress_next_open = False
+            return
+        self._show_popup()
+
     def _show_popup(self) -> None:
         row_count = max(1, min(7, self.preset_list.count()))
-        self.preset_list.setFixedHeight(row_count * 24 + 4)
+        fallback_row_height = self.preset_list.fontMetrics().height() + 4
+        list_height = self.preset_list.frameWidth() * 2
+        for row in range(row_count):
+            row_height = self.preset_list.sizeHintForRow(row)
+            list_height += max(1, row_height, fallback_row_height)
+        self.preset_list.setFixedHeight(list_height)
         self.popup.setFixedWidth(max(230, self.width()))
         self.popup.adjustSize()
         popup_position = self.mapToGlobal(QPoint(0, self.height()))
@@ -1598,7 +1620,12 @@ class IdentityPresetSelector(QPushButton):
         self.popup.move(popup_position)
         self.popup.show()
         self.popup.raise_()
-        self.preset_list.setFocus()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.popup and event.type() == QEvent.Type.Hide:
+            cursor_position = self.mapFromGlobal(QCursor.pos())
+            self._suppress_next_open = self.rect().contains(cursor_position)
+        return super().eventFilter(watched, event)
 
     def _select_item(self, item: QListWidgetItem) -> None:
         preset_id = str(item.data(Qt.ItemDataRole.UserRole))
@@ -2610,7 +2637,7 @@ class EncryptedChatClient(QObject):
             self._new_identity_preset
         )
         identity_layout.addWidget(self.identity_preset_selector)
-        identity_layout.addWidget(QLabel("Username"))
+        identity_layout.addWidget(QLabel("Name"))
         self.identity_username_entry = QLineEdit()
         self.identity_username_entry.setMaxLength(32)
         self.identity_username_entry.textChanged.connect(
@@ -2620,7 +2647,7 @@ class EncryptedChatClient(QObject):
             self._normalize_identity_username_entry
         )
         identity_layout.addWidget(self.identity_username_entry, 1)
-        identity_layout.addWidget(QLabel("Username color"))
+        identity_layout.addWidget(QLabel("Name color"))
         self.identity_color_preview = QLabel()
         self.identity_color_preview.setFixedSize(26, 22)
         self.identity_color_preview.setFrameShape(QFrame.Shape.Panel)
@@ -2630,7 +2657,7 @@ class EncryptedChatClient(QObject):
         identity_color_button.clicked.connect(self._choose_identity_color)
         identity_layout.addWidget(identity_color_button)
         identity_layout.addSpacing(8)
-        identity_layout.addWidget(QLabel("User icon (16x16)"))
+        identity_layout.addWidget(QLabel("Icon"))
         self.profile_icon_preview = QLabel()
         self.profile_icon_preview.setFixedSize(26, 22)
         self.profile_icon_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
