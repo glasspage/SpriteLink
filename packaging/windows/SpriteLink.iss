@@ -33,6 +33,7 @@ SetupLogging=yes
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
+Name: "startmenuicon"; Description: "Create a &Start menu shortcut"; GroupDescription: "Additional shortcuts:"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [InstallDelete]
@@ -42,7 +43,7 @@ Type: filesandordirs; Name: "{app}\_internal"
 Source: "..\..\dist\SpriteLink\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; AppUserModelID: "SpriteLink.SpriteLink"
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; AppUserModelID: "SpriteLink.SpriteLink"; Tasks: startmenuicon
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; AppUserModelID: "SpriteLink.SpriteLink"; Tasks: desktopicon
 
 [Run]
