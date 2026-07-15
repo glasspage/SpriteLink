@@ -3059,11 +3059,19 @@ class EncryptedChatClient(QObject):
 
     def _choose_message_text_color(self) -> None:
         profile = self._active_room_profile()
-        selected = QColorDialog.getColor(
+        dialog = QColorDialog(
             QColor(profile["text_color"]),
             self.root,
-            "Choose message text color",
         )
+        dialog.setWindowTitle("Choose message text color")
+        dialog.setOption(
+            QColorDialog.ColorDialogOption.DontUseNativeDialog,
+            True,
+        )
+        self._apply_window_titlebar_theme(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dialog.currentColor()
         if not selected.isValid():
             return
         profile["text_color"] = selected.name()
