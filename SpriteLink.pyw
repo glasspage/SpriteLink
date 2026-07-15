@@ -73,7 +73,7 @@ try:
         QTextImageFormat,
         QTextOption,
     )
-    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PySide6.QtMultimedia import QSoundEffect
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -2125,14 +2125,15 @@ class EncryptedChatClient(QObject):
         self.message_sound_stop_timer.timeout.connect(
             self._stop_message_sound
         )
-        self.message_sound_audio_output = QAudioOutput(self)
-        self.message_sound_audio_output.setVolume(
-            int(self.message_sound_volume_var.get()) / 100.0
-        )
-        self.message_sound_player = QMediaPlayer(self)
-        self.message_sound_player.setAudioOutput(
-            self.message_sound_audio_output
-        )
+        self.message_sound_effects: dict[str, QSoundEffect] = {}
+        self.active_message_sound_effect: QSoundEffect | None = None
+        self.pending_message_sound_effect: QSoundEffect | None = None
+        self.pending_message_sound_name = ""
+        self.pending_message_sound_report_errors = False
+        for filename in BUILTIN_MESSAGE_SOUND_FILES.values():
+            self._message_sound_effect_for_path(
+                Path(__file__).resolve().parent / "sounds" / filename
+            )
 
         self.chat_tooltip_timer = QTimer(self)
         self.chat_tooltip_timer.setSingleShot(True)
@@ -3960,9 +3961,10 @@ class EncryptedChatClient(QObject):
         self.message_sound_volume_slider.setToolTip(
             f"Volume: {volume_percent}%"
         )
-        self.message_sound_audio_output.setVolume(
-            volume_percent / 100.0
-        )
+        if self.active_message_sound_effect is not None:
+            self.active_message_sound_effect.setVolume(
+                volume_percent / 100.0
+            )
         self._play_message_sound(report_errors=True)
 
     def _sync_config_overlay_geometry(self) -> None:
@@ -6293,12 +6295,83 @@ class EncryptedChatClient(QObject):
             return None
         return Path(__file__).resolve().parent / "sounds" / filename
 
+    def _message_sound_effect_for_path(
+        self,
+        sound_path: Path,
+    ) -> QSoundEffect:
+        resolved_path = str(sound_path.resolve())
+        effect = self.message_sound_effects.get(resolved_path)
+        if effect is not None:
+            return effect
+
+        effect = QSoundEffect(self)
+        effect.setLoopCount(1)
+        effect.setVolume(
+            int(self.message_sound_volume_var.get()) / 100.0
+        )
+        effect.statusChanged.connect(
+            lambda effect=effect: (
+                self._on_message_sound_effect_status_changed(effect)
+            )
+        )
+        self.message_sound_effects[resolved_path] = effect
+        effect.setSource(QUrl.fromLocalFile(resolved_path))
+        return effect
+
+    def _start_message_sound_effect(
+        self,
+        effect: QSoundEffect,
+        sound_name: str,
+    ) -> None:
+        effect.stop()
+        effect.setVolume(
+            int(self.message_sound_volume_var.get()) / 100.0
+        )
+        self.active_message_sound_effect = effect
+        effect.play()
+        if sound_name == "Custom":
+            self.message_sound_stop_timer.start(
+                CUSTOM_MESSAGE_SOUND_MAX_MS
+            )
+
+    def _on_message_sound_effect_status_changed(
+        self,
+        effect: QSoundEffect,
+    ) -> None:
+        if effect is not self.pending_message_sound_effect:
+            return
+        if effect.isLoaded():
+            sound_name = self.pending_message_sound_name
+            self.pending_message_sound_effect = None
+            self.pending_message_sound_name = ""
+            self.pending_message_sound_report_errors = False
+            self._start_message_sound_effect(effect, sound_name)
+            return
+        if effect.status() != QSoundEffect.Status.Error:
+            return
+
+        report_errors = self.pending_message_sound_report_errors
+        self.pending_message_sound_effect = None
+        self.pending_message_sound_name = ""
+        self.pending_message_sound_report_errors = False
+        if report_errors and not self._closing:
+            messagebox.showerror(
+                "Could not play message sound",
+                "The selected WAV file could not be loaded.",
+                parent=self.root,
+            )
+
     def _stop_message_sound(self) -> None:
-        self.message_sound_player.stop()
+        self.message_sound_stop_timer.stop()
+        self.pending_message_sound_effect = None
+        self.pending_message_sound_name = ""
+        self.pending_message_sound_report_errors = False
+        if self.active_message_sound_effect is not None:
+            self.active_message_sound_effect.stop()
+            self.active_message_sound_effect = None
 
     def _play_message_sound(self, *, report_errors: bool = False) -> None:
         sound_name = str(self.message_sound_var.get())
-        self.message_sound_stop_timer.stop()
         self._stop_message_sound()
         sound_path = self._message_sound_path(sound_name)
         if sound_path is None:
@@ -6308,19 +6381,15 @@ class EncryptedChatClient(QObject):
                 raise FileNotFoundError(
                     f"Message sound not found: {sound_path}"
                 )
-            self.message_sound_audio_output.setVolume(
-                int(self.message_sound_volume_var.get()) / 100.0
-            )
-            sound_url = QUrl.fromLocalFile(str(sound_path.resolve()))
-            if self.message_sound_player.source() != sound_url:
-                self.message_sound_player.setSource(sound_url)
+            effect = self._message_sound_effect_for_path(sound_path)
+            if effect.isLoaded():
+                self._start_message_sound_effect(effect, sound_name)
             else:
-                self.message_sound_player.setPosition(0)
-            self.message_sound_player.play()
-            if sound_name == "Custom":
-                self.message_sound_stop_timer.start(
-                    CUSTOM_MESSAGE_SOUND_MAX_MS
-                )
+                self.pending_message_sound_effect = effect
+                self.pending_message_sound_name = sound_name
+                self.pending_message_sound_report_errors = report_errors
+                if effect.status() == QSoundEffect.Status.Error:
+                    self._on_message_sound_effect_status_changed(effect)
         except Exception as exc:
             if report_errors:
                 messagebox.showerror(
