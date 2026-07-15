@@ -158,7 +158,7 @@ try:
 except ImportError:
     RUNNING_VERSION = "Development"
 
-UPDATE_REPOSITORY = "QuestCraftEnjoyer/SpriteLink"
+UPDATE_REPOSITORY = "glasspage/SpriteLink"
 UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 UPDATE_DIRECTORY = Path(
     os.environ.get("LOCALAPPDATA")
