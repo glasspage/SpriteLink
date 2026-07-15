@@ -51,6 +51,7 @@ try:
         Signal,
     )
     from PySide6.QtGui import (
+        QBrush,
         QColor,
         QCursor,
         QDesktopServices,
@@ -58,6 +59,7 @@ try:
         QFontMetrics,
         QIcon,
         QImage,
+        QLinearGradient,
         QPainter,
         QPalette,
         QPixmap,
@@ -1741,10 +1743,14 @@ class IdentityPresetSelector(QPushButton):
 class MessageLogBrowser(QTextBrowser):
     """Complete full-width row selections across paragraph left margins."""
 
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.collapsed_fade_blocks: dict[int, QColor] = {}
+
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
         selections = self.extraSelections()
-        if not selections:
+        if not selections and not self.collapsed_fade_blocks:
             return
 
         painter = QPainter(self.viewport())
@@ -1772,6 +1778,34 @@ class MessageLogBrowser(QTextBrowser):
                 left_width,
                 height + 1,
                 selection.format.background(),
+            )
+
+        viewport_width = self.viewport().width()
+        fade_start = round(viewport_width * 0.75)
+        fade_end = max(fade_start + 1, round(viewport_width * 0.98))
+        for block_number, background in self.collapsed_fade_blocks.items():
+            block = self.document().findBlockByNumber(block_number)
+            if not block.isValid():
+                continue
+            block_cursor = QTextCursor(block)
+            top = self.cursorRect(block_cursor).top()
+            height = max(
+                1,
+                round(document_layout.blockBoundingRect(block).height()),
+            )
+            transparent = QColor(background)
+            transparent.setAlpha(0)
+            opaque = QColor(background)
+            opaque.setAlpha(255)
+            gradient = QLinearGradient(fade_start, 0, fade_end, 0)
+            gradient.setColorAt(0.0, transparent)
+            gradient.setColorAt(1.0, opaque)
+            painter.fillRect(
+                fade_start,
+                top,
+                max(0, viewport_width - fade_start),
+                height + 1,
+                QBrush(gradient),
             )
         painter.end()
 
@@ -5134,11 +5168,22 @@ class EncryptedChatClient(QObject):
         font_name: str,
         has_profile_icon: bool,
     ) -> str:
-        normalized = " ".join(text.split())
-        ending = " [...]"
+        has_embedded_images = bool(direct_image_urls_in_message(text))
+        visible_text = (
+            message_text_without_image_links(text)
+            if has_embedded_images
+            else text
+        )
+        normalized = " ".join(visible_text.split())
+        if has_embedded_images:
+            normalized = (
+                f"[image] {normalized}"
+                if normalized
+                else "[image]"
+            )
 
         if not normalized:
-            return "[...]"
+            return ""
 
         body_metrics = QFontMetrics(self._make_message_font(font_name))
         username_font = self._make_message_font(font_name, bold=True)
@@ -5154,27 +5199,20 @@ class EncryptedChatClient(QObject):
             self.chat_display.viewport().width() - prefix_width,
         )
 
-        if body_metrics.horizontalAdvance(normalized + ending) <= available_width:
-            return normalized + ending
-
-        if body_metrics.horizontalAdvance("[...]") > available_width:
-            return "[...]"
+        if body_metrics.horizontalAdvance(normalized) <= available_width:
+            return normalized
 
         low = 0
         high = len(normalized)
         while low < high:
             midpoint = (low + high + 1) // 2
-            candidate = normalized[:midpoint].rstrip() + ending
+            candidate = normalized[:midpoint].rstrip()
             if body_metrics.horizontalAdvance(candidate) <= available_width:
                 low = midpoint
             else:
                 high = midpoint - 1
 
-        return (
-            normalized[:low].rstrip() + ending
-            if low > 0
-            else "[...]"
-        )
+        return normalized[:low].rstrip()
 
     def _insert_profile_icon(
         self,
@@ -5486,6 +5524,7 @@ class EncryptedChatClient(QObject):
         self.rendered_tooltips.clear()
         self.rendered_image_links.clear()
         self.chat_display.clear()
+        self.chat_display.collapsed_fade_blocks.clear()
 
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -5798,6 +5837,13 @@ class EncryptedChatClient(QObject):
             row_selections.append(selection)
             block = block.next()
 
+        if is_collapsed:
+            collapsed_block = document.findBlock(message_start_position)
+            if collapsed_block.isValid():
+                self.chat_display.collapsed_fade_blocks[
+                    collapsed_block.blockNumber()
+                ] = QColor(background_color)
+
     def _append_system_message(
         self,
         text: str,
@@ -5834,6 +5880,7 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items.clear()
         self.rendered_tooltips.clear()
         self.rendered_image_links.clear()
+        self.chat_display.collapsed_fade_blocks.clear()
         self.chat_display.setExtraSelections([])
         self.chat_display.clear()
 
