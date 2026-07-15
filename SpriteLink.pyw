@@ -159,9 +159,12 @@ THEMES = (
     "Windows Classic",
 )
 
-POLL_INTERVAL_SECONDS = 6.0
-MIN_POLL_REQUEST_SPACING_SECONDS = 5.0
-BACKGROUND_POLL_INTERVAL_SECONDS = 60.0
+FOCUSED_ACTIVE_POLL_INTERVAL_SECONDS = 6.0
+UNFOCUSED_ACTIVE_POLL_INTERVAL_SECONDS = 15.0
+FOCUSED_BACKGROUND_POLL_INTERVAL_SECONDS = 30.0
+UNFOCUSED_BACKGROUND_POLL_INTERVAL_SECONDS = 45.0
+CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
+IMMEDIATE_CHATROOM_SWITCH_LIMIT = 2
 REQUEST_TIMEOUT_SECONDS = 10
 AUTO_HISTORY_SECONDS = 48 * 60 * 60
 GAP_SEPARATOR_SECONDS = 6 * 60 * 60
@@ -1436,6 +1439,7 @@ class EncryptedChatClient(QObject):
         self.root.setWindowTitle("SpriteLink")
         self.root.resize(840, 650)
         self.root.setMinimumSize(670, 500)
+        self.root.installEventFilter(self)
 
         self.config_data = load_config()
         app = QApplication.instance()
@@ -1455,7 +1459,9 @@ class EncryptedChatClient(QObject):
         })
 
         self.stop_event = threading.Event()
-        self.reconnect_requested = threading.Event()
+        self.window_focused_event = threading.Event()
+        self.window_focused_event.set()
+        self.network_control_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.ui_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.send_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 
@@ -1474,6 +1480,7 @@ class EncryptedChatClient(QObject):
         self.image_preview_cache: dict[str, QImage | None] = {}
         self.pending_image_previews: set[str] = set()
         self.current_image_preview_url: str | None = None
+        self.recent_chatroom_switch_times: list[float] = []
         self.image_fetch_executor = ThreadPoolExecutor(
             max_workers=3,
             thread_name_prefix="SpriteLinkImage",
@@ -2154,12 +2161,40 @@ class EncryptedChatClient(QObject):
         if room_id == self.active_chatroom_id:
             self._refresh_chatroom_list()
             return
+        now = time.monotonic()
+        cutoff = now - CHATROOM_SWITCH_BURST_WINDOW_SECONDS
+        self.recent_chatroom_switch_times = [
+            switched_at
+            for switched_at in self.recent_chatroom_switch_times
+            if switched_at >= cutoff
+        ]
+        poll_immediately = (
+            len(self.recent_chatroom_switch_times)
+            < IMMEDIATE_CHATROOM_SWITCH_LIMIT
+        )
+        self.recent_chatroom_switch_times.append(now)
         self._persist_local_history()
         self.active_chatroom_id = room_id
         self.config_data["active_chatroom_id"] = room_id
-        self._switch_active_chatroom()
+        self._switch_active_chatroom(
+            poll_immediately=poll_immediately
+        )
 
-    def _switch_active_chatroom(self) -> None:
+    def _request_network_refresh(
+        self,
+        *,
+        poll_immediately: bool,
+    ) -> None:
+        self.network_control_queue.put({
+            "room_id": self.active_chatroom_id,
+            "poll_immediately": poll_immediately,
+        })
+
+    def _switch_active_chatroom(
+        self,
+        *,
+        poll_immediately: bool = True,
+    ) -> None:
         self._unread_counts().pop(self.active_chatroom_id, None)
         self._update_window_title()
         try:
@@ -2171,7 +2206,9 @@ class EncryptedChatClient(QObject):
         self._load_saved_history_for_current_room()
         self.connected = False
         self.status_var.set("Connecting")
-        self.reconnect_requested.set()
+        self._request_network_refresh(
+            poll_immediately=poll_immediately
+        )
         self.message_entry.clear()
         self._run_message_size_check()
         self._refresh_chatroom_list()
@@ -3006,7 +3043,7 @@ class EncryptedChatClient(QObject):
             room["id"] for room in self._chatroom_definitions()
         )
         self.status_var.set("Reconnecting")
-        self.reconnect_requested.set()
+        self._request_network_refresh(poll_immediately=True)
         self._append_system_message("Configuration saved. Reconnecting.")
         return True
 
@@ -3315,22 +3352,18 @@ class EncryptedChatClient(QObject):
 
     def _network_loop(self) -> None:
         last_poll_times: dict[str, float] = {}
-        next_poll_allowed = 0.0
+        last_background_poll_at: float | None = None
         force_active_poll = True
+        deferred_active_poll_started_at: float | None = None
+        scheduled_active_room_id = ""
 
         while not self.stop_event.is_set():
-            if self.reconnect_requested.is_set():
-                self.reconnect_requested.clear()
-                self.connected = False
-                force_active_poll = True
-                self.ui_queue.put((
-                    "status",
-                    (
-                        "Connecting",
-                        "Applying saved configuration...",
-                        self.active_chatroom_id,
-                    ),
-                ))
+            latest_control: dict[str, Any] | None = None
+            while True:
+                try:
+                    latest_control = self.network_control_queue.get_nowait()
+                except queue.Empty:
+                    break
 
             while True:
                 try:
@@ -3348,48 +3381,97 @@ class EncryptedChatClient(QObject):
                 ),
                 rooms[0],
             )
+            active_room_id = active_room["id"]
+            window_focused = self.window_focused_event.is_set()
+            active_interval = (
+                FOCUSED_ACTIVE_POLL_INTERVAL_SECONDS
+                if window_focused
+                else UNFOCUSED_ACTIVE_POLL_INTERVAL_SECONDS
+            )
+            background_interval = (
+                FOCUSED_BACKGROUND_POLL_INTERVAL_SECONDS
+                if window_focused
+                else UNFOCUSED_BACKGROUND_POLL_INTERVAL_SECONDS
+            )
+
+            if latest_control is not None:
+                requested_room_id = str(latest_control.get("room_id", ""))
+                if requested_room_id == active_room_id:
+                    self.connected = False
+                    poll_immediately = bool(
+                        latest_control.get("poll_immediately", False)
+                    )
+                    force_active_poll = poll_immediately
+                    deferred_active_poll_started_at = (
+                        None if poll_immediately else now
+                    )
+                    scheduled_active_room_id = active_room_id
+                    self.ui_queue.put((
+                        "status",
+                        (
+                            "Connecting",
+                            "Applying saved configuration...",
+                            active_room_id,
+                        ),
+                    ))
+
+            if active_room_id != scheduled_active_room_id:
+                scheduled_active_room_id = active_room_id
+                force_active_poll = True
+                deferred_active_poll_started_at = None
+
             valid_room_ids = {room["id"] for room in rooms}
             for room_id in tuple(last_poll_times):
                 if room_id not in valid_room_ids:
                     last_poll_times.pop(room_id, None)
 
-            if now >= next_poll_allowed:
-                active_room_id = active_room["id"]
-                active_poll_due = (
-                    force_active_poll
-                    or now - last_poll_times.get(active_room_id, 0.0)
-                    >= POLL_INTERVAL_SECONDS
+            active_last_polled = last_poll_times.get(active_room_id)
+            active_poll_due = force_active_poll or (
+                (
+                    deferred_active_poll_started_at is None
+                    or now - deferred_active_poll_started_at
+                    >= active_interval
                 )
-                room_to_poll: dict[str, str] | None = None
-                poll_is_active = False
+                and (
+                    active_last_polled is None
+                    or now - active_last_polled >= active_interval
+                )
+            )
+            background_rooms = [
+                room for room in rooms
+                if room["id"] != active_room_id
+            ]
+            background_poll_due = bool(background_rooms) and (
+                last_background_poll_at is None
+                or now - last_background_poll_at >= background_interval
+            )
 
-                if active_poll_due:
-                    room_to_poll = active_room
-                    poll_is_active = True
+            room_to_poll: dict[str, str] | None = None
+            poll_is_active = False
+            if active_poll_due:
+                room_to_poll = active_room
+                poll_is_active = True
+            elif background_poll_due:
+                room_to_poll = min(
+                    background_rooms,
+                    key=lambda room: last_poll_times.get(
+                        room["id"],
+                        float("-inf"),
+                    ),
+                )
+
+            if room_to_poll is not None:
+                self._network_poll(
+                    room_to_poll,
+                    is_active=poll_is_active,
+                )
+                completed_at = time.monotonic()
+                last_poll_times[room_to_poll["id"]] = completed_at
+                if poll_is_active:
+                    force_active_poll = False
+                    deferred_active_poll_started_at = None
                 else:
-                    room_to_poll = next((
-                        room
-                        for room in rooms
-                        if room["id"] != active_room_id
-                        and (
-                            room["id"] not in last_poll_times
-                            or now - last_poll_times[room["id"]]
-                            >= BACKGROUND_POLL_INTERVAL_SECONDS
-                        )
-                    ), None)
-
-                if room_to_poll is not None:
-                    self._network_poll(
-                        room_to_poll,
-                        is_active=poll_is_active,
-                    )
-                    completed_at = time.monotonic()
-                    last_poll_times[room_to_poll["id"]] = completed_at
-                    next_poll_allowed = (
-                        completed_at + MIN_POLL_REQUEST_SPACING_SECONDS
-                    )
-                    if poll_is_active:
-                        force_active_poll = False
+                    last_background_poll_at = completed_at
 
             self.stop_event.wait(0.08)
 
@@ -4284,6 +4366,15 @@ class EncryptedChatClient(QObject):
             ))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            watched is self.root
+            and hasattr(self, "window_focused_event")
+        ):
+            if event.type() == QEvent.Type.WindowActivate:
+                self.window_focused_event.set()
+            elif event.type() == QEvent.Type.WindowDeactivate:
+                self.window_focused_event.clear()
+
         if (
             watched is getattr(self, "chat_content", None)
             and event.type() == QEvent.Type.Resize
