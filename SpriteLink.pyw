@@ -140,6 +140,7 @@ except ImportError as exc:
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
 CONFIG_FORMAT_VERSION = 17
+WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
@@ -6533,7 +6534,12 @@ def _write_crash_log(error_text: str) -> Path | None:
 def main() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("SpriteLink")
+    window_icon = QIcon(str(WINDOW_ICON_PATH))
+    if not window_icon.isNull():
+        app.setWindowIcon(window_icon)
     root = MainWindow()
+    if not window_icon.isNull():
+        root.setWindowIcon(window_icon)
 
     def report_callback_exception(
         exc_type: type[BaseException],
