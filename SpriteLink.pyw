@@ -1478,6 +1478,34 @@ class ChatroomListRow(QWidget):
             self.setGraphicsEffect(opacity)
 
 
+class ChatroomListWidget(QListWidget):
+    leftItemPressed = Signal(QListWidgetItem)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def mousePressEvent(self, event: Any) -> None:
+        is_left_press = event.button() == Qt.MouseButton.LeftButton
+        item = (
+            self.itemAt(event.position().toPoint())
+            if is_left_press
+            else None
+        )
+        if is_left_press and item is None:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+        if item is not None:
+            self.leftItemPressed.emit(item)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+
 class ThemeComboBox(QComboBox):
     """Draw a guaranteed-visible Classic arrow above Qt's styled control."""
 
@@ -2118,11 +2146,11 @@ class EncryptedChatClient(QObject):
         panel_layout.setSpacing(7)
         panel_layout.addWidget(self._heading("Chatrooms"))
 
-        self.chatrooms_list = QListWidget()
+        self.chatrooms_list = ChatroomListWidget()
         self.chatrooms_list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
-        self.chatrooms_list.itemClicked.connect(
+        self.chatrooms_list.leftItemPressed.connect(
             lambda item: self._activate_chatroom(
                 str(item.data(Qt.ItemDataRole.UserRole))
             )
