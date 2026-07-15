@@ -3023,6 +3023,16 @@ class EncryptedChatClient(QObject):
             # Older Windows versions do not expose the color attributes.
             pass
 
+    def _exec_themed_file_dialog(self, dialog: QFileDialog) -> int:
+        # Native Windows dialogs are created when exec() starts. Apply once to
+        # the wrapper and once from the nested event loop after it is visible.
+        self._apply_window_titlebar_theme(dialog)
+        QTimer.singleShot(
+            0,
+            lambda: self._apply_window_titlebar_theme(dialog),
+        )
+        return int(dialog.exec())
+
     def _apply_titlebar_theme(self) -> None:
         self._apply_window_titlebar_theme(self.root)
 
@@ -4147,8 +4157,10 @@ class EncryptedChatClient(QObject):
             "Image files (*.png *.jpg *.jpeg);;PNG images (*.png);;"
             "JPEG images (*.jpg *.jpeg)"
         )
-        self._apply_window_titlebar_theme(dialog)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if (
+            self._exec_themed_file_dialog(dialog)
+            != QDialog.DialogCode.Accepted
+        ):
             return
         selected_files = dialog.selectedFiles()
         source_path = selected_files[0] if selected_files else ""
@@ -4763,15 +4775,13 @@ class EncryptedChatClient(QObject):
         previous_sound = str(self.message_sound_var.get())
         if selected_sound == "Custom":
             dialog = QFileDialog(self.root, "Choose message sound")
-            dialog.setOption(
-                QFileDialog.Option.DontUseNativeDialog,
-                True,
-            )
             dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
             dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
             dialog.setNameFilter("Audio files (*.wav *.mp3 *.ogg)")
-            self._apply_window_titlebar_theme(dialog)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
+            if (
+                self._exec_themed_file_dialog(dialog)
+                != QDialog.DialogCode.Accepted
+            ):
                 self.message_sound_combo.setCurrentText(previous_sound)
                 return
             selected_files = dialog.selectedFiles()
