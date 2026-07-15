@@ -55,6 +55,7 @@ try:
         QColor,
         QCursor,
         QDesktopServices,
+        QDrag,
         QFont,
         QFontMetrics,
         QIcon,
@@ -72,7 +73,9 @@ try:
         QTextImageFormat,
         QTextOption,
     )
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QSoundEffect
     from PySide6.QtWidgets import (
+        QAbstractItemView,
         QApplication,
         QCheckBox,
         QColorDialog,
@@ -94,6 +97,7 @@ try:
         QProgressBar,
         QPushButton,
         QScrollArea,
+        QSlider,
         QSizePolicy,
         QStyleFactory,
         QTextBrowser,
@@ -133,23 +137,35 @@ except ImportError as exc:
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
 
-try:
-    import winsound
-except ImportError:
-    winsound = None
-
-
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 14
+CONFIG_FORMAT_VERSION = 17
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
 GLOBAL_CHATROOM_ID = "global"
 GLOBAL_CHATROOM_NICKNAME = "Global"
 GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
-CHATROOM_SIDEBAR_WIDTH = 240
+CHATROOM_SIDEBAR_WIDTH = 180
 CONFIG_POPUP_MAX_WIDTH = 720
+DEFAULT_MESSAGE_SOUND = "Chime"
+DEFAULT_MESSAGE_SOUND_VOLUME = 100
+MESSAGE_SOUND_OPTIONS = (
+    "Disabled",
+    "Chime Soft",
+    "Chime",
+    "Chime Glassy",
+    "Blip",
+    "Custom",
+)
+BUILTIN_MESSAGE_SOUND_FILES = {
+    "Chime Soft": "chime_soft.wav",
+    "Chime": "chime.wav",
+    "Chime Glassy": "chime_glassy.wav",
+    "Blip": "blip.wav",
+}
+CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
+COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
@@ -840,7 +856,9 @@ def default_config() -> dict[str, Any]:
         "server_preset": DEFAULT_SERVER_PRESET,
         "server_url": DEFAULT_SERVER_URL,
         "theme": DEFAULT_THEME,
-        "chime_enabled": True,
+        "message_sound": DEFAULT_MESSAGE_SOUND,
+        "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
+        "custom_message_sound_path": "",
         "client_id": secrets.token_hex(32),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
@@ -899,6 +917,42 @@ def load_config() -> dict[str, Any]:
         previous_config_version = int(config.get("config_version", 0) or 0)
     except (TypeError, ValueError):
         previous_config_version = 0
+
+    if previous_config_version < 15:
+        config["message_sound"] = (
+            DEFAULT_MESSAGE_SOUND
+            if bool(config.get("chime_enabled", True))
+            else "Disabled"
+        )
+    message_sound = str(
+        config.get("message_sound", DEFAULT_MESSAGE_SOUND)
+    )
+    config["message_sound"] = (
+        message_sound
+        if message_sound in MESSAGE_SOUND_OPTIONS
+        else DEFAULT_MESSAGE_SOUND
+    )
+    try:
+        message_sound_volume = int(config.get(
+            "message_sound_volume",
+            DEFAULT_MESSAGE_SOUND_VOLUME,
+        ))
+    except (TypeError, ValueError):
+        message_sound_volume = DEFAULT_MESSAGE_SOUND_VOLUME
+    config["message_sound_volume"] = max(
+        10,
+        min(100, ((message_sound_volume + 5) // 10) * 10),
+    )
+    custom_message_sound_path = config.get(
+        "custom_message_sound_path",
+        "",
+    )
+    config["custom_message_sound_path"] = (
+        custom_message_sound_path
+        if isinstance(custom_message_sound_path, str)
+        else ""
+    )
+    config.pop("chime_enabled", None)
 
     if not isinstance(config.get("client_id"), str) or len(config["client_id"]) < 32:
         config["client_id"] = secrets.token_hex(32)
@@ -1516,11 +1570,22 @@ class ChatroomListRow(QWidget):
 
 
 class ChatroomListWidget(QListWidget):
-    leftItemPressed = Signal(QListWidgetItem)
+    roomMoveRequested = Signal(str, int)
+    dragFinished = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(
+            QAbstractItemView.DragDropMode.InternalMove
+        )
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self._pressed_room_id: str | None = None
+        self._dragged_room_id: str | None = None
+        self._dragged_row = -1
 
     def mousePressEvent(self, event: Any) -> None:
         is_left_press = event.button() == Qt.MouseButton.LeftButton
@@ -1532,21 +1597,89 @@ class ChatroomListWidget(QListWidget):
         if is_left_press and item is None:
             event.accept()
             return
+        if is_left_press and item is not None:
+            self._pressed_room_id = str(
+                item.data(Qt.ItemDataRole.UserRole)
+            )
         super().mousePressEvent(event)
-        if item is not None:
-            self.leftItemPressed.emit(item)
 
     def mouseMoveEvent(self, event: Any) -> None:
-        if event.buttons() & Qt.MouseButton.LeftButton:
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._pressed_room_id == GLOBAL_CHATROOM_ID
+        ):
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: Any) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            event.accept()
+        try:
+            super().mouseReleaseEvent(event)
+        finally:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._pressed_room_id = None
+
+    def startDrag(self, supported_actions: Any) -> None:
+        item = self.currentItem()
+        if item is None:
             return
-        super().mouseReleaseEvent(event)
+        room_id = str(item.data(Qt.ItemDataRole.UserRole))
+        if room_id == GLOBAL_CHATROOM_ID:
+            return
+        self._dragged_room_id = room_id
+        self._dragged_row = self.row(item)
+        try:
+            mime_data = self.model().mimeData([self.currentIndex()])
+            if mime_data is None:
+                return
+            drag = QDrag(self)
+            drag.setMimeData(mime_data)
+            transparent_drag_image = QPixmap(1, 1)
+            transparent_drag_image.fill(Qt.GlobalColor.transparent)
+            drag.setPixmap(transparent_drag_image)
+            drag.setHotSpot(QPoint(0, 0))
+            drag.exec(
+                supported_actions,
+                Qt.DropAction.MoveAction,
+            )
+        finally:
+            self._pressed_room_id = None
+            self._dragged_room_id = None
+            self._dragged_row = -1
+            self.dragFinished.emit()
+
+    def dropEvent(self, event: Any) -> None:
+        if self._dragged_room_id is None or self._dragged_row < 1:
+            event.ignore()
+            return
+
+        target_row = self.indexAt(event.position().toPoint()).row()
+        if target_row < 0:
+            insertion_row = self.count()
+        elif self.dropIndicatorPosition() in (
+            QAbstractItemView.DropIndicatorPosition.BelowItem,
+            QAbstractItemView.DropIndicatorPosition.OnViewport,
+        ):
+            insertion_row = target_row + 1
+        else:
+            insertion_row = target_row
+
+        insertion_row = max(1, min(self.count(), insertion_row))
+        if self._dragged_row < insertion_row:
+            insertion_row -= 1
+        if insertion_row != self._dragged_row:
+            room_id = self._dragged_room_id
+            QTimer.singleShot(
+                0,
+                lambda: self.roomMoveRequested.emit(
+                    room_id,
+                    insertion_row,
+                ),
+            )
+        # The configuration/list rebuild performs the move. Report Ignore to
+        # Qt's InternalMove source so it does not also delete the dragged row.
+        event.setDropAction(Qt.DropAction.IgnoreAction)
+        event.accept()
 
 
 class ThemeComboBox(QComboBox):
@@ -1957,8 +2090,14 @@ class EncryptedChatClient(QObject):
         self.theme_var = ValueModel(
             self.config_data.get("theme", DEFAULT_THEME)
         )
-        self.chime_var = ValueModel(
-            bool(self.config_data["chime_enabled"])
+        self.message_sound_var = ValueModel(
+            str(self.config_data["message_sound"])
+        )
+        self.message_sound_volume_var = ValueModel(
+            int(self.config_data["message_sound_volume"])
+        )
+        self.custom_message_sound_path_var = ValueModel(
+            str(self.config_data["custom_message_sound_path"])
         )
         self.status_var = ValueModel("Connecting")
 
@@ -1981,6 +2120,27 @@ class EncryptedChatClient(QObject):
         self.message_limit_reset_timer.timeout.connect(
             self._reset_daily_sent_message_count
         )
+
+        self.message_sound_stop_timer = QTimer(self)
+        self.message_sound_stop_timer.setSingleShot(True)
+        self.message_sound_stop_timer.timeout.connect(
+            self._stop_message_sound
+        )
+        self.message_sound_effects: dict[str, QSoundEffect] = {}
+        self.active_message_sound_effect: QSoundEffect | None = None
+        self.pending_message_sound_effect: QSoundEffect | None = None
+        self.pending_message_sound_name = ""
+        self.pending_message_sound_report_errors = False
+        for filename in BUILTIN_MESSAGE_SOUND_FILES.values():
+            self._message_sound_effect_for_path(
+                Path(__file__).resolve().parent / "sounds" / filename
+            )
+        self.compressed_message_sound_audio_output: (
+            QAudioOutput | None
+        ) = None
+        self.compressed_message_sound_player: QMediaPlayer | None = None
+        self.compressed_message_sound_name = ""
+        self.compressed_message_sound_report_errors = False
 
         self.chat_tooltip_timer = QTimer(self)
         self.chat_tooltip_timer.setSingleShot(True)
@@ -2268,10 +2428,16 @@ class EncryptedChatClient(QObject):
         self.chatrooms_list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
-        self.chatrooms_list.leftItemPressed.connect(
+        self.chatrooms_list.itemClicked.connect(
             lambda item: self._activate_chatroom(
                 str(item.data(Qt.ItemDataRole.UserRole))
             )
+        )
+        self.chatrooms_list.roomMoveRequested.connect(
+            self._move_chatroom
+        )
+        self.chatrooms_list.dragFinished.connect(
+            self._refresh_chatroom_list
         )
         self.chatrooms_list.customContextMenuRequested.connect(
             self._show_chatroom_context_menu
@@ -2468,6 +2634,10 @@ class EncryptedChatClient(QObject):
         for room in self._chatroom_definitions():
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, room["id"])
+            if room["id"] == GLOBAL_CHATROOM_ID:
+                item.setFlags(
+                    item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled
+                )
             self.chatrooms_list.addItem(item)
             row = ChatroomListRow(
                 room["nickname"],
@@ -2482,6 +2652,37 @@ class EncryptedChatClient(QObject):
         if active_item is not None:
             self.chatrooms_list.setCurrentItem(active_item)
         self._update_chatrooms_toggle_unread_style()
+
+    def _move_chatroom(self, room_id: str, target_row: int) -> None:
+        raw_rooms = self.config_data.get("chatrooms", [])
+        if not isinstance(raw_rooms, list):
+            return
+        source_index = next(
+            (
+                index
+                for index, room in enumerate(raw_rooms)
+                if isinstance(room, dict)
+                and str(room.get("id", "")) == room_id
+            ),
+            None,
+        )
+        if source_index is None:
+            return
+
+        original_rooms = list(raw_rooms)
+        moved_room = raw_rooms.pop(source_index)
+        target_index = max(0, min(len(raw_rooms), target_row - 1))
+        raw_rooms.insert(target_index, moved_room)
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            self.config_data["chatrooms"] = original_rooms
+            messagebox.showerror(
+                "Could not reorder chatrooms",
+                str(exc),
+                parent=self.root,
+            )
+        self._refresh_chatroom_list()
 
     def _update_chatrooms_toggle_unread_style(self) -> None:
         if not hasattr(self, "chatrooms_toggle"):
@@ -3560,46 +3761,6 @@ class EncryptedChatClient(QObject):
         layout.setColumnStretch(1, 1)
         row = 0
 
-        layout.addWidget(self._heading("Server"), row, 0, 1, 3)
-        row += 1
-
-        layout.addWidget(QLabel("Preset"), row, 0)
-        self.server_preset_combo = ThemeComboBox()
-        self.server_preset_combo.addItems(list(SERVER_PRESETS.keys()))
-        self.server_preset_combo.setCurrentText(str(self.server_preset_var.get()))
-        self.server_preset_combo.currentTextChanged.connect(
-            self.server_preset_var.set
-        )
-        self.server_preset_combo.currentTextChanged.connect(
-            self._on_server_preset_changed
-        )
-        self.server_preset_var.bind(self.server_preset_combo.setCurrentText)
-        layout.addWidget(self.server_preset_combo, row, 1, 1, 2)
-        row += 1
-
-        layout.addWidget(QLabel("Server URL"), row, 0)
-        self.server_url_entry = QLineEdit()
-        self.server_url_entry.setText(str(self.server_url_var.get()))
-        self.server_url_entry.textChanged.connect(self.server_url_var.set)
-        self.server_url_var.bind(self.server_url_entry.setText)
-        layout.addWidget(self.server_url_entry, row, 1, 1, 2)
-        row += 1
-
-        layout.addWidget(
-            self._description(
-                "ntfy.sh is selected by default. On startup, the client requests "
-                "up to 48 hours of cached encrypted history, subject to the server's "
-                "actual retention period."
-            ),
-            row,
-            0,
-            1,
-            3,
-        )
-        row += 1
-
-        layout.addWidget(self._separator(), row, 0, 1, 3)
-        row += 1
         layout.addWidget(self._heading("Appearance"), row, 0, 1, 3)
         row += 1
 
@@ -3623,15 +3784,199 @@ class EncryptedChatClient(QObject):
         )
         row += 1
 
-        self.chime_checkbox = QCheckBox(
-            "Play a chime when another user sends a message"
+        layout.addWidget(QLabel("Message Sound"), row, 0)
+        self.message_sound_combo = ThemeComboBox()
+        self.message_sound_combo.addItems(list(MESSAGE_SOUND_OPTIONS))
+        self.message_sound_combo.setCurrentText(
+            str(self.message_sound_var.get())
         )
-        self.chime_checkbox.setChecked(bool(self.chime_var.get()))
-        self.chime_checkbox.toggled.connect(self.chime_var.set)
-        self.chime_var.bind(self.chime_checkbox.setChecked)
-        layout.addWidget(self.chime_checkbox, row, 0, 1, 3)
+        self.message_sound_combo.textActivated.connect(
+            self._on_message_sound_selected
+        )
+        self.message_sound_var.bind(
+            self.message_sound_combo.setCurrentText
+        )
+        layout.addWidget(self.message_sound_combo, row, 1)
+        message_sound_volume_control = QWidget()
+        message_sound_volume_layout = QHBoxLayout(
+            message_sound_volume_control
+        )
+        message_sound_volume_layout.setContentsMargins(0, 0, 0, 0)
+        message_sound_volume_layout.setSpacing(6)
+        self.message_sound_volume_label = QLabel(
+            f"Volume: {int(self.message_sound_volume_var.get())}%"
+        )
+        message_sound_volume_layout.addWidget(
+            self.message_sound_volume_label
+        )
+        self.message_sound_volume_slider = QSlider(
+            Qt.Orientation.Horizontal
+        )
+        self.message_sound_volume_slider.setRange(1, 10)
+        self.message_sound_volume_slider.setSingleStep(1)
+        self.message_sound_volume_slider.setPageStep(1)
+        self.message_sound_volume_slider.setMinimumWidth(120)
+        self.message_sound_volume_slider.setAccessibleName(
+            "Message sound volume"
+        )
+        self.message_sound_volume_slider.setValue(
+            int(self.message_sound_volume_var.get()) // 10
+        )
+        self.message_sound_volume_slider.setToolTip(
+            f"Volume: {int(self.message_sound_volume_var.get())}%"
+        )
+        self.message_sound_volume_slider.valueChanged.connect(
+            self._on_message_sound_volume_changed
+        )
+        self.message_sound_volume_var.bind(
+            lambda value: self.message_sound_volume_slider.setValue(
+                int(value) // 10
+            )
+        )
+        message_sound_volume_layout.addWidget(
+            self.message_sound_volume_slider,
+            1,
+        )
+        layout.addWidget(message_sound_volume_control, row, 2)
+        row += 1
+
+        layout.addWidget(self._separator(), row, 0, 1, 3)
+        row += 1
+
+        self.advanced_config_toggle = QPushButton("Advanced ▶")
+        self.advanced_config_toggle.setCheckable(True)
+        self.advanced_config_toggle.setChecked(False)
+        self.advanced_config_toggle.setAccessibleName(
+            "Toggle advanced settings"
+        )
+        self.advanced_config_toggle.toggled.connect(
+            self._on_advanced_config_toggled
+        )
+        layout.addWidget(self.advanced_config_toggle, row, 0, 1, 3)
+        row += 1
+
+        self.advanced_config_content = QWidget()
+        advanced_layout = QGridLayout(self.advanced_config_content)
+        advanced_layout.setContentsMargins(8, 2, 0, 4)
+        advanced_layout.setHorizontalSpacing(10)
+        advanced_layout.setVerticalSpacing(5)
+        advanced_layout.setColumnStretch(1, 1)
+        advanced_row = 0
+
+        advanced_layout.addWidget(
+            self._heading("Server"),
+            advanced_row,
+            0,
+            1,
+            3,
+        )
+        advanced_row += 1
+
+        advanced_layout.addWidget(QLabel("Preset"), advanced_row, 0)
+        self.server_preset_combo = ThemeComboBox()
+        self.server_preset_combo.addItems(list(SERVER_PRESETS.keys()))
+        self.server_preset_combo.setCurrentText(
+            str(self.server_preset_var.get())
+        )
+        self.server_preset_combo.currentTextChanged.connect(
+            self.server_preset_var.set
+        )
+        self.server_preset_combo.currentTextChanged.connect(
+            self._on_server_preset_changed
+        )
+        self.server_preset_var.bind(self.server_preset_combo.setCurrentText)
+        advanced_layout.addWidget(
+            self.server_preset_combo,
+            advanced_row,
+            1,
+            1,
+            2,
+        )
+        advanced_row += 1
+
+        advanced_layout.addWidget(QLabel("Server URL"), advanced_row, 0)
+        self.server_url_entry = QLineEdit()
+        self.server_url_entry.setText(str(self.server_url_var.get()))
+        self.server_url_entry.textChanged.connect(self.server_url_var.set)
+        self.server_url_var.bind(self.server_url_entry.setText)
+        advanced_layout.addWidget(
+            self.server_url_entry,
+            advanced_row,
+            1,
+            1,
+            2,
+        )
+        advanced_row += 1
+
+        advanced_layout.addWidget(
+            self._description(
+                "ntfy.sh is selected by default. On startup, the client "
+                "requests up to 48 hours of cached encrypted history, "
+                "subject to the server's actual retention period."
+            ),
+            advanced_row,
+            0,
+            1,
+            3,
+        )
+        self.advanced_config_content.hide()
+        layout.addWidget(self.advanced_config_content, row, 0, 1, 3)
         row += 1
         layout.setRowStretch(row, 1)
+
+    def _on_advanced_config_toggled(self, expanded: bool) -> None:
+        self.advanced_config_toggle.setText(
+            "Advanced ▼" if expanded else "Advanced ▶"
+        )
+        self.advanced_config_content.setVisible(expanded)
+
+    def _on_message_sound_selected(self, value: str) -> None:
+        selected_sound = str(value)
+        if selected_sound not in MESSAGE_SOUND_OPTIONS:
+            return
+
+        previous_sound = str(self.message_sound_var.get())
+        if selected_sound == "Custom":
+            dialog = QFileDialog(self.root, "Choose message sound")
+            dialog.setOption(
+                QFileDialog.Option.DontUseNativeDialog,
+                True,
+            )
+            dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+            dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+            dialog.setNameFilter("Audio files (*.wav *.mp3 *.ogg)")
+            self._apply_window_titlebar_theme(dialog)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self.message_sound_combo.setCurrentText(previous_sound)
+                return
+            selected_files = dialog.selectedFiles()
+            custom_path = selected_files[0] if selected_files else ""
+            if not custom_path:
+                self.message_sound_combo.setCurrentText(previous_sound)
+                return
+            self.custom_message_sound_path_var.set(custom_path)
+
+        self.message_sound_var.set(selected_sound)
+        self._play_message_sound(report_errors=True)
+
+    def _on_message_sound_volume_changed(self, slider_value: int) -> None:
+        volume_percent = max(1, min(10, int(slider_value))) * 10
+        self.message_sound_volume_var.set(volume_percent)
+        self.message_sound_volume_label.setText(
+            f"Volume: {volume_percent}%"
+        )
+        self.message_sound_volume_slider.setToolTip(
+            f"Volume: {volume_percent}%"
+        )
+        if self.active_message_sound_effect is not None:
+            self.active_message_sound_effect.setVolume(
+                volume_percent / 100.0
+            )
+        if self.compressed_message_sound_audio_output is not None:
+            self.compressed_message_sound_audio_output.setVolume(
+                volume_percent / 100.0
+            )
+        self._play_message_sound(report_errors=True)
 
     def _sync_config_overlay_geometry(self) -> None:
         self.config_overlay.setGeometry(self.chat_content.rect())
@@ -3640,7 +3985,9 @@ class EncryptedChatClient(QObject):
         return (
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
-            bool(self.chime_var.get()),
+            str(self.message_sound_var.get()),
+            int(self.message_sound_volume_var.get()),
+            str(self.custom_message_sound_path_var.get()),
         )
 
     def _set_config_toggle_checked(self, checked: bool) -> None:
@@ -3654,7 +4001,7 @@ class EncryptedChatClient(QObject):
             self._sync_config_overlay_geometry()
             self.config_overlay.show()
             self.config_overlay.raise_()
-            self.server_preset_combo.setFocus()
+            self.theme_combo.setFocus()
             return
 
         self._dismiss_config_popup()
@@ -3664,13 +4011,22 @@ class EncryptedChatClient(QObject):
             self._set_config_toggle_checked(False)
             return True
 
-        changed = (
-            self._config_snapshot_at_open is not None
-            and self._config_ui_snapshot() != self._config_snapshot_at_open
-        )
-        if changed and not self._save_and_reconnect():
-            self._set_config_toggle_checked(True)
-            return False
+        current_snapshot = self._config_ui_snapshot()
+        if self._config_snapshot_at_open is not None:
+            changed = current_snapshot != self._config_snapshot_at_open
+            server_changed = (
+                current_snapshot[:2]
+                != self._config_snapshot_at_open[:2]
+            )
+            if changed:
+                save_succeeded = (
+                    self._save_and_reconnect()
+                    if server_changed
+                    else self._save_settings()
+                )
+                if not save_succeeded:
+                    self._set_config_toggle_checked(True)
+                    return False
 
         self.config_overlay.hide()
         self._set_config_toggle_checked(False)
@@ -3733,9 +4089,22 @@ class EncryptedChatClient(QObject):
         self.config_data["theme"] = (
             theme if theme in THEMES else DEFAULT_THEME
         )
-        self.config_data["chime_enabled"] = bool(self.chime_var.get())
+        message_sound = str(self.message_sound_var.get())
+        self.config_data["message_sound"] = (
+            message_sound
+            if message_sound in MESSAGE_SOUND_OPTIONS
+            else DEFAULT_MESSAGE_SOUND
+        )
+        self.config_data["message_sound_volume"] = max(
+            10,
+            min(100, int(self.message_sound_volume_var.get())),
+        )
+        self.config_data["custom_message_sound_path"] = str(
+            self.custom_message_sound_path_var.get()
+        )
+        self.config_data.pop("chime_enabled", None)
 
-    def _save_and_reconnect(self) -> bool:
+    def _save_settings(self) -> bool:
         try:
             self._copy_ui_to_config()
             save_config(self.config_data)
@@ -3745,6 +4114,11 @@ class EncryptedChatClient(QObject):
                 str(exc),
                 parent=self.root,
             )
+            return False
+        return True
+
+    def _save_and_reconnect(self) -> bool:
+        if not self._save_settings():
             return False
 
         self._clear_visible_room()
@@ -3757,7 +4131,6 @@ class EncryptedChatClient(QObject):
         )
         self.status_var.set("Reconnecting")
         self._request_network_refresh(poll_immediately=True)
-        self._append_system_message("Configuration saved. Reconnecting.")
         return True
 
     def _build_draft_message(self, text: str) -> dict[str, Any]:
@@ -4575,11 +4948,11 @@ class EncryptedChatClient(QObject):
             if not history_scan and not is_local:
                 unread_added += 1
                 if (
-                    self.chime_var.get()
+                    self._should_play_message_sound(room_id)
                     and not self._is_chatroom_muted(room_id)
                     and str(message.get("c", "")) not in muted_user_ids
                 ):
-                    self._play_chime()
+                    self._play_message_sound()
 
         if not added:
             return
@@ -4637,11 +5010,11 @@ class EncryptedChatClient(QObject):
         if (
             play_chime
             and not is_local
-            and self.chime_var.get()
+            and self._should_play_message_sound(self.active_chatroom_id)
             and not self._is_chatroom_muted(self.active_chatroom_id)
             and not self._is_user_muted(str(message["c"]))
         ):
-            self._play_chime()
+            self._play_message_sound()
 
         return True
 
@@ -5912,20 +6285,226 @@ class EncryptedChatClient(QObject):
         self.chat_display.setExtraSelections([])
         self.chat_display.clear()
 
-    def _play_chime(self) -> None:
-        if winsound is None:
+    def _should_play_message_sound(self, room_id: str) -> bool:
+        return (
+            str(self.message_sound_var.get()) != "Disabled"
+            and (
+                room_id != self.active_chatroom_id
+                or not self.window_focused_event.is_set()
+            )
+        )
+
+    def _message_sound_path(self, sound_name: str) -> Path | None:
+        if sound_name == "Custom":
+            custom_path = str(
+                self.custom_message_sound_path_var.get()
+            ).strip()
+            return Path(custom_path) if custom_path else None
+
+        filename = BUILTIN_MESSAGE_SOUND_FILES.get(sound_name)
+        if filename is None:
+            return None
+        return Path(__file__).resolve().parent / "sounds" / filename
+
+    def _message_sound_effect_for_path(
+        self,
+        sound_path: Path,
+    ) -> QSoundEffect:
+        resolved_path = str(sound_path.resolve())
+        effect = self.message_sound_effects.get(resolved_path)
+        if effect is not None:
+            return effect
+
+        effect = QSoundEffect(self)
+        effect.setLoopCount(1)
+        effect.setVolume(
+            int(self.message_sound_volume_var.get()) / 100.0
+        )
+        effect.statusChanged.connect(
+            lambda effect=effect: (
+                self._on_message_sound_effect_status_changed(effect)
+            )
+        )
+        self.message_sound_effects[resolved_path] = effect
+        effect.setSource(QUrl.fromLocalFile(resolved_path))
+        return effect
+
+    def _start_message_sound_effect(
+        self,
+        effect: QSoundEffect,
+        sound_name: str,
+    ) -> None:
+        effect.stop()
+        effect.setVolume(
+            int(self.message_sound_volume_var.get()) / 100.0
+        )
+        self.active_message_sound_effect = effect
+        effect.play()
+        if sound_name == "Custom":
+            self.message_sound_stop_timer.start(
+                CUSTOM_MESSAGE_SOUND_MAX_MS
+            )
+
+    def _on_message_sound_effect_status_changed(
+        self,
+        effect: QSoundEffect,
+    ) -> None:
+        if effect is not self.pending_message_sound_effect:
+            return
+        if effect.isLoaded():
+            sound_name = self.pending_message_sound_name
+            self.pending_message_sound_effect = None
+            self.pending_message_sound_name = ""
+            self.pending_message_sound_report_errors = False
+            self._start_message_sound_effect(effect, sound_name)
+            return
+        if effect.status() != QSoundEffect.Status.Error:
             return
 
+        report_errors = self.pending_message_sound_report_errors
+        self.pending_message_sound_effect = None
+        self.pending_message_sound_name = ""
+        self.pending_message_sound_report_errors = False
+        if report_errors and not self._closing:
+            messagebox.showerror(
+                "Could not play message sound",
+                "The selected WAV file could not be loaded.",
+                parent=self.root,
+            )
+
+    def _ensure_compressed_message_sound_player(
+        self,
+    ) -> tuple[QMediaPlayer, QAudioOutput]:
+        player = self.compressed_message_sound_player
+        audio_output = self.compressed_message_sound_audio_output
+        if player is not None and audio_output is not None:
+            return player, audio_output
+
+        audio_output = QAudioOutput(self)
+        audio_output.setVolume(
+            int(self.message_sound_volume_var.get()) / 100.0
+        )
+        player = QMediaPlayer(self)
+        player.setAudioOutput(audio_output)
+        player.playbackStateChanged.connect(
+            self._on_compressed_message_sound_state_changed
+        )
+        player.errorOccurred.connect(
+            self._on_compressed_message_sound_error
+        )
+        self.compressed_message_sound_audio_output = audio_output
+        self.compressed_message_sound_player = player
+        return player, audio_output
+
+    def _play_compressed_message_sound(
+        self,
+        sound_path: Path,
+        sound_name: str,
+        *,
+        report_errors: bool,
+    ) -> None:
+        player, audio_output = (
+            self._ensure_compressed_message_sound_player()
+        )
+        audio_output.setVolume(
+            int(self.message_sound_volume_var.get()) / 100.0
+        )
+        self.compressed_message_sound_name = sound_name
+        self.compressed_message_sound_report_errors = report_errors
+        sound_url = QUrl.fromLocalFile(str(sound_path.resolve()))
+        if player.source() != sound_url:
+            player.setSource(sound_url)
+        else:
+            player.setPosition(0)
+        player.play()
+
+    def _on_compressed_message_sound_state_changed(
+        self,
+        state: QMediaPlayer.PlaybackState,
+    ) -> None:
+        if (
+            state == QMediaPlayer.PlaybackState.PlayingState
+            and self.compressed_message_sound_name == "Custom"
+        ):
+            self.message_sound_stop_timer.start(
+                CUSTOM_MESSAGE_SOUND_MAX_MS
+            )
+
+    def _on_compressed_message_sound_error(self, *_args: Any) -> None:
+        report_errors = self.compressed_message_sound_report_errors
+        self.compressed_message_sound_name = ""
+        self.compressed_message_sound_report_errors = False
+        if report_errors and not self._closing:
+            player = self.compressed_message_sound_player
+            error_text = (
+                player.errorString() if player is not None else ""
+            ) or (
+                "The selected audio file could not be played."
+            )
+            messagebox.showerror(
+                "Could not play message sound",
+                error_text,
+                parent=self.root,
+            )
+
+    def _stop_message_sound(self) -> None:
+        self.message_sound_stop_timer.stop()
+        self.pending_message_sound_effect = None
+        self.pending_message_sound_name = ""
+        self.pending_message_sound_report_errors = False
+        if self.active_message_sound_effect is not None:
+            self.active_message_sound_effect.stop()
+            self.active_message_sound_effect = None
+        if self.compressed_message_sound_player is not None:
+            self.compressed_message_sound_player.stop()
+        self.compressed_message_sound_name = ""
+        self.compressed_message_sound_report_errors = False
+
+    def _play_message_sound(self, *, report_errors: bool = False) -> None:
+        sound_name = str(self.message_sound_var.get())
+        self._stop_message_sound()
+        sound_path = self._message_sound_path(sound_name)
+        if sound_path is None:
+            return
         try:
-            winsound.MessageBeep(winsound.MB_OK)
-        except Exception:
-            pass
+            if not sound_path.is_file():
+                raise FileNotFoundError(
+                    f"Message sound not found: {sound_path}"
+                )
+            if (
+                sound_path.suffix.casefold()
+                in COMPRESSED_MESSAGE_SOUND_EXTENSIONS
+            ):
+                self._play_compressed_message_sound(
+                    sound_path,
+                    sound_name,
+                    report_errors=report_errors,
+                )
+                return
+            effect = self._message_sound_effect_for_path(sound_path)
+            if effect.isLoaded():
+                self._start_message_sound_effect(effect, sound_name)
+            else:
+                self.pending_message_sound_effect = effect
+                self.pending_message_sound_name = sound_name
+                self.pending_message_sound_report_errors = report_errors
+                if effect.status() == QSoundEffect.Status.Error:
+                    self._on_message_sound_effect_status_changed(effect)
+        except Exception as exc:
+            if report_errors:
+                messagebox.showerror(
+                    "Could not play message sound",
+                    str(exc),
+                    parent=self.root,
+                )
 
     def _on_close(self) -> None:
         if self._closing:
             return
         self._closing = True
         QToolTip.hideText()
+        self.message_sound_stop_timer.stop()
+        self._stop_message_sound()
 
         try:
             self._copy_ui_to_config()
