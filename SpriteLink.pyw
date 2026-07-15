@@ -55,6 +55,7 @@ try:
         QColor,
         QCursor,
         QDesktopServices,
+        QDrag,
         QFont,
         QFontMetrics,
         QIcon,
@@ -1576,7 +1577,19 @@ class ChatroomListWidget(QListWidget):
         self._dragged_room_id = room_id
         self._dragged_row = self.row(item)
         try:
-            super().startDrag(supported_actions)
+            mime_data = self.model().mimeData([self.currentIndex()])
+            if mime_data is None:
+                return
+            drag = QDrag(self)
+            drag.setMimeData(mime_data)
+            transparent_drag_image = QPixmap(1, 1)
+            transparent_drag_image.fill(Qt.GlobalColor.transparent)
+            drag.setPixmap(transparent_drag_image)
+            drag.setHotSpot(QPoint(0, 0))
+            drag.exec(
+                supported_actions,
+                Qt.DropAction.MoveAction,
+            )
         finally:
             self._pressed_room_id = None
             self._dragged_room_id = None
