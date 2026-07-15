@@ -295,6 +295,20 @@ class ImageEmbeddingTests(unittest.TestCase):
             (48, 32),
         )
 
+    def test_large_preview_contains_media_within_visible_overlay(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._set_large_image_preview_frame
+        )
+        self.assertIn("self.image_preview_overlay.height()", source)
+        self.assertIn("self.image_preview_button_row.sizeHint()", source)
+        self.assertIn("available_width", source)
+        self.assertIn("available_height", source)
+        self.assertIn("Qt.AspectRatioMode.KeepAspectRatio", source)
+        self.assertNotIn(
+            "EMBEDDED_IMAGE_MAX_EDGE",
+            source,
+        )
+
     def test_untrusted_image_link_is_omitted_from_display_text(self) -> None:
         url = "https://example.com/private-image.png"
         display_text = (
@@ -493,6 +507,7 @@ class _FakeUpdateWidget:
         self.enabled = True
         self.tooltip = ""
         self.focused = False
+        self.stylesheet = ""
 
     def setText(self, text: str) -> None:
         self.text = text
@@ -505,6 +520,12 @@ class _FakeUpdateWidget:
 
     def setFocus(self) -> None:
         self.focused = True
+
+    def isEnabled(self) -> bool:
+        return self.enabled
+
+    def setStyleSheet(self, stylesheet: str) -> None:
+        self.stylesheet = stylesheet
 
 
 class _FakeConfigOverlay:
@@ -523,6 +544,9 @@ class _FakeUpdateClient:
 
     def _update_config_toggle_update_style(self) -> None:
         self.config_style_updates += 1
+
+    def _update_update_button_style(self) -> None:
+        SPRITELINK.EncryptedChatClient._update_update_button_style(self)
 
     def _show_no_available_update(self) -> None:
         SPRITELINK.EncryptedChatClient._show_no_available_update(self)
@@ -602,6 +626,10 @@ class UpdateConfigTests(unittest.TestCase):
         self.assertEqual(client.latest_version_label.text, "Latest Version: 2.0.0")
         self.assertEqual(client.update_button.text, "Update")
         self.assertTrue(client.update_button.enabled)
+        self.assertEqual(
+            client.update_button.stylesheet,
+            SPRITELINK.NOTIFICATION_BUTTON_STYLESHEET,
+        )
         self.assertIs(client.available_update, release)
 
     def test_current_release_disables_up_to_date_button(self) -> None:
@@ -619,6 +647,7 @@ class UpdateConfigTests(unittest.TestCase):
         self.assertEqual(client.latest_version_label.text, "Latest Version: 1.0.0")
         self.assertEqual(client.update_button.text, "Up-to-date")
         self.assertFalse(client.update_button.enabled)
+        self.assertEqual(client.update_button.stylesheet, "")
         self.assertIsNone(client.available_update)
 
 
