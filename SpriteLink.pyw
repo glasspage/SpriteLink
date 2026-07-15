@@ -2855,6 +2855,7 @@ class EncryptedChatClient(QObject):
 
         self.chat_display = MessageLogBrowser()
         self.chat_display.setReadOnly(True)
+        self.chat_display.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.chat_display.setOpenLinks(False)
         self.chat_display.setOpenExternalLinks(False)
         self.chat_display.setUndoRedoEnabled(False)
