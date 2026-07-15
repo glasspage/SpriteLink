@@ -183,6 +183,7 @@ MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
 EMBEDDED_IMAGE_MAX_EDGE = 96
+NSFW_IMAGE_PLACEHOLDER_SIZE = 64
 TOP_ALIGNED_PROFILE_ICON_PADDING = 3
 IMAGE_PREVIEW_MAX_WIDTH = CONFIG_POPUP_MAX_WIDTH - 32
 IMAGE_PREVIEW_MAX_HEIGHT = 480
@@ -197,6 +198,16 @@ IMAGE_LINK_EXTENSIONS = (
     ".webp",
     ".bmp",
     ".jfif",
+)
+LIKELY_NSFW_IMAGE_DOMAINS = (
+    "e621.net",
+    "gelbooru.com",
+    "nhentai.net",
+    "redgifs.com",
+    "rule34.paheal.net",
+    "rule34.xxx",
+    "xbooru.com",
+    "yande.re",
 )
 MESSAGE_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 MESSAGE_ENTRY_MIN_LINES = 1
@@ -776,6 +787,17 @@ def is_direct_image_url(url: str) -> bool:
     return (
         parsed.scheme.casefold() in {"http", "https"}
         and parsed.path.casefold().endswith(IMAGE_LINK_EXTENSIONS)
+    )
+
+
+def is_likely_nsfw_image_url(url: str) -> bool:
+    try:
+        hostname = (urlsplit(url).hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return False
+    return any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in LIKELY_NSFW_IMAGE_DOMAINS
     )
 
 
@@ -5357,12 +5379,15 @@ class EncryptedChatClient(QObject):
         image = self.image_preview_cache.get(url)
         if not isinstance(image, QImage) or image.isNull():
             return False
-        preview = image.scaled(
-            EMBEDDED_IMAGE_MAX_EDGE,
-            EMBEDDED_IMAGE_MAX_EDGE,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        if is_likely_nsfw_image_url(url):
+            preview = self._likely_nsfw_image_placeholder()
+        else:
+            preview = image.scaled(
+                EMBEDDED_IMAGE_MAX_EDGE,
+                EMBEDDED_IMAGE_MAX_EDGE,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
         token = hashlib.sha256(url.encode("utf-8")).hexdigest()
         self.rendered_image_links[token] = url
         resource_url = QUrl(f"spritelink-chat-image-resource:{token}")
@@ -5382,6 +5407,31 @@ class EncryptedChatClient(QObject):
         image_format.setAnchorHref(f"spritelink-image:{token}")
         cursor.insertImage(image_format)
         return True
+
+    def _likely_nsfw_image_placeholder(self) -> QImage:
+        placeholder = QImage(
+            NSFW_IMAGE_PLACEHOLDER_SIZE,
+            NSFW_IMAGE_PLACEHOLDER_SIZE,
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        placeholder.fill(QColor("#eee8df"))
+        painter = QPainter(placeholder)
+        painter.setRenderHint(
+            QPainter.RenderHint.TextAntialiasing,
+            not self._is_windows_classic_theme(),
+        )
+        painter.setPen(QColor("#c29a70"))
+        painter.drawRect(placeholder.rect().adjusted(0, 0, -1, -1))
+        painter.setPen(QColor("#704825"))
+        painter.setFont(self._make_font("Segoe UI", 8, bold=True))
+        painter.drawText(
+            placeholder.rect().adjusted(4, 4, -4, -4),
+            Qt.AlignmentFlag.AlignCenter
+            | Qt.TextFlag.TextWordWrap,
+            "Likely NSFW",
+        )
+        painter.end()
+        return placeholder
 
     def _insert_log_separator(
         self,
@@ -5603,16 +5653,16 @@ class EncryptedChatClient(QObject):
                     and isinstance(cached_image, QImage)
                     and not cached_image.isNull()
                 ):
-                    embedded_preview = cached_image.scaled(
-                        EMBEDDED_IMAGE_MAX_EDGE,
-                        EMBEDDED_IMAGE_MAX_EDGE,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                    top_align_height = max(
-                        top_align_height,
-                        embedded_preview.height(),
-                    )
+                    if is_likely_nsfw_image_url(url):
+                        preview_height = NSFW_IMAGE_PLACEHOLDER_SIZE
+                    else:
+                        preview_height = cached_image.scaled(
+                            EMBEDDED_IMAGE_MAX_EDGE,
+                            EMBEDDED_IMAGE_MAX_EDGE,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        ).height()
+                    top_align_height = max(top_align_height, preview_height)
         align_message_top = top_align_height > 0
 
         has_profile_icon = self._insert_profile_icon(
