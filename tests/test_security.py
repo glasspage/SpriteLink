@@ -40,6 +40,19 @@ class ProfileIconTests(unittest.TestCase):
         )
         self.assertNotIn("DontUseNativeDialog", source)
         self.assertIn("*.png *.jpg *.jpeg", source)
+        self.assertIn("_exec_themed_file_dialog", source)
+
+    def test_custom_chime_picker_uses_native_themed_dialog(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_message_sound_selected
+        )
+        self.assertNotIn("DontUseNativeDialog", source)
+        self.assertIn("_exec_themed_file_dialog", source)
+        themed_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._exec_themed_file_dialog
+        )
+        self.assertIn("_apply_window_titlebar_theme", themed_source)
+        self.assertIn("QTimer.singleShot", themed_source)
 
 
 class ImageTrustTests(unittest.TestCase):
