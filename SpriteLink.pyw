@@ -1431,15 +1431,11 @@ class AddChatroomDialog(QDialog):
         key_hint = QLabel(
             "32+ characters recommended. Only share this key with others "
             "you want in the chatroom!"
+            + (f" {history_note}" if history_note else "")
         )
         key_hint.setWordWrap(True)
         key_hint.setStyleSheet("color: #777777; font-size: 8pt;")
         form.addWidget(key_hint, 2, 1, 1, 2)
-        if history_note:
-            history_hint = QLabel(history_note)
-            history_hint.setWordWrap(True)
-            history_hint.setStyleSheet("color: #777777; font-size: 8pt;")
-            form.addWidget(history_hint, 3, 1, 1, 2)
         layout.addLayout(form)
 
         buttons = QHBoxLayout()
