@@ -3789,6 +3789,18 @@ class EncryptedChatClient(QObject):
             self.message_sound_combo.setCurrentText
         )
         layout.addWidget(self.message_sound_combo, row, 1)
+        message_sound_volume_control = QWidget()
+        message_sound_volume_layout = QHBoxLayout(
+            message_sound_volume_control
+        )
+        message_sound_volume_layout.setContentsMargins(0, 0, 0, 0)
+        message_sound_volume_layout.setSpacing(6)
+        self.message_sound_volume_label = QLabel(
+            f"Volume: {int(self.message_sound_volume_var.get())}%"
+        )
+        message_sound_volume_layout.addWidget(
+            self.message_sound_volume_label
+        )
         self.message_sound_volume_slider = QSlider(
             Qt.Orientation.Horizontal
         )
@@ -3813,7 +3825,11 @@ class EncryptedChatClient(QObject):
                 int(value) // 10
             )
         )
-        layout.addWidget(self.message_sound_volume_slider, row, 2)
+        message_sound_volume_layout.addWidget(
+            self.message_sound_volume_slider,
+            1,
+        )
+        layout.addWidget(message_sound_volume_control, row, 2)
         row += 1
 
         layout.addWidget(self._separator(), row, 0, 1, 3)
@@ -3938,6 +3954,9 @@ class EncryptedChatClient(QObject):
     def _on_message_sound_volume_changed(self, slider_value: int) -> None:
         volume_percent = max(0, min(10, int(slider_value))) * 10
         self.message_sound_volume_var.set(volume_percent)
+        self.message_sound_volume_label.setText(
+            f"Volume: {volume_percent}%"
+        )
         self.message_sound_volume_slider.setToolTip(
             f"Volume: {volume_percent}%"
         )
