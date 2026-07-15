@@ -263,7 +263,7 @@ MAX_ANIMATED_IMAGE_FRAMES = 500
 IMAGE_PREVIEW_CACHE_LIMIT = 128
 MAX_REMOTE_MEDIA_CACHE_BYTES = 64 * 1024 * 1024
 MAX_ACTIVE_ANIMATED_MEDIA = 12
-MIN_INLINE_ANIMATION_FRAME_MS = 75
+INLINE_MEDIA_NO_UPSCALE_EDGE = 64
 MAX_UNCOMPRESSED_MESSAGE_BYTES = 32 * 1024
 MAX_ENCRYPTED_PACKET_CHARS = NTFY_MAX_BODY_BYTES - 1
 MESSAGE_AUTH_VERSION = 1
@@ -2669,14 +2669,9 @@ class AnimatedMediaController(QObject):
             or frame.width() * frame.height() > MAX_REMOTE_IMAGE_PIXELS
         ):
             return
-        preview = frame.scaled(
-            IMAGE_PREVIEW_MAX_WIDTH,
-            IMAGE_PREVIEW_MAX_HEIGHT,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        preview.setDevicePixelRatio(1.0)
-        self.frame_ready.emit(self.url, preview.copy())
+        emitted_frame = frame.copy()
+        emitted_frame.setDevicePixelRatio(1.0)
+        self.frame_ready.emit(self.url, emitted_frame)
 
     def stop(self) -> None:
         if self._movie is not None:
@@ -4467,12 +4462,6 @@ class EncryptedChatClient(QObject):
         image_positions = self.rendered_image_positions.get(url, [])
         if not image_positions:
             return
-
-        now = time.monotonic()
-        last_frame_at = self.last_inline_animation_frame_at.get(url, 0.0)
-        if (now - last_frame_at) * 1000.0 < MIN_INLINE_ANIMATION_FRAME_MS:
-            return
-        self.last_inline_animation_frame_at[url] = now
 
         preview = self._scaled_inline_media_frame(
             media,
@@ -7018,13 +7007,20 @@ class EncryptedChatClient(QObject):
         media: RemoteMediaPreview,
         frame: QImage,
     ) -> QImage:
-        preview = frame.scaled(
-            EMBEDDED_IMAGE_MAX_EDGE,
-            EMBEDDED_IMAGE_MAX_EDGE,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+        preserve_native_size = (
+            frame.width() <= INLINE_MEDIA_NO_UPSCALE_EDGE
+            and frame.height() <= INLINE_MEDIA_NO_UPSCALE_EDGE
         )
-        if media.kind != "looping_video":
+        if preserve_native_size:
+            preview = frame.copy()
+        else:
+            preview = frame.scaled(
+                EMBEDDED_IMAGE_MAX_EDGE,
+                EMBEDDED_IMAGE_MAX_EDGE,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        if media.kind != "looping_video" or preserve_native_size:
             return preview
 
         canvas = QImage(
