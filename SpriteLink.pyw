@@ -124,10 +124,8 @@ except ImportError as exc:
 
 from spritelink_update import (
     ReleaseInfo,
-    UpdateError,
     download_release_installer,
     fetch_latest_release,
-    parse_semantic_version,
     release_is_newer,
 )
 
@@ -154,7 +152,7 @@ except ImportError as exc:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 20
+CONFIG_FORMAT_VERSION = 21
 WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
 
@@ -164,7 +162,7 @@ except ImportError:
     RUNNING_VERSION = "Development"
 
 UPDATE_REPOSITORY = "glasspage/SpriteLink"
-UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
+UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000
 UPDATE_DIRECTORY = Path(
     os.environ.get("LOCALAPPDATA")
     or os.environ.get("APPDATA")
@@ -1160,7 +1158,6 @@ def default_config() -> dict[str, Any]:
         "message_sound": DEFAULT_MESSAGE_SOUND,
         "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
         "custom_message_sound_path": "",
-        "automatic_update_checks": True,
         "identity_private_key": generate_identity_private_key(),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
@@ -1254,9 +1251,7 @@ def load_config() -> dict[str, Any]:
         if isinstance(custom_message_sound_path, str)
         else ""
     )
-    config["automatic_update_checks"] = bool(
-        config.get("automatic_update_checks", True)
-    )
+    config.pop("automatic_update_checks", None)
     config.pop("chime_enabled", None)
 
     config["identity_private_key"] = normalize_identity_private_key(
@@ -2435,7 +2430,6 @@ class EncryptedChatClient(QObject):
         self.available_update: ReleaseInfo | None = None
         self._update_check_in_progress = False
         self._update_download_in_progress = False
-        self._last_update_check_started_at = 0.0
 
         self.server_preset_var = ValueModel(
             self.config_data["server_preset"]
@@ -2454,9 +2448,6 @@ class EncryptedChatClient(QObject):
         )
         self.custom_message_sound_path_var = ValueModel(
             str(self.config_data["custom_message_sound_path"])
-        )
-        self.automatic_update_checks_var = ValueModel(
-            bool(self.config_data.get("automatic_update_checks", True))
         )
         self.status_var = ValueModel("Connecting")
 
@@ -2489,7 +2480,7 @@ class EncryptedChatClient(QObject):
         self.update_check_timer = QTimer(self)
         self.update_check_timer.setInterval(UPDATE_CHECK_INTERVAL_MS)
         self.update_check_timer.timeout.connect(
-            self._maybe_check_for_updates
+            self._check_for_updates
         )
         self.message_sound_effects: dict[str, QSoundEffect] = {}
         self.active_message_sound_effect: QSoundEffect | None = None
@@ -2526,7 +2517,7 @@ class EncryptedChatClient(QObject):
 
         self.root.close_callback = self._on_close
         QTimer.singleShot(0, self._apply_titlebar_theme)
-        QTimer.singleShot(3000, self._maybe_check_for_updates)
+        QTimer.singleShot(0, self._check_for_updates)
         self.update_check_timer.start()
         self._start_network_thread()
 
@@ -4232,57 +4223,27 @@ class EncryptedChatClient(QObject):
         layout.addWidget(self._heading("Version"), row, 0, 1, 3)
         row += 1
 
-        layout.addWidget(QLabel("Current Version"), row, 0)
-        self.current_version_label = QLabel(RUNNING_VERSION)
-        layout.addWidget(self.current_version_label, row, 1, 1, 2)
+        self.current_version_label = QLabel(
+            f"Current Version: {RUNNING_VERSION}"
+        )
+        layout.addWidget(self.current_version_label, row, 0, 1, 3)
         row += 1
 
-        layout.addWidget(QLabel("Update Checks"), row, 0)
-        self.automatic_update_checks_checkbox = QCheckBox(
-            "Check automatically"
-        )
-        self.automatic_update_checks_checkbox.setChecked(
-            bool(self.automatic_update_checks_var.get())
-        )
-        self.automatic_update_checks_checkbox.toggled.connect(
-            self._on_automatic_update_checks_toggled
-        )
-        self.automatic_update_checks_var.bind(
-            self.automatic_update_checks_checkbox.setChecked
-        )
+        self.latest_version_label = QLabel("Latest Version: ---")
+        layout.addWidget(self.latest_version_label, row, 0, 1, 3)
+        row += 1
+
+        self.update_button = QPushButton("Up-to-date")
+        self.update_button.setEnabled(False)
+        self.update_button.clicked.connect(self._on_update_now_clicked)
         layout.addWidget(
-            self.automatic_update_checks_checkbox,
+            self.update_button,
             row,
+            0,
             1,
-            1,
-            2,
+            3,
+            Qt.AlignmentFlag.AlignLeft,
         )
-        row += 1
-
-        layout.addWidget(QLabel("Status"), row, 0)
-        self.version_status_label = QLabel(
-            "Not checked yet."
-            if parse_semantic_version(RUNNING_VERSION) is not None
-            else "Update checks require a packaged build."
-        )
-        self.version_status_label.setWordWrap(True)
-        layout.addWidget(self.version_status_label, row, 1, 1, 2)
-        row += 1
-
-        version_button_row = QHBoxLayout()
-        version_button_row.addStretch(1)
-        self.check_for_updates_button = QPushButton("Check for Updates")
-        self.check_for_updates_button.clicked.connect(
-            lambda: self._check_for_updates(manual=True)
-        )
-        version_button_row.addWidget(self.check_for_updates_button)
-        self.update_now_button = QPushButton("Update Now")
-        self.update_now_button.clicked.connect(
-            self._on_update_now_clicked
-        )
-        self.update_now_button.hide()
-        version_button_row.addWidget(self.update_now_button)
-        layout.addLayout(version_button_row, row, 0, 1, 3)
         row += 1
 
         layout.addWidget(self._separator(), row, 0, 1, 3)
@@ -4423,122 +4384,81 @@ class EncryptedChatClient(QObject):
             )
         self._play_message_sound(report_errors=True)
 
-    def _on_automatic_update_checks_toggled(self, checked: bool) -> None:
-        self.automatic_update_checks_var.set(bool(checked))
-        if checked and self.available_update is None:
-            QTimer.singleShot(0, self._maybe_check_for_updates)
-
-    def _maybe_check_for_updates(self) -> None:
-        if not bool(self.automatic_update_checks_var.get()):
-            return
-        if time.monotonic() - self._last_update_check_started_at < 300:
-            return
-        self._check_for_updates(manual=False)
-
-    def _check_for_updates(self, *, manual: bool) -> None:
-        if self._closing or self._update_check_in_progress:
-            return
-        if parse_semantic_version(RUNNING_VERSION) is None:
-            self.version_status_label.setText(
-                "Update checks require a packaged build."
-            )
+    def _check_for_updates(self) -> None:
+        if (
+            self._closing
+            or self._update_check_in_progress
+            or self._update_download_in_progress
+        ):
             return
 
         self._update_check_in_progress = True
-        self._last_update_check_started_at = time.monotonic()
         self.update_check_timer.start()
-        self.check_for_updates_button.setEnabled(False)
-        self.version_status_label.setStyleSheet("")
-        self.version_status_label.setToolTip("")
-        self.version_status_label.setText("Checking for updates...")
+        self.update_button.setText("Checking...")
+        self.update_button.setEnabled(False)
+        self.update_button.setToolTip("")
         threading.Thread(
             target=self._check_for_updates_worker,
-            args=(manual,),
             daemon=True,
             name="SpriteLinkUpdateCheck",
         ).start()
 
-    def _check_for_updates_worker(self, manual: bool) -> None:
+    def _check_for_updates_worker(self) -> None:
         try:
             release = fetch_latest_release(
                 UPDATE_REPOSITORY,
                 current_version=RUNNING_VERSION,
             )
-        except Exception as exc:
-            error = str(exc) or "The update check failed."
+        except Exception:
             self.ui_queue.put((
                 "update_check_result",
-                {
-                    "error": error,
-                    "manual": manual,
-                },
+                {"error": True},
             ))
             return
 
         self.ui_queue.put((
             "update_check_result",
-            {
-                "release": release,
-                "manual": manual,
-            },
+            {"release": release},
         ))
+
+    def _show_no_available_update(self) -> None:
+        self.available_update = None
+        self.update_button.setText("Up-to-date")
+        self.update_button.setEnabled(False)
+        self.update_button.setToolTip("")
+        self._update_config_toggle_update_style()
 
     def _handle_update_check_result(self, payload: dict[str, Any]) -> None:
         self._update_check_in_progress = False
-        self.check_for_updates_button.setEnabled(
-            not self._update_download_in_progress
-        )
 
-        error = str(payload.get("error", "")).strip()
-        if error:
-            if self.available_update is None:
-                self.version_status_label.setText(
-                    "Could not check for updates."
-                )
-                self.version_status_label.setStyleSheet("color: #b00020;")
-            else:
-                self.version_status_label.setText(
-                    f"SpriteLink {self.available_update.version} is available."
-                )
-                self.version_status_label.setStyleSheet(
-                    "color: #d97706; font-weight: 600;"
-                )
-            self.version_status_label.setToolTip(error)
+        if payload.get("error"):
+            self.latest_version_label.setText("Latest Version: ---")
+            self.latest_version_label.setToolTip("")
+            self._show_no_available_update()
             return
 
         release = payload.get("release")
         if not isinstance(release, ReleaseInfo):
-            self.version_status_label.setText(
-                "GitHub returned an invalid update response."
-            )
-            self.version_status_label.setStyleSheet("color: #b00020;")
+            self.latest_version_label.setText("Latest Version: ---")
+            self.latest_version_label.setToolTip("")
+            self._show_no_available_update()
             return
 
-        self.version_status_label.setToolTip(release.page_url)
+        self.latest_version_label.setText(
+            f"Latest Version: {release.version}"
+        )
+        self.latest_version_label.setToolTip(release.page_url)
         if release_is_newer(RUNNING_VERSION, release.version):
             self.available_update = release
-            self.version_status_label.setText(
-                f"SpriteLink {release.version} is available."
-            )
-            self.version_status_label.setStyleSheet(
-                "color: #d97706; font-weight: 600;"
-            )
-            self.update_now_button.setText(
-                f"Update to {release.version}"
-            )
-            self.update_now_button.setToolTip(release.notes.strip())
-            self.update_now_button.show()
+            self.update_button.setText("Update")
+            self.update_button.setEnabled(True)
+            self.update_button.setToolTip(release.notes.strip())
             self._update_config_toggle_update_style()
             if self.config_overlay.isVisible():
-                self.update_now_button.setFocus()
+                self.update_button.setFocus()
             return
 
-        self.available_update = None
-        self.version_status_label.setText("SpriteLink is up to date.")
-        self.version_status_label.setStyleSheet("")
-        self.update_now_button.hide()
-        self.update_now_button.setToolTip("")
-        self._update_config_toggle_update_style()
+        self._show_no_available_update()
 
     def _on_update_now_clicked(self) -> None:
         release = self.available_update
@@ -4555,12 +4475,8 @@ class EncryptedChatClient(QObject):
             return
 
         self._update_download_in_progress = True
-        self.update_now_button.setEnabled(False)
-        self.check_for_updates_button.setEnabled(False)
-        self.version_status_label.setStyleSheet("")
-        self.version_status_label.setText(
-            f"Downloading SpriteLink {release.version}..."
-        )
+        self.update_button.setText("Downloading...")
+        self.update_button.setEnabled(False)
         threading.Thread(
             target=self._download_update_worker,
             args=(release,),
@@ -4590,11 +4506,9 @@ class EncryptedChatClient(QObject):
 
     def _handle_update_download_failed(self, error: str) -> None:
         self._update_download_in_progress = False
-        self.update_now_button.setEnabled(True)
-        self.check_for_updates_button.setEnabled(True)
-        self.version_status_label.setText("The update could not be installed.")
-        self.version_status_label.setStyleSheet("color: #b00020;")
-        self.version_status_label.setToolTip(error)
+        self.update_button.setText("Update")
+        self.update_button.setEnabled(self.available_update is not None)
+        self.update_button.setToolTip(error)
         messagebox.showerror(
             "Could not update SpriteLink",
             error,
@@ -4626,9 +4540,8 @@ class EncryptedChatClient(QObject):
             self._handle_update_download_failed(str(exc))
             return
 
-        self.version_status_label.setText(
-            f"Installing SpriteLink {version}..."
-        )
+        self.update_button.setText("Installing...")
+        self.update_button.setEnabled(False)
         QTimer.singleShot(250, self.root.close)
 
     def _sync_config_overlay_geometry(self) -> None:
@@ -4641,7 +4554,6 @@ class EncryptedChatClient(QObject):
             str(self.message_sound_var.get()),
             int(self.message_sound_volume_var.get()),
             str(self.custom_message_sound_path_var.get()),
-            bool(self.automatic_update_checks_var.get()),
         )
 
     def _set_config_toggle_checked(self, checked: bool) -> None:
@@ -4656,7 +4568,7 @@ class EncryptedChatClient(QObject):
             self.config_overlay.show()
             self.config_overlay.raise_()
             (
-                self.update_now_button
+                self.update_button
                 if self.available_update is not None
                 else self.theme_combo
             ).setFocus()
@@ -4760,9 +4672,7 @@ class EncryptedChatClient(QObject):
         self.config_data["custom_message_sound_path"] = str(
             self.custom_message_sound_path_var.get()
         )
-        self.config_data["automatic_update_checks"] = bool(
-            self.automatic_update_checks_var.get()
-        )
+        self.config_data.pop("automatic_update_checks", None)
         self.config_data.pop("chime_enabled", None)
 
     def _save_settings(self) -> bool:

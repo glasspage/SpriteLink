@@ -2,8 +2,10 @@ from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
 import copy
+import inspect
 import sys
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "SpriteLink.pyw"
@@ -236,6 +238,141 @@ class SignedClientIdentityTests(unittest.TestCase):
                 len(SPRITELINK.identity_public_key_bytes(key)),
                 SPRITELINK.ED25519_PUBLIC_KEY_BYTES,
             )
+
+
+class _FakeUpdateWidget:
+    def __init__(self) -> None:
+        self.text = ""
+        self.enabled = True
+        self.tooltip = ""
+        self.focused = False
+
+    def setText(self, text: str) -> None:
+        self.text = text
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def setToolTip(self, tooltip: str) -> None:
+        self.tooltip = tooltip
+
+    def setFocus(self) -> None:
+        self.focused = True
+
+
+class _FakeConfigOverlay:
+    def isVisible(self) -> bool:
+        return False
+
+
+class _FakeUpdateClient:
+    def __init__(self) -> None:
+        self.available_update = object()
+        self._update_check_in_progress = True
+        self.latest_version_label = _FakeUpdateWidget()
+        self.update_button = _FakeUpdateWidget()
+        self.config_overlay = _FakeConfigOverlay()
+        self.config_style_updates = 0
+
+    def _update_config_toggle_update_style(self) -> None:
+        self.config_style_updates += 1
+
+    def _show_no_available_update(self) -> None:
+        SPRITELINK.EncryptedChatClient._show_no_available_update(self)
+
+
+class UpdateConfigTests(unittest.TestCase):
+    @staticmethod
+    def _release(version: str) -> object:
+        return SPRITELINK.ReleaseInfo(
+            version=version,
+            tag_name=f"v{version}",
+            installer_url=f"https://example.com/SpriteLink-{version}.exe",
+            checksum_url=f"https://example.com/SpriteLink-{version}.exe.sha256",
+            page_url=f"https://example.com/releases/{version}",
+            notes="Release notes",
+        )
+
+    def test_update_checks_are_forced_at_startup_and_every_30_minutes(
+        self,
+    ) -> None:
+        self.assertEqual(
+            SPRITELINK.UPDATE_CHECK_INTERVAL_MS,
+            30 * 60 * 1000,
+        )
+        self.assertNotIn(
+            "automatic_update_checks",
+            SPRITELINK.default_config(),
+        )
+        init_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.__init__
+        )
+        self.assertIn(
+            "QTimer.singleShot(0, self._check_for_updates)",
+            init_source,
+        )
+        self.assertIn("self.update_check_timer.start()", init_source)
+
+    def test_version_controls_use_the_compact_left_aligned_format(
+        self,
+    ) -> None:
+        ui_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_config_tab
+        )
+        self.assertIn("Current Version: {RUNNING_VERSION}", ui_source)
+        self.assertIn('QLabel("Latest Version: ---")', ui_source)
+        self.assertIn('QPushButton("Up-to-date")', ui_source)
+        self.assertIn("Qt.AlignmentFlag.AlignLeft", ui_source)
+        self.assertNotIn("Check for Updates", ui_source)
+        self.assertNotIn("Check automatically", ui_source)
+
+    def test_failed_check_uses_silent_unknown_up_to_date_state(self) -> None:
+        client = _FakeUpdateClient()
+        SPRITELINK.EncryptedChatClient._handle_update_check_result(
+            client,
+            {"error": True},
+        )
+        self.assertEqual(client.latest_version_label.text, "Latest Version: ---")
+        self.assertEqual(client.latest_version_label.tooltip, "")
+        self.assertEqual(client.update_button.text, "Up-to-date")
+        self.assertFalse(client.update_button.enabled)
+        self.assertEqual(client.update_button.tooltip, "")
+        self.assertIsNone(client.available_update)
+        self.assertFalse(client._update_check_in_progress)
+
+    def test_available_update_enables_update_button(self) -> None:
+        client = _FakeUpdateClient()
+        release = self._release("2.0.0")
+        with mock.patch.object(
+            SPRITELINK,
+            "release_is_newer",
+            return_value=True,
+        ):
+            SPRITELINK.EncryptedChatClient._handle_update_check_result(
+                client,
+                {"release": release},
+            )
+        self.assertEqual(client.latest_version_label.text, "Latest Version: 2.0.0")
+        self.assertEqual(client.update_button.text, "Update")
+        self.assertTrue(client.update_button.enabled)
+        self.assertIs(client.available_update, release)
+
+    def test_current_release_disables_up_to_date_button(self) -> None:
+        client = _FakeUpdateClient()
+        release = self._release("1.0.0")
+        with mock.patch.object(
+            SPRITELINK,
+            "release_is_newer",
+            return_value=False,
+        ):
+            SPRITELINK.EncryptedChatClient._handle_update_check_result(
+                client,
+                {"release": release},
+            )
+        self.assertEqual(client.latest_version_label.text, "Latest Version: 1.0.0")
+        self.assertEqual(client.update_button.text, "Up-to-date")
+        self.assertFalse(client.update_button.enabled)
+        self.assertIsNone(client.available_update)
 
 
 if __name__ == "__main__":
