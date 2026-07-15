@@ -3560,46 +3560,6 @@ class EncryptedChatClient(QObject):
         layout.setColumnStretch(1, 1)
         row = 0
 
-        layout.addWidget(self._heading("Server"), row, 0, 1, 3)
-        row += 1
-
-        layout.addWidget(QLabel("Preset"), row, 0)
-        self.server_preset_combo = ThemeComboBox()
-        self.server_preset_combo.addItems(list(SERVER_PRESETS.keys()))
-        self.server_preset_combo.setCurrentText(str(self.server_preset_var.get()))
-        self.server_preset_combo.currentTextChanged.connect(
-            self.server_preset_var.set
-        )
-        self.server_preset_combo.currentTextChanged.connect(
-            self._on_server_preset_changed
-        )
-        self.server_preset_var.bind(self.server_preset_combo.setCurrentText)
-        layout.addWidget(self.server_preset_combo, row, 1, 1, 2)
-        row += 1
-
-        layout.addWidget(QLabel("Server URL"), row, 0)
-        self.server_url_entry = QLineEdit()
-        self.server_url_entry.setText(str(self.server_url_var.get()))
-        self.server_url_entry.textChanged.connect(self.server_url_var.set)
-        self.server_url_var.bind(self.server_url_entry.setText)
-        layout.addWidget(self.server_url_entry, row, 1, 1, 2)
-        row += 1
-
-        layout.addWidget(
-            self._description(
-                "ntfy.sh is selected by default. On startup, the client requests "
-                "up to 48 hours of cached encrypted history, subject to the server's "
-                "actual retention period."
-            ),
-            row,
-            0,
-            1,
-            3,
-        )
-        row += 1
-
-        layout.addWidget(self._separator(), row, 0, 1, 3)
-        row += 1
         layout.addWidget(self._heading("Appearance"), row, 0, 1, 3)
         row += 1
 
@@ -3631,7 +3591,96 @@ class EncryptedChatClient(QObject):
         self.chime_var.bind(self.chime_checkbox.setChecked)
         layout.addWidget(self.chime_checkbox, row, 0, 1, 3)
         row += 1
+
+        layout.addWidget(self._separator(), row, 0, 1, 3)
+        row += 1
+
+        self.advanced_config_toggle = QPushButton("Advanced ▶")
+        self.advanced_config_toggle.setCheckable(True)
+        self.advanced_config_toggle.setChecked(False)
+        self.advanced_config_toggle.setAccessibleName(
+            "Toggle advanced settings"
+        )
+        self.advanced_config_toggle.toggled.connect(
+            self._on_advanced_config_toggled
+        )
+        layout.addWidget(self.advanced_config_toggle, row, 0, 1, 3)
+        row += 1
+
+        self.advanced_config_content = QWidget()
+        advanced_layout = QGridLayout(self.advanced_config_content)
+        advanced_layout.setContentsMargins(8, 2, 0, 4)
+        advanced_layout.setHorizontalSpacing(10)
+        advanced_layout.setVerticalSpacing(5)
+        advanced_layout.setColumnStretch(1, 1)
+        advanced_row = 0
+
+        advanced_layout.addWidget(
+            self._heading("Server"),
+            advanced_row,
+            0,
+            1,
+            3,
+        )
+        advanced_row += 1
+
+        advanced_layout.addWidget(QLabel("Preset"), advanced_row, 0)
+        self.server_preset_combo = ThemeComboBox()
+        self.server_preset_combo.addItems(list(SERVER_PRESETS.keys()))
+        self.server_preset_combo.setCurrentText(
+            str(self.server_preset_var.get())
+        )
+        self.server_preset_combo.currentTextChanged.connect(
+            self.server_preset_var.set
+        )
+        self.server_preset_combo.currentTextChanged.connect(
+            self._on_server_preset_changed
+        )
+        self.server_preset_var.bind(self.server_preset_combo.setCurrentText)
+        advanced_layout.addWidget(
+            self.server_preset_combo,
+            advanced_row,
+            1,
+            1,
+            2,
+        )
+        advanced_row += 1
+
+        advanced_layout.addWidget(QLabel("Server URL"), advanced_row, 0)
+        self.server_url_entry = QLineEdit()
+        self.server_url_entry.setText(str(self.server_url_var.get()))
+        self.server_url_entry.textChanged.connect(self.server_url_var.set)
+        self.server_url_var.bind(self.server_url_entry.setText)
+        advanced_layout.addWidget(
+            self.server_url_entry,
+            advanced_row,
+            1,
+            1,
+            2,
+        )
+        advanced_row += 1
+
+        advanced_layout.addWidget(
+            self._description(
+                "ntfy.sh is selected by default. On startup, the client "
+                "requests up to 48 hours of cached encrypted history, "
+                "subject to the server's actual retention period."
+            ),
+            advanced_row,
+            0,
+            1,
+            3,
+        )
+        self.advanced_config_content.hide()
+        layout.addWidget(self.advanced_config_content, row, 0, 1, 3)
+        row += 1
         layout.setRowStretch(row, 1)
+
+    def _on_advanced_config_toggled(self, expanded: bool) -> None:
+        self.advanced_config_toggle.setText(
+            "Advanced ▼" if expanded else "Advanced ▶"
+        )
+        self.advanced_config_content.setVisible(expanded)
 
     def _sync_config_overlay_geometry(self) -> None:
         self.config_overlay.setGeometry(self.chat_content.rect())
@@ -3654,7 +3703,7 @@ class EncryptedChatClient(QObject):
             self._sync_config_overlay_geometry()
             self.config_overlay.show()
             self.config_overlay.raise_()
-            self.server_preset_combo.setFocus()
+            self.theme_combo.setFocus()
             return
 
         self._dismiss_config_popup()
