@@ -4,6 +4,7 @@ from pathlib import Path
 import copy
 import inspect
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -15,6 +16,30 @@ assert SPEC is not None
 SPRITELINK = module_from_spec(SPEC)
 sys.modules[SPEC.name] = SPRITELINK
 LOADER.exec_module(SPRITELINK)
+
+
+class ProfileIconTests(unittest.TestCase):
+    def test_jpeg_profile_icons_are_optimized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "profile.jpg"
+            SPRITELINK.Image.new(
+                "RGB",
+                (48, 32),
+                (20, 100, 180),
+            ).save(source_path, format="JPEG")
+            gif_data = SPRITELINK.optimize_profile_icon(str(source_path))
+
+        self.assertIn(gif_data[:6], (b"GIF87a", b"GIF89a"))
+        SPRITELINK.decode_profile_icon(
+            SPRITELINK.encode_profile_icon(gif_data)
+        )
+
+    def test_profile_icon_picker_uses_native_thumbnail_dialog(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._choose_profile_icon
+        )
+        self.assertNotIn("DontUseNativeDialog", source)
+        self.assertIn("*.png *.jpg *.jpeg", source)
 
 
 class ImageTrustTests(unittest.TestCase):
