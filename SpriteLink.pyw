@@ -73,7 +73,7 @@ try:
         QTextImageFormat,
         QTextOption,
     )
-    from PySide6.QtMultimedia import QSoundEffect
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QSoundEffect
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -165,6 +165,7 @@ BUILTIN_MESSAGE_SOUND_FILES = {
     "Blip": "blip.wav",
 }
 CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
+COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
@@ -2134,6 +2135,12 @@ class EncryptedChatClient(QObject):
             self._message_sound_effect_for_path(
                 Path(__file__).resolve().parent / "sounds" / filename
             )
+        self.compressed_message_sound_audio_output: (
+            QAudioOutput | None
+        ) = None
+        self.compressed_message_sound_player: QMediaPlayer | None = None
+        self.compressed_message_sound_name = ""
+        self.compressed_message_sound_report_errors = False
 
         self.chat_tooltip_timer = QTimer(self)
         self.chat_tooltip_timer.setSingleShot(True)
@@ -3937,7 +3944,7 @@ class EncryptedChatClient(QObject):
             )
             dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
             dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-            dialog.setNameFilter("WAV audio (*.wav)")
+            dialog.setNameFilter("Audio files (*.wav *.mp3 *.ogg)")
             self._apply_window_titlebar_theme(dialog)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 self.message_sound_combo.setCurrentText(previous_sound)
@@ -3963,6 +3970,10 @@ class EncryptedChatClient(QObject):
         )
         if self.active_message_sound_effect is not None:
             self.active_message_sound_effect.setVolume(
+                volume_percent / 100.0
+            )
+        if self.compressed_message_sound_audio_output is not None:
+            self.compressed_message_sound_audio_output.setVolume(
                 volume_percent / 100.0
             )
         self._play_message_sound(report_errors=True)
@@ -6361,6 +6372,81 @@ class EncryptedChatClient(QObject):
                 parent=self.root,
             )
 
+    def _ensure_compressed_message_sound_player(
+        self,
+    ) -> tuple[QMediaPlayer, QAudioOutput]:
+        player = self.compressed_message_sound_player
+        audio_output = self.compressed_message_sound_audio_output
+        if player is not None and audio_output is not None:
+            return player, audio_output
+
+        audio_output = QAudioOutput(self)
+        audio_output.setVolume(
+            int(self.message_sound_volume_var.get()) / 100.0
+        )
+        player = QMediaPlayer(self)
+        player.setAudioOutput(audio_output)
+        player.playbackStateChanged.connect(
+            self._on_compressed_message_sound_state_changed
+        )
+        player.errorOccurred.connect(
+            self._on_compressed_message_sound_error
+        )
+        self.compressed_message_sound_audio_output = audio_output
+        self.compressed_message_sound_player = player
+        return player, audio_output
+
+    def _play_compressed_message_sound(
+        self,
+        sound_path: Path,
+        sound_name: str,
+        *,
+        report_errors: bool,
+    ) -> None:
+        player, audio_output = (
+            self._ensure_compressed_message_sound_player()
+        )
+        audio_output.setVolume(
+            int(self.message_sound_volume_var.get()) / 100.0
+        )
+        self.compressed_message_sound_name = sound_name
+        self.compressed_message_sound_report_errors = report_errors
+        sound_url = QUrl.fromLocalFile(str(sound_path.resolve()))
+        if player.source() != sound_url:
+            player.setSource(sound_url)
+        else:
+            player.setPosition(0)
+        player.play()
+
+    def _on_compressed_message_sound_state_changed(
+        self,
+        state: QMediaPlayer.PlaybackState,
+    ) -> None:
+        if (
+            state == QMediaPlayer.PlaybackState.PlayingState
+            and self.compressed_message_sound_name == "Custom"
+        ):
+            self.message_sound_stop_timer.start(
+                CUSTOM_MESSAGE_SOUND_MAX_MS
+            )
+
+    def _on_compressed_message_sound_error(self, *_args: Any) -> None:
+        report_errors = self.compressed_message_sound_report_errors
+        self.compressed_message_sound_name = ""
+        self.compressed_message_sound_report_errors = False
+        if report_errors and not self._closing:
+            player = self.compressed_message_sound_player
+            error_text = (
+                player.errorString() if player is not None else ""
+            ) or (
+                "The selected audio file could not be played."
+            )
+            messagebox.showerror(
+                "Could not play message sound",
+                error_text,
+                parent=self.root,
+            )
+
     def _stop_message_sound(self) -> None:
         self.message_sound_stop_timer.stop()
         self.pending_message_sound_effect = None
@@ -6369,6 +6455,10 @@ class EncryptedChatClient(QObject):
         if self.active_message_sound_effect is not None:
             self.active_message_sound_effect.stop()
             self.active_message_sound_effect = None
+        if self.compressed_message_sound_player is not None:
+            self.compressed_message_sound_player.stop()
+        self.compressed_message_sound_name = ""
+        self.compressed_message_sound_report_errors = False
 
     def _play_message_sound(self, *, report_errors: bool = False) -> None:
         sound_name = str(self.message_sound_var.get())
@@ -6381,6 +6471,16 @@ class EncryptedChatClient(QObject):
                 raise FileNotFoundError(
                     f"Message sound not found: {sound_path}"
                 )
+            if (
+                sound_path.suffix.casefold()
+                in COMPRESSED_MESSAGE_SOUND_EXTENSIONS
+            ):
+                self._play_compressed_message_sound(
+                    sound_path,
+                    sound_name,
+                    report_errors=report_errors,
+                )
+                return
             effect = self._message_sound_effect_for_path(sound_path)
             if effect.isLoaded():
                 self._start_message_sound_effect(effect, sound_name)
