@@ -33,6 +33,13 @@ The `Windows package` workflow can be used in two ways:
   the version tag and GitHub Release from the selected branch.
 
 Release versions must contain exactly three numeric components, such as
-`0.1.0`. Draft and prerelease channels can be added when integrated updating is
-implemented.
+`0.1.0`. The integrated updater follows GitHub's latest stable Release; draft
+and prerelease channels are not offered to installed clients.
 
+## Integrated updates
+
+The release version is embedded into the packaged application automatically.
+SpriteLink checks the repository's latest public GitHub Release and expects the
+workflow's exact versioned installer and checksum names. The repository and its
+Releases must be publicly readable for installed clients to check and download
+updates without embedding a GitHub credential.
