@@ -1747,6 +1747,24 @@ class MessageLogBrowser(QTextBrowser):
         super().__init__(parent)
         self.row_background_blocks: dict[int, QColor] = {}
         self.collapsed_fade_blocks: dict[int, QColor] = {}
+        self.horizontalScrollBar().rangeChanged.connect(
+            self._lock_horizontal_scroll
+        )
+        self.horizontalScrollBar().valueChanged.connect(
+            self._lock_horizontal_scroll
+        )
+        self._lock_horizontal_scroll()
+
+    def _lock_horizontal_scroll(self, *_args: Any) -> None:
+        scrollbar = self.horizontalScrollBar()
+        signals_were_blocked = scrollbar.blockSignals(True)
+        scrollbar.setRange(0, 0)
+        scrollbar.setValue(0)
+        scrollbar.blockSignals(signals_were_blocked)
+
+    def scrollContentsBy(self, _dx: int, dy: int) -> None:
+        self._lock_horizontal_scroll()
+        super().scrollContentsBy(0, dy)
 
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
@@ -2837,6 +2855,7 @@ class EncryptedChatClient(QObject):
 
         self.chat_display = MessageLogBrowser()
         self.chat_display.setReadOnly(True)
+        self.chat_display.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.chat_display.setOpenLinks(False)
         self.chat_display.setOpenExternalLinks(False)
         self.chat_display.setUndoRedoEnabled(False)
