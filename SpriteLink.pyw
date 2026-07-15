@@ -4839,7 +4839,7 @@ class EncryptedChatClient(QObject):
 
         align_message_top = False
         if not is_collapsed:
-            for _start, _end, url in message_url_spans(display_text):
+            for _start, _end, url in message_url_spans(text):
                 cached_image = self.image_preview_cache.get(url)
                 if (
                     is_direct_image_url(url)
