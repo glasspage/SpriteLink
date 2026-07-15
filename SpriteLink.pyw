@@ -4024,7 +4024,6 @@ class EncryptedChatClient(QObject):
         )
         self.status_var.set("Reconnecting")
         self._request_network_refresh(poll_immediately=True)
-        self._append_system_message("Configuration saved. Reconnecting.")
         return True
 
     def _build_draft_message(self, text: str) -> dict[str, Any]:
