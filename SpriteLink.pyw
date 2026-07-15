@@ -24,6 +24,7 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 from functools import lru_cache
+from html.parser import HTMLParser
 from datetime import datetime
 import hashlib
 import io
@@ -40,7 +41,7 @@ import traceback
 import sys
 import uuid
 import zlib
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 try:
     from PySide6.QtCore import (
         QBuffer,
@@ -255,6 +256,7 @@ TOP_ALIGNED_PROFILE_ICON_PADDING = 3
 IMAGE_PREVIEW_MAX_WIDTH = CONFIG_POPUP_MAX_WIDTH - 32
 IMAGE_PREVIEW_MAX_HEIGHT = 480
 MAX_REMOTE_IMAGE_BYTES = 50 * 1024 * 1024
+MAX_MEDIA_PAGE_HTML_BYTES = 2 * 1024 * 1024
 MAX_REMOTE_IMAGE_PIXELS = 16 * 1024 * 1024
 MAX_ANIMATED_IMAGE_PIXELS = 4 * 1024 * 1024
 MAX_ANIMATED_IMAGE_FRAMES = 500
@@ -288,8 +290,12 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "images.unsplash.com",
     "images.pexels.com",
     "cdn.bsky.app",
+    "tenor.com",
+    "www.tenor.com",
     "media.tenor.com",
     "c.tenor.com",
+    "giphy.com",
+    "www.giphy.com",
     "media.giphy.com",
     "media0.giphy.com",
     "media1.giphy.com",
@@ -297,6 +303,8 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "media3.giphy.com",
     "media4.giphy.com",
     "i.giphy.com",
+    "imgur.com",
+    "www.imgur.com",
     "klipy.com",
     "*.klipy.com",
     "res.cloudinary.com",
@@ -344,6 +352,40 @@ TENOR_MEDIA_HOSTS = (
 TENOR_VIDEO_EXTENSIONS = (
     ".mp4",
     ".webm",
+)
+LOOPING_VIDEO_HOST_PATTERNS = (
+    "media.tenor.com",
+    "c.tenor.com",
+    "*.klipy.com",
+    "media.giphy.com",
+    "media0.giphy.com",
+    "media1.giphy.com",
+    "media2.giphy.com",
+    "media3.giphy.com",
+    "media4.giphy.com",
+    "*.redgifs.com",
+)
+TRUSTED_MEDIA_PAGE_PATHS = {
+    "tenor.com": ("/view/",),
+    "www.tenor.com": ("/view/",),
+    "klipy.com": ("/gifs/",),
+    "www.klipy.com": ("/gifs/",),
+    "giphy.com": ("/gifs/", "/stickers/"),
+    "www.giphy.com": ("/gifs/", "/stickers/"),
+    "imgur.com": ("/",),
+    "www.imgur.com": ("/",),
+    "redgifs.com": ("/watch/", "/ifr/"),
+    "www.redgifs.com": ("/watch/", "/ifr/"),
+}
+MEDIA_PAGE_METADATA_KEYS = (
+    "og:video:secure_url",
+    "og:video:url",
+    "og:video",
+    "twitter:player:stream",
+    "og:image:secure_url",
+    "og:image:url",
+    "og:image",
+    "twitter:image",
 )
 LIKELY_NSFW_IMAGE_DOMAINS = (
     "e621.net",
@@ -960,29 +1002,69 @@ def _image_hostname_matches_pattern(
     return hostname == pattern
 
 
-def is_tenor_video_url(url: str) -> bool:
-    try:
-        parsed = urlsplit(url)
-    except ValueError:
-        return False
-    hostname = (parsed.hostname or "").casefold().rstrip(".")
+def _url_has_video_extension(parsed: Any) -> bool:
     query_format = (
         parse_qs(parsed.query).get("format", [""])[0]
         .strip()
         .casefold()
     )
     return (
+        parsed.path.casefold().endswith(TENOR_VIDEO_EXTENSIONS)
+        or f".{query_format}" in TENOR_VIDEO_EXTENSIONS
+    )
+
+
+def is_tenor_video_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    return (
         parsed.scheme.casefold() in {"http", "https"}
         and hostname in TENOR_MEDIA_HOSTS
-        and (
-            parsed.path.casefold().endswith(TENOR_VIDEO_EXTENSIONS)
-            or f".{query_format}" in TENOR_VIDEO_EXTENSIONS
+        and _url_has_video_extension(parsed)
+    )
+
+
+def is_trusted_looping_video_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    return (
+        parsed.scheme.casefold() == "https"
+        and _url_has_video_extension(parsed)
+        and any(
+            _image_hostname_matches_pattern(hostname, pattern)
+            for pattern in LOOPING_VIDEO_HOST_PATTERNS
         )
     )
 
 
+def is_supported_media_page_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    prefixes = TRUSTED_MEDIA_PAGE_PATHS.get(hostname, ())
+    path = parsed.path or "/"
+    return (
+        parsed.scheme.casefold() == "https"
+        and bool(prefixes)
+        and any(path.startswith(prefix) for prefix in prefixes)
+        and path != "/"
+    )
+
+
 def is_embeddable_media_url(url: str) -> bool:
-    return is_direct_image_url(url) or is_tenor_video_url(url)
+    return (
+        is_direct_image_url(url)
+        or is_trusted_looping_video_url(url)
+        or is_supported_media_page_url(url)
+    )
 
 
 def is_trusted_image_url(url: str) -> bool:
@@ -1081,6 +1163,70 @@ def message_text_with_untrusted_images_hidden(
         if visible_text
         else "[untrusted image]"
     )
+
+
+class MediaPageMetadataParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.values: dict[str, str] = {}
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attributes: list[tuple[str, str | None]],
+    ) -> None:
+        if tag.casefold() != "meta":
+            return
+        values = {
+            str(name).casefold(): str(value or "").strip()
+            for name, value in attributes
+        }
+        key = (
+            values.get("property")
+            or values.get("name")
+            or ""
+        ).casefold()
+        content = values.get("content", "")
+        if (
+            key in MEDIA_PAGE_METADATA_KEYS
+            and content
+            and key not in self.values
+        ):
+            self.values[key] = content
+
+
+def resolve_media_url_from_page(
+    page_url: str,
+    html_text: str,
+) -> tuple[str, str] | None:
+    parser = MediaPageMetadataParser()
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except Exception:
+        return None
+
+    for key in MEDIA_PAGE_METADATA_KEYS:
+        candidate = parser.values.get(key, "")
+        if not candidate:
+            continue
+        resolved_url = urljoin(page_url, candidate)
+        try:
+            parsed = urlsplit(resolved_url)
+        except ValueError:
+            continue
+        if (
+            parsed.scheme.casefold() != "https"
+            or not is_trusted_image_url(resolved_url)
+        ):
+            continue
+        media_hint = (
+            "video"
+            if "video" in key or key == "twitter:player:stream"
+            else "image"
+        )
+        return resolved_url, media_hint
+    return None
 
 
 def _encode_identity_bytes(value: bytes) -> str:
@@ -2446,6 +2592,7 @@ class MainWindow(QMainWindow):
 
 @dataclass
 class RemoteMediaPreview:
+    source_url: str
     data: bytes
     kind: str
     frame: QImage | None
@@ -2473,7 +2620,7 @@ class AnimatedMediaController(QObject):
     def start(self) -> None:
         if self.media.kind == "animated_gif":
             self._start_gif()
-        elif self.media.kind == "tenor_video":
+        elif self.media.kind == "looping_video":
             self._start_video()
 
     def _start_gif(self) -> None:
@@ -2503,7 +2650,10 @@ class AnimatedMediaController(QObject):
         player = QMediaPlayer(self)
         player.setVideoSink(video_sink)
         player.setLoops(QMediaPlayer.Loops.Infinite)
-        player.setSourceDevice(self._buffer, QUrl(self.url))
+        player.setSourceDevice(
+            self._buffer,
+            QUrl(self.media.source_url or self.url),
+        )
         self._video_sink = video_sink
         self._player = player
         player.play()
@@ -4277,7 +4427,7 @@ class EncryptedChatClient(QObject):
         url: str,
         media: RemoteMediaPreview,
     ) -> None:
-        if media.kind not in {"animated_gif", "tenor_video"}:
+        if media.kind not in {"animated_gif", "looping_video"}:
             return
         if url in self.animated_media_controllers:
             return
@@ -5716,16 +5866,23 @@ class EncryptedChatClient(QObject):
                     url = str(payload.get("url", ""))
                     data = payload.get("data")
                     kind = str(payload.get("kind", ""))
+                    source_url = str(payload.get("source_url", url))
                     self.pending_image_previews.discard(url)
                     media: RemoteMediaPreview | None = None
                     if isinstance(data, bytes) and data:
-                        if kind == "tenor_video":
-                            media = RemoteMediaPreview(data, kind, None)
+                        if kind == "looping_video":
+                            media = RemoteMediaPreview(
+                                source_url,
+                                data,
+                                kind,
+                                None,
+                            )
                         elif kind in {"static_image", "animated_gif"}:
                             candidate = QImage.fromData(data)
                             if not candidate.isNull():
                                 candidate.setDevicePixelRatio(1.0)
                                 media = RemoteMediaPreview(
+                                    source_url,
                                     data,
                                     kind,
                                     candidate,
@@ -6289,10 +6446,85 @@ class EncryptedChatClient(QObject):
     def _fetch_remote_image_preview(self, url: str) -> None:
         image_data: bytes | None = None
         media_kind: str | None = None
-        tenor_video = is_tenor_video_url(url)
+        source_url = url
+
+        def read_limited_response(
+            response: Any,
+            maximum_bytes: int,
+        ) -> bytes:
+            content_length = response.headers.get("Content-Length")
+            if (
+                content_length
+                and int(content_length) > maximum_bytes
+            ):
+                raise ValueError("The linked media is too large.")
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > maximum_bytes:
+                    raise ValueError("The linked media is too large.")
+                chunks.append(chunk)
+            return b"".join(chunks)
+
         try:
+            resolved_from_page = is_supported_media_page_url(url)
+            resolved_media_hint = ""
+            if resolved_from_page:
+                with requests.get(
+                    url,
+                    headers={
+                        "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
+                        "Accept": "text/html, application/xhtml+xml",
+                    },
+                    stream=True,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                    allow_redirects=True,
+                ) as page_response:
+                    page_response.raise_for_status()
+                    final_page_url = str(page_response.url)
+                    if not is_supported_media_page_url(final_page_url):
+                        raise ValueError(
+                            "The provider page redirected outside its site."
+                        )
+                    page_content_type = page_response.headers.get(
+                        "Content-Type",
+                        "",
+                    ).split(";", 1)[0].strip().casefold()
+                    if (
+                        page_content_type
+                        and page_content_type not in {
+                            "text/html",
+                            "application/xhtml+xml",
+                        }
+                    ):
+                        raise ValueError(
+                            "The provider link did not return a media page."
+                        )
+                    page_data = read_limited_response(
+                        page_response,
+                        MAX_MEDIA_PAGE_HTML_BYTES,
+                    )
+                    page_encoding = page_response.encoding or "utf-8"
+
+                resolved_media = resolve_media_url_from_page(
+                    final_page_url,
+                    page_data.decode(page_encoding, errors="replace"),
+                )
+                if resolved_media is None:
+                    raise ValueError(
+                        "The provider page did not advertise embeddable media."
+                    )
+                source_url, resolved_media_hint = resolved_media
+
+            looping_video = (
+                resolved_media_hint == "video"
+                or is_trusted_looping_video_url(source_url)
+            )
             with requests.get(
-                url,
+                source_url,
                 headers={
                     "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
                     "Accept": "image/*, video/mp4, video/webm;q=0.9",
@@ -6306,37 +6538,32 @@ class EncryptedChatClient(QObject):
                     "Content-Type",
                     "",
                 ).split(";", 1)[0].strip().casefold()
-                if tenor_video:
-                    if content_type and content_type not in {
-                        "video/mp4",
-                        "video/webm",
-                        "application/octet-stream",
-                    }:
+                if content_type.startswith("video/"):
+                    if not (
+                        resolved_from_page
+                        or is_trusted_looping_video_url(source_url)
+                    ):
                         raise ValueError(
-                            "The Tenor link did not return supported video."
+                            "The link did not return trusted looping video."
                         )
-                elif content_type and not content_type.startswith("image/"):
-                    raise ValueError("The link did not return an image.")
-                content_length = response.headers.get("Content-Length")
-                if (
-                    content_length
-                    and int(content_length) > MAX_REMOTE_IMAGE_BYTES
-                ):
-                    raise ValueError("The linked media is too large.")
+                    if content_type not in {"video/mp4", "video/webm"}:
+                        raise ValueError(
+                            "The link returned unsupported video."
+                        )
+                    looping_video = True
+                elif content_type.startswith("image/"):
+                    looping_video = False
+                elif content_type not in {"", "application/octet-stream"}:
+                    raise ValueError(
+                        "The link did not return supported media."
+                    )
+                candidate = read_limited_response(
+                    response,
+                    MAX_REMOTE_IMAGE_BYTES,
+                )
 
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in response.iter_content(64 * 1024):
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > MAX_REMOTE_IMAGE_BYTES:
-                        raise ValueError("The linked media is too large.")
-                    chunks.append(chunk)
-                candidate = b"".join(chunks)
-
-            if tenor_video:
-                parsed_url = urlsplit(url)
+            if looping_video:
+                parsed_url = urlsplit(source_url)
                 query_format = (
                     parse_qs(parsed_url.query).get("format", [""])[0]
                     .strip()
@@ -6357,8 +6584,10 @@ class EncryptedChatClient(QObject):
                         and candidate[4:8] == b"ftyp"
                     )
                 if not valid_container:
-                    raise ValueError("The Tenor video container is invalid.")
-                media_kind = "tenor_video"
+                    raise ValueError(
+                        "The looping video container is invalid."
+                    )
+                media_kind = "looping_video"
             else:
                 with Image.open(io.BytesIO(candidate)) as remote_image:
                     width, height = remote_image.size
@@ -6395,12 +6624,14 @@ class EncryptedChatClient(QObject):
         except Exception:
             image_data = None
             media_kind = None
+            source_url = url
 
         if not self._closing:
             self.ui_queue.put((
                 "image_preview_loaded",
                 {
                     "url": url,
+                    "source_url": source_url,
                     "data": image_data,
                     "kind": media_kind,
                 },
@@ -6793,7 +7024,7 @@ class EncryptedChatClient(QObject):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        if media.kind != "tenor_video":
+        if media.kind != "looping_video":
             return preview
 
         canvas = QImage(
