@@ -1396,6 +1396,7 @@ class AddChatroomDialog(QDialog):
         submit_label: str = "Add Chatroom",
         nickname: str = "",
         chatroom_key: str = "",
+        history_note: str = "",
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -1434,6 +1435,11 @@ class AddChatroomDialog(QDialog):
         key_hint.setWordWrap(True)
         key_hint.setStyleSheet("color: #777777; font-size: 8pt;")
         form.addWidget(key_hint, 2, 1, 1, 2)
+        if history_note:
+            history_hint = QLabel(history_note)
+            history_hint.setWordWrap(True)
+            history_hint.setStyleSheet("color: #777777; font-size: 8pt;")
+            form.addWidget(history_hint, 3, 1, 1, 2)
         layout.addLayout(form)
 
         buttons = QHBoxLayout()
@@ -2502,6 +2508,10 @@ class EncryptedChatClient(QObject):
             submit_label="Save",
             nickname=old_nickname,
             chatroom_key=old_key,
+            history_note=(
+                "All locally stored history will remain here even if the "
+                "chatroom key is changed."
+            ),
         )
         self._apply_window_titlebar_theme(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
