@@ -4,11 +4,13 @@ on:
   pull_request:
     paths:
       - "SpriteLink.pyw"
+      - "spritelink_update.py"
       - "SL.ico"
       - "sounds/**"
       - "requirements*.txt"
       - "SpriteLink.spec"
       - "packaging/windows/**"
+      - "tests/**"
       - ".github/workflows/windows-package.yml"
   push:
     tags:
@@ -50,7 +52,7 @@ jobs:
           } else {
             $version = "0.0.0"
           }
-          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+          if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
             throw "Version must use the form 0.1.0. Received: $version"
           }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -69,6 +71,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
+
+      - name: Run updater tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
 
       - name: Build installer
         shell: pwsh
