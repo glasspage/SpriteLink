@@ -73,6 +73,7 @@ try:
         QTextOption,
     )
     from PySide6.QtWidgets import (
+        QAbstractItemView,
         QApplication,
         QCheckBox,
         QColorDialog,
@@ -148,7 +149,7 @@ DEFAULT_SERVER_URL = "https://ntfy.sh"
 GLOBAL_CHATROOM_ID = "global"
 GLOBAL_CHATROOM_NICKNAME = "Global"
 GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
-CHATROOM_SIDEBAR_WIDTH = 240
+CHATROOM_SIDEBAR_WIDTH = 180
 CONFIG_POPUP_MAX_WIDTH = 720
 
 SERVER_PRESETS: dict[str, str] = {
@@ -1516,11 +1517,22 @@ class ChatroomListRow(QWidget):
 
 
 class ChatroomListWidget(QListWidget):
-    leftItemPressed = Signal(QListWidgetItem)
+    roomMoveRequested = Signal(str, int)
+    dragFinished = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(
+            QAbstractItemView.DragDropMode.InternalMove
+        )
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self._pressed_room_id: str | None = None
+        self._dragged_room_id: str | None = None
+        self._dragged_row = -1
 
     def mousePressEvent(self, event: Any) -> None:
         is_left_press = event.button() == Qt.MouseButton.LeftButton
@@ -1532,21 +1544,77 @@ class ChatroomListWidget(QListWidget):
         if is_left_press and item is None:
             event.accept()
             return
+        if is_left_press and item is not None:
+            self._pressed_room_id = str(
+                item.data(Qt.ItemDataRole.UserRole)
+            )
         super().mousePressEvent(event)
-        if item is not None:
-            self.leftItemPressed.emit(item)
 
     def mouseMoveEvent(self, event: Any) -> None:
-        if event.buttons() & Qt.MouseButton.LeftButton:
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._pressed_room_id == GLOBAL_CHATROOM_ID
+        ):
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: Any) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            event.accept()
+        try:
+            super().mouseReleaseEvent(event)
+        finally:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._pressed_room_id = None
+
+    def startDrag(self, supported_actions: Any) -> None:
+        item = self.currentItem()
+        if item is None:
             return
-        super().mouseReleaseEvent(event)
+        room_id = str(item.data(Qt.ItemDataRole.UserRole))
+        if room_id == GLOBAL_CHATROOM_ID:
+            return
+        self._dragged_room_id = room_id
+        self._dragged_row = self.row(item)
+        try:
+            super().startDrag(supported_actions)
+        finally:
+            self._pressed_room_id = None
+            self._dragged_room_id = None
+            self._dragged_row = -1
+            self.dragFinished.emit()
+
+    def dropEvent(self, event: Any) -> None:
+        if self._dragged_room_id is None or self._dragged_row < 1:
+            event.ignore()
+            return
+
+        target_row = self.indexAt(event.position().toPoint()).row()
+        if target_row < 0:
+            insertion_row = self.count()
+        elif self.dropIndicatorPosition() in (
+            QAbstractItemView.DropIndicatorPosition.BelowItem,
+            QAbstractItemView.DropIndicatorPosition.OnViewport,
+        ):
+            insertion_row = target_row + 1
+        else:
+            insertion_row = target_row
+
+        insertion_row = max(1, min(self.count(), insertion_row))
+        if self._dragged_row < insertion_row:
+            insertion_row -= 1
+        if insertion_row != self._dragged_row:
+            room_id = self._dragged_room_id
+            QTimer.singleShot(
+                0,
+                lambda: self.roomMoveRequested.emit(
+                    room_id,
+                    insertion_row,
+                ),
+            )
+        # The configuration/list rebuild performs the move. Report Ignore to
+        # Qt's InternalMove source so it does not also delete the dragged row.
+        event.setDropAction(Qt.DropAction.IgnoreAction)
+        event.accept()
 
 
 class ThemeComboBox(QComboBox):
@@ -2268,10 +2336,16 @@ class EncryptedChatClient(QObject):
         self.chatrooms_list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
-        self.chatrooms_list.leftItemPressed.connect(
+        self.chatrooms_list.itemClicked.connect(
             lambda item: self._activate_chatroom(
                 str(item.data(Qt.ItemDataRole.UserRole))
             )
+        )
+        self.chatrooms_list.roomMoveRequested.connect(
+            self._move_chatroom
+        )
+        self.chatrooms_list.dragFinished.connect(
+            self._refresh_chatroom_list
         )
         self.chatrooms_list.customContextMenuRequested.connect(
             self._show_chatroom_context_menu
@@ -2468,6 +2542,10 @@ class EncryptedChatClient(QObject):
         for room in self._chatroom_definitions():
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, room["id"])
+            if room["id"] == GLOBAL_CHATROOM_ID:
+                item.setFlags(
+                    item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled
+                )
             self.chatrooms_list.addItem(item)
             row = ChatroomListRow(
                 room["nickname"],
@@ -2482,6 +2560,37 @@ class EncryptedChatClient(QObject):
         if active_item is not None:
             self.chatrooms_list.setCurrentItem(active_item)
         self._update_chatrooms_toggle_unread_style()
+
+    def _move_chatroom(self, room_id: str, target_row: int) -> None:
+        raw_rooms = self.config_data.get("chatrooms", [])
+        if not isinstance(raw_rooms, list):
+            return
+        source_index = next(
+            (
+                index
+                for index, room in enumerate(raw_rooms)
+                if isinstance(room, dict)
+                and str(room.get("id", "")) == room_id
+            ),
+            None,
+        )
+        if source_index is None:
+            return
+
+        original_rooms = list(raw_rooms)
+        moved_room = raw_rooms.pop(source_index)
+        target_index = max(0, min(len(raw_rooms), target_row - 1))
+        raw_rooms.insert(target_index, moved_room)
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            self.config_data["chatrooms"] = original_rooms
+            messagebox.showerror(
+                "Could not reorder chatrooms",
+                str(exc),
+                parent=self.root,
+            )
+        self._refresh_chatroom_list()
 
     def _update_chatrooms_toggle_unread_style(self) -> None:
         if not hasattr(self, "chatrooms_toggle"):
