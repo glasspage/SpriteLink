@@ -39,7 +39,7 @@ import traceback
 import sys
 import uuid
 import zlib
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 try:
     from PySide6.QtCore import (
         QEvent,
@@ -149,7 +149,7 @@ except ImportError as exc:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 18
+CONFIG_FORMAT_VERSION = 19
 WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
 
@@ -244,6 +244,34 @@ IMAGE_PREVIEW_MAX_HEIGHT = 480
 MAX_REMOTE_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_REMOTE_IMAGE_PIXELS = 16 * 1024 * 1024
 IMAGE_PREVIEW_CACHE_LIMIT = 128
+MAX_UNCOMPRESSED_MESSAGE_BYTES = 32 * 1024
+MAX_ENCRYPTED_PACKET_CHARS = NTFY_MAX_BODY_BYTES - 1
+TRUSTED_EXTENSIONLESS_IMAGE_HOSTS = (
+    "images.unsplash.com",
+    "pbs.twimg.com",
+    "cdn.bsky.app",
+)
+TRUSTED_IMAGE_HOST_PATTERNS = (
+    "cdn.discordapp.com",
+    "media.discordapp.net",
+    "upload.wikimedia.org",
+    "cdn.donmai.*",
+    "pbs.twimg.com",
+    "i.imgur.com",
+    "images.unsplash.com",
+    "images.pexels.com",
+    "cdn.bsky.app",
+    "media.tenor.com",
+    "media.giphy.com",
+    "i.giphy.com",
+    "static.wikia.nocookie.net",
+    "avatars.githubusercontent.com",
+    "user-images.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "steamuserimages-a.akamaihd.net",
+    "image.tmdb.org",
+    "cdn.myanimelist.net",
+)
 IMAGE_LINK_EXTENSIONS = (
     ".png",
     ".jpg",
@@ -839,10 +867,65 @@ def is_direct_image_url(url: str) -> bool:
         parsed = urlsplit(url)
     except ValueError:
         return False
+    query_format = (
+        parse_qs(parsed.query).get("format", [""])[0]
+        .strip()
+        .casefold()
+    )
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
     return (
         parsed.scheme.casefold() in {"http", "https"}
-        and parsed.path.casefold().endswith(IMAGE_LINK_EXTENSIONS)
+        and (
+            parsed.path.casefold().endswith(IMAGE_LINK_EXTENSIONS)
+            or f".{query_format}" in IMAGE_LINK_EXTENSIONS
+            or hostname in TRUSTED_EXTENSIONLESS_IMAGE_HOSTS
+        )
     )
+
+
+def _image_hostname_matches_pattern(
+    hostname: str,
+    pattern: str,
+) -> bool:
+    if pattern.endswith(".*"):
+        prefix = pattern[:-1]
+        suffix = hostname[len(prefix):] if hostname.startswith(prefix) else ""
+        return bool(suffix) and "." not in suffix
+    return hostname == pattern
+
+
+def is_trusted_image_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        hostname = (parsed.hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.casefold() == "https"
+        and bool(hostname)
+        and any(
+            _image_hostname_matches_pattern(hostname, pattern)
+            for pattern in TRUSTED_IMAGE_HOST_PATTERNS
+        )
+    )
+
+
+def is_image_url_trusted_for_sender(
+    url: str,
+    client_id: str,
+    is_local: bool,
+    trusted_user_ids: set[str],
+) -> bool:
+    return (
+        is_local
+        or client_id in trusted_user_ids
+        or is_trusted_image_url(url)
+    )
+
+
+def generate_chatroom_key() -> str:
+    # 24 random bytes encode to exactly 32 URL-safe characters.
+    return secrets.token_urlsafe(24)
 
 
 def is_likely_nsfw_image_url(url: str) -> bool:
@@ -863,12 +946,22 @@ def message_contains_only_image_links(text: str) -> bool:
     )
 
 
-def message_text_without_image_links(text: str) -> str:
+def message_text_without_image_links(
+    text: str,
+    embedded_image_urls: set[str] | None = None,
+) -> str:
     visible_parts: list[str] = []
     position = 0
     for start, end, url in message_url_spans(text):
         visible_parts.append(text[position:start])
-        if not is_direct_image_url(url):
+        should_remove = (
+            is_direct_image_url(url)
+            and (
+                embedded_image_urls is None
+                or url in embedded_image_urls
+            )
+        )
+        if not should_remove:
             visible_parts.append(text[start:end])
         position = end
     visible_parts.append(text[position:])
@@ -909,6 +1002,7 @@ def default_config() -> dict[str, Any]:
         "identities": {},
         "history": {},
         "muted_users": {},
+        "trusted_image_users": {},
         "collapsed_messages": {},
         "sent_message_utc_day": current_utc_day_number(),
         "sent_messages_today": 0,
@@ -1008,6 +1102,9 @@ def load_config() -> dict[str, Any]:
 
     if not isinstance(config.get("muted_users"), dict):
         config["muted_users"] = {}
+
+    if not isinstance(config.get("trusted_image_users"), dict):
+        config["trusted_image_users"] = {}
 
     if not isinstance(config.get("collapsed_messages"), dict):
         config["collapsed_messages"] = {}
@@ -1361,8 +1458,22 @@ def estimate_opaque_packet_size(message: dict[str, Any]) -> int:
 
 
 def open_opaque_packet(packet_text: str, passphrase: str) -> dict[str, Any]:
-    padding = "=" * ((4 - len(packet_text) % 4) % 4)
-    packet = base64.urlsafe_b64decode(packet_text + padding)
+    try:
+        encoded_packet = packet_text.encode("ascii")
+    except (AttributeError, UnicodeEncodeError) as exc:
+        raise ValueError("Encrypted packet is not valid ASCII.") from exc
+    if len(encoded_packet) > MAX_ENCRYPTED_PACKET_CHARS:
+        raise ValueError("Encrypted packet is too large.")
+
+    padding = b"=" * ((4 - len(encoded_packet) % 4) % 4)
+    try:
+        packet = base64.b64decode(
+            encoded_packet + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+    except Exception as exc:
+        raise ValueError("Encrypted packet is not valid Base64.") from exc
 
     minimum_length = 1 + 16 + 12 + 16
     if len(packet) < minimum_length:
@@ -1387,7 +1498,19 @@ def open_opaque_packet(packet_text: str, passphrase: str) -> dict[str, Any]:
         raise ValueError("Decrypted packet length is invalid.")
 
     compressed = padded[4:4 + compressed_length]
-    raw_json = zlib.decompress(compressed)
+    decompressor = zlib.decompressobj()
+    raw_json = decompressor.decompress(
+        compressed,
+        MAX_UNCOMPRESSED_MESSAGE_BYTES + 1,
+    )
+    if (
+        len(raw_json) > MAX_UNCOMPRESSED_MESSAGE_BYTES
+        or decompressor.unconsumed_tail
+    ):
+        raise ValueError("Decompressed message is too large.")
+    if not decompressor.eof or decompressor.unused_data:
+        raise ValueError("Compressed message data is malformed.")
+
     message = json.loads(raw_json.decode("utf-8"))
 
     if not isinstance(message, dict):
@@ -1525,7 +1648,7 @@ class AddChatroomDialog(QDialog):
         title: str = "Add Chatroom",
         submit_label: str = "Add Chatroom",
         nickname: str = "",
-        chatroom_key: str = "",
+        chatroom_key: str | None = None,
         history_note: str = "",
     ) -> None:
         super().__init__(parent)
@@ -1546,7 +1669,11 @@ class AddChatroomDialog(QDialog):
         form.addWidget(QLabel("Key"), 1, 0)
         self.key_entry = QLineEdit()
         self.key_entry.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_entry.setText(chatroom_key)
+        self.key_entry.setText(
+            chatroom_key
+            if chatroom_key is not None
+            else generate_chatroom_key()
+        )
         form.addWidget(self.key_entry, 1, 1)
         show_key = QCheckBox("Show")
         show_key.toggled.connect(
@@ -5630,6 +5757,24 @@ class EncryptedChatClient(QObject):
         self._write_room_preference_ids("muted_users", muted_ids)
         self._rerender_preserving_scroll()
 
+    def _set_user_image_trusted(
+        self,
+        client_id: str,
+        trusted: bool,
+    ) -> None:
+        trusted_ids = self._room_preference_ids("trusted_image_users")
+
+        if trusted:
+            trusted_ids.add(client_id)
+        else:
+            trusted_ids.discard(client_id)
+
+        self._write_room_preference_ids(
+            "trusted_image_users",
+            trusted_ids,
+        )
+        self._rerender_preserving_scroll()
+
     def _set_message_collapsed(
         self,
         message_id: str,
@@ -5758,6 +5903,7 @@ class EncryptedChatClient(QObject):
                 },
                 stream=True,
                 timeout=REQUEST_TIMEOUT_SECONDS,
+                allow_redirects=False,
             ) as response:
                 response.raise_for_status()
                 content_type = response.headers.get(
@@ -6053,8 +6199,12 @@ class EncryptedChatClient(QObject):
 
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
+        trusted_image_ids = self._room_preference_ids(
+            "trusted_image_users"
+        )
         is_muted = client_id in muted_ids
         is_manually_collapsed = message_id in collapsed_ids
+        trusts_images = client_id in trusted_image_ids
 
         menu = QMenu(self.root)
         mute_action = menu.addAction(
@@ -6064,6 +6214,18 @@ class EncryptedChatClient(QObject):
         if not is_local:
             mute_action.triggered.connect(
                 lambda: self._set_user_muted(client_id, not is_muted)
+            )
+
+        trust_images_action = menu.addAction("Trust Images from User")
+        trust_images_action.setCheckable(True)
+        trust_images_action.setChecked(is_local or trusts_images)
+        trust_images_action.setEnabled(not is_local)
+        if not is_local:
+            trust_images_action.toggled.connect(
+                lambda checked: self._set_user_image_trusted(
+                    client_id,
+                    checked,
+                )
             )
 
         collapse_action = menu.addAction(
@@ -6120,6 +6282,7 @@ class EncryptedChatClient(QObject):
         font_name: str,
         *,
         muted: bool,
+        embedded_image_urls: set[str],
         align_top: bool,
         top_align_height: int,
     ) -> None:
@@ -6135,7 +6298,7 @@ class EncryptedChatClient(QObject):
                         top_align_height=top_align_height,
                     ),
                 )
-            if is_direct_image_url(url):
+            if url in embedded_image_urls:
                 position = end
                 continue
             link_color = "#0000ee" if self._is_windows_classic_theme() else "#0066cc"
@@ -6284,6 +6447,9 @@ class EncryptedChatClient(QObject):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
+        trusted_image_user_ids = self._room_preference_ids(
+            "trusted_image_users"
+        )
         row_selections: list[QTextEdit.ExtraSelection] = []
         previous_timestamp: int | None = None
         previous_local_date: Any = None
@@ -6342,6 +6508,7 @@ class EncryptedChatClient(QObject):
                 item,
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
+                trusted_image_user_ids=trusted_image_user_ids,
                 background_color=MESSAGE_ROW_BACKGROUNDS[
                     stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
                 ],
@@ -6373,6 +6540,7 @@ class EncryptedChatClient(QObject):
         *,
         muted_ids: set[str],
         collapsed_ids: set[str],
+        trusted_image_user_ids: set[str],
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
@@ -6398,6 +6566,39 @@ class EncryptedChatClient(QObject):
             collapsed_block_format = cursor.blockFormat()
             collapsed_block_format.setNonBreakableLines(True)
             cursor.setBlockFormat(collapsed_block_format)
+
+        candidate_image_urls = direct_image_urls_in_message(text)
+        embedded_image_url_set = {
+            url
+            for url in candidate_image_urls
+            if is_image_url_trusted_for_sender(
+                url,
+                client_id,
+                bool(item["is_local"]),
+                trusted_image_user_ids,
+            )
+        }
+        has_untrusted_image = any(
+            url not in embedded_image_url_set
+            for url in candidate_image_urls
+        )
+        display_text = (
+            self._collapsed_message_preview(text)
+            if is_collapsed
+            else text
+        )
+        if has_untrusted_image:
+            display_text = "[untrusted image] " + display_text
+        image_urls = (
+            []
+            if is_collapsed
+            else [
+                url
+                for url in direct_image_urls_in_message(display_text)
+                if url in embedded_image_url_set
+            ]
+        )
+
         username_color = (
             self._blend_toward_chat_background(original_color)
             if is_muted
@@ -6449,13 +6650,16 @@ class EncryptedChatClient(QObject):
         top_align_height = 0
         if (
             not is_collapsed
-            and message_contains_only_image_links(text)
+            and bool(image_urls)
+            and not message_text_without_image_links(
+                display_text,
+                set(image_urls),
+            ).strip()
         ):
-            for _start, _end, url in message_url_spans(text):
+            for url in image_urls:
                 cached_image = self.image_preview_cache.get(url)
                 if (
-                    is_direct_image_url(url)
-                    and isinstance(cached_image, QImage)
+                    isinstance(cached_image, QImage)
                     and not cached_image.isNull()
                 ):
                     if is_likely_nsfw_image_url(url):
@@ -6519,18 +6723,9 @@ class EncryptedChatClient(QObject):
             ),
         )
 
-        display_text = (
-            self._collapsed_message_preview(text)
-            if is_collapsed
-            else text
-        )
-        image_urls = (
-            []
-            if is_collapsed
-            else direct_image_urls_in_message(display_text)
-        )
         visible_text_without_images = message_text_without_image_links(
-            display_text
+            display_text,
+            set(image_urls),
         )
         add_image_line_break = (
             bool(image_urls)
@@ -6558,6 +6753,7 @@ class EncryptedChatClient(QObject):
                 body_color,
                 font_name,
                 muted=is_muted,
+                embedded_image_urls=set(image_urls),
                 align_top=align_message_top,
                 top_align_height=top_align_height,
             )
