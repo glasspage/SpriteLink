@@ -548,10 +548,10 @@ SAFE_USERNAME_COLORS = (
 
 
 def optimize_profile_icon(source_path: str) -> bytes:
-    """Convert a PNG to a compact, single-frame 16x16 palette GIF."""
+    """Convert a PNG or JPEG to a compact, single-frame 16x16 palette GIF."""
     with Image.open(source_path) as source:
-        if source.format != "PNG":
-            raise ValueError("Profile icons must be PNG images.")
+        if source.format not in {"PNG", "JPEG"}:
+            raise ValueError("Profile icons must be PNG or JPG images.")
         source.load()
         icon = source.convert("RGBA")
 
@@ -3023,6 +3023,16 @@ class EncryptedChatClient(QObject):
             # Older Windows versions do not expose the color attributes.
             pass
 
+    def _exec_themed_file_dialog(self, dialog: QFileDialog) -> int:
+        # Native Windows dialogs are created when exec() starts. Apply once to
+        # the wrapper and once from the nested event loop after it is visible.
+        self._apply_window_titlebar_theme(dialog)
+        QTimer.singleShot(
+            0,
+            lambda: self._apply_window_titlebar_theme(dialog),
+        )
+        return int(dialog.exec())
+
     def _apply_titlebar_theme(self) -> None:
         self._apply_window_titlebar_theme(self.root)
 
@@ -4141,15 +4151,16 @@ class EncryptedChatClient(QObject):
 
     def _choose_profile_icon(self) -> None:
         dialog = QFileDialog(self.root, "Choose icon")
-        dialog.setOption(
-            QFileDialog.Option.DontUseNativeDialog,
-            True,
-        )
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter("PNG images (*.png)")
-        self._apply_window_titlebar_theme(dialog)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        dialog.setNameFilter(
+            "Image files (*.png *.jpg *.jpeg);;PNG images (*.png);;"
+            "JPEG images (*.jpg *.jpeg)"
+        )
+        if (
+            self._exec_themed_file_dialog(dialog)
+            != QDialog.DialogCode.Accepted
+        ):
             return
         selected_files = dialog.selectedFiles()
         source_path = selected_files[0] if selected_files else ""
@@ -4764,15 +4775,13 @@ class EncryptedChatClient(QObject):
         previous_sound = str(self.message_sound_var.get())
         if selected_sound == "Custom":
             dialog = QFileDialog(self.root, "Choose message sound")
-            dialog.setOption(
-                QFileDialog.Option.DontUseNativeDialog,
-                True,
-            )
             dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
             dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
             dialog.setNameFilter("Audio files (*.wav *.mp3 *.ogg)")
-            self._apply_window_titlebar_theme(dialog)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
+            if (
+                self._exec_themed_file_dialog(dialog)
+                != QDialog.DialogCode.Accepted
+            ):
                 self.message_sound_combo.setCurrentText(previous_sound)
                 return
             selected_files = dialog.selectedFiles()
