@@ -727,6 +727,14 @@ def message_contains_only_image_links(text: str) -> bool:
     return found_image_link and not "".join(visible_parts).strip()
 
 
+def direct_image_urls_in_message(text: str) -> list[str]:
+    image_urls: list[str] = []
+    for _start, _end, url in message_url_spans(text):
+        if is_direct_image_url(url) and url not in image_urls:
+            image_urls.append(url)
+    return image_urls
+
+
 def default_config() -> dict[str, Any]:
     global_profile = default_room_profile()
     return {
@@ -4597,8 +4605,7 @@ class EncryptedChatClient(QObject):
         muted: bool,
         align_top: bool,
         top_align_height: int,
-    ) -> list[str]:
-        image_urls: list[str] = []
+    ) -> None:
         position = 0
         for start, end, url in message_url_spans(text):
             if start > position:
@@ -4612,9 +4619,6 @@ class EncryptedChatClient(QObject):
                     ),
                 )
             if is_direct_image_url(url):
-                self._schedule_image_preview_fetch(url)
-                if url not in image_urls:
-                    image_urls.append(url)
                 position = end
                 continue
             link_color = "#0000ee" if self._is_windows_classic_theme() else "#0066cc"
@@ -4640,7 +4644,6 @@ class EncryptedChatClient(QObject):
                     top_align_height=top_align_height,
                 ),
             )
-        return image_urls
 
     def _insert_embedded_image_preview(
         self,
@@ -4967,7 +4970,13 @@ class EncryptedChatClient(QObject):
             if is_collapsed
             else text
         )
-        image_urls: list[str] = []
+        image_urls = (
+            []
+            if is_collapsed
+            else direct_image_urls_in_message(display_text)
+        )
+        for image_url in image_urls:
+            self._schedule_image_preview_fetch(image_url)
         if is_collapsed:
             cursor.insertText(
                 display_text,
@@ -4979,7 +4988,7 @@ class EncryptedChatClient(QObject):
                 ),
             )
         else:
-            image_urls = self._insert_message_text_with_links(
+            self._insert_message_text_with_links(
                 cursor,
                 display_text,
                 body_color,
@@ -4988,6 +4997,7 @@ class EncryptedChatClient(QObject):
                 align_top=align_message_top,
                 top_align_height=top_align_height,
             )
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
         for image_url in image_urls:
             self._insert_embedded_image_preview(cursor, image_url)
 
