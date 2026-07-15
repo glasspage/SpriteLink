@@ -29,6 +29,18 @@ class ImageTrustTests(unittest.TestCase):
             "https://images.unsplash.com/photo-example",
             "https://cdn.bsky.app/img/feed_fullsize/plain/example",
             "https://media.tenor.com/example/tenor.gif",
+            "https://media2.giphy.com/media/example/giphy.gif",
+            "https://cdn.klipy.com/example.gif",
+            "https://res.cloudinary.com/example/image/upload/sample",
+            "https://images.ctfassets.net/example/image.jpg",
+            "https://cdn.sanity.io/images/example/image.webp",
+            "https://live.staticflickr.com/example/image.jpg",
+            "https://cdn.pixabay.com/photo/example.jpg",
+            "https://static1.e621.net/data/example.png",
+            "https://img3.gelbooru.com/images/example.jpg",
+            "https://i.nhentai.net/galleries/example/1.jpg",
+            "https://thumbs2.redgifs.com/example.jpg",
+            "https://wimg.rule34.xxx/images/example.jpeg",
             "https://static.wikia.nocookie.net/example/image.png",
             "https://raw.githubusercontent.com/owner/repo/main/example.png",
         )
@@ -43,6 +55,8 @@ class ImageTrustTests(unittest.TestCase):
             "https://cdn.discordapp.com.evil.example/example.png",
             "https://evilcdn.discordapp.com/example.png",
             "https://cdn.donmai.evil.example/example.png",
+            "https://static1.e621.net.evil.example/example.png",
+            "https://cdn.klipy.com.evil.example/example.gif",
             "https://example.com/example.png",
         )
         for url in untrusted_urls:
@@ -74,6 +88,93 @@ class ImageTrustTests(unittest.TestCase):
                 True,
                 set(),
             )
+        )
+
+
+class ImageEmbeddingTests(unittest.TestCase):
+    def test_remote_media_download_limit_is_50_mb(self) -> None:
+        self.assertEqual(
+            SPRITELINK.MAX_REMOTE_IMAGE_BYTES,
+            50 * 1024 * 1024,
+        )
+
+    def test_nsfw_hosts_are_trusted_but_remain_masked(self) -> None:
+        urls = (
+            "https://static1.e621.net/data/example.png",
+            "https://img3.gelbooru.com/images/example.jpg",
+            "https://i.nhentai.net/galleries/example/1.jpg",
+            "https://thumbs2.redgifs.com/example.jpg",
+            "https://rule34-data-001.paheal.net/example.jpg",
+            "https://wimg.rule34.xxx/images/example.jpeg",
+            "https://img.xbooru.com/images/example.png",
+            "https://files.yande.re/image/example.jpg",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertTrue(SPRITELINK.is_trusted_image_url(url))
+                self.assertTrue(SPRITELINK.is_likely_nsfw_image_url(url))
+
+    def test_tenor_videos_are_embeddable_looping_media(self) -> None:
+        urls = (
+            "https://media.tenor.com/example/tenor.mp4",
+            "https://c.tenor.com/example/tenor.webm",
+            "https://media.tenor.com/example/tenor?format=mp4",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertTrue(SPRITELINK.is_tenor_video_url(url))
+                self.assertTrue(SPRITELINK.is_embeddable_media_url(url))
+                self.assertTrue(SPRITELINK.is_trusted_image_url(url))
+        self.assertFalse(
+            SPRITELINK.is_tenor_video_url(
+                "https://example.com/not-tenor.mp4"
+            )
+        )
+        controller_source = inspect.getsource(
+            SPRITELINK.AnimatedMediaController
+        )
+        self.assertIn("QVideoSink", controller_source)
+        self.assertIn("QMediaPlayer.Loops.Infinite", controller_source)
+        self.assertIn("player.play()", controller_source)
+
+    def test_gifs_use_the_animated_media_controller(self) -> None:
+        controller_source = inspect.getsource(
+            SPRITELINK.AnimatedMediaController
+        )
+        self.assertIn("QMovie", controller_source)
+        self.assertIn("movie.frameChanged.connect", controller_source)
+        preview_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_animated_media_frame
+        )
+        self.assertIn("_set_large_image_preview_frame", preview_source)
+        self.assertIn("document.addResource", preview_source)
+
+    def test_untrusted_image_link_is_omitted_from_display_text(self) -> None:
+        url = "https://example.com/private-image.png"
+        display_text = (
+            SPRITELINK.message_text_with_untrusted_images_hidden(
+                f"look at {url} please",
+                {url},
+            )
+        )
+        self.assertEqual(
+            display_text,
+            "[untrusted image] look at please",
+        )
+        self.assertNotIn(url, display_text)
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertIn(
+            "message_text_with_untrusted_images_hidden",
+            render_source,
+        )
+        self.assertEqual(
+            SPRITELINK.message_text_with_untrusted_images_hidden(
+                url,
+                {url},
+            ),
+            "[untrusted image]",
         )
 
 
