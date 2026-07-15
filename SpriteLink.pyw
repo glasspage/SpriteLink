@@ -73,6 +73,7 @@ try:
         QTextImageFormat,
         QTextOption,
     )
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -96,6 +97,7 @@ try:
         QProgressBar,
         QPushButton,
         QScrollArea,
+        QSlider,
         QSizePolicy,
         QStyleFactory,
         QTextBrowser,
@@ -135,15 +137,9 @@ except ImportError as exc:
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
 
-try:
-    import winsound
-except ImportError:
-    winsound = None
-
-
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 15
+CONFIG_FORMAT_VERSION = 16
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
@@ -153,6 +149,7 @@ GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
 CHATROOM_SIDEBAR_WIDTH = 180
 CONFIG_POPUP_MAX_WIDTH = 720
 DEFAULT_MESSAGE_SOUND = "Chime"
+DEFAULT_MESSAGE_SOUND_VOLUME = 100
 MESSAGE_SOUND_OPTIONS = (
     "Disabled",
     "Chime Soft",
@@ -859,6 +856,7 @@ def default_config() -> dict[str, Any]:
         "server_url": DEFAULT_SERVER_URL,
         "theme": DEFAULT_THEME,
         "message_sound": DEFAULT_MESSAGE_SOUND,
+        "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
         "custom_message_sound_path": "",
         "client_id": secrets.token_hex(32),
         "chatrooms": [],
@@ -932,6 +930,17 @@ def load_config() -> dict[str, Any]:
         message_sound
         if message_sound in MESSAGE_SOUND_OPTIONS
         else DEFAULT_MESSAGE_SOUND
+    )
+    try:
+        message_sound_volume = int(config.get(
+            "message_sound_volume",
+            DEFAULT_MESSAGE_SOUND_VOLUME,
+        ))
+    except (TypeError, ValueError):
+        message_sound_volume = DEFAULT_MESSAGE_SOUND_VOLUME
+    config["message_sound_volume"] = max(
+        0,
+        min(100, ((message_sound_volume + 5) // 10) * 10),
     )
     custom_message_sound_path = config.get(
         "custom_message_sound_path",
@@ -2083,6 +2092,9 @@ class EncryptedChatClient(QObject):
         self.message_sound_var = ValueModel(
             str(self.config_data["message_sound"])
         )
+        self.message_sound_volume_var = ValueModel(
+            int(self.config_data["message_sound_volume"])
+        )
         self.custom_message_sound_path_var = ValueModel(
             str(self.config_data["custom_message_sound_path"])
         )
@@ -2112,6 +2124,14 @@ class EncryptedChatClient(QObject):
         self.message_sound_stop_timer.setSingleShot(True)
         self.message_sound_stop_timer.timeout.connect(
             self._stop_message_sound
+        )
+        self.message_sound_audio_output = QAudioOutput(self)
+        self.message_sound_audio_output.setVolume(
+            int(self.message_sound_volume_var.get()) / 100.0
+        )
+        self.message_sound_player = QMediaPlayer(self)
+        self.message_sound_player.setAudioOutput(
+            self.message_sound_audio_output
         )
 
         self.chat_tooltip_timer = QTimer(self)
@@ -3768,7 +3788,32 @@ class EncryptedChatClient(QObject):
         self.message_sound_var.bind(
             self.message_sound_combo.setCurrentText
         )
-        layout.addWidget(self.message_sound_combo, row, 1, 1, 2)
+        layout.addWidget(self.message_sound_combo, row, 1)
+        self.message_sound_volume_slider = QSlider(
+            Qt.Orientation.Horizontal
+        )
+        self.message_sound_volume_slider.setRange(0, 10)
+        self.message_sound_volume_slider.setSingleStep(1)
+        self.message_sound_volume_slider.setPageStep(1)
+        self.message_sound_volume_slider.setMinimumWidth(120)
+        self.message_sound_volume_slider.setAccessibleName(
+            "Message sound volume"
+        )
+        self.message_sound_volume_slider.setValue(
+            int(self.message_sound_volume_var.get()) // 10
+        )
+        self.message_sound_volume_slider.setToolTip(
+            f"Volume: {int(self.message_sound_volume_var.get())}%"
+        )
+        self.message_sound_volume_slider.valueChanged.connect(
+            self._on_message_sound_volume_changed
+        )
+        self.message_sound_volume_var.bind(
+            lambda value: self.message_sound_volume_slider.setValue(
+                int(value) // 10
+            )
+        )
+        layout.addWidget(self.message_sound_volume_slider, row, 2)
         row += 1
 
         layout.addWidget(self._separator(), row, 0, 1, 3)
@@ -3890,6 +3935,17 @@ class EncryptedChatClient(QObject):
         self.message_sound_var.set(selected_sound)
         self._play_message_sound(report_errors=True)
 
+    def _on_message_sound_volume_changed(self, slider_value: int) -> None:
+        volume_percent = max(0, min(10, int(slider_value))) * 10
+        self.message_sound_volume_var.set(volume_percent)
+        self.message_sound_volume_slider.setToolTip(
+            f"Volume: {volume_percent}%"
+        )
+        self.message_sound_audio_output.setVolume(
+            volume_percent / 100.0
+        )
+        self._play_message_sound(report_errors=True)
+
     def _sync_config_overlay_geometry(self) -> None:
         self.config_overlay.setGeometry(self.chat_content.rect())
 
@@ -3898,6 +3954,7 @@ class EncryptedChatClient(QObject):
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
             str(self.message_sound_var.get()),
+            int(self.message_sound_volume_var.get()),
             str(self.custom_message_sound_path_var.get()),
         )
 
@@ -3996,6 +4053,10 @@ class EncryptedChatClient(QObject):
             message_sound
             if message_sound in MESSAGE_SOUND_OPTIONS
             else DEFAULT_MESSAGE_SOUND
+        )
+        self.config_data["message_sound_volume"] = max(
+            0,
+            min(100, int(self.message_sound_volume_var.get())),
         )
         self.config_data["custom_message_sound_path"] = str(
             self.custom_message_sound_path_var.get()
@@ -6200,18 +6261,9 @@ class EncryptedChatClient(QObject):
         return Path(__file__).resolve().parent / "sounds" / filename
 
     def _stop_message_sound(self) -> None:
-        if winsound is None:
-            return
-
-        try:
-            winsound.PlaySound(None, 0)
-        except Exception:
-            pass
+        self.message_sound_player.stop()
 
     def _play_message_sound(self, *, report_errors: bool = False) -> None:
-        if winsound is None:
-            return
-
         sound_name = str(self.message_sound_var.get())
         self.message_sound_stop_timer.stop()
         self._stop_message_sound()
@@ -6219,12 +6271,19 @@ class EncryptedChatClient(QObject):
         if sound_path is None:
             return
         try:
-            winsound.PlaySound(
-                str(sound_path),
-                winsound.SND_FILENAME
-                | winsound.SND_ASYNC
-                | winsound.SND_NODEFAULT,
+            if not sound_path.is_file():
+                raise FileNotFoundError(
+                    f"Message sound not found: {sound_path}"
+                )
+            self.message_sound_audio_output.setVolume(
+                int(self.message_sound_volume_var.get()) / 100.0
             )
+            sound_url = QUrl.fromLocalFile(str(sound_path.resolve()))
+            if self.message_sound_player.source() != sound_url:
+                self.message_sound_player.setSource(sound_url)
+            else:
+                self.message_sound_player.setPosition(0)
+            self.message_sound_player.play()
             if sound_name == "Custom":
                 self.message_sound_stop_timer.start(
                     CUSTOM_MESSAGE_SOUND_MAX_MS
