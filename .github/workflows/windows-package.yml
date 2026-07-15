@@ -1,0 +1,106 @@
+name: Windows package
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v"
+        required: true
+        default: "0.1.0"
+        type: string
+      publish_release:
+        description: "Publish a GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "push") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $version = "${{ inputs.version }}".Trim().TrimStart("v")
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version must use the form 0.1.0. Received: $version"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          .\packaging\windows\build.ps1 -Version "${{ steps.version.outputs.version }}"
+
+      - name: Create checksum
+        id: package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $installer = "dist/installer/SpriteLink-Setup-$version.exe"
+          if (-not (Test-Path $installer)) {
+            throw "Installer was not created: $installer"
+          }
+          $fileName = Split-Path $installer -Leaf
+          $checksum = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumPath = "$installer.sha256"
+          Set-Content -Path $checksumPath -Value "$checksum  $fileName" -Encoding ascii -NoNewline
+          "installer=$installer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "checksum=$checksumPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpriteLink-Windows-${{ steps.version.outputs.version }}
+          path: |
+            ${{ steps.package.outputs.installer }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' || inputs.publish_release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $tag = "v$version"
+          gh release create $tag `
+            "${{ steps.package.outputs.installer }}" `
+            "${{ steps.package.outputs.checksum }}" `
+            --target "${{ github.sha }}" `
+            --title "SpriteLink $version" `
+            --generate-notes
+
