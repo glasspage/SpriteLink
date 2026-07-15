@@ -1781,7 +1781,7 @@ class MessageLogBrowser(QTextBrowser):
             )
 
         viewport_width = self.viewport().width()
-        fade_start = round(viewport_width * 0.75)
+        fade_start = round(viewport_width * 0.55)
         fade_end = max(fade_start + 1, round(viewport_width * 0.98))
         for block_number, background in self.collapsed_fade_blocks.items():
             block = self.document().findBlockByNumber(block_number)
