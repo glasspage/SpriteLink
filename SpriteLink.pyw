@@ -548,10 +548,10 @@ SAFE_USERNAME_COLORS = (
 
 
 def optimize_profile_icon(source_path: str) -> bytes:
-    """Convert a PNG to a compact, single-frame 16x16 palette GIF."""
+    """Convert a PNG or JPEG to a compact, single-frame 16x16 palette GIF."""
     with Image.open(source_path) as source:
-        if source.format != "PNG":
-            raise ValueError("Profile icons must be PNG images.")
+        if source.format not in {"PNG", "JPEG"}:
+            raise ValueError("Profile icons must be PNG or JPG images.")
         source.load()
         icon = source.convert("RGBA")
 
@@ -4141,13 +4141,12 @@ class EncryptedChatClient(QObject):
 
     def _choose_profile_icon(self) -> None:
         dialog = QFileDialog(self.root, "Choose icon")
-        dialog.setOption(
-            QFileDialog.Option.DontUseNativeDialog,
-            True,
-        )
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter("PNG images (*.png)")
+        dialog.setNameFilter(
+            "Image files (*.png *.jpg *.jpeg);;PNG images (*.png);;"
+            "JPEG images (*.jpg *.jpeg)"
+        )
         self._apply_window_titlebar_theme(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
