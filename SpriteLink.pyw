@@ -1745,68 +1745,97 @@ class MessageLogBrowser(QTextBrowser):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.row_background_blocks: dict[int, QColor] = {}
         self.collapsed_fade_blocks: dict[int, QColor] = {}
 
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
-        selections = self.extraSelections()
-        if not selections and not self.collapsed_fade_blocks:
+        if not self.row_background_blocks and not self.collapsed_fade_blocks:
             return
 
-        painter = QPainter(self.viewport())
-        document_layout = self.document().documentLayout()
-        for selection in selections:
-            if not bool(selection.format.property(
-                QTextFormat.Property.FullWidthSelection
-            )):
-                continue
-            block = selection.cursor.block()
-            if not block.isValid():
-                continue
-            block_cursor = QTextCursor(block)
-            left_width = max(0, self.cursorRect(block_cursor).left())
-            if left_width <= 0:
-                continue
-            top = self.cursorRect(block_cursor).top()
-            height = max(
-                1,
-                round(document_layout.blockBoundingRect(block).height()),
-            )
-            painter.fillRect(
-                0,
-                top,
-                left_width,
-                height + 1,
-                selection.format.background(),
-            )
+        viewport = self.viewport()
+        viewport_width = viewport.width()
+        viewport_height = viewport.height()
+        if viewport_width <= 0 or viewport_height <= 0:
+            return
 
-        viewport_width = self.viewport().width()
+        paint_rect = event.rect()
+        first_block = self.cursorForPosition(QPoint(
+            0,
+            max(0, paint_rect.top()),
+        )).block().blockNumber()
+        last_block = self.cursorForPosition(QPoint(
+            max(0, viewport_width - 1),
+            min(viewport_height - 1, paint_rect.bottom()),
+        )).block().blockNumber()
+        first_block = max(0, first_block - 1)
+        last_block = min(
+            self.document().blockCount() - 1,
+            last_block + 1,
+        )
+
+        painter = QPainter(viewport)
+        painter.setClipRegion(event.region())
+        document_layout = self.document().documentLayout()
         fade_start = round(viewport_width * 0.55)
         fade_end = max(fade_start + 1, round(viewport_width * 0.98))
-        for block_number, background in self.collapsed_fade_blocks.items():
+        fade_brushes: dict[int, QBrush] = {}
+
+        for block_number in range(first_block, last_block + 1):
+            background = self.row_background_blocks.get(block_number)
+            fade_background = self.collapsed_fade_blocks.get(block_number)
+            if background is None and fade_background is None:
+                continue
+
             block = self.document().findBlockByNumber(block_number)
             if not block.isValid():
                 continue
             block_cursor = QTextCursor(block)
-            top = self.cursorRect(block_cursor).top()
+            cursor_rect = self.cursorRect(block_cursor)
+            top = cursor_rect.top()
             height = max(
                 1,
                 round(document_layout.blockBoundingRect(block).height()),
             )
-            transparent = QColor(background)
-            transparent.setAlpha(0)
-            opaque = QColor(background)
-            opaque.setAlpha(255)
-            gradient = QLinearGradient(fade_start, 0, fade_end, 0)
-            gradient.setColorAt(0.0, transparent)
-            gradient.setColorAt(1.0, opaque)
-            painter.fillRect(
-                fade_start,
-                top,
-                max(0, viewport_width - fade_start),
-                height + 1,
-                QBrush(gradient),
-            )
+            if top > paint_rect.bottom() or top + height < paint_rect.top():
+                continue
+
+            if background is not None:
+                left_width = max(0, cursor_rect.left())
+                if left_width > 0:
+                    painter.fillRect(
+                        0,
+                        top,
+                        left_width,
+                        height + 1,
+                        background,
+                    )
+
+            if fade_background is not None:
+                color_key = int(fade_background.rgba())
+                fade_brush = fade_brushes.get(color_key)
+                if fade_brush is None:
+                    transparent = QColor(fade_background)
+                    transparent.setAlpha(0)
+                    opaque = QColor(fade_background)
+                    opaque.setAlpha(255)
+                    gradient = QLinearGradient(
+                        fade_start,
+                        0,
+                        fade_end,
+                        0,
+                    )
+                    gradient.setColorAt(0.0, transparent)
+                    gradient.setColorAt(1.0, opaque)
+                    fade_brush = QBrush(gradient)
+                    fade_brushes[color_key] = fade_brush
+                painter.fillRect(
+                    fade_start,
+                    top,
+                    max(0, viewport_width - fade_start),
+                    height + 1,
+                    fade_brush,
+                )
         painter.end()
 
 
@@ -1933,10 +1962,6 @@ class EncryptedChatClient(QObject):
         self.message_limit_reset_timer.timeout.connect(
             self._reset_daily_sent_message_count
         )
-
-        self.chat_render_timer = QTimer(self)
-        self.chat_render_timer.setSingleShot(True)
-        self.chat_render_timer.timeout.connect(self._finish_chat_resize_render)
 
         self.chat_tooltip_timer = QTimer(self)
         self.chat_tooltip_timer.setSingleShot(True)
@@ -2815,6 +2840,9 @@ class EncryptedChatClient(QObject):
         self.chat_display.setOpenLinks(False)
         self.chat_display.setOpenExternalLinks(False)
         self.chat_display.setUndoRedoEnabled(False)
+        self.chat_display.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.chat_display.setFont(self._make_font("Segoe UI", 10))
         self.chat_display.setViewportMargins(0, 0, 0, 0)
         self.chat_display.document().setDocumentMargin(0)
@@ -4874,15 +4902,6 @@ class EncryptedChatClient(QObject):
         scrollbar = self.chat_display.verticalScrollBar()
         scrollbar.setValue(round(fraction * scrollbar.maximum()))
 
-    def _on_chat_display_configure(self) -> None:
-        muted_ids = self._room_preference_ids("muted_users")
-        collapsed_ids = self._room_preference_ids("collapsed_messages")
-        if muted_ids or collapsed_ids:
-            self.chat_render_timer.start(120)
-
-    def _finish_chat_resize_render(self) -> None:
-        self._rerender_preserving_scroll()
-
     def _schedule_chat_tooltip(
         self,
         message_id: str,
@@ -5057,10 +5076,7 @@ class EncryptedChatClient(QObject):
             hasattr(self, "chat_display")
             and watched is self.chat_display.viewport()
         ):
-            if event.type() == QEvent.Type.Resize:
-                self._on_chat_display_configure()
-
-            elif event.type() == QEvent.Type.MouseMove:
+            if event.type() == QEvent.Type.MouseMove:
                 anchor = self.chat_display.anchorAt(event.position().toPoint())
                 message_id = self._message_id_from_anchor(anchor)
 
@@ -5162,11 +5178,7 @@ class EncryptedChatClient(QObject):
 
     def _collapsed_message_preview(
         self,
-        username: str,
-        status_suffix: str,
         text: str,
-        font_name: str,
-        has_profile_icon: bool,
     ) -> str:
         has_embedded_images = bool(direct_image_urls_in_message(text))
         visible_text = (
@@ -5182,37 +5194,7 @@ class EncryptedChatClient(QObject):
                 else "[image]"
             )
 
-        if not normalized:
-            return ""
-
-        body_metrics = QFontMetrics(self._make_message_font(font_name))
-        username_font = self._make_message_font(font_name, bold=True)
-        username_metrics = QFontMetrics(username_font)
-        prefix_width = (
-            username_metrics.horizontalAdvance(username)
-            + body_metrics.horizontalAdvance(status_suffix + ": ")
-            + 36
-            + (20 if has_profile_icon else 0)
-        )
-        available_width = max(
-            0,
-            self.chat_display.viewport().width() - prefix_width,
-        )
-
-        if body_metrics.horizontalAdvance(normalized) <= available_width:
-            return normalized
-
-        low = 0
-        high = len(normalized)
-        while low < high:
-            midpoint = (low + high + 1) // 2
-            candidate = normalized[:midpoint].rstrip()
-            if body_metrics.horizontalAdvance(candidate) <= available_width:
-                low = midpoint
-            else:
-                high = midpoint - 1
-
-        return normalized[:low].rstrip()
+        return normalized
 
     def _insert_profile_icon(
         self,
@@ -5524,6 +5506,7 @@ class EncryptedChatClient(QObject):
         self.rendered_tooltips.clear()
         self.rendered_image_links.clear()
         self.chat_display.clear()
+        self.chat_display.row_background_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
 
         cursor = self.chat_display.textCursor()
@@ -5598,7 +5581,15 @@ class EncryptedChatClient(QObject):
             previous_timestamp = current_timestamp
             previous_local_date = current_local_date
 
+        self.chat_display.row_background_blocks = {
+            selection.cursor.block().blockNumber(): QColor(
+                selection.format.background().color()
+            )
+            for selection in row_selections
+            if selection.cursor.block().isValid()
+        }
         self.chat_display.setExtraSelections(row_selections)
+        self.chat_display.horizontalScrollBar().setValue(0)
 
         if scroll_to_bottom:
             scrollbar = self.chat_display.verticalScrollBar()
@@ -5632,6 +5623,10 @@ class EncryptedChatClient(QObject):
 
         is_muted = client_id in muted_ids and not item["is_local"]
         is_collapsed = is_muted or message_id in collapsed_ids
+        if is_collapsed:
+            collapsed_block_format = cursor.blockFormat()
+            collapsed_block_format.setNonBreakableLines(True)
+            cursor.setBlockFormat(collapsed_block_format)
         username_color = (
             self._blend_toward_chat_background(original_color)
             if is_muted
@@ -5753,13 +5748,7 @@ class EncryptedChatClient(QObject):
         )
 
         display_text = (
-            self._collapsed_message_preview(
-                username,
-                status_suffix,
-                text,
-                font_name,
-                has_profile_icon,
-            )
+            self._collapsed_message_preview(text)
             if is_collapsed
             else text
         )
@@ -5880,6 +5869,7 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items.clear()
         self.rendered_tooltips.clear()
         self.rendered_image_links.clear()
+        self.chat_display.row_background_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
         self.chat_display.setExtraSelections([])
         self.chat_display.clear()
