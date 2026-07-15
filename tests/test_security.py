@@ -92,6 +92,61 @@ class ImageTrustTests(unittest.TestCase):
 
 
 class ImageEmbeddingTests(unittest.TestCase):
+    def test_extensionless_provider_pages_are_embeddable(self) -> None:
+        urls = (
+            "https://tenor.com/view/shower-head-shower-random-dacing-taking-shower-gif-3237625789977090490",
+            "https://klipy.com/gifs/christian-bale-me-when-the",
+            "https://giphy.com/gifs/example-slug",
+            "https://imgur.com/example",
+            "https://redgifs.com/watch/example",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertTrue(
+                    SPRITELINK.is_supported_media_page_url(url)
+                )
+                self.assertTrue(
+                    SPRITELINK.is_embeddable_media_url(url)
+                )
+                self.assertTrue(SPRITELINK.is_trusted_image_url(url))
+                self.assertEqual(
+                    SPRITELINK.direct_image_urls_in_message(url),
+                    [url],
+                )
+
+    def test_provider_metadata_prefers_looping_video(self) -> None:
+        page_url = "https://tenor.com/view/example"
+        html = """
+        <html><head>
+        <meta property="og:image"
+              content="https://media.tenor.com/example/tenor.gif">
+        <meta property="og:video:secure_url"
+              content="https://media.tenor.com/example/tenor.mp4">
+        </head></html>
+        """
+        self.assertEqual(
+            SPRITELINK.resolve_media_url_from_page(page_url, html),
+            (
+                "https://media.tenor.com/example/tenor.mp4",
+                "video",
+            ),
+        )
+
+    def test_klipy_metadata_accepts_extensionless_cdn_media(self) -> None:
+        page_url = "https://klipy.com/gifs/example"
+        html = """
+        <meta property="og:image"
+              content="//cdn.klipy.com/media/example">
+        """
+        self.assertEqual(
+            SPRITELINK.resolve_media_url_from_page(page_url, html),
+            ("https://cdn.klipy.com/media/example", "image"),
+        )
+        fetch_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._fetch_remote_image_preview
+        )
+        self.assertIn("resolve_media_url_from_page", fetch_source)
+
     def test_remote_media_download_limit_is_50_mb(self) -> None:
         self.assertEqual(
             SPRITELINK.MAX_REMOTE_IMAGE_BYTES,
@@ -119,10 +174,16 @@ class ImageEmbeddingTests(unittest.TestCase):
             "https://media.tenor.com/example/tenor.mp4",
             "https://c.tenor.com/example/tenor.webm",
             "https://media.tenor.com/example/tenor?format=mp4",
+            "https://cdn.klipy.com/example.mp4",
+            "https://media2.giphy.com/example.webm",
         )
         for url in urls:
             with self.subTest(url=url):
-                self.assertTrue(SPRITELINK.is_tenor_video_url(url))
+                if "tenor.com" in url:
+                    self.assertTrue(SPRITELINK.is_tenor_video_url(url))
+                self.assertTrue(
+                    SPRITELINK.is_trusted_looping_video_url(url)
+                )
                 self.assertTrue(SPRITELINK.is_embeddable_media_url(url))
                 self.assertTrue(SPRITELINK.is_trusted_image_url(url))
         self.assertFalse(
