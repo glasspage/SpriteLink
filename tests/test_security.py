@@ -210,6 +210,121 @@ class BehaviorSettingsTests(unittest.TestCase):
         )
 
 
+class RichTextFormattingTests(unittest.TestCase):
+    def test_parser_supports_only_bold_italic_and_underline_tags(self) -> None:
+        markup = (
+            "plain <b>bold <i>both</i></b> "
+            "<u>underlined</u> <script>literal</script>"
+        )
+        plain, runs = SPRITELINK.parse_message_rich_text(markup)
+        self.assertEqual(
+            plain,
+            "plain bold both underlined <script>literal</script>",
+        )
+        styled_text = {
+            plain[run.start:run.end]: (
+                run.bold,
+                run.italic,
+                run.underline,
+            )
+            for run in runs
+        }
+        self.assertEqual(styled_text["bold "], (True, False, False))
+        self.assertEqual(styled_text["both"], (True, True, False))
+        self.assertEqual(styled_text["underlined"], (False, False, True))
+
+    def test_unmatched_closing_tags_remain_visible(self) -> None:
+        plain, _runs = SPRITELINK.parse_message_rich_text(
+            "text</b></i></u>"
+        )
+        self.assertEqual(plain, "text</b></i></u>")
+
+    def test_unclosed_tags_do_not_affect_the_next_message(self) -> None:
+        first_plain, first_runs = SPRITELINK.parse_message_rich_text(
+            "<b>unfinished"
+        )
+        second_plain, second_runs = SPRITELINK.parse_message_rich_text(
+            "next message"
+        )
+        self.assertEqual(first_plain, "unfinished")
+        self.assertTrue(all(run.bold for run in first_runs))
+        self.assertEqual(second_plain, "next message")
+        self.assertTrue(all(not run.bold for run in second_runs))
+
+    def test_composer_segments_serialize_to_balanced_tags(self) -> None:
+        markup = SPRITELINK.serialize_message_rich_text([
+            ("bold", True, False, False),
+            (" plain ", False, False, False),
+            ("all", True, True, True),
+            (" italic", False, True, False),
+        ])
+        self.assertEqual(
+            markup,
+            (
+                "<b>bold</b> plain "
+                "<b><i><u>all</u></i></b>"
+                "<i> italic</i>"
+            ),
+        )
+        self.assertEqual(
+            SPRITELINK.message_plain_text(markup),
+            "bold plain all italic",
+        )
+
+    def test_formatting_menu_and_tagged_send_path_are_wired(self) -> None:
+        ui_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        self.assertIn('QPushButton("Formatting")', ui_source)
+        self.assertIn('QPushButton("Bold")', ui_source)
+        self.assertIn('QPushButton("Italic")', ui_source)
+        self.assertIn('QPushButton("Underline")', ui_source)
+        self.assertIn("bold_button_font.setBold(True)", ui_source)
+        self.assertIn("italic_button_font.setItalic(True)", ui_source)
+        self.assertIn("underline_button_font.setUnderline(True)", ui_source)
+
+        composer_source = inspect.getsource(
+            SPRITELINK.ComposeTextEdit.to_message_text
+        )
+        self.assertIn("serialize_message_rich_text", composer_source)
+        toggle_source = inspect.getsource(
+            SPRITELINK.ComposeTextEdit.apply_formatting
+        )
+        self.assertIn("cursor.hasSelection()", toggle_source)
+        self.assertIn("cursor.mergeCharFormat", toggle_source)
+        self.assertIn("mergeCurrentCharFormat", toggle_source)
+        send_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._send_current_message
+        )
+        size_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._run_message_size_check
+        )
+        self.assertIn("to_message_text()", send_source)
+        self.assertIn("to_message_text()", size_source)
+
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertIn(
+            "cursor.setCharFormat(QTextCharFormat())",
+            render_source,
+        )
+        username_format_start = render_source.index(
+            "cursor.insertText(\n            username,"
+        )
+        username_format_end = render_source.index(
+            "        if status_suffix:",
+            username_format_start,
+        )
+        username_format = render_source[
+            username_format_start:username_format_end
+        ]
+        self.assertIn("bold=False", username_format)
+        self.assertIn("italic=False", username_format)
+        self.assertIn("underline=False", username_format)
+        self.assertNotIn("bold=True", username_format)
+
+
 class RuntimeOptimizationTests(unittest.TestCase):
     def test_wrapped_messages_align_to_row_edge_and_keep_background(self) -> None:
         source = inspect.getsource(
