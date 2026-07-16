@@ -2812,11 +2812,39 @@ class AnimatedMediaController(QObject):
         self.frame_ready.emit(self.url, emitted_frame)
 
     def stop(self) -> None:
-        if self._movie is not None:
-            self._movie.stop()
-        if self._player is not None:
-            self._player.stop()
+        movie = self._movie
+        self._movie = None
+        if movie is not None:
+            movie.stop()
+            try:
+                movie.frameChanged.disconnect(
+                    self._on_movie_frame_changed
+                )
+                movie.finished.disconnect(self._restart_gif)
+            except (RuntimeError, TypeError):
+                pass
+            movie.deleteLater()
+
+        player = self._player
+        self._player = None
+        video_sink = self._video_sink
+        self._video_sink = None
+        if player is not None:
+            player.stop()
+            player.setVideoSink(None)
+            player.setSource(QUrl())
+            player.deleteLater()
+        if video_sink is not None:
+            try:
+                video_sink.videoFrameChanged.disconnect(
+                    self._on_video_frame_changed
+                )
+            except (RuntimeError, TypeError):
+                pass
+            video_sink.deleteLater()
+
         self._buffer.close()
+        self._buffer.setData(QByteArray())
 
 
 class EncryptedChatClient(QObject):
@@ -3352,6 +3380,7 @@ class EncryptedChatClient(QObject):
         if self.image_preview_overlay.isVisible():
             self._hide_image_preview_popup()
         self._pause_animated_media()
+        self._release_message_sound_resources()
         self.image_preview_cache.clear()
         self.rendered_message_items.clear()
         self.rendered_image_links.clear()
@@ -3369,11 +3398,13 @@ class EncryptedChatClient(QObject):
         is_trusted_image_url.cache_clear()
         is_likely_nsfw_image_url.cache_clear()
         QPixmapCache.clear()
+        self.root.setUpdatesEnabled(False)
 
     def _resume_from_tray(self) -> None:
         if not self._tray_ui_suspended:
             return
         self._tray_ui_suspended = False
+        self.root.setUpdatesEnabled(True)
         self._render_message_log(scroll_to_bottom=True)
         self._sync_window_activity()
 
@@ -8319,6 +8350,11 @@ class EncryptedChatClient(QObject):
                 self._on_message_sound_effect_status_changed(effect)
             )
         )
+        effect.playingChanged.connect(
+            lambda effect=effect: (
+                self._on_message_sound_effect_playing_changed(effect)
+            )
+        )
         self.message_sound_effects[resolved_path] = effect
         effect.setSource(QUrl.fromLocalFile(resolved_path))
         return effect
@@ -8364,6 +8400,16 @@ class EncryptedChatClient(QObject):
                 "Could not play message sound",
                 "The selected WAV file could not be loaded.",
                 parent=self.root,
+            )
+
+    def _on_message_sound_effect_playing_changed(
+        self,
+        effect: QSoundEffect,
+    ) -> None:
+        if self._tray_ui_suspended and not effect.isPlaying():
+            QTimer.singleShot(
+                0,
+                self._release_message_sound_resources,
             )
 
     def _ensure_compressed_message_sound_player(
@@ -8424,6 +8470,14 @@ class EncryptedChatClient(QObject):
             self.message_sound_stop_timer.start(
                 CUSTOM_MESSAGE_SOUND_MAX_MS
             )
+        elif (
+            state == QMediaPlayer.PlaybackState.StoppedState
+            and self._tray_ui_suspended
+        ):
+            QTimer.singleShot(
+                0,
+                self._release_message_sound_resources,
+            )
 
     def _on_compressed_message_sound_error(self, *_args: Any) -> None:
         report_errors = self.compressed_message_sound_report_errors
@@ -8454,6 +8508,28 @@ class EncryptedChatClient(QObject):
             self.compressed_message_sound_player.stop()
         self.compressed_message_sound_name = ""
         self.compressed_message_sound_report_errors = False
+
+    def _release_message_sound_resources(self) -> None:
+        self._stop_message_sound()
+        for effect in set(self.message_sound_effects.values()):
+            effect.stop()
+            effect.setSource(QUrl())
+            effect.deleteLater()
+        self.message_sound_effects.clear()
+        self.pending_message_sound_effect = None
+        self.active_message_sound_effect = None
+
+        player = self.compressed_message_sound_player
+        audio_output = self.compressed_message_sound_audio_output
+        self.compressed_message_sound_player = None
+        self.compressed_message_sound_audio_output = None
+        if player is not None:
+            player.stop()
+            player.setSource(QUrl())
+            player.setAudioOutput(None)
+            player.deleteLater()
+        if audio_output is not None:
+            audio_output.deleteLater()
 
     def _play_message_sound(self, *, report_errors: bool = False) -> None:
         sound_name = str(self.message_sound_var.get())
