@@ -204,7 +204,226 @@ class BehaviorSettingsTests(unittest.TestCase):
         restore_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._restore_from_tray
         )
-        self.assertIn("_tray_normal_icon", restore_source)
+        self.assertIn("_clear_tray_notification", restore_source)
+
+
+class RuntimeOptimizationTests(unittest.TestCase):
+    def test_network_worker_waits_until_real_work_is_due(self) -> None:
+        self.assertEqual(
+            SPRITELINK.network_idle_wait_seconds(
+                now=100.0,
+                active_last_polled=95.0,
+                background_last_polled=90.0,
+                active_interval=6.0,
+                background_interval=45.0,
+                has_background_rooms=True,
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            SPRITELINK.network_idle_wait_seconds(
+                now=100.0,
+                active_last_polled=99.0,
+                background_last_polled=None,
+                active_interval=6.0,
+                background_interval=45.0,
+                has_background_rooms=True,
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            SPRITELINK.network_idle_wait_seconds(
+                now=100.0,
+                active_last_polled=100.0,
+                background_last_polled=100.0,
+                active_interval=6.0,
+                background_interval=45.0,
+                has_background_rooms=True,
+                force_active_poll=True,
+            ),
+            0.0,
+        )
+
+        loop_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._network_loop
+        )
+        self.assertIn("network_idle_wait_seconds", loop_source)
+        self.assertIn("network_wakeup_event.wait", loop_source)
+        self.assertNotIn("wait(0.08)", loop_source)
+
+    def test_network_wakes_immediately_for_send_config_and_focus(self) -> None:
+        refresh_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._request_network_refresh
+        )
+        send_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._send_current_message
+        )
+        event_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        self.assertIn("network_wakeup_event.set()", refresh_source)
+        self.assertIn("network_wakeup_event.set()", send_source)
+        self.assertIn("network_wakeup_event.set()", event_source)
+
+    def test_ui_queue_is_signal_driven_instead_of_polled(self) -> None:
+        init_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.__init__
+        )
+        queue_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._queue_ui_event
+        )
+        self.assertIn(
+            "ui_event_available.connect(self._process_ui_queue)",
+            init_source,
+        )
+        self.assertNotIn("ui_queue_timer", init_source)
+        self.assertIn("ui_queue.put(event)", queue_source)
+        self.assertIn("ui_event_available.emit()", queue_source)
+
+    def test_multimedia_and_sounds_are_loaded_on_demand(self) -> None:
+        init_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.__init__
+        )
+        wav_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._message_sound_effect_for_path
+        )
+        video_source = inspect.getsource(
+            SPRITELINK.AnimatedMediaController._start_video
+        )
+        self.assertNotIn(
+            "_message_sound_effect_for_path(",
+            init_source,
+        )
+        self.assertIn("ensure_qt_multimedia_loaded()", wav_source)
+        self.assertIn("ensure_qt_multimedia_loaded()", video_source)
+
+    def test_repeated_message_url_parsing_is_cached(self) -> None:
+        SPRITELINK._cached_message_url_spans.cache_clear()
+        text = "hello https://example.com/picture.png"
+        self.assertEqual(
+            SPRITELINK.message_url_spans(text),
+            [(6, len(text), "https://example.com/picture.png")],
+        )
+        SPRITELINK.message_url_spans(text)
+        self.assertEqual(
+            SPRITELINK._cached_message_url_spans.cache_info().hits,
+            1,
+        )
+
+    def test_tooltips_are_created_only_when_hovered(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        show_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_pending_chat_tooltip
+        )
+        self.assertNotIn("profile_icon_tooltip_data_uri", insert_source)
+        self.assertIn("_tooltip_for_message_item", show_source)
+
+
+class TrayLifecycleOptimizationTests(unittest.TestCase):
+    def test_tray_icon_is_always_visible_while_running(self) -> None:
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_tray_icon
+        )
+        self.assertIn("self.tray_icon.show()", build_source)
+        self.assertLess(
+            build_source.index('"Show SpriteLink"'),
+            build_source.index('"Minimize to Tray"'),
+        )
+        self.assertIn("setCheckable(True)", build_source)
+        self.assertIn("_on_tray_minimize_toggled", build_source)
+
+        restore_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._restore_from_tray
+        )
+        self.assertNotIn("tray_icon.hide()", restore_source)
+
+    def test_setting_only_controls_close_button_behavior(self) -> None:
+        close_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_close
+        )
+        can_hide_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._can_minimize_to_tray
+        )
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_tray_icon
+        )
+        self.assertIn("_can_minimize_to_tray()", close_source)
+        self.assertIn("minimize_to_tray_var.get()", can_hide_source)
+        self.assertNotIn("minimize_to_tray_var.get()", build_source)
+
+    def test_notifications_work_for_normal_minimize(self) -> None:
+        mark_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._mark_tray_notification
+        )
+        event_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        self.assertIn("window_focused_event.is_set()", mark_source)
+        self.assertNotIn("_minimized_to_tray", mark_source)
+        self.assertIn("_clear_tray_notification", event_source)
+        self.assertIn("WindowStateChange", event_source)
+
+    def test_hidden_tray_mode_releases_heavy_render_state(self) -> None:
+        suspend_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._suspend_for_tray
+        )
+        resume_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._resume_from_tray
+        )
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._render_message_log
+        )
+        queue_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._process_ui_queue
+        )
+        self.assertIn("_pause_animated_media()", suspend_source)
+        self.assertIn(
+            "_release_message_sound_resources()",
+            suspend_source,
+        )
+        self.assertIn("image_preview_cache.clear()", suspend_source)
+        self.assertIn("_reset_chat_document()", suspend_source)
+        self.assertIn("QPixmapCache.clear()", suspend_source)
+        self.assertIn("setUpdatesEnabled(False)", suspend_source)
+        self.assertIn("setUpdatesEnabled(True)", resume_source)
+        self.assertIn("_render_message_log", resume_source)
+        self.assertIn("_tray_ui_suspended", render_source)
+        self.assertIn("_tray_ui_suspended", queue_source)
+
+    def test_tray_mode_fully_detaches_multimedia_backends(self) -> None:
+        controller_source = inspect.getsource(
+            SPRITELINK.AnimatedMediaController.stop
+        )
+        audio_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._release_message_sound_resources
+        )
+        self.assertIn("player.setVideoSink(None)", controller_source)
+        self.assertIn("player.setSource(QUrl())", controller_source)
+        self.assertIn("video_sink.deleteLater()", controller_source)
+        self.assertIn("_buffer.setData(QByteArray())", controller_source)
+        self.assertIn("effect.setSource(QUrl())", audio_source)
+        self.assertIn("player.setAudioOutput(None)", audio_source)
+        self.assertIn("message_sound_effects.clear()", audio_source)
+
+    def test_tray_audio_is_released_after_notifications(self) -> None:
+        wav_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._on_message_sound_effect_playing_changed
+        )
+        compressed_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._on_compressed_message_sound_state_changed
+        )
+        self.assertIn("_tray_ui_suspended", wav_source)
+        self.assertIn("_release_message_sound_resources", wav_source)
+        self.assertIn("_tray_ui_suspended", compressed_source)
+        self.assertIn(
+            "_release_message_sound_resources",
+            compressed_source,
+        )
 
 
 class ProfileIconTests(unittest.TestCase):

@@ -71,6 +71,7 @@ try:
         QPainter,
         QPalette,
         QPixmap,
+        QPixmapCache,
         QPolygon,
         QTextBlockFormat,
         QTextCharFormat,
@@ -79,12 +80,6 @@ try:
         QTextFormat,
         QTextImageFormat,
         QTextOption,
-    )
-    from PySide6.QtMultimedia import (
-        QAudioOutput,
-        QMediaPlayer,
-        QSoundEffect,
-        QVideoSink,
     )
     from PySide6.QtWidgets import (
         QAbstractItemView,
@@ -125,6 +120,29 @@ except ImportError as exc:
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
 from typing import Any
+
+QAudioOutput: Any = None
+QMediaPlayer: Any = None
+QSoundEffect: Any = None
+QVideoSink: Any = None
+
+
+def ensure_qt_multimedia_loaded() -> None:
+    """Load Qt's multimedia backend only when audio or video is first used."""
+    global QAudioOutput, QMediaPlayer, QSoundEffect, QVideoSink
+    if QMediaPlayer is not None:
+        return
+    from PySide6.QtMultimedia import (
+        QAudioOutput as AudioOutput,
+        QMediaPlayer as MediaPlayer,
+        QSoundEffect as SoundEffect,
+        QVideoSink as VideoSink,
+    )
+    QAudioOutput = AudioOutput
+    QMediaPlayer = MediaPlayer
+    QSoundEffect = SoundEffect
+    QVideoSink = VideoSink
+
 
 try:
     import requests
@@ -958,7 +976,10 @@ def local_reset_time_label() -> str:
     )
 
 
-def message_url_spans(text: str) -> list[tuple[int, int, str]]:
+@lru_cache(maxsize=4096)
+def _cached_message_url_spans(
+    text: str,
+) -> tuple[tuple[int, int, str], ...]:
     spans: list[tuple[int, int, str]] = []
     for match in MESSAGE_URL_PATTERN.finditer(text):
         start, end = match.span()
@@ -972,7 +993,11 @@ def message_url_spans(text: str) -> list[tuple[int, int, str]]:
                 end -= 1
         if url:
             spans.append((start, end, url))
-    return spans
+    return tuple(spans)
+
+
+def message_url_spans(text: str) -> list[tuple[int, int, str]]:
+    return list(_cached_message_url_spans(text))
 
 
 def is_direct_image_url(url: str) -> bool:
@@ -1066,6 +1091,7 @@ def is_supported_media_page_url(url: str) -> bool:
     )
 
 
+@lru_cache(maxsize=4096)
 def is_embeddable_media_url(url: str) -> bool:
     return (
         is_direct_image_url(url)
@@ -1074,6 +1100,7 @@ def is_embeddable_media_url(url: str) -> bool:
     )
 
 
+@lru_cache(maxsize=4096)
 def is_trusted_image_url(url: str) -> bool:
     try:
         parsed = urlsplit(url)
@@ -1108,6 +1135,7 @@ def generate_chatroom_key() -> str:
     return secrets.token_urlsafe(24)
 
 
+@lru_cache(maxsize=4096)
 def is_likely_nsfw_image_url(url: str) -> bool:
     try:
         hostname = (urlsplit(url).hostname or "").casefold().rstrip(".")
@@ -2337,6 +2365,39 @@ def vertical_range_is_near_viewport(
     )
 
 
+def network_idle_wait_seconds(
+    *,
+    now: float,
+    active_last_polled: float | None,
+    background_last_polled: float | None,
+    active_interval: float,
+    background_interval: float,
+    has_background_rooms: bool,
+    force_active_poll: bool = False,
+    deferred_active_poll_started_at: float | None = None,
+) -> float:
+    if force_active_poll:
+        return 0.0
+    active_ready_at = (
+        now
+        if active_last_polled is None
+        else active_last_polled + max(0.0, active_interval)
+    )
+    if deferred_active_poll_started_at is not None:
+        active_ready_at = max(
+            active_ready_at,
+            deferred_active_poll_started_at + max(0.0, active_interval),
+        )
+    deadlines = [active_ready_at]
+    if has_background_rooms:
+        deadlines.append(
+            now
+            if background_last_polled is None
+            else background_last_polled + max(0.0, background_interval)
+        )
+    return max(0.0, min(60.0, min(deadlines) - now))
+
+
 class ThemeComboBox(QComboBox):
     """Config combo box with Classic styling and no wheel changes."""
 
@@ -2721,6 +2782,7 @@ class AnimatedMediaController(QObject):
             self._emit_frame(movie.currentImage())
 
     def _start_video(self) -> None:
+        ensure_qt_multimedia_loaded()
         video_sink = QVideoSink(self)
         video_sink.videoFrameChanged.connect(self._on_video_frame_changed)
         player = QMediaPlayer(self)
@@ -2750,14 +2812,44 @@ class AnimatedMediaController(QObject):
         self.frame_ready.emit(self.url, emitted_frame)
 
     def stop(self) -> None:
-        if self._movie is not None:
-            self._movie.stop()
-        if self._player is not None:
-            self._player.stop()
+        movie = self._movie
+        self._movie = None
+        if movie is not None:
+            movie.stop()
+            try:
+                movie.frameChanged.disconnect(
+                    self._on_movie_frame_changed
+                )
+                movie.finished.disconnect(self._restart_gif)
+            except (RuntimeError, TypeError):
+                pass
+            movie.deleteLater()
+
+        player = self._player
+        self._player = None
+        video_sink = self._video_sink
+        self._video_sink = None
+        if player is not None:
+            player.stop()
+            player.setVideoSink(None)
+            player.setSource(QUrl())
+            player.deleteLater()
+        if video_sink is not None:
+            try:
+                video_sink.videoFrameChanged.disconnect(
+                    self._on_video_frame_changed
+                )
+            except (RuntimeError, TypeError):
+                pass
+            video_sink.deleteLater()
+
         self._buffer.close()
+        self._buffer.setData(QByteArray())
 
 
 class EncryptedChatClient(QObject):
+    ui_event_available = Signal()
+
     def __init__(self, root: MainWindow) -> None:
         super().__init__(root)
         self.root = root
@@ -2787,6 +2879,7 @@ class EncryptedChatClient(QObject):
         })
 
         self.stop_event = threading.Event()
+        self.network_wakeup_event = threading.Event()
         self.window_focused_event = threading.Event()
         self.window_focused_event.set()
         self.network_control_queue: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -2803,7 +2896,6 @@ class EncryptedChatClient(QObject):
         self.current_estimated_packet_size = 0
         self.message_size_check_pending = False
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
-        self.rendered_tooltips: dict[str, str] = {}
         self.rendered_image_links: dict[str, str] = {}
         self.rendered_image_positions: dict[str, list[int]] = {}
         self.rendered_image_candidates: dict[str, list[int]] = {}
@@ -2825,6 +2917,7 @@ class EncryptedChatClient(QObject):
         self._pending_tooltip_message_id: str | None = None
         self._pending_tooltip_global_position = QPoint()
         self._config_snapshot_at_open: tuple[Any, ...] | None = None
+        self._message_font_cache: dict[tuple[str, bool, bool], QFont] = {}
         self._loading_profile_controls = False
         self.active_chatroom_id = str(
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
@@ -2848,6 +2941,7 @@ class EncryptedChatClient(QObject):
         self._closing = False
         self._force_quit = False
         self._minimized_to_tray = False
+        self._tray_ui_suspended = False
         self.available_update: ReleaseInfo | None = None
         self._update_check_in_progress = False
         self._update_download_in_progress = False
@@ -2922,10 +3016,6 @@ class EncryptedChatClient(QObject):
         self.pending_message_sound_effect: QSoundEffect | None = None
         self.pending_message_sound_name = ""
         self.pending_message_sound_report_errors = False
-        for filename in BUILTIN_MESSAGE_SOUND_FILES.values():
-            self._message_sound_effect_for_path(
-                Path(__file__).resolve().parent / "sounds" / filename
-            )
         self.compressed_message_sound_audio_output: (
             QAudioOutput | None
         ) = None
@@ -2945,9 +3035,7 @@ class EncryptedChatClient(QObject):
             self._show_pending_chat_tooltip
         )
 
-        self.ui_queue_timer = QTimer(self)
-        self.ui_queue_timer.timeout.connect(self._process_ui_queue)
-        self.ui_queue_timer.start(100)
+        self.ui_event_available.connect(self._process_ui_queue)
 
         self._apply_theme()
         self._apply_application_font_strategy()
@@ -3000,14 +3088,24 @@ class EncryptedChatClient(QObject):
         *,
         bold: bool = False,
     ) -> QFont:
-        point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
-        return self._make_font(
+        cache_key = (
             font_name,
-            point_size,
-            bold=bold,
+            bool(bold),
+            self._is_windows_classic_theme(),
         )
+        cached = self._message_font_cache.get(cache_key)
+        if cached is None:
+            point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
+            cached = self._make_font(
+                font_name,
+                point_size,
+                bold=bold,
+            )
+            self._message_font_cache[cache_key] = cached
+        return cached
 
     def _apply_application_font_strategy(self) -> None:
+        self._message_font_cache.clear()
         app = QApplication.instance()
         if app is None:
             return
@@ -3199,6 +3297,16 @@ class EncryptedChatClient(QObject):
         self.tray_menu = QMenu()
         show_action = self.tray_menu.addAction("Show SpriteLink")
         show_action.triggered.connect(self._restore_from_tray)
+        self.tray_minimize_action = self.tray_menu.addAction(
+            "Minimize to Tray"
+        )
+        self.tray_minimize_action.setCheckable(True)
+        self.tray_minimize_action.toggled.connect(
+            self._on_tray_minimize_toggled
+        )
+        self.minimize_to_tray_var.bind(
+            self._sync_tray_minimize_action
+        )
         self.tray_menu.addSeparator()
         exit_action = self.tray_menu.addAction("Exit")
         exit_action.triggered.connect(self._quit_from_tray)
@@ -3206,32 +3314,128 @@ class EncryptedChatClient(QObject):
         self.tray_icon.activated.connect(
             self._on_tray_icon_activated
         )
+        if self._tray_available():
+            self.tray_icon.show()
+
+    def _tray_available(self) -> bool:
+        return (
+            QSystemTrayIcon.isSystemTrayAvailable()
+            and not self._tray_normal_icon.isNull()
+        )
 
     def _can_minimize_to_tray(self) -> bool:
         return (
             bool(self.minimize_to_tray_var.get())
-            and QSystemTrayIcon.isSystemTrayAvailable()
-            and not self._tray_normal_icon.isNull()
+            and self._tray_available()
         )
+
+    def _sync_tray_minimize_action(self, enabled: Any) -> None:
+        previous = self.tray_minimize_action.blockSignals(True)
+        self.tray_minimize_action.setChecked(bool(enabled))
+        self.tray_minimize_action.blockSignals(previous)
+
+    def _on_tray_minimize_toggled(self, enabled: bool) -> None:
+        previous = bool(
+            self.config_data.get("minimize_to_tray", False)
+        )
+        self.minimize_to_tray_var.set(bool(enabled))
+        self.config_data["minimize_to_tray"] = bool(enabled)
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            self.config_data["minimize_to_tray"] = previous
+            self.minimize_to_tray_var.set(previous)
+            messagebox.showerror(
+                "Could not save settings",
+                str(exc),
+                parent=self.root,
+            )
+
+    def _pause_animated_media(self) -> None:
+        for controller in self.animated_media_controllers.values():
+            controller.stop()
+            controller.deleteLater()
+        self.animated_media_controllers.clear()
+        self.last_inline_animation_frame_at.clear()
+
+    def _sync_window_activity(self) -> None:
+        if (
+            self._tray_ui_suspended
+            or not self.root.isVisible()
+            or self.root.isMinimized()
+        ):
+            self._pause_animated_media()
+            return
+        for url in self.rendered_image_positions:
+            media = self.image_preview_cache.get(url)
+            if isinstance(media, RemoteMediaPreview):
+                self._ensure_animated_media_controller(url, media)
+
+    def _suspend_for_tray(self) -> None:
+        if self._tray_ui_suspended:
+            return
+        self._tray_ui_suspended = True
+        self.viewport_media_timer.stop()
+        self._hide_chat_tooltip()
+        if self.image_preview_overlay.isVisible():
+            self._hide_image_preview_popup()
+        self._pause_animated_media()
+        self._release_message_sound_resources()
+        self.image_preview_cache.clear()
+        self.rendered_message_items.clear()
+        self.rendered_image_links.clear()
+        self.rendered_image_positions.clear()
+        self.rendered_image_candidates.clear()
+        self.viewport_embedded_image_urls.clear()
+        self.chat_display.row_background_blocks.clear()
+        self.chat_display.collapsed_fade_blocks.clear()
+        self.chat_display.setExtraSelections([])
+        self._reset_chat_document()
+        self._message_font_cache.clear()
+        profile_icon_tooltip_data_uri.cache_clear()
+        _cached_message_url_spans.cache_clear()
+        is_embeddable_media_url.cache_clear()
+        is_trusted_image_url.cache_clear()
+        is_likely_nsfw_image_url.cache_clear()
+        QPixmapCache.clear()
+        self.root.setUpdatesEnabled(False)
+
+    def _resume_from_tray(self) -> None:
+        if not self._tray_ui_suspended:
+            return
+        self._tray_ui_suspended = False
+        self.root.setUpdatesEnabled(True)
+        self._render_message_log(scroll_to_bottom=True)
+        self._sync_window_activity()
 
     def _hide_to_tray(self) -> None:
         self._minimized_to_tray = True
-        self.tray_icon.setIcon(self._tray_normal_icon)
-        self.tray_icon.setToolTip(APP_NAME)
-        self.tray_icon.show()
+        self._clear_tray_notification()
+        self._suspend_for_tray()
         self.root.hide()
 
     def _restore_from_tray(self) -> None:
+        was_suspended = self._tray_ui_suspended
         self._minimized_to_tray = False
-        self.tray_icon.setIcon(self._tray_normal_icon)
-        self.tray_icon.setToolTip(APP_NAME)
-        self.tray_icon.hide()
+        self._clear_tray_notification()
         self.root.showNormal()
         self.root.raise_()
         self.root.activateWindow()
+        if was_suspended:
+            QTimer.singleShot(0, self._resume_from_tray)
+        else:
+            QTimer.singleShot(0, self._sync_window_activity)
+
+    def _clear_tray_notification(self) -> None:
+        if not self._tray_normal_icon.isNull():
+            self.tray_icon.setIcon(self._tray_normal_icon)
+        self.tray_icon.setToolTip(APP_NAME)
 
     def _mark_tray_notification(self) -> None:
-        if not self._minimized_to_tray or not self.tray_icon.isVisible():
+        if (
+            self.window_focused_event.is_set()
+            or not self.tray_icon.isVisible()
+        ):
             return
         if not self._tray_notification_icon.isNull():
             self.tray_icon.setIcon(self._tray_notification_icon)
@@ -3953,6 +4157,7 @@ class EncryptedChatClient(QObject):
             "room_id": self.active_chatroom_id,
             "poll_immediately": poll_immediately,
         })
+        self.network_wakeup_event.set()
 
     def _switch_active_chatroom(
         self,
@@ -5150,13 +5355,13 @@ class EncryptedChatClient(QObject):
                 current_version=RUNNING_VERSION,
             )
         except Exception:
-            self.ui_queue.put((
+            self._queue_ui_event((
                 "update_check_result",
                 {"error": True},
             ))
             return
 
-        self.ui_queue.put((
+        self._queue_ui_event((
             "update_check_result",
             {"release": release},
         ))
@@ -5234,12 +5439,12 @@ class EncryptedChatClient(QObject):
                 UPDATE_DIRECTORY,
             )
         except Exception as exc:
-            self.ui_queue.put((
+            self._queue_ui_event((
                 "update_download_failed",
                 str(exc) or "The update download failed.",
             ))
             return
-        self.ui_queue.put((
+        self._queue_ui_event((
             "update_download_ready",
             {
                 "path": str(installer_path),
@@ -5753,6 +5958,7 @@ class EncryptedChatClient(QObject):
             "packet": packet,
             "message": message,
         })
+        self.network_wakeup_event.set()
 
         self.message_entry.clear()
         self.draft_message_id = uuid.uuid4().hex
@@ -5828,7 +6034,7 @@ class EncryptedChatClient(QObject):
                         None if poll_immediately else now
                     )
                     scheduled_active_room_id = active_room_id
-                    self.ui_queue.put((
+                    self._queue_ui_event((
                         "status",
                         (
                             "Connecting",
@@ -5895,7 +6101,20 @@ class EncryptedChatClient(QObject):
                 else:
                     last_background_poll_at = completed_at
 
-            self.stop_event.wait(0.08)
+            wait_seconds = network_idle_wait_seconds(
+                now=time.monotonic(),
+                active_last_polled=last_poll_times.get(active_room_id),
+                background_last_polled=last_background_poll_at,
+                active_interval=active_interval,
+                background_interval=background_interval,
+                has_background_rooms=bool(background_rooms),
+                force_active_poll=force_active_poll,
+                deferred_active_poll_started_at=(
+                    deferred_active_poll_started_at
+                ),
+            )
+            self.network_wakeup_event.wait(max(0.01, wait_seconds))
+            self.network_wakeup_event.clear()
 
     def _network_send(self, outbound: dict[str, Any]) -> None:
         try:
@@ -5912,7 +6131,7 @@ class EncryptedChatClient(QObject):
             )
             response.raise_for_status()
         except Exception as exc:
-            self.ui_queue.put((
+            self._queue_ui_event((
                 "send_failed",
                 {
                     "message": outbound["message"],
@@ -5921,7 +6140,7 @@ class EncryptedChatClient(QObject):
                 },
             ))
         else:
-            self.ui_queue.put((
+            self._queue_ui_event((
                 "send_succeeded",
                 {
                     "room_id": outbound.get("room_id"),
@@ -5958,7 +6177,7 @@ class EncryptedChatClient(QObject):
         if not server_url or not encryption_key:
             if is_active and room_id == self.active_chatroom_id:
                 self.connected = False
-                self.ui_queue.put((
+                self._queue_ui_event((
                     "status",
                     ("Disconnected", "No chatroom is selected.", room_id),
                 ))
@@ -6050,13 +6269,13 @@ class EncryptedChatClient(QObject):
                 and not self.connected
             ):
                 self.connected = True
-                self.ui_queue.put((
+                self._queue_ui_event((
                     "status",
                     ("Connected", server_url, room_id),
                 ))
 
             if decoded_messages or was_initial_history_scan:
-                self.ui_queue.put((
+                self._queue_ui_event((
                     "messages",
                     {
                         "items": decoded_messages,
@@ -6066,7 +6285,7 @@ class EncryptedChatClient(QObject):
                 ))
 
             if failed_decryptions:
-                self.ui_queue.put((
+                self._queue_ui_event((
                     "decrypt_failures",
                     failed_decryptions,
                 ))
@@ -6074,7 +6293,7 @@ class EncryptedChatClient(QObject):
         except Exception as exc:
             if is_active and room_id == self.active_chatroom_id:
                 self.connected = False
-                self.ui_queue.put((
+                self._queue_ui_event((
                     "status",
                     ("Disconnected", str(exc), room_id),
                 ))
@@ -6135,6 +6354,10 @@ class EncryptedChatClient(QObject):
 
         verify_message_identity(message, encryption_key)
 
+    def _queue_ui_event(self, event: tuple[str, Any]) -> None:
+        self.ui_queue.put(event)
+        self.ui_event_available.emit()
+
     def _process_ui_queue(self) -> None:
         try:
             while True:
@@ -6194,6 +6417,8 @@ class EncryptedChatClient(QObject):
                     kind = str(payload.get("kind", ""))
                     source_url = str(payload.get("source_url", url))
                     self.pending_image_previews.discard(url)
+                    if self._tray_ui_suspended:
+                        continue
                     media: RemoteMediaPreview | None = None
                     if isinstance(data, bytes) and data:
                         if kind == "looping_video":
@@ -6747,13 +6972,36 @@ class EncryptedChatClient(QObject):
         self._pending_tooltip_message_id = None
         if not message_id or message_id != self._hovered_message_id:
             return
-        tooltip = self.rendered_tooltips.get(message_id, "")
+        item = self.rendered_message_items.get(message_id)
+        tooltip = self._tooltip_for_message_item(item) if item else ""
         if tooltip:
             QToolTip.showText(
                 self._pending_tooltip_global_position,
                 tooltip,
                 self.chat_display.viewport(),
             )
+
+    def _tooltip_for_message_item(
+        self,
+        item: dict[str, Any],
+    ) -> str:
+        message = item["message"]
+        hover_timestamp = self._format_hover_timestamp(
+            self._display_timestamp_for_item(item)
+        )
+        user_id_preview = visible_user_id(str(message["c"]))
+        tooltip_icon_uri = profile_icon_tooltip_data_uri(
+            str(message.get("p", ""))
+        )
+        if tooltip_icon_uri:
+            return (
+                '<div align="center">'
+                f'<img src="{tooltip_icon_uri}" width="64" height="64">'
+                f"<br>{hover_timestamp}<br>"
+                f"User ID: {user_id_preview}"
+                "</div>"
+            )
+        return f"{hover_timestamp}\nUser ID: {user_id_preview}"
 
     def _hide_chat_tooltip(self) -> None:
         self.chat_tooltip_timer.stop()
@@ -6800,7 +7048,11 @@ class EncryptedChatClient(QObject):
         menu.exec(global_position)
 
     def _update_viewport_media(self) -> None:
-        if self._closing or not hasattr(self, "chat_display"):
+        if (
+            self._closing
+            or self._tray_ui_suspended
+            or not hasattr(self, "chat_display")
+        ):
             return
         viewport = self.chat_display.viewport()
         viewport_height = max(1, viewport.height())
@@ -7039,7 +7291,7 @@ class EncryptedChatClient(QObject):
             source_url = url
 
         if not self._closing:
-            self.ui_queue.put((
+            self._queue_ui_event((
                 "image_preview_loaded",
                 {
                     "url": url,
@@ -7056,8 +7308,14 @@ class EncryptedChatClient(QObject):
         ):
             if event.type() == QEvent.Type.WindowActivate:
                 self.window_focused_event.set()
+                self.network_wakeup_event.set()
+                if hasattr(self, "tray_icon"):
+                    self._clear_tray_notification()
             elif event.type() == QEvent.Type.WindowDeactivate:
                 self.window_focused_event.clear()
+                self.network_wakeup_event.set()
+            elif event.type() == QEvent.Type.WindowStateChange:
+                QTimer.singleShot(0, self._sync_window_activity)
 
         if (
             watched is getattr(self, "chat_content", None)
@@ -7608,10 +7866,19 @@ class EncryptedChatClient(QObject):
         cursor.setBlockFormat(QTextBlockFormat())
         return True
 
+    def _reset_chat_document(self) -> None:
+        document = QTextDocument(self.chat_display)
+        document.setDocumentMargin(0)
+        text_option = document.defaultTextOption()
+        text_option.setWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        document.setDefaultTextOption(text_option)
+        self.chat_display.setDocument(document)
+
     def _render_message_log(self, *, scroll_to_bottom: bool) -> None:
+        if self._tray_ui_suspended:
+            return
         self._hide_chat_tooltip()
         self.rendered_message_items.clear()
-        self.rendered_tooltips.clear()
         self.rendered_image_links.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
@@ -7846,22 +8113,6 @@ class EncryptedChatClient(QObject):
         )
 
         self.rendered_message_items[message_id] = item
-        hover_timestamp = self._format_hover_timestamp(timestamp)
-        tooltip_icon_uri = profile_icon_tooltip_data_uri(profile_icon)
-        if tooltip_icon_uri:
-            self.rendered_tooltips[message_id] = (
-                '<div align="center">'
-                f'<img src="{tooltip_icon_uri}" width="64" height="64">'
-                f"<br>{hover_timestamp}<br>"
-                f"User ID: {user_id_preview}"
-                "</div>"
-            )
-        else:
-            self.rendered_tooltips[message_id] = (
-                f"{hover_timestamp}\n"
-                f"User ID: {user_id_preview}"
-            )
-
         top_align_height = 0
         if (
             not is_collapsed
@@ -8043,7 +8294,6 @@ class EncryptedChatClient(QObject):
         self.seen_ntfy_message_ids.clear()
         self.message_log.clear()
         self.rendered_message_items.clear()
-        self.rendered_tooltips.clear()
         self.rendered_image_links.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
@@ -8051,12 +8301,13 @@ class EncryptedChatClient(QObject):
         self.viewport_media_timer.stop()
         for controller in self.animated_media_controllers.values():
             controller.stop()
+            controller.deleteLater()
         self.animated_media_controllers.clear()
         self.last_inline_animation_frame_at.clear()
         self.chat_display.row_background_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
         self.chat_display.setExtraSelections([])
-        self.chat_display.clear()
+        self._reset_chat_document()
 
     def _should_play_message_sound(self, room_id: str) -> bool:
         return (
@@ -8083,6 +8334,7 @@ class EncryptedChatClient(QObject):
         self,
         sound_path: Path,
     ) -> QSoundEffect:
+        ensure_qt_multimedia_loaded()
         resolved_path = str(sound_path.resolve())
         effect = self.message_sound_effects.get(resolved_path)
         if effect is not None:
@@ -8096,6 +8348,11 @@ class EncryptedChatClient(QObject):
         effect.statusChanged.connect(
             lambda effect=effect: (
                 self._on_message_sound_effect_status_changed(effect)
+            )
+        )
+        effect.playingChanged.connect(
+            lambda effect=effect: (
+                self._on_message_sound_effect_playing_changed(effect)
             )
         )
         self.message_sound_effects[resolved_path] = effect
@@ -8145,9 +8402,20 @@ class EncryptedChatClient(QObject):
                 parent=self.root,
             )
 
+    def _on_message_sound_effect_playing_changed(
+        self,
+        effect: QSoundEffect,
+    ) -> None:
+        if self._tray_ui_suspended and not effect.isPlaying():
+            QTimer.singleShot(
+                0,
+                self._release_message_sound_resources,
+            )
+
     def _ensure_compressed_message_sound_player(
         self,
     ) -> tuple[QMediaPlayer, QAudioOutput]:
+        ensure_qt_multimedia_loaded()
         player = self.compressed_message_sound_player
         audio_output = self.compressed_message_sound_audio_output
         if player is not None and audio_output is not None:
@@ -8202,6 +8470,14 @@ class EncryptedChatClient(QObject):
             self.message_sound_stop_timer.start(
                 CUSTOM_MESSAGE_SOUND_MAX_MS
             )
+        elif (
+            state == QMediaPlayer.PlaybackState.StoppedState
+            and self._tray_ui_suspended
+        ):
+            QTimer.singleShot(
+                0,
+                self._release_message_sound_resources,
+            )
 
     def _on_compressed_message_sound_error(self, *_args: Any) -> None:
         report_errors = self.compressed_message_sound_report_errors
@@ -8232,6 +8508,28 @@ class EncryptedChatClient(QObject):
             self.compressed_message_sound_player.stop()
         self.compressed_message_sound_name = ""
         self.compressed_message_sound_report_errors = False
+
+    def _release_message_sound_resources(self) -> None:
+        self._stop_message_sound()
+        for effect in set(self.message_sound_effects.values()):
+            effect.stop()
+            effect.setSource(QUrl())
+            effect.deleteLater()
+        self.message_sound_effects.clear()
+        self.pending_message_sound_effect = None
+        self.active_message_sound_effect = None
+
+        player = self.compressed_message_sound_player
+        audio_output = self.compressed_message_sound_audio_output
+        self.compressed_message_sound_player = None
+        self.compressed_message_sound_audio_output = None
+        if player is not None:
+            player.stop()
+            player.setSource(QUrl())
+            player.setAudioOutput(None)
+            player.deleteLater()
+        if audio_output is not None:
+            audio_output.deleteLater()
 
     def _play_message_sound(self, *, report_errors: bool = False) -> None:
         sound_name = str(self.message_sound_var.get())
@@ -8298,7 +8596,7 @@ class EncryptedChatClient(QObject):
             pass
 
         self.stop_event.set()
-        self.ui_queue_timer.stop()
+        self.network_wakeup_event.set()
         for controller in self.animated_media_controllers.values():
             controller.stop()
         self.animated_media_controllers.clear()
