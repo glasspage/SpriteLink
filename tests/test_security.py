@@ -256,7 +256,7 @@ class RuntimeOptimizationTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._request_network_refresh
         )
         send_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._send_message
+            SPRITELINK.EncryptedChatClient._send_current_message
         )
         event_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient.eventFilter
