@@ -94,7 +94,7 @@ class BehaviorSettingsTests(unittest.TestCase):
             SPRITELINK.MESSAGE_HISTORY_OPTIONS,
             (100, 500, 1000, 10000),
         )
-        self.assertEqual(config["message_history_limit"], 1000)
+        self.assertEqual(config["message_history_limit"], 500)
         self.assertFalse(config["minimize_to_tray"])
 
     def test_history_pruning_is_per_room_and_can_skip_active_room(self) -> None:
@@ -688,6 +688,139 @@ class RuntimeOptimizationTests(unittest.TestCase):
         )
         self.assertNotIn("profile_icon_tooltip_data_uri", insert_source)
         self.assertIn("_tooltip_for_message_item", show_source)
+
+
+class QualityOfLifeUpdateTests(unittest.TestCase):
+    def test_single_instance_mutex_rejects_a_second_process(self) -> None:
+        kernel32 = mock.Mock()
+        kernel32.CreateMutexW.return_value = 123
+        kernel32.GetLastError.return_value = 183
+
+        with mock.patch.object(
+            SPRITELINK,
+            "_SINGLE_INSTANCE_MUTEX_HANDLE",
+            None,
+        ):
+            self.assertFalse(
+                SPRITELINK.acquire_single_instance_lock(kernel32)
+            )
+
+        kernel32.CloseHandle.assert_called_once_with(123)
+        main_source = inspect.getsource(SPRITELINK.main)
+        self.assertLess(
+            main_source.index("acquire_single_instance_lock()"),
+            main_source.index("QApplication.instance()"),
+        )
+
+    def test_single_instance_mutex_is_retained_for_process_lifetime(
+        self,
+    ) -> None:
+        kernel32 = mock.Mock()
+        kernel32.CreateMutexW.return_value = 456
+        kernel32.GetLastError.return_value = 0
+
+        with mock.patch.object(
+            SPRITELINK,
+            "_SINGLE_INSTANCE_MUTEX_HANDLE",
+            None,
+        ):
+            self.assertTrue(
+                SPRITELINK.acquire_single_instance_lock(kernel32)
+            )
+            self.assertEqual(
+                SPRITELINK._SINGLE_INSTANCE_MUTEX_HANDLE,
+                456,
+            )
+
+        kernel32.CloseHandle.assert_not_called()
+
+    def test_chatroom_context_menu_order_and_key_copy(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_chatroom_context_menu
+        )
+        edit_at = source.index('menu.addAction("Edit")')
+        copy_at = source.index('menu.addAction("Copy Chatroom Key")')
+        mute_at = source.index(
+            'menu.addAction("Unmute" if is_muted else "Mute")'
+        )
+        remove_at = source.index('menu.addAction("Remove")')
+        self.assertLess(edit_at, copy_at)
+        self.assertLess(copy_at, mute_at)
+        self.assertLess(mute_at, remove_at)
+        self.assertIn("_copy_chatroom_key(room_id)", source)
+
+    def test_user_and_message_context_menus_are_separated(self) -> None:
+        user_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_username_context_menu
+        )
+        self.assertLess(
+            user_source.index('menu.addAction("Trust Images from User")'),
+            user_source.index('"Unmute User" if is_muted else "Mute User"'),
+        )
+        self.assertNotIn("Collapse Message", user_source)
+        self.assertNotIn("Expand Message", user_source)
+
+        message_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_message_context_menu
+        )
+        self.assertLess(
+            message_source.index('menu.addAction("Copy Message")'),
+            message_source.index('"Collapse Message"'),
+        )
+        self.assertIn("message_plain_text", message_source)
+        self.assertIn("Expand Message", message_source)
+
+        event_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        self.assertIn("_message_id_at_position", event_source)
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertIn("rendered_message_blocks", insert_source)
+
+    def test_remove_dialog_places_remove_button_on_the_right(self) -> None:
+        source = inspect.getsource(SPRITELINK.RemoveChatroomDialog.__init__)
+        self.assertLess(
+            source.index('self.cancel_button = QPushButton("Cancel")'),
+            source.index('self.remove_button = QPushButton("Remove!")'),
+        )
+        self.assertIn(
+            '"This chatroom and its locally stored history will be removed "',
+            source,
+        )
+        self.assertIn(
+            '"from your computer. Existing messages will still be visible "',
+            source,
+        )
+        self.assertIn('"for other participants."', source)
+
+    def test_removing_chatroom_deletes_its_local_history(self) -> None:
+        config = {
+            "history": {
+                "removed-scope": [{"message": {"m": "secret"}}],
+                "other-scope": [{"message": {"m": "keep"}}],
+            },
+        }
+        with mock.patch.object(
+            SPRITELINK,
+            "room_scope_id",
+            return_value="removed-scope",
+        ):
+            self.assertTrue(
+                SPRITELINK.delete_local_chatroom_history(
+                    config,
+                    "https://ntfy.sh",
+                    "room-key",
+                )
+            )
+        self.assertNotIn("removed-scope", config["history"])
+        self.assertIn("other-scope", config["history"])
+
+        remove_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._remove_chatroom
+        )
+        self.assertIn("delete_local_chatroom_history(", remove_source)
 
 
 class MultiTopicSubscriptionTests(unittest.TestCase):

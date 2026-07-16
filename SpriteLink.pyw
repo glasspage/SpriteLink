@@ -106,6 +106,7 @@ try:
         QScrollArea,
         QSlider,
         QSizePolicy,
+        QStyle,
         QStyleFactory,
         QSystemTrayIcon,
         QTextBrowser,
@@ -185,6 +186,10 @@ APP_VERSION = 1
 CONFIG_FORMAT_VERSION = 23
 WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
+WINDOWS_SINGLE_INSTANCE_MUTEX_NAME = (
+    r"Local\SpriteLink-{D2EB08B2-F3E3-4F88-8D9E-51DC7A8754A0}"
+)
+_SINGLE_INSTANCE_MUTEX_HANDLE: Any = None
 
 try:
     from spritelink_build_version import VERSION as RUNNING_VERSION
@@ -280,7 +285,7 @@ BUILTIN_MESSAGE_SOUND_FILES = {
 CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
 COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
 MESSAGE_HISTORY_OPTIONS = (100, 500, 1000, 10000)
-DEFAULT_MESSAGE_HISTORY_LIMIT = 1000
+DEFAULT_MESSAGE_HISTORY_LIMIT = 500
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 TRAY_NOTIFICATION_OUTLINE_COLOR = "#ff7a00"
 
@@ -1665,6 +1670,22 @@ def prune_local_history_map(
     return changed
 
 
+def delete_local_chatroom_history(
+    config: dict[str, Any],
+    server_url: str,
+    encryption_key: str,
+) -> bool:
+    try:
+        scope_id = room_scope_id(server_url, encryption_key)
+    except Exception:
+        return False
+
+    histories = config.get("history")
+    if not isinstance(histories, dict):
+        return False
+    return histories.pop(scope_id, None) is not None
+
+
 def default_config() -> dict[str, Any]:
     global_profile = default_room_profile()
     default_preset = default_identity_preset()
@@ -2476,6 +2497,47 @@ class ConfigOverlay(QWidget):
             event.accept()
             return
         super().mousePressEvent(event)
+
+
+class RemoveChatroomDialog(QDialog):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Remove Chatroom")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+
+        layout = QVBoxLayout(self)
+        message_row = QHBoxLayout()
+        warning_icon = QLabel()
+        warning_icon.setPixmap(
+            self.style().standardIcon(
+                QStyle.StandardPixmap.SP_MessageBoxWarning
+            ).pixmap(32, 32)
+        )
+        message_row.addWidget(
+            warning_icon,
+            0,
+            Qt.AlignmentFlag.AlignTop,
+        )
+        message = QLabel(
+            "This chatroom and its locally stored history will be removed "
+            "from your computer. Existing messages will still be visible "
+            "for other participants."
+        )
+        message.setWordWrap(True)
+        message_row.addWidget(message, 1)
+        layout.addLayout(message_row)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setDefault(True)
+        self.cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(self.cancel_button)
+        self.remove_button = QPushButton("Remove!")
+        self.remove_button.clicked.connect(self.accept)
+        buttons.addWidget(self.remove_button)
+        layout.addLayout(buttons)
 
 
 class AddChatroomDialog(QDialog):
@@ -3384,6 +3446,7 @@ class EncryptedChatClient(QObject):
         self.current_estimated_packet_size = 0
         self.message_size_check_pending = False
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
+        self.rendered_message_blocks: dict[int, str] = {}
         self.rendered_image_links: dict[str, str] = {}
         self.rendered_image_positions: dict[str, list[int]] = {}
         self.rendered_image_candidates: dict[str, list[int]] = {}
@@ -3885,6 +3948,7 @@ class EncryptedChatClient(QObject):
         self._release_message_sound_resources()
         self.image_preview_cache.clear()
         self.rendered_message_items.clear()
+        self.rendered_message_blocks.clear()
         self.rendered_image_links.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
@@ -4618,6 +4682,11 @@ class EncryptedChatClient(QObject):
                 self._update_window_title()
             self._refresh_chatroom_list()
 
+    def _copy_chatroom_key(self, room_id: str) -> None:
+        room = self._find_chatroom(room_id)
+        if room is not None:
+            QApplication.clipboard().setText(str(room["key"]))
+
     def _show_chatroom_context_menu(self, position: Any) -> None:
         item = self.chatrooms_list.itemAt(position)
         if item is None:
@@ -4626,16 +4695,24 @@ class EncryptedChatClient(QObject):
         room_id = str(item.data(Qt.ItemDataRole.UserRole))
         is_muted = self._is_chatroom_muted(room_id)
         menu = QMenu(self.root)
-        mute_action = menu.addAction("Unmute" if is_muted else "Mute")
-        mute_action.triggered.connect(
-            lambda: self._set_chatroom_muted(room_id, not is_muted)
-        )
+
         edit_action = menu.addAction("Edit")
         edit_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
         if room_id != GLOBAL_CHATROOM_ID:
             edit_action.triggered.connect(
                 lambda: self._edit_chatroom(room_id)
             )
+
+        copy_key_action = menu.addAction("Copy Chatroom Key")
+        copy_key_action.triggered.connect(
+            lambda: self._copy_chatroom_key(room_id)
+        )
+
+        mute_action = menu.addAction("Unmute" if is_muted else "Mute")
+        mute_action.triggered.connect(
+            lambda: self._set_chatroom_muted(room_id, not is_muted)
+        )
+
         remove_action = menu.addAction("Remove")
         remove_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
         if room_id != GLOBAL_CHATROOM_ID:
@@ -4660,25 +4737,23 @@ class EncryptedChatClient(QObject):
     def _remove_chatroom(self, room_id: str) -> None:
         if room_id == GLOBAL_CHATROOM_ID:
             return
-
-        confirmation = QMessageBox(self.root)
-        confirmation.setIcon(QMessageBox.Icon.Warning)
-        confirmation.setWindowTitle("Remove Chatroom")
-        confirmation.setText(
-            "This chatroom will be removed from your view; existing messages "
-            "will stay there for other participants."
-        )
-        remove_button = confirmation.addButton(
-            "Remove!",
-            QMessageBox.ButtonRole.DestructiveRole,
-        )
-        confirmation.addButton(
-            "Cancel",
-            QMessageBox.ButtonRole.RejectRole,
-        )
-        confirmation.exec()
-        if confirmation.clickedButton() is not remove_button:
+        room = self._find_chatroom(room_id)
+        if room is None:
             return
+
+        confirmation = RemoveChatroomDialog(self.root)
+        self._apply_window_titlebar_theme(confirmation)
+        if confirmation.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        server_url = normalize_server_url(
+            str(self.config_data.get("server_url", ""))
+        )
+        delete_local_chatroom_history(
+            self.config_data,
+            server_url,
+            str(room["key"]),
+        )
 
         rooms = self.config_data.get("chatrooms", [])
         self.config_data["chatrooms"] = [
@@ -8396,6 +8471,19 @@ class EncryptedChatClient(QObject):
                             link_url,
                             event.globalPos(),
                         )
+                    else:
+                        clicked_message_id = self._message_id_at_position(
+                            event.pos()
+                        )
+                        clicked_item = self.rendered_message_items.get(
+                            clicked_message_id or ""
+                        )
+                        if clicked_item is not None:
+                            self._hide_chat_tooltip()
+                            self._show_message_context_menu(
+                                clicked_item,
+                                event.globalPos(),
+                            )
                 # Never show QTextBrowser's generic Copy/Copy Link/Select All
                 # menu in the log viewport.
                 return True
@@ -8408,6 +8496,12 @@ class EncryptedChatClient(QObject):
         if anchor.startswith(prefix):
             return anchor[len(prefix):]
         return None
+
+    def _message_id_at_position(self, position: QPoint) -> str | None:
+        cursor = self.chat_display.cursorForPosition(position)
+        return self.rendered_message_blocks.get(
+            cursor.block().blockNumber()
+        )
 
     def _blend_toward_chat_background(
         self,
@@ -8548,28 +8642,16 @@ class EncryptedChatClient(QObject):
         QToolTip.hideText()
         message = item["message"]
         client_id = str(message["c"])
-        message_id = str(message["i"])
         is_local = bool(item.get("is_local", False))
 
         muted_ids = self._room_preference_ids("muted_users")
-        collapsed_ids = self._room_preference_ids("collapsed_messages")
         trusted_image_ids = self._room_preference_ids(
             "trusted_image_users"
         )
         is_muted = client_id in muted_ids
-        is_manually_collapsed = message_id in collapsed_ids
         trusts_images = client_id in trusted_image_ids
 
         menu = QMenu(self.root)
-        mute_action = menu.addAction(
-            "Unmute User" if is_muted else "Mute User"
-        )
-        mute_action.setEnabled(not is_local)
-        if not is_local:
-            mute_action.triggered.connect(
-                lambda: self._set_user_muted(client_id, not is_muted)
-            )
-
         trust_images_action = menu.addAction("Trust Images from User")
         trust_images_action.setCheckable(True)
         trust_images_action.setChecked(is_local or trusts_images)
@@ -8581,6 +8663,40 @@ class EncryptedChatClient(QObject):
                     checked,
                 )
             )
+
+        mute_action = menu.addAction(
+            "Unmute User" if is_muted else "Mute User"
+        )
+        mute_action.setEnabled(not is_local)
+        if not is_local:
+            mute_action.triggered.connect(
+                lambda: self._set_user_muted(client_id, not is_muted)
+            )
+
+        menu.exec(global_position)
+
+    def _show_message_context_menu(
+        self,
+        item: dict[str, Any],
+        global_position: Any,
+    ) -> None:
+        message = item["message"]
+        message_id = str(message["i"])
+        client_id = str(message["c"])
+        collapsed_ids = self._room_preference_ids("collapsed_messages")
+        is_manually_collapsed = message_id in collapsed_ids
+        is_muted = (
+            not bool(item.get("is_local", False))
+            and self._is_user_muted(client_id)
+        )
+
+        menu = QMenu(self.root)
+        copy_action = menu.addAction("Copy Message")
+        copy_action.triggered.connect(
+            lambda: QApplication.clipboard().setText(
+                message_plain_text(str(message["m"]))
+            )
+        )
 
         collapse_action = menu.addAction(
             "Expand Message"
@@ -8882,6 +8998,7 @@ class EncryptedChatClient(QObject):
             return
         self._hide_chat_tooltip()
         self.rendered_message_items.clear()
+        self.rendered_message_blocks.clear()
         self.rendered_image_links.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
@@ -9261,6 +9378,9 @@ class EncryptedChatClient(QObject):
                 True,
             )
             row_selections.append(selection)
+            self.rendered_message_blocks[
+                block.blockNumber()
+            ] = message_id
             block = block.next()
 
         if is_collapsed:
@@ -9304,6 +9424,7 @@ class EncryptedChatClient(QObject):
         self.seen_ntfy_message_ids.clear()
         self.message_log.clear()
         self.rendered_message_items.clear()
+        self.rendered_message_blocks.clear()
         self.rendered_image_links.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
@@ -9627,6 +9748,45 @@ class EncryptedChatClient(QObject):
         )
         return True
 
+def acquire_single_instance_lock(kernel32: Any | None = None) -> bool:
+    global _SINGLE_INSTANCE_MUTEX_HANDLE
+
+    if kernel32 is None:
+        if os.name != "nt":
+            return True
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_last_error = ctypes.get_last_error
+    else:
+        get_last_error = kernel32.GetLastError
+
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = [
+        ctypes.c_void_p,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    ]
+    create_mutex.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = create_mutex(
+        None,
+        False,
+        WINDOWS_SINGLE_INSTANCE_MUTEX_NAME,
+    )
+    if not handle:
+        raise ctypes.WinError()
+
+    ERROR_ALREADY_EXISTS = 183
+    if get_last_error() == ERROR_ALREADY_EXISTS:
+        close_handle(handle)
+        return False
+
+    _SINGLE_INSTANCE_MUTEX_HANDLE = handle
+    return True
+
+
 def _write_crash_log(error_text: str) -> Path | None:
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -9640,6 +9800,18 @@ def _write_crash_log(error_text: str) -> Path | None:
 
 def main() -> None:
     if os.name == "nt":
+        try:
+            if not acquire_single_instance_lock():
+                ctypes.windll.user32.MessageBoxW(
+                    None,
+                    "SpriteLink is already running.",
+                    APP_NAME,
+                    0x40,
+                )
+                return
+        except Exception:
+            pass
+
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
                 WINDOWS_APP_USER_MODEL_ID
