@@ -294,6 +294,7 @@ TRAY_POLL_INTERVAL_SECONDS = 20.0
 # Leave the remaining budget for reconnecting the long-lived stream.
 SUBSCRIPTION_RECONNECT_DELAY_SECONDS = 30.0
 SUBSCRIPTION_READ_TIMEOUT_SECONDS = 75
+SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS = 2 * 60
 MAX_SUBSCRIPTION_SIGNAL_QUEUE = 1024
 CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
 IMMEDIATE_CHATROOM_SWITCH_LIMIT = 2
@@ -2583,6 +2584,20 @@ def next_poll_room_id(
         return None
     valid_urgent_room_ids = urgent_room_ids.intersection(room_ids)
 
+    active_last_poll = last_poll_times.get(active_room_id)
+    if active_last_poll is None:
+        return active_room_id
+    latest_poll_time = max(last_poll_times.values(), default=float("-inf"))
+    active_was_last_polled = active_last_poll >= latest_poll_time
+    active_poll_deadline = max(0.0, poll_interval) * 2
+    if (
+        active_room_id in valid_urgent_room_ids
+        and not active_was_last_polled
+    ):
+        return active_room_id
+    if now - active_last_poll >= active_poll_deadline:
+        return active_room_id
+
     # Finish the first manual pass before stream activity can favor rooms
     # that have already been checked.
     never_polled_room_ids = [
@@ -2604,20 +2619,20 @@ def next_poll_room_id(
     manual_check_deadline = (
         max(0.0, poll_interval) * max(1, len(room_ids))
     )
-    # Stream signals can reorder fresh rooms, but an overdue room always gets
-    # the next global request slot. This guarantees one manual check per
-    # nominal round even when another room continuously produces signals.
+    # Once the active-room reservation is satisfied, an overdue room gets the
+    # next global request slot so passive background checks keep progressing.
     if (
         now - last_poll_times[oldest_room_id]
         >= manual_check_deadline
     ):
         return oldest_room_id
 
-    if active_room_id in valid_urgent_room_ids:
-        return active_room_id
-    if valid_urgent_room_ids:
+    background_urgent_room_ids = (
+        valid_urgent_room_ids - {active_room_id}
+    )
+    if background_urgent_room_ids:
         return min(
-            valid_urgent_room_ids,
+            background_urgent_room_ids,
             key=lambda room_id: last_poll_times[room_id],
         )
     return oldest_room_id
@@ -6354,7 +6369,11 @@ class EncryptedChatClient(QObject):
             try:
                 response = self.subscription_session.get(
                     f"{server_url}/{topics}/json",
-                    params={"since": "latest"},
+                    params={
+                        "since": (
+                            f"{SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS}s"
+                        ),
+                    },
                     stream=True,
                     timeout=(
                         REQUEST_TIMEOUT_SECONDS,
