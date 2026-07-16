@@ -210,6 +210,84 @@ class BehaviorSettingsTests(unittest.TestCase):
         )
 
 
+class RichTextFormattingTests(unittest.TestCase):
+    def test_parser_supports_only_bold_italic_and_underline_tags(self) -> None:
+        markup = (
+            "plain <b>bold <i>both</i></b> "
+            "<u>underlined</u> <script>literal</script>"
+        )
+        plain, runs = SPRITELINK.parse_message_rich_text(markup)
+        self.assertEqual(
+            plain,
+            "plain bold both underlined <script>literal</script>",
+        )
+        styled_text = {
+            plain[run.start:run.end]: (
+                run.bold,
+                run.italic,
+                run.underline,
+            )
+            for run in runs
+        }
+        self.assertEqual(styled_text["bold "], (True, False, False))
+        self.assertEqual(styled_text["both"], (True, True, False))
+        self.assertEqual(styled_text["underlined"], (False, False, True))
+
+    def test_unmatched_closing_tags_remain_visible(self) -> None:
+        plain, _runs = SPRITELINK.parse_message_rich_text(
+            "text</b></i></u>"
+        )
+        self.assertEqual(plain, "text</b></i></u>")
+
+    def test_composer_segments_serialize_to_balanced_tags(self) -> None:
+        markup = SPRITELINK.serialize_message_rich_text([
+            ("bold", True, False, False),
+            (" plain ", False, False, False),
+            ("all", True, True, True),
+            (" italic", False, True, False),
+        ])
+        self.assertEqual(
+            markup,
+            (
+                "<b>bold</b> plain "
+                "<b><i><u>all</u></i></b>"
+                "<i> italic</i>"
+            ),
+        )
+        self.assertEqual(
+            SPRITELINK.message_plain_text(markup),
+            "bold plain all italic",
+        )
+
+    def test_formatting_menu_and_tagged_send_path_are_wired(self) -> None:
+        ui_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        self.assertIn('QPushButton("Formatting")', ui_source)
+        self.assertIn('QPushButton("Bold")', ui_source)
+        self.assertIn('QPushButton("Italic")', ui_source)
+        self.assertIn('QPushButton("Underline")', ui_source)
+
+        composer_source = inspect.getsource(
+            SPRITELINK.ComposeTextEdit.to_message_text
+        )
+        self.assertIn("serialize_message_rich_text", composer_source)
+        toggle_source = inspect.getsource(
+            SPRITELINK.ComposeTextEdit.apply_formatting
+        )
+        self.assertIn("cursor.hasSelection()", toggle_source)
+        self.assertIn("cursor.mergeCharFormat", toggle_source)
+        self.assertIn("mergeCurrentCharFormat", toggle_source)
+        send_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._send_current_message
+        )
+        size_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._run_message_size_check
+        )
+        self.assertIn("to_message_text()", send_source)
+        self.assertIn("to_message_text()", size_source)
+
+
 class RuntimeOptimizationTests(unittest.TestCase):
     def test_wrapped_messages_align_to_row_edge_and_keep_background(self) -> None:
         source = inspect.getsource(
