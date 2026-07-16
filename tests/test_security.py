@@ -204,7 +204,10 @@ class BehaviorSettingsTests(unittest.TestCase):
         restore_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._restore_from_tray
         )
-        self.assertIn("_clear_tray_notification", restore_source)
+        self.assertIn(
+            "_clear_tray_notification_if_no_unread",
+            restore_source,
+        )
 
 
 class RuntimeOptimizationTests(unittest.TestCase):
@@ -602,8 +605,34 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
         self.assertNotIn("window_focused_event.is_set()", mark_source)
         self.assertIn("tray_icon.isVisible()", mark_source)
         self.assertNotIn("_minimized_to_tray", mark_source)
-        self.assertIn("_clear_tray_notification", event_source)
+        self.assertIn(
+            "_clear_tray_notification_if_no_unread",
+            event_source,
+        )
+        self.assertNotIn(
+            "self._clear_tray_notification()",
+            event_source,
+        )
         self.assertIn("WindowStateChange", event_source)
+
+    def test_tray_outline_is_kept_until_all_unread_are_cleared(self) -> None:
+        client = mock.Mock()
+        unread_counts: dict[str, int] = {"background": 2}
+        client._unread_counts.side_effect = lambda: unread_counts
+        client._has_unread_messages.side_effect = lambda: (
+            SPRITELINK.EncryptedChatClient._has_unread_messages(client)
+        )
+
+        SPRITELINK.EncryptedChatClient._clear_tray_notification_if_no_unread(
+            client
+        )
+        client._clear_tray_notification.assert_not_called()
+
+        unread_counts.clear()
+        SPRITELINK.EncryptedChatClient._clear_tray_notification_if_no_unread(
+            client
+        )
+        client._clear_tray_notification.assert_called_once_with()
 
     def test_hidden_tray_mode_releases_heavy_render_state(self) -> None:
         suspend_source = inspect.getsource(
@@ -669,12 +698,20 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
         quit_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._quit_from_tray
         )
+        finish_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._finish_quit_from_tray
+        )
         close_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._on_close
         )
-        self.assertIn("QApplication.instance()", quit_source)
-        self.assertIn("app.quit()", quit_source)
-        self.assertIn("network_thread.join", close_source)
+        self.assertIn("QTimer.singleShot", quit_source)
+        self.assertNotIn("self.root.close()", quit_source)
+        self.assertIn("self.root.close()", finish_source)
+        self.assertIn("QApplication.instance()", finish_source)
+        self.assertIn("app.quit()", finish_source)
+        self.assertNotIn(".join(", close_source)
+        self.assertIn("self.subscription_refresh_event.set()", close_source)
+        self.assertIn("daemon=True", close_source)
         self.assertIn("self.session.close()", close_source)
         self.assertIn(
             "_release_message_sound_resources()",
