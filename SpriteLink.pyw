@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import base64
-from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -2128,6 +2127,72 @@ class ValueModel:
         listener(self._value)
 
 
+class DaemonTaskPool:
+    """Small fixed-size worker pool whose tasks cannot hold process exit."""
+
+    def __init__(self, max_workers: int, thread_name_prefix: str) -> None:
+        self._tasks: queue.Queue[Any] = queue.Queue()
+        self._lock = threading.Lock()
+        self._shutdown = False
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"{thread_name_prefix}_{worker_index}",
+                daemon=True,
+            )
+            for worker_index in range(max_workers)
+        ]
+        for worker in self._threads:
+            worker.start()
+
+    def submit(self, function: Any, *args: Any, **kwargs: Any) -> None:
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("Worker pool is shut down.")
+            self._tasks.put((function, args, kwargs))
+
+    def _worker(self) -> None:
+        while True:
+            task = self._tasks.get()
+            try:
+                if task is None:
+                    return
+                function, args, kwargs = task
+                try:
+                    function(*args, **kwargs)
+                except Exception:
+                    pass
+            finally:
+                self._tasks.task_done()
+
+    def shutdown(
+        self,
+        *,
+        wait: bool,
+        cancel_futures: bool,
+    ) -> None:
+        with self._lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            if cancel_futures:
+                while True:
+                    try:
+                        pending_task = self._tasks.get_nowait()
+                    except queue.Empty:
+                        break
+                    else:
+                        self._tasks.task_done()
+                        if pending_task is None:
+                            break
+            for _worker in self._threads:
+                self._tasks.put(None)
+
+        if wait:
+            for worker in self._threads:
+                worker.join()
+
+
 class MessageBoxes:
     @staticmethod
     def showerror(title: str, text: str, parent: QWidget | None = None) -> None:
@@ -2990,7 +3055,7 @@ class EncryptedChatClient(QObject):
         self.last_inline_animation_frame_at: dict[str, float] = {}
         self.current_image_preview_url: str | None = None
         self.recent_chatroom_switch_times: list[float] = []
-        self.image_fetch_executor = ThreadPoolExecutor(
+        self.image_fetch_executor = DaemonTaskPool(
             max_workers=3,
             thread_name_prefix="SpriteLinkImage",
         )
@@ -3535,6 +3600,11 @@ class EncryptedChatClient(QObject):
     def _quit_from_tray(self) -> None:
         self._force_quit = True
         self.root.close()
+        if not self._closing:
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _apply_titlebar_theme(self) -> None:
         self._apply_window_titlebar_theme(self.root)
@@ -6283,83 +6353,95 @@ class EncryptedChatClient(QObject):
                 scope_id,
                 {},
             )
+            was_initial_history_scan = (
+                room_id in self.initial_history_pending_rooms
+            )
+            response = self.session.get(
+                f"{server_url}/{topic}/json",
+                params={
+                    "poll": "1",
+                    "since": self._current_poll_since(state, room_id),
+                },
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            fetched_records = newest_first_ntfy_records(
+                parse_ntfy_ndjson(response)
+            )
+            if self._find_chatroom(room_id) is None:
+                return
+
             pending_batch = self.pending_ntfy_poll_batches.get(scope_id)
             if pending_batch is None:
-                was_initial_history_scan = (
-                    room_id in self.initial_history_pending_rooms
-                )
-                response = self.session.get(
-                    f"{server_url}/{topic}/json",
-                    params={
-                        "poll": "1",
-                        "since": self._current_poll_since(state, room_id),
-                    },
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                )
-                response.raise_for_status()
-                records = newest_first_ntfy_records(
-                    parse_ntfy_ndjson(response)
-                )
-                if self._find_chatroom(room_id) is None:
-                    return
-
-                newest_record_id: str | None = None
-                newest_record_time = int(
-                    state.get("newest_time", 0) or 0
-                )
-                for record in records:
-                    ntfy_id = record.get("id")
-                    ntfy_time = record.get("time")
-                    if (
-                        isinstance(ntfy_id, str)
-                        and bool(ntfy_id)
-                        and type(ntfy_time) is int
-                    ):
-                        newest_record_id = ntfy_id
-                        newest_record_time = max(
-                            newest_record_time,
-                            ntfy_time,
-                        )
-                        break
-
                 pending_batch = {
                     "room_id": room_id,
-                    "records": records,
-                    "newest_ntfy_id": newest_record_id,
-                    "newest_time": newest_record_time,
-                    "history_scan": was_initial_history_scan,
+                    "records": {},
+                    "polled_ids": set(),
+                    "newest_ntfy_id": None,
+                    "newest_time": int(
+                        state.get("newest_time", 0) or 0
+                    ),
                 }
                 self.pending_ntfy_poll_batches[scope_id] = pending_batch
 
-            records = pending_batch.get("records", [])
-            if not isinstance(records, list):
-                records = []
-            was_initial_history_scan = bool(
-                pending_batch.get("history_scan", False)
+            pending_records = pending_batch.get("records")
+            if not isinstance(pending_records, dict):
+                pending_records = {}
+                pending_batch["records"] = pending_records
+            polled_ids = pending_batch.get("polled_ids")
+            if not isinstance(polled_ids, set):
+                polled_ids = set()
+                pending_batch["polled_ids"] = polled_ids
+
+            fetched_newest_id: str | None = None
+            fetched_newest_time = -1
+            for record in fetched_records:
+                ntfy_id = record.get("id")
+                ntfy_time = record.get("time")
+                if (
+                    not isinstance(ntfy_id, str)
+                    or not ntfy_id
+                    or type(ntfy_time) is not int
+                ):
+                    continue
+                if fetched_newest_id is None:
+                    fetched_newest_id = ntfy_id
+                    fetched_newest_time = ntfy_time
+                if ntfy_id not in polled_ids:
+                    pending_records[ntfy_id] = record
+
+            stored_newest_time = int(
+                pending_batch.get("newest_time", 0) or 0
+            )
+            if (
+                fetched_newest_id is not None
+                and fetched_newest_time >= stored_newest_time
+            ):
+                pending_batch["newest_ntfy_id"] = fetched_newest_id
+                pending_batch["newest_time"] = fetched_newest_time
+
+            records_to_poll = newest_first_ntfy_records(
+                list(pending_records.values())
             )
             decoded_messages: list[dict[str, Any]] = []
             failed_decryptions = 0
             decrypt_attempts = 0
-            remaining_records: list[dict[str, Any]] = []
 
-            for record_index, record in enumerate(records):
-                if not isinstance(record, dict):
-                    continue
-                ntfy_id = record.get("id")
-                ntfy_time = record.get("time")
+            for record in records_to_poll:
+                ntfy_id = record["id"]
+                ntfy_time = record["time"]
                 packet = record.get("message")
 
-                if not isinstance(ntfy_id, str) or not ntfy_id:
-                    continue
-                if type(ntfy_time) is not int:
-                    continue
                 if not isinstance(packet, str):
+                    polled_ids.add(ntfy_id)
+                    pending_records.pop(ntfy_id, None)
                     continue
                 if decrypt_attempts >= MAX_DECRYPT_ATTEMPTS_PER_POLL:
-                    remaining_records.extend(records[record_index:])
                     break
 
                 decrypt_attempts += 1
+                polled_ids.add(ntfy_id)
+                pending_records.pop(ntfy_id, None)
                 try:
                     message = open_opaque_packet(packet, encryption_key)
                     self._validate_decrypted_message(
@@ -6377,9 +6459,7 @@ class EncryptedChatClient(QObject):
                     "message": message,
                 })
 
-            pending_batch["records"] = remaining_records
-            batch_complete = not remaining_records
-
+            batch_complete = not pending_records
             if batch_complete:
                 self.pending_ntfy_poll_batches.pop(scope_id, None)
                 newest_record_id = pending_batch.get("newest_ntfy_id")
@@ -8762,7 +8842,7 @@ class EncryptedChatClient(QObject):
         self.background_history_prune_timer.stop()
         self.viewport_media_timer.stop()
         self.message_sound_stop_timer.stop()
-        self._stop_message_sound()
+        self._release_message_sound_resources()
         self.tray_icon.hide()
 
         try:
@@ -8774,6 +8854,10 @@ class EncryptedChatClient(QObject):
 
         self.stop_event.set()
         self.network_wakeup_event.set()
+        network_thread = self.network_thread
+        if network_thread is not None and network_thread.is_alive():
+            network_thread.join(timeout=0.25)
+        self.session.close()
         for controller in self.animated_media_controllers.values():
             controller.stop()
         self.animated_media_controllers.clear()
