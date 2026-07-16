@@ -18,6 +18,126 @@ sys.modules[SPEC.name] = SPRITELINK
 LOADER.exec_module(SPRITELINK)
 
 
+class BehaviorSettingsTests(unittest.TestCase):
+    def test_behavior_defaults_and_history_options(self) -> None:
+        config = SPRITELINK.default_config()
+        self.assertEqual(
+            SPRITELINK.MESSAGE_HISTORY_OPTIONS,
+            (100, 500, 1000, 10000),
+        )
+        self.assertEqual(config["message_history_limit"], 1000)
+        self.assertFalse(config["minimize_to_tray"])
+
+    def test_history_pruning_is_per_room_and_can_skip_active_room(self) -> None:
+        histories = {
+            "active": list(range(1200)),
+            "background": list(range(700)),
+        }
+        changed = SPRITELINK.prune_local_history_map(
+            histories,
+            500,
+            excluded_scope_id="active",
+        )
+        self.assertTrue(changed)
+        self.assertEqual(len(histories["active"]), 1200)
+        self.assertEqual(histories["background"], list(range(200, 700)))
+
+        SPRITELINK.prune_local_history_map(histories, 500)
+        self.assertEqual(histories["active"], list(range(700, 1200)))
+
+    def test_history_limit_is_normalized_to_presets(self) -> None:
+        for value in SPRITELINK.MESSAGE_HISTORY_OPTIONS:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    SPRITELINK.normalize_message_history_limit(str(value)),
+                    value,
+                )
+        self.assertEqual(
+            SPRITELINK.normalize_message_history_limit(999),
+            SPRITELINK.DEFAULT_MESSAGE_HISTORY_LIMIT,
+        )
+
+    def test_behavior_controls_are_present_in_config(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_config_tab
+        )
+        self.assertIn('self._heading("Behavior")', source)
+        self.assertNotIn("Notifications and rendering", source)
+        self.assertIn('QLabel("Message History")', source)
+        self.assertIn('QCheckBox("Minimize to Tray")', source)
+        self.assertIn("MESSAGE_HISTORY_OPTIONS", source)
+
+    def test_background_history_pruning_runs_hourly(self) -> None:
+        self.assertEqual(
+            SPRITELINK.BACKGROUND_HISTORY_PRUNE_INTERVAL_MS,
+            60 * 60 * 1000,
+        )
+        init_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.__init__
+        )
+        self.assertIn("background_history_prune_timer.start()", init_source)
+        prune_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._prune_background_local_histories
+        )
+        self.assertIn("excluded_scope_id=active_scope_id", prune_source)
+        background_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._accept_background_messages
+        )
+        self.assertNotIn("history[-1000:]", background_source)
+
+    def test_history_persistence_uses_selected_limit(self) -> None:
+        load_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._load_saved_history_for_current_room
+        )
+        persist_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._persist_local_history
+        )
+        add_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._add_message_to_log
+        )
+        self.assertIn("_message_history_limit()", load_source)
+        self.assertIn("_message_history_limit()", persist_source)
+        self.assertIn("_message_history_limit()", add_source)
+        self.assertNotIn("1000", persist_source)
+
+    def test_close_can_hide_to_tray_or_exit(self) -> None:
+        close_event_source = inspect.getsource(
+            SPRITELINK.MainWindow.closeEvent
+        )
+        self.assertIn("event.ignore()", close_event_source)
+        close_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_close
+        )
+        self.assertIn("_can_minimize_to_tray()", close_source)
+        self.assertIn("_hide_to_tray()", close_source)
+        self.assertIn("return False", close_source)
+        tray_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_tray_icon
+        )
+        self.assertIn('"Show SpriteLink"', tray_source)
+        self.assertIn('"Exit"', tray_source)
+
+    def test_tray_notification_uses_orange_outline(self) -> None:
+        self.assertEqual(
+            SPRITELINK.TRAY_NOTIFICATION_OUTLINE_COLOR,
+            "#ff7a00",
+        )
+        icon_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_tray_notification_icon
+        )
+        self.assertIn("offset_x", icon_source)
+        self.assertIn("offset_y", icon_source)
+        self.assertIn("setPixelColor", icon_source)
+        mark_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._mark_tray_notification
+        )
+        self.assertIn("_tray_notification_icon", mark_source)
+        restore_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._restore_from_tray
+        )
+        self.assertIn("_tray_normal_icon", restore_source)
+
+
 class ProfileIconTests(unittest.TestCase):
     def test_jpeg_profile_icons_are_optimized(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
