@@ -532,14 +532,15 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
         self.assertIn("minimize_to_tray_var.get()", can_hide_source)
         self.assertNotIn("minimize_to_tray_var.get()", build_source)
 
-    def test_notifications_work_for_normal_minimize(self) -> None:
+    def test_notifications_work_while_open_or_minimized(self) -> None:
         mark_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._mark_tray_notification
         )
         event_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient.eventFilter
         )
-        self.assertIn("window_focused_event.is_set()", mark_source)
+        self.assertNotIn("window_focused_event.is_set()", mark_source)
+        self.assertIn("tray_icon.isVisible()", mark_source)
         self.assertNotIn("_minimized_to_tray", mark_source)
         self.assertIn("_clear_tray_notification", event_source)
         self.assertIn("WindowStateChange", event_source)
