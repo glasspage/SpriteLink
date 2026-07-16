@@ -8993,6 +8993,8 @@ class EncryptedChatClient(QObject):
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
+        # Never allow a previous message's character format to carry over.
+        cursor.setCharFormat(QTextCharFormat())
         message_start_position = cursor.position()
 
         message = item["message"]
@@ -9151,7 +9153,9 @@ class EncryptedChatClient(QObject):
             username,
             self._text_format(
                 username_color,
-                bold=True,
+                bold=False,
+                italic=False,
+                underline=False,
                 anchor=f"spritelink:{message_id}",
                 font_name=font_name,
                 align_top=align_message_top,
