@@ -3172,6 +3172,7 @@ class EncryptedChatClient(QObject):
         self._closing = False
         self._force_quit = False
         self._minimized_to_tray = False
+        self._window_minimized = False
         self._tray_ui_suspended = False
         self.available_update: ReleaseInfo | None = None
         self._update_check_in_progress = False
@@ -3604,6 +3605,11 @@ class EncryptedChatClient(QObject):
             if isinstance(media, RemoteMediaPreview):
                 self._ensure_animated_media_controller(url, media)
 
+    def _sync_window_state(self) -> None:
+        self._window_minimized = self.root.isMinimized()
+        self._sync_window_activity()
+        self._sync_tray_notification_icon()
+
     def _suspend_for_tray(self) -> None:
         if self._tray_ui_suspended:
             return
@@ -3654,6 +3660,7 @@ class EncryptedChatClient(QObject):
     def _restore_from_tray(self) -> None:
         was_suspended = self._tray_ui_suspended
         self._minimized_to_tray = False
+        self._window_minimized = False
         self._clear_tray_notification()
         self.root.showNormal()
         self.root.raise_()
@@ -3677,13 +3684,12 @@ class EncryptedChatClient(QObject):
             return
         self._tray_notification_pending = True
         if (
-            self.root.isVisible()
-            and not self.root.isMinimized()
+            not self._window_minimized
             and not self._tray_ui_suspended
         ):
-            # Do not even query QSystemTrayIcon while the full window is
-            # visible. On Windows, touching Qt's native tray helper here can
-            # briefly expose its otherwise-hidden blank window.
+            # Message receipt must not touch any native Qt window while the
+            # full SpriteLink window is open. Window state is cached only
+            # when Windows reports an actual state transition.
             return
         if not self.tray_icon.isVisible():
             return
@@ -3693,8 +3699,7 @@ class EncryptedChatClient(QObject):
         if not self._tray_notification_pending:
             return
         if (
-            self.root.isVisible()
-            and not self.root.isMinimized()
+            not self._window_minimized
             and not self._tray_ui_suspended
         ):
             # Replacing a visible QSystemTrayIcon can briefly expose Qt's
@@ -7801,6 +7806,7 @@ class EncryptedChatClient(QObject):
             and hasattr(self, "window_focused_event")
         ):
             if event.type() == QEvent.Type.WindowActivate:
+                self._window_minimized = False
                 self.window_focused_event.set()
                 self.network_wakeup_event.set()
                 if hasattr(self, "tray_icon"):
@@ -7809,8 +7815,7 @@ class EncryptedChatClient(QObject):
                 self.window_focused_event.clear()
                 self.network_wakeup_event.set()
             elif event.type() == QEvent.Type.WindowStateChange:
-                QTimer.singleShot(0, self._sync_window_activity)
-                QTimer.singleShot(0, self._sync_tray_notification_icon)
+                QTimer.singleShot(0, self._sync_window_state)
 
         if (
             watched is getattr(self, "chat_content", None)
