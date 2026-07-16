@@ -2576,27 +2576,65 @@ def next_poll_room_id(
     active_room_id: str,
     urgent_room_ids: set[str],
     last_poll_times: dict[str, float],
+    now: float,
+    poll_interval: float,
 ) -> str | None:
     if not room_ids:
         return None
     valid_urgent_room_ids = urgent_room_ids.intersection(room_ids)
+
+    # Finish the first manual pass before stream activity can favor rooms
+    # that have already been checked.
+    never_polled_room_ids = [
+        room_id for room_id in room_ids
+        if room_id not in last_poll_times
+    ]
+    if never_polled_room_ids:
+        if (
+            active_room_id in valid_urgent_room_ids
+            and active_room_id in never_polled_room_ids
+        ):
+            return active_room_id
+        return never_polled_room_ids[0]
+
+    oldest_room_id = min(
+        room_ids,
+        key=lambda room_id: last_poll_times[room_id],
+    )
+    manual_check_deadline = (
+        max(0.0, poll_interval) * max(1, len(room_ids))
+    )
+    # Stream signals can reorder fresh rooms, but an overdue room always gets
+    # the next global request slot. This guarantees one manual check per
+    # nominal round even when another room continuously produces signals.
+    if (
+        now - last_poll_times[oldest_room_id]
+        >= manual_check_deadline
+    ):
+        return oldest_room_id
+
     if active_room_id in valid_urgent_room_ids:
         return active_room_id
-    candidates = (
-        [
-            room_id
-            for room_id in room_ids
-            if room_id in valid_urgent_room_ids
-        ]
-        if valid_urgent_room_ids
-        else room_ids
-    )
-    return min(
-        candidates,
-        key=lambda room_id: last_poll_times.get(
-            room_id,
-            float("-inf"),
-        ),
+    if valid_urgent_room_ids:
+        return min(
+            valid_urgent_room_ids,
+            key=lambda room_id: last_poll_times[room_id],
+        )
+    return oldest_room_id
+
+
+def poll_message_should_notify(
+    item: dict[str, Any],
+    *,
+    history_scan: bool,
+    notification_started_at: int,
+) -> bool:
+    if not history_scan:
+        return True
+    ntfy_time = item.get("ntfy_time")
+    return (
+        type(ntfy_time) is int
+        and ntfy_time >= notification_started_at
     )
 
 
@@ -3164,6 +3202,7 @@ class EncryptedChatClient(QObject):
         self.initial_history_pending_rooms = {
             room["id"] for room in self._chatroom_definitions()
         }
+        self.notification_started_at = int(time.time())
         if cleared_stale_unread:
             try:
                 save_config(self.config_data)
@@ -6440,6 +6479,8 @@ class EncryptedChatClient(QObject):
                     active_room_id=active_room_id,
                     urgent_room_ids=urgent_room_ids,
                     last_poll_times=last_poll_times,
+                    now=now,
+                    poll_interval=poll_interval,
                 )
                 room_to_poll = next(
                     (
@@ -6827,7 +6868,13 @@ class EncryptedChatClient(QObject):
                             item,
                             persist=False,
                             render=False,
-                            play_chime=not history_scan,
+                            play_chime=poll_message_should_notify(
+                                item,
+                                history_scan=history_scan,
+                                notification_started_at=(
+                                    self.notification_started_at
+                                ),
+                            ),
                         ):
                             added += 1
 
@@ -7006,7 +7053,12 @@ class EncryptedChatClient(QObject):
             })
             added += 1
 
-            if not history_scan and not is_local:
+            should_notify = poll_message_should_notify(
+                item,
+                history_scan=history_scan,
+                notification_started_at=self.notification_started_at,
+            )
+            if should_notify and not is_local:
                 unread_added += 1
                 sender_id = str(message.get("c", ""))
                 is_muted_notification = (
