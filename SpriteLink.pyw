@@ -3210,6 +3210,7 @@ class EncryptedChatClient(QObject):
                 pass
         self._closing = False
         self._force_quit = False
+        self._tray_quit_pending = False
         self._minimized_to_tray = False
         self._tray_ui_suspended = False
         self.available_update: ReleaseInfo | None = None
@@ -3684,14 +3685,14 @@ class EncryptedChatClient(QObject):
 
     def _hide_to_tray(self) -> None:
         self._minimized_to_tray = True
-        self._clear_tray_notification()
+        self._clear_tray_notification_if_no_unread()
         self._suspend_for_tray()
         self.root.hide()
 
     def _restore_from_tray(self) -> None:
         was_suspended = self._tray_ui_suspended
         self._minimized_to_tray = False
-        self._clear_tray_notification()
+        self._clear_tray_notification_if_no_unread()
         self.root.showNormal()
         self.root.raise_()
         self.root.activateWindow()
@@ -3704,6 +3705,19 @@ class EncryptedChatClient(QObject):
         if not self._tray_normal_icon.isNull():
             self.tray_icon.setIcon(self._tray_normal_icon)
         self.tray_icon.setToolTip(APP_NAME)
+
+    def _has_unread_messages(self) -> bool:
+        for unread_count in self._unread_counts().values():
+            try:
+                if int(unread_count) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def _clear_tray_notification_if_no_unread(self) -> None:
+        if not self._has_unread_messages():
+            self._clear_tray_notification()
 
     def _mark_tray_notification(self) -> None:
         if not self.tray_icon.isVisible():
@@ -3723,7 +3737,16 @@ class EncryptedChatClient(QObject):
             self._restore_from_tray()
 
     def _quit_from_tray(self) -> None:
+        if self._closing or self._tray_quit_pending:
+            return
         self._force_quit = True
+        self._tray_quit_pending = True
+        # Let the native tray menu finish handling its action before closing
+        # its owner window and stopping the Qt event loop.
+        QTimer.singleShot(0, self._finish_quit_from_tray)
+
+    def _finish_quit_from_tray(self) -> None:
+        self._tray_quit_pending = False
         self.root.close()
         if not self._closing:
             return
@@ -4167,8 +4190,10 @@ class EncryptedChatClient(QObject):
     def _mark_chatroom_read(self, room_id: str) -> None:
         unread_counts = self._unread_counts()
         if room_id not in unread_counts:
+            self._clear_tray_notification_if_no_unread()
             return
         unread_counts.pop(room_id, None)
+        self._clear_tray_notification_if_no_unread()
         try:
             save_config(self.config_data)
         except Exception:
@@ -4394,6 +4419,7 @@ class EncryptedChatClient(QObject):
         muted_ids.discard(room_id)
         self.config_data["muted_chatrooms"] = sorted(muted_ids)
         self._unread_counts().pop(room_id, None)
+        self._clear_tray_notification_if_no_unread()
         self.config_data.get("room_profiles", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
         self._request_subscription_refresh()
@@ -4452,6 +4478,7 @@ class EncryptedChatClient(QObject):
         poll_immediately: bool = True,
     ) -> None:
         self._unread_counts().pop(self.active_chatroom_id, None)
+        self._clear_tray_notification_if_no_unread()
         self._update_window_title()
         try:
             save_config(self.config_data)
@@ -7820,7 +7847,7 @@ class EncryptedChatClient(QObject):
                 self.window_focused_event.set()
                 self.network_wakeup_event.set()
                 if hasattr(self, "tray_icon"):
-                    self._clear_tray_notification()
+                    self._clear_tray_notification_if_no_unread()
             elif event.type() == QEvent.Type.WindowDeactivate:
                 self.window_focused_event.clear()
                 self.network_wakeup_event.set()
@@ -9107,18 +9134,15 @@ class EncryptedChatClient(QObject):
 
         self.stop_event.set()
         self.network_wakeup_event.set()
-        self._request_subscription_refresh()
-        network_thread = self.network_thread
-        if network_thread is not None and network_thread.is_alive():
-            network_thread.join(timeout=0.25)
-        subscription_thread = self.subscription_thread
-        if (
-            subscription_thread is not None
-            and subscription_thread.is_alive()
-        ):
-            subscription_thread.join(timeout=0.25)
+        self.subscription_refresh_event.set()
+        # Network workers are daemons. Do not block the GUI thread waiting on
+        # a request or streaming response while the application is exiting.
         self.session.close()
-        self.subscription_session.close()
+        threading.Thread(
+            target=self.subscription_session.close,
+            name="SpriteLinkSubscriptionClose",
+            daemon=True,
+        ).start()
         for controller in self.animated_media_controllers.values():
             controller.stop()
         self.animated_media_controllers.clear()
