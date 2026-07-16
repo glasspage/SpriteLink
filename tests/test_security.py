@@ -425,6 +425,35 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
             compressed_source,
         )
 
+    def test_tray_exit_explicitly_stops_the_application(self) -> None:
+        quit_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._quit_from_tray
+        )
+        close_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_close
+        )
+        self.assertIn("QApplication.instance()", quit_source)
+        self.assertIn("app.quit()", quit_source)
+        self.assertIn("network_thread.join", close_source)
+        self.assertIn("self.session.close()", close_source)
+        self.assertIn(
+            "_release_message_sound_resources()",
+            close_source,
+        )
+
+    def test_image_workers_cannot_keep_python_running(self) -> None:
+        worker_pool = SPRITELINK.DaemonTaskPool(
+            max_workers=2,
+            thread_name_prefix="SecurityTestWorker",
+        )
+        try:
+            self.assertTrue(worker_pool._threads)
+            self.assertTrue(
+                all(worker.daemon for worker in worker_pool._threads)
+            )
+        finally:
+            worker_pool.shutdown(wait=True, cancel_futures=True)
+
 
 class ProfileIconTests(unittest.TestCase):
     def test_jpeg_profile_icons_are_optimized(self) -> None:
@@ -746,6 +775,37 @@ class ImageEmbeddingTests(unittest.TestCase):
         )
 
 
+class HttpsOnlyMediaAndLinkTests(unittest.TestCase):
+    def test_only_https_urls_are_recognized_as_links(self) -> None:
+        insecure = "http://cdn.discordapp.com/example.png"
+        secure = "https://cdn.discordapp.com/example.png"
+        spans = SPRITELINK.message_url_spans(
+            f"insecure {insecure} secure {secure}"
+        )
+        self.assertEqual(
+            [url for _start, _end, url in spans],
+            [secure],
+        )
+        self.assertFalse(SPRITELINK.is_direct_image_url(insecure))
+        self.assertTrue(SPRITELINK.is_direct_image_url(secure))
+        self.assertFalse(
+            SPRITELINK.is_tenor_video_url(
+                "http://media.tenor.com/example.mp4"
+            )
+        )
+
+    def test_browser_and_context_link_guards_require_https(self) -> None:
+        open_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._open_url_in_browser
+        )
+        context_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._link_url_from_anchor
+        )
+        for source in (open_source, context_source):
+            self.assertIn('scheme().casefold() == "https"', source)
+            self.assertNotIn('"http"', source)
+
+
 class RoomKeyTests(unittest.TestCase):
     def test_generated_room_keys_are_exactly_32_url_safe_characters(self) -> None:
         keys = {SPRITELINK.generate_chatroom_key() for _ in range(16)}
@@ -796,6 +856,135 @@ class PacketLimitTests(unittest.TestCase):
             SPRITELINK.open_opaque_packet(packet, self.PASSPHRASE)
 
 
+class PollDecryptLimitTests(unittest.TestCase):
+    def test_records_are_newest_first(self) -> None:
+        records = [
+            {"id": "old", "time": 100},
+            {"id": "new", "time": 300},
+            {"id": "middle", "time": 200},
+        ]
+        ordered = SPRITELINK.newest_first_ntfy_records(records)
+        self.assertEqual(
+            [record["id"] for record in ordered],
+            ["new", "middle", "old"],
+        )
+
+    def test_each_poll_prioritizes_new_unpolled_records(self) -> None:
+        self.assertEqual(SPRITELINK.MAX_DECRYPT_ATTEMPTS_PER_POLL, 25)
+        first_records = [
+            {
+                "event": "message",
+                "id": f"record-{index}",
+                "time": 1_000 + index,
+                "message": f"packet-{index}",
+            }
+            for index in range(30)
+        ]
+        second_records = first_records + [
+            {
+                "event": "message",
+                "id": f"record-{index}",
+                "time": 1_000 + index,
+                "message": f"packet-{index}",
+            }
+            for index in (30, 31)
+        ]
+        room = {"id": "room", "key": "room key"}
+        response = mock.Mock()
+        client = mock.Mock()
+        client.config_data = {
+            "server_url": "https://ntfy.sh",
+            "room_state": {},
+        }
+        client.pending_ntfy_poll_batches = {}
+        client.initial_history_pending_rooms = set()
+        client.session.get.return_value = response
+        client._find_chatroom.return_value = room
+        client._current_poll_since.return_value = "48h"
+        opened_packets: list[str] = []
+
+        def open_packet(packet: str, _key: str) -> dict[str, object]:
+            opened_packets.append(packet)
+            return {"packet": packet}
+
+        with (
+            mock.patch.object(
+                SPRITELINK,
+                "derive_ntfy_topic",
+                return_value="topic",
+            ),
+            mock.patch.object(
+                SPRITELINK,
+                "room_scope_id",
+                return_value="scope",
+            ),
+            mock.patch.object(
+                SPRITELINK,
+                "parse_ntfy_ndjson",
+                side_effect=[first_records, second_records],
+            ),
+            mock.patch.object(
+                SPRITELINK,
+                "open_opaque_packet",
+                side_effect=open_packet,
+            ),
+            mock.patch.object(SPRITELINK, "save_config") as save_config,
+        ):
+            SPRITELINK.EncryptedChatClient._network_poll(
+                client,
+                room,
+                is_active=False,
+            )
+
+            self.assertEqual(len(opened_packets), 25)
+            self.assertEqual(opened_packets[0], "packet-29")
+            self.assertEqual(opened_packets[-1], "packet-5")
+            pending_batch = client.pending_ntfy_poll_batches["scope"]
+            self.assertEqual(len(pending_batch["records"]), 5)
+            self.assertEqual(len(pending_batch["polled_ids"]), 25)
+            self.assertNotIn(
+                "newest_ntfy_id",
+                client.config_data["room_state"]["scope"],
+            )
+            save_config.assert_not_called()
+
+            SPRITELINK.EncryptedChatClient._network_poll(
+                client,
+                room,
+                is_active=False,
+            )
+
+        self.assertEqual(
+            opened_packets[25:],
+            [
+                "packet-31",
+                "packet-30",
+                "packet-4",
+                "packet-3",
+                "packet-2",
+                "packet-1",
+                "packet-0",
+            ],
+        )
+        self.assertEqual(client.session.get.call_count, 2)
+        self.assertNotIn("scope", client.pending_ntfy_poll_batches)
+        self.assertEqual(
+            client.config_data["room_state"]["scope"]["newest_ntfy_id"],
+            "record-31",
+        )
+        self.assertEqual(
+            client._validate_decrypted_message.call_count,
+            32,
+        )
+        self.assertEqual(
+            client._validate_decrypted_message.call_args_list[25].kwargs[
+                "ntfy_time"
+            ],
+            1_031,
+        )
+        save_config.assert_called_once()
+
+
 class SignedClientIdentityTests(unittest.TestCase):
     ROOM_ONE = "first room encryption key"
     ROOM_TWO = "second room encryption key"
@@ -844,11 +1033,19 @@ class SignedClientIdentityTests(unittest.TestCase):
             self.ROOM_TWO,
         )
 
-    def test_visible_user_id_is_eight_uppercase_characters(self) -> None:
+    def test_visible_user_id_is_eight_base32_characters(self) -> None:
         message = self._signed_message()
         visible_id = SPRITELINK.visible_user_id(str(message["c"]))
         self.assertEqual(len(visible_id), 8)
-        self.assertRegex(visible_id, r"^[0-9A-F]{8}$")
+        self.assertRegex(visible_id, r"^[A-Z2-7]{8}$")
+        self.assertEqual(
+            SPRITELINK.visible_user_id("00" * 32),
+            "AAAAAAAA",
+        )
+        self.assertEqual(
+            SPRITELINK.visible_user_id("ff" * 32),
+            "77777777",
+        )
 
     def test_message_round_trip_requires_a_valid_signature(self) -> None:
         message = self._signed_message()
@@ -859,6 +1056,59 @@ class SignedClientIdentityTests(unittest.TestCase):
             self.ROOM_ONE,
         )
         self.assertEqual(opened, message)
+
+    def test_ntfy_time_accepts_clock_skew_within_tolerance(self) -> None:
+        message = self._signed_message()
+        message_time = int(message["t"])
+        tolerance = SPRITELINK.MESSAGE_CLOCK_TOLERANCE_SECONDS
+        for delta in (-tolerance, 0, tolerance):
+            with self.subTest(delta=delta):
+                SPRITELINK.EncryptedChatClient._validate_decrypted_message(
+                    message,
+                    self.ROOM_ONE,
+                    ntfy_time=message_time + delta,
+                )
+
+    def test_ntfy_time_rejects_records_outside_clock_tolerance(self) -> None:
+        message = self._signed_message()
+        message_time = int(message["t"])
+        outside = SPRITELINK.MESSAGE_CLOCK_TOLERANCE_SECONDS + 1
+        for delta in (-outside, outside):
+            with self.subTest(delta=delta):
+                with self.assertRaisesRegex(ValueError, "Ntfy time"):
+                    SPRITELINK.EncryptedChatClient._validate_decrypted_message(
+                        message,
+                        self.ROOM_ONE,
+                        ntfy_time=message_time + delta,
+                    )
+
+    def test_username_sanitizer_removes_spoofing_characters(self) -> None:
+        unsafe = (
+            " Al\nice\u200b\u202e\u2066X\u2069\ufe0f "
+        )
+        self.assertEqual(
+            SPRITELINK.sanitize_username(unsafe),
+            "AliceX",
+        )
+        normalized = SPRITELINK.normalize_identity_preset({
+            "username": unsafe,
+            "username_color": "#123456",
+        })
+        self.assertEqual(normalized["username"], "AliceX")
+
+    def test_signed_username_with_invisible_controls_is_rejected(self) -> None:
+        unsafe_message = self._message()
+        unsafe_message["u"] = "Alice\u200b\u202eBob"
+        signed = SPRITELINK.sign_message_identity(
+            unsafe_message,
+            self.ROOM_ONE,
+            self.private_key,
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported characters"):
+            SPRITELINK.EncryptedChatClient._validate_decrypted_message(
+                signed,
+                self.ROOM_ONE,
+            )
 
     def test_changing_signed_message_content_is_rejected(self) -> None:
         message = self._signed_message()
