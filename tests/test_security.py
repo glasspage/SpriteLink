@@ -1199,6 +1199,10 @@ class _FakeUpdateClient:
         self.update_button = _FakeUpdateWidget()
         self.config_overlay = _FakeConfigOverlay()
         self.config_style_updates = 0
+        self.windows_classic = False
+
+    def _is_windows_classic_theme(self) -> bool:
+        return self.windows_classic
 
     def _update_config_toggle_update_style(self) -> None:
         self.config_style_updates += 1
@@ -1208,6 +1212,45 @@ class _FakeUpdateClient:
 
     def _show_no_available_update(self) -> None:
         SPRITELINK.EncryptedChatClient._show_no_available_update(self)
+
+
+class NotificationButtonThemeTests(unittest.TestCase):
+    def test_classic_attention_style_preserves_beveled_buttons(self) -> None:
+        classic = SPRITELINK.notification_button_stylesheet(True)
+        modern = SPRITELINK.notification_button_stylesheet(False)
+
+        self.assertEqual(
+            classic,
+            SPRITELINK.WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET,
+        )
+        self.assertEqual(
+            modern,
+            SPRITELINK.NOTIFICATION_BUTTON_STYLESHEET,
+        )
+        self.assertIn("background-color: #f8d8ad", classic)
+        self.assertIn("border-top: 2px solid #ffffff", classic)
+        self.assertIn("border-left: 2px solid #ffffff", classic)
+        self.assertIn("border-right: 2px solid #000000", classic)
+        self.assertIn("border-bottom: 2px solid #000000", classic)
+        self.assertIn("border-radius: 0px", classic)
+        self.assertIn(
+            "QPushButton:pressed, QPushButton:checked",
+            classic,
+        )
+        self.assertNotIn("border-radius: 3px", classic)
+        self.assertNotIn("border: 1px solid #dca15d", classic)
+
+    def test_expand_config_and_update_buttons_use_theme_style(self) -> None:
+        for method in (
+            SPRITELINK.EncryptedChatClient
+            ._update_chatrooms_toggle_unread_style,
+            SPRITELINK.EncryptedChatClient
+            ._update_config_toggle_update_style,
+            SPRITELINK.EncryptedChatClient._update_update_button_style,
+        ):
+            source = inspect.getsource(method)
+            self.assertIn("notification_button_stylesheet(", source)
+            self.assertIn("_is_windows_classic_theme()", source)
 
 
 class UpdateConfigTests(unittest.TestCase):
@@ -1289,6 +1332,24 @@ class UpdateConfigTests(unittest.TestCase):
             SPRITELINK.NOTIFICATION_BUTTON_STYLESHEET,
         )
         self.assertIs(client.available_update, release)
+
+    def test_available_update_uses_classic_attention_style(self) -> None:
+        client = _FakeUpdateClient()
+        client.windows_classic = True
+        release = self._release("2.0.0")
+        with mock.patch.object(
+            SPRITELINK,
+            "release_is_newer",
+            return_value=True,
+        ):
+            SPRITELINK.EncryptedChatClient._handle_update_check_result(
+                client,
+                {"release": release},
+            )
+        self.assertEqual(
+            client.update_button.stylesheet,
+            SPRITELINK.WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET,
+        )
 
     def test_current_release_disables_up_to_date_button(self) -> None:
         client = _FakeUpdateClient()
