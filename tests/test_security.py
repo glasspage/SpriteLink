@@ -267,6 +267,9 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn('QPushButton("Bold")', ui_source)
         self.assertIn('QPushButton("Italic")', ui_source)
         self.assertIn('QPushButton("Underline")', ui_source)
+        self.assertIn("bold_button_font.setBold(True)", ui_source)
+        self.assertIn("italic_button_font.setItalic(True)", ui_source)
+        self.assertIn("underline_button_font.setUnderline(True)", ui_source)
 
         composer_source = inspect.getsource(
             SPRITELINK.ComposeTextEdit.to_message_text
