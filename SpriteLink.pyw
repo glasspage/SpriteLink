@@ -1097,6 +1097,112 @@ def message_url_spans(text: str) -> list[tuple[int, int, str]]:
     return list(_cached_message_url_spans(text))
 
 
+@dataclass(frozen=True)
+class RichTextRun:
+    start: int
+    end: int
+    bold: bool = False
+    italic: bool = False
+    underline: bool = False
+
+
+RICH_TEXT_TAG_PATTERN = re.compile(r"</?([biu])>")
+RICH_TEXT_TAG_ORDER = ("b", "i", "u")
+
+
+@lru_cache(maxsize=4096)
+def parse_message_rich_text(
+    text: str,
+) -> tuple[str, tuple[RichTextRun, ...]]:
+    """Parse SpriteLink's small formatting language without accepting HTML."""
+    parts: list[str] = []
+    runs: list[RichTextRun] = []
+    active = {tag: 0 for tag in RICH_TEXT_TAG_ORDER}
+    plain_length = 0
+    position = 0
+
+    def append_text(value: str) -> None:
+        nonlocal plain_length
+        if not value:
+            return
+        start = plain_length
+        parts.append(value)
+        plain_length += len(value)
+        style = (
+            active["b"] > 0,
+            active["i"] > 0,
+            active["u"] > 0,
+        )
+        if runs and (
+            runs[-1].end == start
+            and (
+                runs[-1].bold,
+                runs[-1].italic,
+                runs[-1].underline,
+            ) == style
+        ):
+            previous = runs[-1]
+            runs[-1] = RichTextRun(
+                previous.start,
+                plain_length,
+                *style,
+            )
+        else:
+            runs.append(RichTextRun(start, plain_length, *style))
+
+    for match in RICH_TEXT_TAG_PATTERN.finditer(text):
+        append_text(text[position:match.start()])
+        tag = match.group(1)
+        is_closing = text[match.start() + 1] == "/"
+        if is_closing:
+            if active[tag] > 0:
+                active[tag] -= 1
+            else:
+                append_text(match.group(0))
+        else:
+            active[tag] += 1
+        position = match.end()
+    append_text(text[position:])
+    return "".join(parts), tuple(runs)
+
+
+def message_plain_text(text: str) -> str:
+    return parse_message_rich_text(text)[0]
+
+
+def serialize_message_rich_text(
+    segments: list[tuple[str, bool, bool, bool]],
+) -> str:
+    """Serialize visibly formatted composer segments into safe message tags."""
+    output: list[str] = []
+    active_tags: list[str] = []
+    for text, bold, italic, underline in segments:
+        desired_tags = [
+            tag
+            for tag, enabled in zip(
+                RICH_TEXT_TAG_ORDER,
+                (bold, italic, underline),
+            )
+            if enabled
+        ]
+        common = 0
+        while (
+            common < len(active_tags)
+            and common < len(desired_tags)
+            and active_tags[common] == desired_tags[common]
+        ):
+            common += 1
+        for tag in reversed(active_tags[common:]):
+            output.append(f"</{tag}>")
+        for tag in desired_tags[common:]:
+            output.append(f"<{tag}>")
+        active_tags = desired_tags
+        output.append(text)
+    for tag in reversed(active_tags):
+        output.append(f"</{tag}>")
+    return "".join(output)
+
+
 def is_direct_image_url(url: str) -> bool:
     try:
         parsed = urlsplit(url)
@@ -2273,6 +2379,56 @@ messagebox = MessageBoxes()
 
 class ComposeTextEdit(QPlainTextEdit):
     send_requested = Signal()
+
+    def to_message_text(self) -> str:
+        segments: list[tuple[str, bool, bool, bool]] = []
+        block = self.document().begin()
+        first_block = True
+        while block.isValid():
+            if not first_block:
+                segments.append(("\n", False, False, False))
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    formatting = fragment.charFormat()
+                    segments.append((
+                        fragment.text(),
+                        formatting.fontWeight() >= QFont.Weight.Bold,
+                        formatting.fontItalic(),
+                        formatting.fontUnderline(),
+                    ))
+                iterator += 1
+            first_block = False
+            block = block.next()
+        return serialize_message_rich_text(segments)
+
+    def apply_formatting(self, style: str, enabled: bool) -> None:
+        formatting = QTextCharFormat()
+        if style == "bold":
+            formatting.setFontWeight(
+                QFont.Weight.Bold if enabled else QFont.Weight.Normal
+            )
+        elif style == "italic":
+            formatting.setFontItalic(enabled)
+        elif style == "underline":
+            formatting.setFontUnderline(enabled)
+        else:
+            return
+
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            cursor.mergeCharFormat(formatting)
+            self.setTextCursor(cursor)
+        else:
+            self.mergeCurrentCharFormat(formatting)
+
+    def clear_formatting_state(self) -> None:
+        formatting = QTextCharFormat()
+        formatting.setFontWeight(QFont.Weight.Normal)
+        formatting.setFontItalic(False)
+        formatting.setFontUnderline(False)
+        self.mergeCurrentCharFormat(formatting)
 
     def keyPressEvent(self, event: Any) -> None:
         if (
@@ -4608,6 +4764,8 @@ class EncryptedChatClient(QObject):
             poll_immediately=poll_immediately
         )
         self.message_entry.clear()
+        self.message_entry.clear_formatting_state()
+        self._sync_formatting_buttons()
         self._run_message_size_check()
         self._refresh_chatroom_list()
 
@@ -4688,6 +4846,12 @@ class EncryptedChatClient(QObject):
             self._on_font_menu_toggled
         )
         composer_actions.addWidget(self.font_menu_button)
+        self.formatting_menu_button = QPushButton("Formatting")
+        self.formatting_menu_button.setCheckable(True)
+        self.formatting_menu_button.toggled.connect(
+            self._on_formatting_menu_toggled
+        )
+        composer_actions.addWidget(self.formatting_menu_button)
         composer_actions.addStretch(1)
 
         self.identity_menu = QFrame()
@@ -4773,6 +4937,34 @@ class EncryptedChatClient(QObject):
         font_layout.addWidget(text_color_button)
         self.font_menu.hide()
         content_layout.addWidget(self.font_menu)
+
+        self.formatting_menu = QFrame()
+        self.formatting_menu.setFrameShape(QFrame.Shape.StyledPanel)
+        formatting_layout = QHBoxLayout(self.formatting_menu)
+        formatting_layout.setContentsMargins(8, 5, 8, 5)
+        formatting_layout.setSpacing(7)
+        self.bold_format_button = QPushButton("Bold")
+        self.italic_format_button = QPushButton("Italic")
+        self.underline_format_button = QPushButton("Underline")
+        for button, style in (
+            (self.bold_format_button, "bold"),
+            (self.italic_format_button, "italic"),
+            (self.underline_format_button, "underline"),
+        ):
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.clicked.connect(
+                lambda checked, selected_style=style: (
+                    self._toggle_composer_formatting(
+                        selected_style,
+                        checked,
+                    )
+                )
+            )
+            formatting_layout.addWidget(button)
+        formatting_layout.addStretch(1)
+        self.formatting_menu.hide()
+        content_layout.addWidget(self.formatting_menu)
         content_layout.addLayout(composer_actions)
 
         compose_layout = QGridLayout()
@@ -4790,6 +4982,12 @@ class EncryptedChatClient(QObject):
             QSizePolicy.Policy.Fixed,
         )
         self.message_entry.textChanged.connect(self._schedule_composer_update)
+        self.message_entry.cursorPositionChanged.connect(
+            self._sync_formatting_buttons
+        )
+        self.message_entry.selectionChanged.connect(
+            self._sync_formatting_buttons
+        )
         self.message_entry.send_requested.connect(self._send_current_message)
         compose_layout.addWidget(self.message_entry, 0, 0)
 
@@ -4828,6 +5026,8 @@ class EncryptedChatClient(QObject):
         if checked:
             self._set_button_checked(self.font_menu_button, False)
             self.font_menu.hide()
+            self._set_button_checked(self.formatting_menu_button, False)
+            self.formatting_menu.hide()
             self.identity_username_entry.setFocus()
 
     def _on_font_menu_toggled(self, checked: bool) -> None:
@@ -4835,7 +5035,43 @@ class EncryptedChatClient(QObject):
         if checked:
             self._set_button_checked(self.identity_menu_button, False)
             self.identity_menu.hide()
+            self._set_button_checked(self.formatting_menu_button, False)
+            self.formatting_menu.hide()
             self.message_font_combo.setFocus()
+
+    def _on_formatting_menu_toggled(self, checked: bool) -> None:
+        self.formatting_menu.setVisible(checked)
+        if checked:
+            self._set_button_checked(self.identity_menu_button, False)
+            self.identity_menu.hide()
+            self._set_button_checked(self.font_menu_button, False)
+            self.font_menu.hide()
+            self.message_entry.setFocus()
+            self._sync_formatting_buttons()
+
+    def _toggle_composer_formatting(
+        self,
+        style: str,
+        enabled: bool,
+    ) -> None:
+        self.message_entry.apply_formatting(style, enabled)
+        self.message_entry.setFocus()
+        self._sync_formatting_buttons()
+
+    def _sync_formatting_buttons(self) -> None:
+        if not hasattr(self, "bold_format_button"):
+            return
+        formatting = self.message_entry.currentCharFormat()
+        states = (
+            (
+                self.bold_format_button,
+                formatting.fontWeight() >= QFont.Weight.Bold,
+            ),
+            (self.italic_format_button, formatting.fontItalic()),
+            (self.underline_format_button, formatting.fontUnderline()),
+        )
+        for button, checked in states:
+            self._set_button_checked(button, checked)
 
     @staticmethod
     def _set_color_preview(preview: QLabel, color: str) -> None:
@@ -6165,7 +6401,7 @@ class EncryptedChatClient(QObject):
 
     def _run_message_size_check(self) -> None:
         self.message_size_check_pending = False
-        text = self.message_entry.toPlainText()
+        text = self.message_entry.to_message_text()
 
         try:
             draft_message = self._build_draft_message(text)
@@ -6301,9 +6537,10 @@ class EncryptedChatClient(QObject):
         )
 
     def _send_current_message(self) -> None:
-        text = self.message_entry.toPlainText()
+        plain_text = self.message_entry.toPlainText()
+        text = self.message_entry.to_message_text()
 
-        if not text.strip():
+        if not plain_text.strip():
             return
 
         if len(text) > MAX_MESSAGE_CHARS:
@@ -6390,6 +6627,8 @@ class EncryptedChatClient(QObject):
         self.network_wakeup_event.set()
 
         self.message_entry.clear()
+        self.message_entry.clear_formatting_state()
+        self._sync_formatting_buttons()
         self.draft_message_id = uuid.uuid4().hex
         self._resize_message_entry()
         self._run_message_size_check()
@@ -7113,7 +7352,9 @@ class EncryptedChatClient(QObject):
                         warning=True,
                     )
                     self._append_system_message(
-                        f"Unsent text from {message['u']}: {message['m']}",
+                        "Unsent text from "
+                        f"{message['u']}: "
+                        f"{message_plain_text(str(message['m']))}",
                         warning=True,
                     )
 
@@ -8342,6 +8583,8 @@ class EncryptedChatClient(QObject):
         color: str,
         *,
         bold: bool = False,
+        italic: bool = False,
+        underline: bool = False,
         anchor: str | None = None,
         font_name: str = DEFAULT_MESSAGE_FONT,
         align_top: bool = False,
@@ -8352,6 +8595,8 @@ class EncryptedChatClient(QObject):
         formatting.setFont(
             self._make_message_font(font_name, bold=bold)
         )
+        formatting.setFontItalic(italic)
+        formatting.setFontUnderline(underline)
         if anchor:
             formatting.setAnchor(True)
             formatting.setAnchorHref(anchor)
@@ -8379,44 +8624,52 @@ class EncryptedChatClient(QObject):
         align_top: bool,
         top_align_height: int,
     ) -> None:
-        position = 0
-        for start, end, url in message_url_spans(text):
-            if start > position:
-                cursor.insertText(
-                    text[position:start],
-                    self._text_format(
-                        body_color,
-                        font_name=font_name,
-                        align_top=align_top,
-                        top_align_height=top_align_height,
-                    ),
-                )
-            if url in embedded_image_urls:
-                position = end
-                continue
-            link_color = "#0000ee" if self._is_windows_classic_theme() else "#0066cc"
-            if muted:
-                link_color = self._blend_toward_chat_background(link_color)
-            link_format = self._text_format(
-                link_color,
-                anchor=url,
-                font_name=font_name,
-                align_top=align_top,
-                top_align_height=top_align_height,
-            )
-            link_format.setFontUnderline(True)
-            cursor.insertText(text[start:end], link_format)
-            position = end
-        if position < len(text):
-            cursor.insertText(
-                text[position:],
-                self._text_format(
-                    body_color,
+        plain_text, rich_runs = parse_message_rich_text(text)
+        url_spans = message_url_spans(plain_text)
+        link_color = (
+            "#0000ee"
+            if self._is_windows_classic_theme()
+            else "#0066cc"
+        )
+        if muted:
+            link_color = self._blend_toward_chat_background(link_color)
+
+        for run in rich_runs:
+            position = run.start
+
+            def insert_chunk(
+                start: int,
+                end: int,
+                anchor: str | None = None,
+            ) -> None:
+                if end <= start:
+                    return
+                formatting = self._text_format(
+                    link_color if anchor else body_color,
+                    bold=run.bold,
+                    italic=run.italic,
+                    underline=run.underline,
+                    anchor=anchor,
                     font_name=font_name,
                     align_top=align_top,
                     top_align_height=top_align_height,
-                ),
-            )
+                )
+                if anchor:
+                    formatting.setFontUnderline(True)
+                cursor.insertText(plain_text[start:end], formatting)
+
+            for start, end, url in url_spans:
+                if end <= run.start:
+                    continue
+                if start >= run.end:
+                    break
+                overlap_start = max(start, run.start)
+                overlap_end = min(end, run.end)
+                insert_chunk(position, overlap_start)
+                if url not in embedded_image_urls:
+                    insert_chunk(overlap_start, overlap_end, url)
+                position = overlap_end
+            insert_chunk(position, run.end)
 
     @staticmethod
     def _scaled_inline_media_frame(
@@ -8743,6 +8996,7 @@ class EncryptedChatClient(QObject):
         )
         profile_icon = str(message.get("p", ""))
         text = str(message["m"])
+        plain_text = message_plain_text(text)
         message_id = str(message["i"])
         client_id = str(message["c"])
         user_id_preview = visible_user_id(client_id)
@@ -8754,7 +9008,7 @@ class EncryptedChatClient(QObject):
             collapsed_block_format.setNonBreakableLines(True)
             cursor.setBlockFormat(collapsed_block_format)
 
-        candidate_image_urls = direct_image_urls_in_message(text)
+        candidate_image_urls = direct_image_urls_in_message(plain_text)
         embedded_image_url_set = {
             url
             for url in candidate_image_urls
@@ -8772,7 +9026,7 @@ class EncryptedChatClient(QObject):
         }
         has_untrusted_image = bool(untrusted_image_urls)
         if is_collapsed:
-            display_text = self._collapsed_message_preview(text)
+            display_text = self._collapsed_message_preview(plain_text)
             if has_untrusted_image:
                 display_text = (
                     "[untrusted image] "
@@ -8785,6 +9039,7 @@ class EncryptedChatClient(QObject):
             )
         else:
             display_text = text
+        plain_display_text = message_plain_text(display_text)
         image_urls = (
             []
             if is_collapsed
@@ -8848,7 +9103,7 @@ class EncryptedChatClient(QObject):
             not is_collapsed
             and bool(active_image_urls)
             and not message_text_without_image_links(
-                display_text,
+                plain_display_text,
                 set(image_urls),
             ).strip()
         ):
@@ -8914,7 +9169,7 @@ class EncryptedChatClient(QObject):
             ),
         )
         visible_text_without_images = message_text_without_image_links(
-            display_text,
+            plain_display_text,
             set(image_urls),
         )
         add_image_line_break = (
