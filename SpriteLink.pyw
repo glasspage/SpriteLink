@@ -183,7 +183,7 @@ except ImportError as exc:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 23
+CONFIG_FORMAT_VERSION = 24
 WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
 WINDOWS_SINGLE_INSTANCE_MUTEX_NAME = (
@@ -284,8 +284,8 @@ BUILTIN_MESSAGE_SOUND_FILES = {
 }
 CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
 COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
-MESSAGE_HISTORY_OPTIONS = (100, 500, 1000, 10000)
-DEFAULT_MESSAGE_HISTORY_LIMIT = 500
+CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
+DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 TRAY_NOTIFICATION_OUTLINE_COLOR = "#ff7a00"
 
@@ -296,7 +296,6 @@ SERVER_PRESETS: dict[str, str] = {
 }
 
 DEFAULT_THEME = "Modern (Light)"
-LEGACY_BASIC_THEME = "Basic (Light)"
 THEMES = (
     DEFAULT_THEME,
     "Windows Classic",
@@ -506,12 +505,7 @@ MESSAGE_FONT_POINT_SIZES = {
     "Times New Roman": 14,
     "Tahoma": 12,
 }
-# Preserve receive compatibility with messages created by earlier v11 drafts.
-# Neither legacy value remains selectable for new messages.
-SUPPORTED_MESSAGE_FONTS = SELECTABLE_MESSAGE_FONTS + (
-    "System",
-    "Bahnschrift",
-)
+SUPPORTED_MESSAGE_FONTS = SELECTABLE_MESSAGE_FONTS
 
 WINDOWS_CLASSIC_STYLESHEET = """
 QMainWindow, QDialog, QWidget {
@@ -889,14 +883,6 @@ def normalize_identity_preset(value: Any) -> dict[str, str]:
     }
 
 
-def identity_signature(value: dict[str, str]) -> tuple[str, str, str]:
-    return (
-        str(value.get("username", "User")),
-        str(value.get("username_color", "#000000")).casefold(),
-        str(value.get("profile_icon", "")),
-    )
-
-
 def apply_identity_preset_to_profile(
     profile: dict[str, str],
     preset: dict[str, str],
@@ -955,7 +941,6 @@ def normalize_room_profile(
         "identity_preset_id": identity_preset_id,
     }
 
-# The former EncryptedChatClient directory is intentionally not migrated.
 APP_DATA_DIR = Path(
     os.environ.get("LOCALAPPDATA")
     or os.environ.get("APPDATA")
@@ -963,7 +948,9 @@ APP_DATA_DIR = Path(
 ) / APP_NAME
 
 CONFIG_PATH = APP_DATA_DIR / "settings.bin"
-DPAPI_ENTROPY = b"EncryptedChatClient-v3-config"
+CHATROOM_HISTORY_DIRECTORY = APP_DATA_DIR / "history"
+SETTINGS_DPAPI_ENTROPY = b"SpriteLink-v1-settings"
+CHATROOM_HISTORY_DPAPI_ENTROPY = b"SpriteLink-v1-chatroom-history"
 
 
 class DATA_BLOB(ctypes.Structure):
@@ -982,13 +969,16 @@ def _bytes_to_blob(data: bytes) -> tuple[DATA_BLOB, Any]:
     return blob, buffer
 
 
-def dpapi_encrypt(data: bytes) -> bytes:
+def dpapi_encrypt(
+    data: bytes,
+    entropy: bytes = SETTINGS_DPAPI_ENTROPY,
+) -> bytes:
     """Encrypt bytes using Windows DPAPI for the current Windows user."""
     if os.name != "nt":
         raise RuntimeError("Windows DPAPI is only available on Windows.")
 
     in_blob, in_buffer = _bytes_to_blob(data)
-    entropy_blob, entropy_buffer = _bytes_to_blob(DPAPI_ENTROPY)
+    entropy_blob, entropy_buffer = _bytes_to_blob(entropy)
     out_blob = DATA_BLOB()
 
     crypt32 = ctypes.windll.crypt32
@@ -1016,7 +1006,10 @@ def dpapi_encrypt(data: bytes) -> bytes:
         kernel32.LocalFree(out_blob.pbData)
 
 
-def dpapi_decrypt(data: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytes:
+def dpapi_decrypt(
+    data: bytes,
+    entropy: bytes = SETTINGS_DPAPI_ENTROPY,
+) -> bytes:
     """Decrypt bytes using Windows DPAPI for the current Windows user."""
     if os.name != "nt":
         raise RuntimeError("Windows DPAPI is only available on Windows.")
@@ -1641,49 +1634,125 @@ def verify_message_identity(
     )
 
 
-def normalize_message_history_limit(value: Any) -> int:
+def normalize_chatroom_history_limit(value: Any) -> int:
     try:
         candidate = int(value)
     except (TypeError, ValueError):
-        candidate = DEFAULT_MESSAGE_HISTORY_LIMIT
+        candidate = DEFAULT_CHATROOM_HISTORY_LIMIT
     return (
         candidate
-        if candidate in MESSAGE_HISTORY_OPTIONS
-        else DEFAULT_MESSAGE_HISTORY_LIMIT
+        if candidate in CHATROOM_HISTORY_OPTIONS
+        else DEFAULT_CHATROOM_HISTORY_LIMIT
     )
 
 
-def prune_local_history_map(
-    history_by_scope: dict[str, Any],
+def _decode_dpapi_json(encrypted: bytes, entropy: bytes) -> Any:
+    decoded = dpapi_decrypt(encrypted, entropy)
+    return json.loads(decoded.decode("utf-8"))
+
+
+def _write_dpapi_json(path: Path, value: Any, entropy: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encrypted = dpapi_encrypt(raw, entropy)
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_bytes(encrypted)
+    os.replace(temp_path, path)
+
+
+def _load_dpapi_config(encrypted: bytes) -> dict[str, Any]:
+    loaded = _decode_dpapi_json(encrypted, SETTINGS_DPAPI_ENTROPY)
+    if not isinstance(loaded, dict):
+        raise ValueError("Settings must contain a JSON object.")
+    return loaded
+
+
+def chatroom_history_path(server_url: str, encryption_key: str) -> Path:
+    scope_id = room_scope_id(server_url, encryption_key)
+    return CHATROOM_HISTORY_DIRECTORY / f"{scope_id}.bin"
+
+
+def _load_chatroom_history_file(path: Path) -> list[dict[str, Any]]:
+    loaded = _decode_dpapi_json(
+        path.read_bytes(),
+        CHATROOM_HISTORY_DPAPI_ENTROPY,
+    )
+    if not isinstance(loaded, list):
+        raise ValueError("Chatroom history must contain a JSON array.")
+    return [entry for entry in loaded if isinstance(entry, dict)]
+
+
+def load_chatroom_history(
+    server_url: str,
+    encryption_key: str,
+) -> list[dict[str, Any]]:
+    try:
+        path = chatroom_history_path(server_url, encryption_key)
+        if not path.exists():
+            return []
+        return _load_chatroom_history_file(path)
+    except Exception:
+        return []
+
+
+def save_chatroom_history(
+    server_url: str,
+    encryption_key: str,
+    entries: list[dict[str, Any]],
+) -> None:
+    path = chatroom_history_path(server_url, encryption_key)
+    if not entries:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    _write_dpapi_json(
+        path,
+        entries,
+        CHATROOM_HISTORY_DPAPI_ENTROPY,
+    )
+
+
+def prune_chatroom_history(
+    server_url: str,
+    encryption_key: str,
     maximum_messages: int,
-    *,
-    excluded_scope_id: str | None = None,
 ) -> bool:
-    limit = normalize_message_history_limit(maximum_messages)
-    changed = False
-    for scope_id, entries in list(history_by_scope.items()):
-        if scope_id == excluded_scope_id or not isinstance(entries, list):
-            continue
-        if len(entries) > limit:
-            history_by_scope[scope_id] = entries[-limit:]
-            changed = True
-    return changed
+    try:
+        path = chatroom_history_path(server_url, encryption_key)
+        if not path.exists():
+            return False
+        entries = _load_chatroom_history_file(path)
+    except Exception:
+        return False
+
+    limit = normalize_chatroom_history_limit(maximum_messages)
+    if len(entries) <= limit:
+        return False
+    save_chatroom_history(
+        server_url,
+        encryption_key,
+        entries[-limit:],
+    )
+    return True
 
 
 def delete_local_chatroom_history(
-    config: dict[str, Any],
     server_url: str,
     encryption_key: str,
 ) -> bool:
     try:
-        scope_id = room_scope_id(server_url, encryption_key)
+        chatroom_history_path(server_url, encryption_key).unlink()
+        return True
+    except FileNotFoundError:
+        return False
     except Exception:
         return False
-
-    histories = config.get("history")
-    if not isinstance(histories, dict):
-        return False
-    return histories.pop(scope_id, None) is not None
 
 
 def default_config() -> dict[str, Any]:
@@ -1698,7 +1767,7 @@ def default_config() -> dict[str, Any]:
         "message_sound": DEFAULT_MESSAGE_SOUND,
         "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
         "custom_message_sound_path": "",
-        "message_history_limit": DEFAULT_MESSAGE_HISTORY_LIMIT,
+        "chatroom_history_limit": DEFAULT_CHATROOM_HISTORY_LIMIT,
         "minimize_to_tray": False,
         "identity_private_key": generate_identity_private_key(),
         "chatrooms": [],
@@ -1710,7 +1779,6 @@ def default_config() -> dict[str, Any]:
         "muted_chatrooms": [],
         "unread_counts": {},
         "room_state": {},
-        "history": {},
         "muted_users": {},
         "trusted_image_users": {},
         "collapsed_messages": {},
@@ -1719,52 +1787,18 @@ def default_config() -> dict[str, Any]:
     }
 
 
-def _load_dpapi_config(encrypted: bytes) -> dict[str, Any]:
-    # Current entropy first, then prior development-build values for migration.
-    entropies = (
-        DPAPI_ENTROPY,
-        b"EncryptedChatClient-v2-config",
-        b"EncryptedChatClient-v1-config",
-    )
-
-    last_error: Exception | None = None
-
-    for entropy in entropies:
-        try:
-            decoded = dpapi_decrypt(encrypted, entropy)
-            loaded = json.loads(decoded.decode("utf-8"))
-            if isinstance(loaded, dict):
-                return loaded
-        except Exception as exc:
-            last_error = exc
-
-    if last_error:
-        raise last_error
-
-    raise ValueError("Could not decode settings.")
-
-
 def load_config() -> dict[str, Any]:
     config = default_config()
 
     if CONFIG_PATH.exists():
         try:
             loaded = _load_dpapi_config(CONFIG_PATH.read_bytes())
+            if loaded.get("config_version") != CONFIG_FORMAT_VERSION:
+                return config
             config.update(loaded)
         except Exception:
-            pass
+            return config
 
-    try:
-        previous_config_version = int(config.get("config_version", 0) or 0)
-    except (TypeError, ValueError):
-        previous_config_version = 0
-
-    if previous_config_version < 15:
-        config["message_sound"] = (
-            DEFAULT_MESSAGE_SOUND
-            if bool(config.get("chime_enabled", True))
-            else "Disabled"
-        )
     message_sound = str(
         config.get("message_sound", DEFAULT_MESSAGE_SOUND)
     )
@@ -1793,43 +1827,27 @@ def load_config() -> dict[str, Any]:
         if isinstance(custom_message_sound_path, str)
         else ""
     )
-    config["message_history_limit"] = normalize_message_history_limit(
-        config.get("message_history_limit", DEFAULT_MESSAGE_HISTORY_LIMIT)
+    config["chatroom_history_limit"] = normalize_chatroom_history_limit(
+        config.get(
+            "chatroom_history_limit",
+            DEFAULT_CHATROOM_HISTORY_LIMIT,
+        )
     )
     config["minimize_to_tray"] = bool(
         config.get("minimize_to_tray", False)
     )
-    stored_history = config.get("history")
-    if not isinstance(stored_history, dict):
-        stored_history = {}
-    config["history"] = stored_history
-    prune_local_history_map(
-        stored_history,
-        config["message_history_limit"],
-    )
-    config.pop("automatic_update_checks", None)
-    config.pop("chime_enabled", None)
-
     config["identity_private_key"] = normalize_identity_private_key(
         config.get("identity_private_key")
     )
-    config.pop("client_id", None)
-    config.pop("identities", None)
 
-    if not isinstance(config.get("room_state"), dict):
-        config["room_state"] = {}
-
-    if not isinstance(config.get("history"), dict):
-        config["history"] = {}
-
-    if not isinstance(config.get("muted_users"), dict):
-        config["muted_users"] = {}
-
-    if not isinstance(config.get("trusted_image_users"), dict):
-        config["trusted_image_users"] = {}
-
-    if not isinstance(config.get("collapsed_messages"), dict):
-        config["collapsed_messages"] = {}
+    for dictionary_key in (
+        "room_state",
+        "muted_users",
+        "trusted_image_users",
+        "collapsed_messages",
+    ):
+        if not isinstance(config.get(dictionary_key), dict):
+            config[dictionary_key] = {}
 
     today_utc = current_utc_day_number()
     try:
@@ -1896,26 +1914,6 @@ def load_config() -> dict[str, Any]:
     raw_profiles = config.get("room_profiles")
     if not isinstance(raw_profiles, dict):
         raw_profiles = {}
-
-    if previous_config_version < 11:
-        legacy_username = config.get("username", "User")
-        legacy_username_color = config.get(
-            "username_color",
-            secrets.choice(SAFE_USERNAME_COLORS),
-        )
-        if previous_config_version < 3:
-            if legacy_username == "Anonymous":
-                legacy_username = "User"
-            if legacy_username_color == "#4ea1ff":
-                legacy_username_color = secrets.choice(SAFE_USERNAME_COLORS)
-        raw_profiles = dict(raw_profiles)
-        raw_profiles[GLOBAL_CHATROOM_ID] = {
-            "username": legacy_username,
-            "username_color": legacy_username_color,
-            "font": DEFAULT_MESSAGE_FONT,
-            "text_color": DEFAULT_MESSAGE_TEXT_COLOR,
-        }
-
     global_profile = normalize_room_profile(
         raw_profiles.get(GLOBAL_CHATROOM_ID)
     )
@@ -1928,11 +1926,7 @@ def load_config() -> dict[str, Any]:
             global_profile,
         )
 
-    raw_identity_presets = (
-        config.get("identity_presets", [])
-        if previous_config_version >= 14
-        else []
-    )
+    raw_identity_presets = config.get("identity_presets", [])
     if not isinstance(raw_identity_presets, list):
         raw_identity_presets = []
     identity_presets: list[dict[str, str]] = []
@@ -1945,49 +1939,27 @@ def load_config() -> dict[str, Any]:
         identity_presets.append(preset)
         if len(identity_presets) >= MAX_IDENTITY_PRESETS:
             break
+    if not identity_presets:
+        identity_presets.append(default_identity_preset())
 
-    ordered_room_ids = [
-        GLOBAL_CHATROOM_ID,
-        *sorted(valid_room_ids - {GLOBAL_CHATROOM_ID}),
-    ]
-    for room_id in ordered_room_ids:
-        profile = cleaned_profiles[room_id]
-        selected_id = profile.get("identity_preset_id", "")
-        selected_preset = next((
-            preset for preset in identity_presets
-            if preset["id"] == selected_id
-        ), None)
-        if selected_preset is None:
-            signature = identity_signature(profile)
-            selected_preset = next((
-                preset for preset in identity_presets
-                if identity_signature(preset) == signature
-            ), None)
-        if (
-            selected_preset is None
-            and len(identity_presets) < MAX_IDENTITY_PRESETS
-        ):
-            selected_preset = normalize_identity_preset({
-                "username": profile["username"],
-                "username_color": profile["username_color"],
-                "profile_icon": profile["profile_icon"],
-            })
-            identity_presets.append(selected_preset)
-        if selected_preset is None:
-            if not identity_presets:
-                identity_presets.append(default_identity_preset())
-            selected_preset = identity_presets[0]
-        apply_identity_preset_to_profile(profile, selected_preset)
+    presets_by_id = {
+        preset["id"]: preset
+        for preset in identity_presets
+    }
+    default_preset = identity_presets[0]
+    for profile in cleaned_profiles.values():
+        selected_preset = presets_by_id.get(
+            profile.get("identity_preset_id", "")
+        )
+        apply_identity_preset_to_profile(
+            profile,
+            selected_preset or default_preset,
+        )
 
     config["room_profiles"] = cleaned_profiles
     config["identity_presets"] = identity_presets
-    config.pop("username", None)
-    config.pop("username_color", None)
 
-    config.pop("anti_aliased_text", None)
     theme = str(config.get("theme", DEFAULT_THEME))
-    if theme == LEGACY_BASIC_THEME:
-        theme = DEFAULT_THEME
     config["theme"] = theme if theme in THEMES else DEFAULT_THEME
 
     muted_chatrooms = config.get("muted_chatrooms")
@@ -2014,41 +1986,18 @@ def load_config() -> dict[str, Any]:
         if unread_count:
             cleaned_unread_counts[room_id] = unread_count
     config["unread_counts"] = cleaned_unread_counts
-
-    # Chatroom keys now live only in the Chatrooms sidebar. The former single
-    # key is deliberately not converted into a custom chatroom.
-    config.pop("encryption_key", None)
-
-    # Migrate the exact default from v1 to the public ntfy server.
-    old_preset = str(config.get("server_preset", ""))
-    old_url = str(config.get("server_url", ""))
-    if (
-        old_preset == "Localhost"
-        and old_url.rstrip("/") == "http://127.0.0.1:8000"
-    ):
-        config["server_preset"] = DEFAULT_SERVER_PRESET
-        config["server_url"] = DEFAULT_SERVER_URL
-
-    # Old numeric-cursor state is not compatible with ntfy message IDs.
-    config.pop("server_cursors", None)
-    config.pop("last_server_id", None)
     config["config_version"] = CONFIG_FORMAT_VERSION
-
     return config
 
 
 def save_config(config: dict[str, Any]) -> None:
-    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(
-        config,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-    encrypted = dpapi_encrypt(raw)
-    temp_path = CONFIG_PATH.with_suffix(".tmp")
-    temp_path.write_bytes(encrypted)
-    os.replace(temp_path, CONFIG_PATH)
+    stored_config = dict(config)
+    stored_config.pop("history", None)
+    _write_dpapi_json(
+        CONFIG_PATH,
+        stored_config,
+        SETTINGS_DPAPI_ENTROPY,
+    )
 
 
 def normalize_server_url(url: str) -> str:
@@ -3392,8 +3341,8 @@ class EncryptedChatClient(QObject):
         self.root.installEventFilter(self)
 
         self.config_data = load_config()
-        # Persist a newly generated or migrated signing identity before any
-        # messages are created so the authenticated ID survives a crash.
+        # Persist a newly generated signing identity before any messages are
+        # created so the authenticated ID survives a crash.
         save_config(self.config_data)
         app = QApplication.instance()
         self._basic_style_name = (
@@ -3518,8 +3467,8 @@ class EncryptedChatClient(QObject):
         self.custom_message_sound_path_var = ValueModel(
             str(self.config_data["custom_message_sound_path"])
         )
-        self.message_history_limit_var = ValueModel(
-            int(self.config_data["message_history_limit"])
+        self.chatroom_history_limit_var = ValueModel(
+            int(self.config_data["chatroom_history_limit"])
         )
         self.minimize_to_tray_var = ValueModel(
             bool(self.config_data["minimize_to_tray"])
@@ -4750,7 +4699,6 @@ class EncryptedChatClient(QObject):
             str(self.config_data.get("server_url", ""))
         )
         delete_local_chatroom_history(
-            self.config_data,
             server_url,
             str(room["key"]),
         )
@@ -5864,25 +5812,25 @@ class EncryptedChatClient(QObject):
         layout.addWidget(message_sound_volume_control, row, 2)
         row += 1
 
-        layout.addWidget(QLabel("Message History"), row, 0)
-        self.message_history_combo = ThemeComboBox()
-        self.message_history_combo.addItems([
-            str(option) for option in MESSAGE_HISTORY_OPTIONS
+        layout.addWidget(QLabel("Chatroom History"), row, 0)
+        self.chatroom_history_combo = ThemeComboBox()
+        self.chatroom_history_combo.addItems([
+            str(option) for option in CHATROOM_HISTORY_OPTIONS
         ])
-        self.message_history_combo.setCurrentText(
-            str(self.message_history_limit_var.get())
+        self.chatroom_history_combo.setCurrentText(
+            str(self.chatroom_history_limit_var.get())
         )
-        self.message_history_combo.currentTextChanged.connect(
-            lambda value: self.message_history_limit_var.set(
-                normalize_message_history_limit(value)
+        self.chatroom_history_combo.currentTextChanged.connect(
+            lambda value: self.chatroom_history_limit_var.set(
+                normalize_chatroom_history_limit(value)
             )
         )
-        self.message_history_limit_var.bind(
-            lambda value: self.message_history_combo.setCurrentText(
+        self.chatroom_history_limit_var.bind(
+            lambda value: self.chatroom_history_combo.setCurrentText(
                 str(value)
             )
         )
-        layout.addWidget(self.message_history_combo, row, 1, 1, 2)
+        layout.addWidget(self.chatroom_history_combo, row, 1, 1, 2)
         row += 1
 
         self.minimize_to_tray_checkbox = QCheckBox("Minimize to Tray")
@@ -6252,7 +6200,7 @@ class EncryptedChatClient(QObject):
             str(self.message_sound_var.get()),
             int(self.message_sound_volume_var.get()),
             str(self.custom_message_sound_path_var.get()),
-            int(self.message_history_limit_var.get()),
+            int(self.chatroom_history_limit_var.get()),
             bool(self.minimize_to_tray_var.get()),
         )
 
@@ -6372,21 +6320,19 @@ class EncryptedChatClient(QObject):
         self.config_data["custom_message_sound_path"] = str(
             self.custom_message_sound_path_var.get()
         )
-        self.config_data["message_history_limit"] = (
-            normalize_message_history_limit(
-                self.message_history_limit_var.get()
+        self.config_data["chatroom_history_limit"] = (
+            normalize_chatroom_history_limit(
+                self.chatroom_history_limit_var.get()
             )
         )
         self.config_data["minimize_to_tray"] = bool(
             self.minimize_to_tray_var.get()
         )
-        self.config_data.pop("automatic_update_checks", None)
-        self.config_data.pop("chime_enabled", None)
 
     def _save_settings(self) -> bool:
         try:
             self._copy_ui_to_config()
-            self._apply_message_history_limit()
+            self._apply_chatroom_history_limit()
             save_config(self.config_data)
         except Exception as exc:
             messagebox.showerror(
@@ -7547,28 +7493,17 @@ class EncryptedChatClient(QObject):
         if not server_url or not encryption_key:
             return
 
-        try:
-            scope_id = room_scope_id(server_url, encryption_key)
-        except Exception:
-            return
-
-        all_history = self.config_data.setdefault("history", {})
-        history = all_history.get(scope_id, [])
-        if not isinstance(history, list):
-            history = []
-
+        history = load_chatroom_history(server_url, encryption_key)
         seen_ntfy_ids = {
             str(entry.get("ntfy_id"))
             for entry in history
-            if isinstance(entry, dict)
-            and isinstance(entry.get("ntfy_id"), str)
+            if isinstance(entry.get("ntfy_id"), str)
             and entry.get("ntfy_id")
         }
         seen_client_message_ids = {
             str(entry["message"].get("i"))
             for entry in history
-            if isinstance(entry, dict)
-            and isinstance(entry.get("message"), dict)
+            if isinstance(entry.get("message"), dict)
             and isinstance(entry["message"].get("i"), str)
         }
         muted_user_ids = self._room_preference_ids_for_key(
@@ -7632,18 +7567,24 @@ class EncryptedChatClient(QObject):
 
         history.sort(key=self._message_sort_key)
         # Inactive rooms are pruned by the hourly maintenance timer.
-        all_history[scope_id] = history
+        try:
+            save_chatroom_history(
+                server_url,
+                encryption_key,
+                history,
+            )
+        except Exception:
+            pass
+
         if unread_added:
             unread_counts = self._unread_counts()
             unread_counts[room_id] = (
                 int(unread_counts.get(room_id, 0) or 0) + unread_added
             )
-
-        try:
-            save_config(self.config_data)
-        except Exception:
-            pass
-        if unread_added:
+            try:
+                save_config(self.config_data)
+            except Exception:
+                pass
             self._refresh_chatroom_list()
 
     def _accept_network_message(
@@ -7720,7 +7661,7 @@ class EncryptedChatClient(QObject):
         })
 
         self.message_log.sort(key=self._message_sort_key)
-        history_limit = self._message_history_limit()
+        history_limit = self._chatroom_history_limit()
         if len(self.message_log) > history_limit:
             del self.message_log[:-history_limit]
         if persist:
@@ -7729,25 +7670,16 @@ class EncryptedChatClient(QObject):
             self._render_message_log(scroll_to_bottom=True)
 
     def _load_saved_history_for_current_room(self) -> None:
-        server_url = normalize_server_url(str(self.config_data.get("server_url", "")))
+        server_url = normalize_server_url(
+            str(self.config_data.get("server_url", ""))
+        )
         encryption_key = self._active_chatroom()["key"]
 
         if not server_url or not encryption_key:
             return
 
-        try:
-            scope_id = room_scope_id(server_url, encryption_key)
-        except Exception:
-            return
-
-        entries = self.config_data.setdefault("history", {}).get(scope_id, [])
-        if not isinstance(entries, list):
-            return
-
-        for item in entries[-self._message_history_limit():]:
-            if not isinstance(item, dict):
-                continue
-
+        entries = load_chatroom_history(server_url, encryption_key)
+        for item in entries[-self._chatroom_history_limit():]:
             message = item.get("message")
             if not isinstance(message, dict):
                 continue
@@ -7794,19 +7726,16 @@ class EncryptedChatClient(QObject):
             self._render_message_log(scroll_to_bottom=True)
 
     def _persist_local_history(self) -> None:
-        server_url = normalize_server_url(str(self.config_data.get("server_url", "")))
+        server_url = normalize_server_url(
+            str(self.config_data.get("server_url", ""))
+        )
         encryption_key = self._active_chatroom()["key"]
 
         if not server_url or not encryption_key:
             return
 
-        try:
-            scope_id = room_scope_id(server_url, encryption_key)
-        except Exception:
-            return
-
         serializable = []
-        history_limit = self._message_history_limit()
+        history_limit = self._chatroom_history_limit()
         for item in self.message_log[-history_limit:]:
             serializable.append({
                 "message": item["message"],
@@ -7815,47 +7744,52 @@ class EncryptedChatClient(QObject):
                 "ntfy_time": int(item.get("ntfy_time", 0) or 0),
             })
 
-        self.config_data.setdefault("history", {})[scope_id] = serializable
         try:
-            save_config(self.config_data)
+            save_chatroom_history(
+                server_url,
+                encryption_key,
+                serializable,
+            )
         except Exception:
             pass
 
-    def _message_history_limit(self) -> int:
+    def _chatroom_history_limit(self) -> int:
         value = (
-            self.message_history_limit_var.get()
-            if hasattr(self, "message_history_limit_var")
+            self.chatroom_history_limit_var.get()
+            if hasattr(self, "chatroom_history_limit_var")
             else self.config_data.get(
-                "message_history_limit",
-                DEFAULT_MESSAGE_HISTORY_LIMIT,
+                "chatroom_history_limit",
+                DEFAULT_CHATROOM_HISTORY_LIMIT,
             )
         )
-        return normalize_message_history_limit(value)
+        return normalize_chatroom_history_limit(value)
 
-    def _apply_message_history_limit(self) -> None:
-        history_limit = self._message_history_limit()
-        self.config_data["message_history_limit"] = history_limit
-        prune_local_history_map(
-            self.config_data.setdefault("history", {}),
-            history_limit,
-        )
+    def _apply_chatroom_history_limit(self) -> None:
+        history_limit = self._chatroom_history_limit()
+        self.config_data["chatroom_history_limit"] = history_limit
         if len(self.message_log) > history_limit:
             del self.message_log[:-history_limit]
             if hasattr(self, "chat_display"):
                 self._render_message_log(scroll_to_bottom=True)
+        self._persist_local_history()
+        self._prune_background_local_histories()
 
     def _prune_background_local_histories(self) -> None:
-        history_by_scope = self.config_data.setdefault("history", {})
-        active_scope_id = self._current_room_scope_id()
-        if prune_local_history_map(
-            history_by_scope,
-            self._message_history_limit(),
-            excluded_scope_id=active_scope_id,
-        ):
-            try:
-                save_config(self.config_data)
-            except Exception:
-                pass
+        server_url = normalize_server_url(
+            str(self.config_data.get("server_url", ""))
+        )
+        if not server_url:
+            return
+
+        history_limit = self._chatroom_history_limit()
+        for room in self._chatroom_definitions():
+            if room["id"] == self.active_chatroom_id:
+                continue
+            prune_chatroom_history(
+                server_url,
+                str(room["key"]),
+                history_limit,
+            )
 
     @staticmethod
     def _display_timestamp_for_item(item: dict[str, Any]) -> int:
@@ -9722,7 +9656,7 @@ class EncryptedChatClient(QObject):
 
         try:
             self._copy_ui_to_config()
-            self._apply_message_history_limit()
+            self._apply_chatroom_history_limit()
             save_config(self.config_data)
         except Exception:
             pass

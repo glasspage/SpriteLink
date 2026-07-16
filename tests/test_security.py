@@ -88,42 +88,147 @@ class LazyViewportMediaTests(unittest.TestCase):
 
 
 class BehaviorSettingsTests(unittest.TestCase):
+    @staticmethod
+    def _history_storage_patches(directory: Path) -> tuple[object, ...]:
+        return (
+            mock.patch.object(
+                SPRITELINK,
+                "CHATROOM_HISTORY_DIRECTORY",
+                directory,
+            ),
+            mock.patch.object(
+                SPRITELINK,
+                "dpapi_encrypt",
+                side_effect=lambda data, _entropy: data,
+            ),
+            mock.patch.object(
+                SPRITELINK,
+                "dpapi_decrypt",
+                side_effect=lambda data, _entropy: data,
+            ),
+            mock.patch.object(
+                SPRITELINK,
+                "room_scope_id",
+                side_effect=lambda _server, key: {
+                    "active-key": "a" * 64,
+                    "background-key": "b" * 64,
+                    "other-key": "c" * 64,
+                }[key],
+            ),
+        )
+
     def test_behavior_defaults_and_history_options(self) -> None:
         config = SPRITELINK.default_config()
         self.assertEqual(
-            SPRITELINK.MESSAGE_HISTORY_OPTIONS,
+            SPRITELINK.CHATROOM_HISTORY_OPTIONS,
             (100, 500, 1000, 10000),
         )
-        self.assertEqual(config["message_history_limit"], 500)
+        self.assertEqual(config["chatroom_history_limit"], 1000)
+        self.assertEqual(SPRITELINK.DEFAULT_CHATROOM_HISTORY_LIMIT, 1000)
+        self.assertNotIn("history", config)
         self.assertFalse(config["minimize_to_tray"])
 
-    def test_history_pruning_is_per_room_and_can_skip_active_room(self) -> None:
-        histories = {
-            "active": list(range(1200)),
-            "background": list(range(700)),
-        }
-        changed = SPRITELINK.prune_local_history_map(
-            histories,
-            500,
-            excluded_scope_id="active",
-        )
-        self.assertTrue(changed)
-        self.assertEqual(len(histories["active"]), 1200)
-        self.assertEqual(histories["background"], list(range(200, 700)))
+    def test_each_chatroom_history_uses_a_separate_encrypted_file(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            patches = self._history_storage_patches(directory)
+            with patches[0], patches[1], patches[2], patches[3]:
+                active_entries = [{"index": 1}]
+                background_entries = [{"index": 2}]
+                SPRITELINK.save_chatroom_history(
+                    "https://ntfy.sh",
+                    "active-key",
+                    active_entries,
+                )
+                SPRITELINK.save_chatroom_history(
+                    "https://ntfy.sh",
+                    "background-key",
+                    background_entries,
+                )
 
-        SPRITELINK.prune_local_history_map(histories, 500)
-        self.assertEqual(histories["active"], list(range(700, 1200)))
+                active_path = SPRITELINK.chatroom_history_path(
+                    "https://ntfy.sh",
+                    "active-key",
+                )
+                background_path = SPRITELINK.chatroom_history_path(
+                    "https://ntfy.sh",
+                    "background-key",
+                )
+                self.assertNotEqual(active_path, background_path)
+                self.assertEqual(active_path.parent, directory)
+                self.assertTrue(active_path.exists())
+                self.assertTrue(background_path.exists())
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(
+                        "https://ntfy.sh",
+                        "active-key",
+                    ),
+                    active_entries,
+                )
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(
+                        "https://ntfy.sh",
+                        "background-key",
+                    ),
+                    background_entries,
+                )
+
+    def test_history_pruning_is_per_chatroom(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            patches = self._history_storage_patches(directory)
+            with patches[0], patches[1], patches[2], patches[3]:
+                active_entries = [
+                    {"index": index}
+                    for index in range(1200)
+                ]
+                background_entries = [
+                    {"index": index}
+                    for index in range(700)
+                ]
+                SPRITELINK.save_chatroom_history(
+                    "https://ntfy.sh",
+                    "active-key",
+                    active_entries,
+                )
+                SPRITELINK.save_chatroom_history(
+                    "https://ntfy.sh",
+                    "background-key",
+                    background_entries,
+                )
+
+                self.assertTrue(SPRITELINK.prune_chatroom_history(
+                    "https://ntfy.sh",
+                    "background-key",
+                    500,
+                ))
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(
+                        "https://ntfy.sh",
+                        "active-key",
+                    ),
+                    active_entries,
+                )
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(
+                        "https://ntfy.sh",
+                        "background-key",
+                    ),
+                    background_entries[-500:],
+                )
 
     def test_history_limit_is_normalized_to_presets(self) -> None:
-        for value in SPRITELINK.MESSAGE_HISTORY_OPTIONS:
+        for value in SPRITELINK.CHATROOM_HISTORY_OPTIONS:
             with self.subTest(value=value):
                 self.assertEqual(
-                    SPRITELINK.normalize_message_history_limit(str(value)),
+                    SPRITELINK.normalize_chatroom_history_limit(str(value)),
                     value,
                 )
         self.assertEqual(
-            SPRITELINK.normalize_message_history_limit(999),
-            SPRITELINK.DEFAULT_MESSAGE_HISTORY_LIMIT,
+            SPRITELINK.normalize_chatroom_history_limit(999),
+            SPRITELINK.DEFAULT_CHATROOM_HISTORY_LIMIT,
         )
 
     def test_behavior_controls_are_present_in_config(self) -> None:
@@ -132,9 +237,10 @@ class BehaviorSettingsTests(unittest.TestCase):
         )
         self.assertIn('self._heading("Behavior")', source)
         self.assertNotIn("Notifications and rendering", source)
-        self.assertIn('QLabel("Message History")', source)
+        self.assertIn('QLabel("Chatroom History")', source)
+        self.assertNotIn('QLabel("Message History")', source)
         self.assertIn('QCheckBox("Minimize to Tray")', source)
-        self.assertIn("MESSAGE_HISTORY_OPTIONS", source)
+        self.assertIn("CHATROOM_HISTORY_OPTIONS", source)
 
     def test_background_history_pruning_runs_hourly(self) -> None:
         self.assertEqual(
@@ -148,10 +254,15 @@ class BehaviorSettingsTests(unittest.TestCase):
         prune_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._prune_background_local_histories
         )
-        self.assertIn("excluded_scope_id=active_scope_id", prune_source)
+        self.assertIn(
+            'if room["id"] == self.active_chatroom_id',
+            prune_source,
+        )
+        self.assertIn("prune_chatroom_history(", prune_source)
         background_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._accept_background_messages
         )
+        self.assertIn("save_chatroom_history(", background_source)
         self.assertNotIn("history[-1000:]", background_source)
 
     def test_history_persistence_uses_selected_limit(self) -> None:
@@ -164,10 +275,73 @@ class BehaviorSettingsTests(unittest.TestCase):
         add_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._add_message_to_log
         )
-        self.assertIn("_message_history_limit()", load_source)
-        self.assertIn("_message_history_limit()", persist_source)
-        self.assertIn("_message_history_limit()", add_source)
-        self.assertNotIn("1000", persist_source)
+        self.assertIn("load_chatroom_history(", load_source)
+        self.assertIn("save_chatroom_history(", persist_source)
+        self.assertNotIn("save_config(", persist_source)
+        self.assertIn("_chatroom_history_limit()", load_source)
+        self.assertIn("_chatroom_history_limit()", persist_source)
+        self.assertIn("_chatroom_history_limit()", add_source)
+
+    def test_settings_never_embed_chatroom_history(self) -> None:
+        config = SPRITELINK.default_config()
+        config["history"] = {"scope": [{"message": {"m": "secret"}}]}
+        with mock.patch.object(
+            SPRITELINK,
+            "_write_dpapi_json",
+        ) as write_json:
+            SPRITELINK.save_config(config)
+        stored_config = write_json.call_args.args[1]
+        self.assertNotIn("history", stored_config)
+
+    def test_previous_settings_formats_are_rejected_not_converted(
+        self,
+    ) -> None:
+        legacy_config = {
+            "config_version": SPRITELINK.CONFIG_FORMAT_VERSION - 1,
+            "server_url": "https://legacy.invalid",
+            "username": "Legacy User",
+            "identities": [{"username": "Legacy User"}],
+            "chime_enabled": False,
+        }
+        config_path = mock.Mock()
+        config_path.exists.return_value = True
+        config_path.read_bytes.return_value = b"legacy settings"
+        with (
+            mock.patch.object(SPRITELINK, "CONFIG_PATH", config_path),
+            mock.patch.object(
+                SPRITELINK,
+                "_load_dpapi_config",
+                return_value=legacy_config,
+            ),
+        ):
+            config = SPRITELINK.load_config()
+
+        self.assertEqual(
+            config["server_url"],
+            SPRITELINK.DEFAULT_SERVER_URL,
+        )
+        self.assertEqual(config["chatrooms"], [])
+        self.assertNotIn("username", config)
+        self.assertNotIn("identities", config)
+
+        load_source = inspect.getsource(SPRITELINK.load_config)
+        module_source = inspect.getsource(SPRITELINK)
+        self.assertIn(
+            'loaded.get("config_version") != CONFIG_FORMAT_VERSION',
+            load_source,
+        )
+        for removed_upgrade_token in (
+            "previous_config_version",
+            "legacy_username",
+            "chime_enabled",
+            "server_cursors",
+            "last_server_id",
+            "EncryptedChatClient-v2-config",
+            "EncryptedChatClient-v1-config",
+            "identity_signature",
+            "LEGACY_BASIC_THEME",
+        ):
+            self.assertNotIn(removed_upgrade_token, module_source)
 
     def test_close_can_hide_to_tray_or_exit(self) -> None:
         close_event_source = inspect.getsource(
@@ -796,26 +970,63 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
         self.assertIn('"for other participants."', source)
 
     def test_removing_chatroom_deletes_its_local_history(self) -> None:
-        config = {
-            "history": {
-                "removed-scope": [{"message": {"m": "secret"}}],
-                "other-scope": [{"message": {"m": "keep"}}],
-            },
-        }
-        with mock.patch.object(
-            SPRITELINK,
-            "room_scope_id",
-            return_value="removed-scope",
-        ):
-            self.assertTrue(
-                SPRITELINK.delete_local_chatroom_history(
-                    config,
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            with (
+                mock.patch.object(
+                    SPRITELINK,
+                    "CHATROOM_HISTORY_DIRECTORY",
+                    directory,
+                ),
+                mock.patch.object(
+                    SPRITELINK,
+                    "dpapi_encrypt",
+                    side_effect=lambda data, _entropy: data,
+                ),
+                mock.patch.object(
+                    SPRITELINK,
+                    "dpapi_decrypt",
+                    side_effect=lambda data, _entropy: data,
+                ),
+                mock.patch.object(
+                    SPRITELINK,
+                    "room_scope_id",
+                    side_effect=lambda _server, key: {
+                        "room-key": "a" * 64,
+                        "other-key": "b" * 64,
+                    }[key],
+                ),
+            ):
+                SPRITELINK.save_chatroom_history(
                     "https://ntfy.sh",
                     "room-key",
+                    [{"message": {"m": "secret"}}],
                 )
-            )
-        self.assertNotIn("removed-scope", config["history"])
-        self.assertIn("other-scope", config["history"])
+                SPRITELINK.save_chatroom_history(
+                    "https://ntfy.sh",
+                    "other-key",
+                    [{"message": {"m": "keep"}}],
+                )
+                self.assertTrue(
+                    SPRITELINK.delete_local_chatroom_history(
+                        "https://ntfy.sh",
+                        "room-key",
+                    )
+                )
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(
+                        "https://ntfy.sh",
+                        "room-key",
+                    ),
+                    [],
+                )
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(
+                        "https://ntfy.sh",
+                        "other-key",
+                    ),
+                    [{"message": {"m": "keep"}}],
+                )
 
         remove_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._remove_chatroom
