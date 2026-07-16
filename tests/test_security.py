@@ -634,6 +634,17 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
         )
         client._clear_tray_notification.assert_called_once_with()
 
+    def test_existing_unread_is_shown_when_tray_icon_starts(self) -> None:
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_tray_icon
+        )
+        self.assertIn("self._has_unread_messages()", build_source)
+        self.assertIn("self._mark_tray_notification()", build_source)
+        self.assertLess(
+            build_source.index("self.tray_icon.show()"),
+            build_source.index("self._has_unread_messages()"),
+        )
+
     def test_hidden_tray_mode_releases_heavy_render_state(self) -> None:
         suspend_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._suspend_for_tray
