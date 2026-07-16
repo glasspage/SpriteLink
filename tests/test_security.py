@@ -785,6 +785,15 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
             source.index('self.cancel_button = QPushButton("Cancel")'),
             source.index('self.remove_button = QPushButton("Remove!")'),
         )
+        self.assertIn(
+            '"This chatroom and its locally stored history will be removed "',
+            source,
+        )
+        self.assertIn(
+            '"from your computer. Existing messages will still be visible "',
+            source,
+        )
+        self.assertIn('"for other participants."', source)
 
     def test_removing_chatroom_deletes_its_local_history(self) -> None:
         config = {
