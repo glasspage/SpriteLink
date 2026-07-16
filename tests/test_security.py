@@ -425,6 +425,35 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
             compressed_source,
         )
 
+    def test_tray_exit_explicitly_stops_the_application(self) -> None:
+        quit_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._quit_from_tray
+        )
+        close_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_close
+        )
+        self.assertIn("QApplication.instance()", quit_source)
+        self.assertIn("app.quit()", quit_source)
+        self.assertIn("network_thread.join", close_source)
+        self.assertIn("self.session.close()", close_source)
+        self.assertIn(
+            "_release_message_sound_resources()",
+            close_source,
+        )
+
+    def test_image_workers_cannot_keep_python_running(self) -> None:
+        worker_pool = SPRITELINK.DaemonTaskPool(
+            max_workers=2,
+            thread_name_prefix="SecurityTestWorker",
+        )
+        try:
+            self.assertTrue(worker_pool._threads)
+            self.assertTrue(
+                all(worker.daemon for worker in worker_pool._threads)
+            )
+        finally:
+            worker_pool.shutdown(wait=True, cancel_futures=True)
+
 
 class ProfileIconTests(unittest.TestCase):
     def test_jpeg_profile_icons_are_optimized(self) -> None:
@@ -840,9 +869,9 @@ class PollDecryptLimitTests(unittest.TestCase):
             ["new", "middle", "old"],
         )
 
-    def test_decrypt_cap_defers_records_without_advancing_cursor(self) -> None:
+    def test_each_poll_prioritizes_new_unpolled_records(self) -> None:
         self.assertEqual(SPRITELINK.MAX_DECRYPT_ATTEMPTS_PER_POLL, 25)
-        records = [
+        first_records = [
             {
                 "event": "message",
                 "id": f"record-{index}",
@@ -850,6 +879,15 @@ class PollDecryptLimitTests(unittest.TestCase):
                 "message": f"packet-{index}",
             }
             for index in range(30)
+        ]
+        second_records = first_records + [
+            {
+                "event": "message",
+                "id": f"record-{index}",
+                "time": 1_000 + index,
+                "message": f"packet-{index}",
+            }
+            for index in (30, 31)
         ]
         room = {"id": "room", "key": "room key"}
         response = mock.Mock()
@@ -883,7 +921,7 @@ class PollDecryptLimitTests(unittest.TestCase):
             mock.patch.object(
                 SPRITELINK,
                 "parse_ntfy_ndjson",
-                return_value=records,
+                side_effect=[first_records, second_records],
             ),
             mock.patch.object(
                 SPRITELINK,
@@ -901,14 +939,9 @@ class PollDecryptLimitTests(unittest.TestCase):
             self.assertEqual(len(opened_packets), 25)
             self.assertEqual(opened_packets[0], "packet-29")
             self.assertEqual(opened_packets[-1], "packet-5")
-            self.assertEqual(
-                len(
-                    client.pending_ntfy_poll_batches[
-                        "scope"
-                    ]["records"]
-                ),
-                5,
-            )
+            pending_batch = client.pending_ntfy_poll_batches["scope"]
+            self.assertEqual(len(pending_batch["records"]), 5)
+            self.assertEqual(len(pending_batch["polled_ids"]), 25)
             self.assertNotIn(
                 "newest_ntfy_id",
                 client.config_data["room_state"]["scope"],
@@ -921,23 +954,33 @@ class PollDecryptLimitTests(unittest.TestCase):
                 is_active=False,
             )
 
-        self.assertEqual(len(opened_packets), 30)
-        self.assertEqual(opened_packets[-1], "packet-0")
-        self.assertEqual(client.session.get.call_count, 1)
+        self.assertEqual(
+            opened_packets[25:],
+            [
+                "packet-31",
+                "packet-30",
+                "packet-4",
+                "packet-3",
+                "packet-2",
+                "packet-1",
+                "packet-0",
+            ],
+        )
+        self.assertEqual(client.session.get.call_count, 2)
         self.assertNotIn("scope", client.pending_ntfy_poll_batches)
         self.assertEqual(
             client.config_data["room_state"]["scope"]["newest_ntfy_id"],
-            "record-29",
+            "record-31",
         )
         self.assertEqual(
             client._validate_decrypted_message.call_count,
-            30,
+            32,
         )
         self.assertEqual(
-            client._validate_decrypted_message.call_args_list[0].kwargs[
+            client._validate_decrypted_message.call_args_list[25].kwargs[
                 "ntfy_time"
             ],
-            1_029,
+            1_031,
         )
         save_config.assert_called_once()
 
