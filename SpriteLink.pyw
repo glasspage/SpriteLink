@@ -288,9 +288,11 @@ THEMES = (
 )
 
 FOCUSED_POLL_INTERVAL_SECONDS = 6.0
-UNFOCUSED_POLL_INTERVAL_SECONDS = 15.0
-TRAY_POLL_INTERVAL_SECONDS = 30.0
-SUBSCRIPTION_RECONNECT_DELAY_SECONDS = 1.0
+UNFOCUSED_POLL_INTERVAL_SECONDS = 10.0
+TRAY_POLL_INTERVAL_SECONDS = 20.0
+# Focused catch-up polls use most of ntfy's sustained request allowance.
+# Leave the remaining budget for reconnecting the long-lived stream.
+SUBSCRIPTION_RECONNECT_DELAY_SECONDS = 30.0
 SUBSCRIPTION_READ_TIMEOUT_SECONDS = 75
 MAX_SUBSCRIPTION_SIGNAL_QUEUE = 1024
 CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
@@ -2558,24 +2560,43 @@ def polling_interval_seconds(
 def network_idle_wait_seconds(
     *,
     now: float,
-    last_poll_times: dict[str, float],
-    room_ids: list[str],
+    last_global_poll_at: float | None,
     poll_interval: float,
-    has_urgent_poll: bool = False,
 ) -> float:
-    if has_urgent_poll:
+    if last_global_poll_at is None:
         return 0.0
+    ready_at = last_global_poll_at + max(0.0, poll_interval)
+    return max(0.0, min(60.0, ready_at - now))
+
+
+def next_poll_room_id(
+    *,
+    room_ids: list[str],
+    active_room_id: str,
+    urgent_room_ids: set[str],
+    last_poll_times: dict[str, float],
+) -> str | None:
     if not room_ids:
-        return min(60.0, max(0.01, poll_interval))
-    ready_times = [
-        (
-            now
-            if room_id not in last_poll_times
-            else last_poll_times[room_id] + max(0.0, poll_interval)
-        )
-        for room_id in room_ids
-    ]
-    return max(0.0, min(60.0, min(ready_times) - now))
+        return None
+    valid_urgent_room_ids = urgent_room_ids.intersection(room_ids)
+    if active_room_id in valid_urgent_room_ids:
+        return active_room_id
+    candidates = (
+        [
+            room_id
+            for room_id in room_ids
+            if room_id in valid_urgent_room_ids
+        ]
+        if valid_urgent_room_ids
+        else room_ids
+    )
+    return min(
+        candidates,
+        key=lambda room_id: last_poll_times.get(
+            room_id,
+            float("-inf"),
+        ),
+    )
 
 
 def subscription_room_ids(
@@ -6337,8 +6358,8 @@ class EncryptedChatClient(QObject):
 
     def _network_loop(self) -> None:
         last_poll_times: dict[str, float] = {}
+        last_global_poll_at: float | None = None
         urgent_room_ids: set[str] = set()
-        force_active_poll = True
         scheduled_active_room_id = ""
 
         while not self.stop_event.is_set():
@@ -6381,8 +6402,7 @@ class EncryptedChatClient(QObject):
 
             if active_room_id != scheduled_active_room_id:
                 scheduled_active_room_id = active_room_id
-                if latest_control is None:
-                    force_active_poll = True
+                urgent_room_ids.add(active_room_id)
 
             if latest_control is not None:
                 requested_room_id = str(latest_control.get("room_id", ""))
@@ -6392,10 +6412,8 @@ class EncryptedChatClient(QObject):
                         latest_control.get("poll_immediately", False)
                     )
                     if poll_immediately:
-                        force_active_poll = True
                         urgent_room_ids.add(active_room_id)
                     else:
-                        force_active_poll = False
                         last_poll_times[active_room_id] = now
                     self._queue_ui_event((
                         "status",
@@ -6412,40 +6430,25 @@ class EncryptedChatClient(QObject):
                     last_poll_times.pop(room_id, None)
             urgent_room_ids.intersection_update(valid_room_ids)
 
+            global_poll_due = (
+                last_global_poll_at is None
+                or now - last_global_poll_at >= poll_interval
+            )
             room_to_poll: dict[str, str] | None = None
-            if force_active_poll:
-                room_to_poll = active_room
-            else:
+            if global_poll_due:
+                room_id_to_poll = next_poll_room_id(
+                    room_ids=[room["id"] for room in rooms],
+                    active_room_id=active_room_id,
+                    urgent_room_ids=urgent_room_ids,
+                    last_poll_times=last_poll_times,
+                )
                 room_to_poll = next(
                     (
                         room for room in rooms
-                        if room["id"] in urgent_room_ids
+                        if room["id"] == room_id_to_poll
                     ),
                     None,
                 )
-
-            if room_to_poll is None:
-                due_rooms = [
-                    room
-                    for room in rooms
-                    if (
-                        room["id"] not in last_poll_times
-                        or now - last_poll_times[room["id"]]
-                        >= poll_interval
-                    )
-                ]
-                if due_rooms:
-                    room_to_poll = (
-                        active_room
-                        if active_room in due_rooms
-                        else min(
-                            due_rooms,
-                            key=lambda room: last_poll_times.get(
-                                room["id"],
-                                float("-inf"),
-                            ),
-                        )
-                    )
 
             if room_to_poll is not None:
                 poll_is_active = room_to_poll["id"] == active_room_id
@@ -6454,19 +6457,14 @@ class EncryptedChatClient(QObject):
                     is_active=poll_is_active,
                 )
                 completed_at = time.monotonic()
+                last_global_poll_at = completed_at
                 last_poll_times[room_to_poll["id"]] = completed_at
                 urgent_room_ids.discard(room_to_poll["id"])
-                if poll_is_active:
-                    force_active_poll = False
 
             wait_seconds = network_idle_wait_seconds(
                 now=time.monotonic(),
-                last_poll_times=last_poll_times,
-                room_ids=[room["id"] for room in rooms],
+                last_global_poll_at=last_global_poll_at,
                 poll_interval=poll_interval,
-                has_urgent_poll=(
-                    force_active_poll or bool(urgent_room_ids)
-                ),
             )
             self.network_wakeup_event.wait(max(0.01, wait_seconds))
             self.network_wakeup_event.clear()
