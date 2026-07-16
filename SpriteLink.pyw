@@ -3091,6 +3091,8 @@ class EncryptedChatClient(QObject):
             self._update_chatrooms_toggle_unread_style()
         if hasattr(self, "config_toggle"):
             self._update_config_toggle_update_style()
+        if hasattr(self, "update_button"):
+            self._update_update_button_style()
         self._apply_titlebar_theme()
 
     def _heading(self, text: str) -> QLabel:
@@ -3436,6 +3438,19 @@ class EncryptedChatClient(QObject):
         else:
             self.config_toggle.setStyleSheet("")
             self.config_toggle.setToolTip("")
+
+    def _update_update_button_style(self) -> None:
+        if not hasattr(self, "update_button"):
+            return
+        if (
+            self.available_update is not None
+            and self.update_button.isEnabled()
+        ):
+            self.update_button.setStyleSheet(
+                NOTIFICATION_BUTTON_STYLESHEET
+            )
+        else:
+            self.update_button.setStyleSheet("")
 
     def _unread_counts(self) -> dict[str, int]:
         unread_counts = self.config_data.setdefault("unread_counts", {})
@@ -4407,6 +4422,7 @@ class EncryptedChatClient(QObject):
         panel_layout.addWidget(self.image_preview_label, 1)
 
         button_row = QHBoxLayout()
+        self.image_preview_button_row = button_row
         self.image_preview_url_label = QLabel()
         self.image_preview_url_label.setMinimumWidth(0)
         self.image_preview_url_label.setSizePolicy(
@@ -4491,16 +4507,40 @@ class EncryptedChatClient(QObject):
         self.chat_display.viewport().update()
 
     def _set_large_image_preview_frame(self, image: QImage) -> None:
+        overlay_layout = self.image_preview_overlay.layout()
+        panel_layout = self.image_preview_panel.layout()
+        overlay_margins = overlay_layout.contentsMargins()
+        panel_margins = panel_layout.contentsMargins()
+        panel_frame = self.image_preview_panel.frameWidth()
+
         available_width = max(
-            EMBEDDED_IMAGE_MAX_EDGE,
+            1,
             min(
                 IMAGE_PREVIEW_MAX_WIDTH,
-                self.image_preview_panel.width() - 32,
+                self.image_preview_panel.contentsRect().width()
+                - panel_margins.left()
+                - panel_margins.right(),
+            ),
+        )
+        vertical_chrome = (
+            overlay_margins.top()
+            + overlay_margins.bottom()
+            + panel_margins.top()
+            + panel_margins.bottom()
+            + panel_layout.spacing()
+            + self.image_preview_button_row.sizeHint().height()
+            + panel_frame * 2
+        )
+        available_height = max(
+            1,
+            min(
+                IMAGE_PREVIEW_MAX_HEIGHT,
+                self.image_preview_overlay.height() - vertical_chrome,
             ),
         )
         preview = image.scaled(
             available_width,
-            IMAGE_PREVIEW_MAX_HEIGHT,
+            available_height,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
@@ -4826,6 +4866,7 @@ class EncryptedChatClient(QObject):
         self.update_button.setText("Checking...")
         self.update_button.setEnabled(False)
         self.update_button.setToolTip("")
+        self._update_update_button_style()
         threading.Thread(
             target=self._check_for_updates_worker,
             daemon=True,
@@ -4855,6 +4896,7 @@ class EncryptedChatClient(QObject):
         self.update_button.setText("Up-to-date")
         self.update_button.setEnabled(False)
         self.update_button.setToolTip("")
+        self._update_update_button_style()
         self._update_config_toggle_update_style()
 
     def _handle_update_check_result(self, payload: dict[str, Any]) -> None:
@@ -4882,6 +4924,7 @@ class EncryptedChatClient(QObject):
             self.update_button.setText("Update")
             self.update_button.setEnabled(True)
             self.update_button.setToolTip(release.notes.strip())
+            self._update_update_button_style()
             self._update_config_toggle_update_style()
             if self.config_overlay.isVisible():
                 self.update_button.setFocus()
@@ -4906,6 +4949,7 @@ class EncryptedChatClient(QObject):
         self._update_download_in_progress = True
         self.update_button.setText("Downloading...")
         self.update_button.setEnabled(False)
+        self._update_update_button_style()
         threading.Thread(
             target=self._download_update_worker,
             args=(release,),
@@ -4938,6 +4982,7 @@ class EncryptedChatClient(QObject):
         self.update_button.setText("Update")
         self.update_button.setEnabled(self.available_update is not None)
         self.update_button.setToolTip(error)
+        self._update_update_button_style()
         messagebox.showerror(
             "Could not update SpriteLink",
             error,
@@ -4971,6 +5016,7 @@ class EncryptedChatClient(QObject):
 
         self.update_button.setText("Installing...")
         self.update_button.setEnabled(False)
+        self._update_update_button_style()
         QTimer.singleShot(250, self.root.close)
 
     def _sync_config_overlay_geometry(self) -> None:
