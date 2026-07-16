@@ -221,20 +221,19 @@ class RuntimeOptimizationTests(unittest.TestCase):
                 window_focused=False,
                 tray_suspended=False,
             ),
-            15.0,
+            10.0,
         )
         self.assertEqual(
             SPRITELINK.polling_interval_seconds(
                 window_focused=False,
                 tray_suspended=True,
             ),
-            30.0,
+            20.0,
         )
         self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
                 now=100.0,
-                last_poll_times={"room-a": 95.0, "room-b": 99.0},
-                room_ids=["room-a", "room-b"],
+                last_global_poll_at=95.0,
                 poll_interval=6.0,
             ),
             1.0,
@@ -242,8 +241,7 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
                 now=100.0,
-                last_poll_times={"room-a": 99.0},
-                room_ids=["room-a", "room-b"],
+                last_global_poll_at=None,
                 poll_interval=6.0,
             ),
             0.0,
@@ -251,12 +249,37 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
                 now=100.0,
-                last_poll_times={"room-a": 100.0},
-                room_ids=["room-a"],
+                last_global_poll_at=100.0,
                 poll_interval=6.0,
-                has_urgent_poll=True,
             ),
-            0.0,
+            6.0,
+        )
+
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "older", "urgent"],
+                active_room_id="active",
+                urgent_room_ids={"urgent"},
+                last_poll_times={
+                    "active": 90.0,
+                    "older": 10.0,
+                    "urgent": 99.0,
+                },
+            ),
+            "urgent",
+        )
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "older", "newer"],
+                active_room_id="active",
+                urgent_room_ids=set(),
+                last_poll_times={
+                    "active": 90.0,
+                    "older": 10.0,
+                    "newer": 80.0,
+                },
+            ),
+            "older",
         )
 
         loop_source = inspect.getsource(
@@ -264,7 +287,8 @@ class RuntimeOptimizationTests(unittest.TestCase):
         )
         self.assertIn("network_idle_wait_seconds", loop_source)
         self.assertIn("network_wakeup_event.wait", loop_source)
-        self.assertIn("due_rooms", loop_source)
+        self.assertIn("last_global_poll_at", loop_source)
+        self.assertIn("next_poll_room_id", loop_source)
         self.assertIn("subscription_room_queue", loop_source)
         self.assertNotIn("last_background_poll_at", loop_source)
         self.assertNotIn("wait(0.08)", loop_source)
@@ -340,6 +364,14 @@ class RuntimeOptimizationTests(unittest.TestCase):
 
 
 class MultiTopicSubscriptionTests(unittest.TestCase):
+    def test_subscription_reconnects_leave_request_budget_headroom(
+        self,
+    ) -> None:
+        self.assertGreaterEqual(
+            SPRITELINK.SUBSCRIPTION_RECONNECT_DELAY_SECONDS,
+            30.0,
+        )
+
     def test_message_records_route_by_opaque_topic(self) -> None:
         topic_rooms = {
             "topic-a": ("room-a",),
