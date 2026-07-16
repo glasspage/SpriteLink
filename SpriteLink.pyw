@@ -4946,6 +4946,15 @@ class EncryptedChatClient(QObject):
         self.bold_format_button = QPushButton("Bold")
         self.italic_format_button = QPushButton("Italic")
         self.underline_format_button = QPushButton("Underline")
+        bold_button_font = QFont(self.bold_format_button.font())
+        bold_button_font.setBold(True)
+        self.bold_format_button.setFont(bold_button_font)
+        italic_button_font = QFont(self.italic_format_button.font())
+        italic_button_font.setItalic(True)
+        self.italic_format_button.setFont(italic_button_font)
+        underline_button_font = QFont(self.underline_format_button.font())
+        underline_button_font.setUnderline(True)
+        self.underline_format_button.setFont(underline_button_font)
         for button, style in (
             (self.bold_format_button, "bold"),
             (self.italic_format_button, "italic"),
