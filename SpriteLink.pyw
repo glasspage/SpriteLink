@@ -304,6 +304,9 @@ THEMES = (
 FOCUSED_POLL_INTERVAL_SECONDS = 6.0
 UNFOCUSED_POLL_INTERVAL_SECONDS = 9.0
 TRAY_POLL_INTERVAL_SECONDS = 12.0
+MUTED_INACTIVE_FOCUSED_POLL_INTERVAL_SECONDS = 5 * 60.0
+MUTED_INACTIVE_UNFOCUSED_POLL_INTERVAL_SECONDS = 7.5 * 60.0
+MUTED_INACTIVE_TRAY_POLL_INTERVAL_SECONDS = 10 * 60.0
 # Focused catch-up polls use most of ntfy's sustained request allowance.
 # Leave the remaining budget for reconnecting the long-lived stream.
 SUBSCRIPTION_RECONNECT_DELAY_SECONDS = 30.0
@@ -2737,6 +2740,18 @@ def polling_interval_seconds(
     return UNFOCUSED_POLL_INTERVAL_SECONDS
 
 
+def muted_inactive_polling_interval_seconds(
+    *,
+    window_focused: bool,
+    tray_suspended: bool,
+) -> float:
+    if tray_suspended:
+        return MUTED_INACTIVE_TRAY_POLL_INTERVAL_SECONDS
+    if window_focused:
+        return MUTED_INACTIVE_FOCUSED_POLL_INTERVAL_SECONDS
+    return MUTED_INACTIVE_UNFOCUSED_POLL_INTERVAL_SECONDS
+
+
 def network_idle_wait_seconds(
     *,
     now: float,
@@ -2782,10 +2797,23 @@ def next_poll_room_id(
     last_poll_times: dict[str, float],
     now: float,
     poll_interval: float,
+    muted_inactive_room_ids: set[str] | None = None,
+    muted_poll_interval: float = 0.0,
 ) -> str | None:
     if not room_ids:
         return None
-    valid_urgent_room_ids = urgent_room_ids.intersection(room_ids)
+
+    muted_room_ids = (
+        (muted_inactive_room_ids or set()).intersection(room_ids)
+        - {active_room_id}
+    )
+    regular_room_ids = [
+        room_id for room_id in room_ids
+        if room_id not in muted_room_ids
+    ]
+    valid_urgent_room_ids = (
+        urgent_room_ids.intersection(regular_room_ids)
+    )
 
     active_last_poll = last_poll_times.get(active_room_id)
     if active_last_poll is None:
@@ -2801,10 +2829,11 @@ def next_poll_room_id(
     if now - active_last_poll >= active_poll_deadline:
         return active_room_id
 
-    # Finish the first manual pass before stream activity can favor rooms
-    # that have already been checked.
+    # Finish the first manual pass for ordinary rooms before stream activity
+    # can favor rooms that have already been checked. Muted inactive rooms
+    # deliberately wait for their long timer before their first poll.
     never_polled_room_ids = [
-        room_id for room_id in room_ids
+        room_id for room_id in regular_room_ids
         if room_id not in last_poll_times
     ]
     if never_polled_room_ids:
@@ -2815,15 +2844,30 @@ def next_poll_room_id(
             return active_room_id
         return never_polled_room_ids[0]
 
+    muted_due_room_ids = [
+        room_id
+        for room_id in muted_room_ids
+        if (
+            room_id in last_poll_times
+            and now - last_poll_times[room_id]
+            >= max(0.0, muted_poll_interval)
+        )
+    ]
+    if muted_due_room_ids:
+        return min(
+            muted_due_room_ids,
+            key=lambda room_id: last_poll_times[room_id],
+        )
+
     oldest_room_id = min(
-        room_ids,
+        regular_room_ids,
         key=lambda room_id: last_poll_times[room_id],
     )
     manual_check_deadline = (
-        max(0.0, poll_interval) * max(1, len(room_ids))
+        max(0.0, poll_interval) * max(1, len(regular_room_ids))
     )
-    # Once the active-room reservation is satisfied, an overdue room gets the
-    # next global request slot so passive background checks keep progressing.
+    # Once the active-room reservation is satisfied, an overdue ordinary room
+    # gets the next global request slot so passive checks keep progressing.
     if (
         now - last_poll_times[oldest_room_id]
         >= manual_check_deadline
@@ -4681,6 +4725,9 @@ class EncryptedChatClient(QObject):
             save_config(self.config_data)
         except Exception:
             pass
+        if room_id != self.active_chatroom_id:
+            self._request_subscription_refresh()
+        self.network_wakeup_event.set()
         self._refresh_chatroom_list()
 
     def _remove_chatroom(self, room_id: str) -> None:
@@ -4747,11 +4794,17 @@ class EncryptedChatClient(QObject):
             < IMMEDIATE_CHATROOM_SWITCH_LIMIT
         )
         self.recent_chatroom_switch_times.append(now)
+        muted_room_ids = self._muted_chatroom_ids()
+        refresh_subscription = (
+            self.active_chatroom_id in muted_room_ids
+            or room_id in muted_room_ids
+        )
         self._persist_local_history()
         self.active_chatroom_id = room_id
         self.config_data["active_chatroom_id"] = room_id
         self._switch_active_chatroom(
-            poll_immediately=poll_immediately
+            poll_immediately=poll_immediately,
+            refresh_subscription=refresh_subscription,
         )
 
     def _request_network_refresh(
@@ -4769,6 +4822,7 @@ class EncryptedChatClient(QObject):
         self,
         *,
         poll_immediately: bool = True,
+        refresh_subscription: bool = False,
     ) -> None:
         self._unread_counts().pop(self.active_chatroom_id, None)
         self._clear_tray_notification_if_no_unread()
@@ -4786,6 +4840,8 @@ class EncryptedChatClient(QObject):
         self._request_network_refresh(
             poll_immediately=poll_immediately
         )
+        if refresh_subscription:
+            self._request_subscription_refresh()
         self.message_entry.clear()
         self.message_entry.clear_formatting_state()
         self._sync_formatting_buttons()
@@ -6675,7 +6731,14 @@ class EncryptedChatClient(QObject):
             return "", {}
 
         topic_room_lists: dict[str, list[str]] = {}
+        muted_room_ids = self._muted_chatroom_ids()
+        active_room_id = self.active_chatroom_id
         for room in self._chatroom_definitions():
+            if (
+                room["id"] != active_room_id
+                and room["id"] in muted_room_ids
+            ):
+                continue
             encryption_key = room.get("key", "")
             if not encryption_key:
                 continue
@@ -6863,9 +6926,27 @@ class EncryptedChatClient(QObject):
                 rooms[0],
             )
             active_room_id = active_room["id"]
+            window_focused = self.window_focused_event.is_set()
+            tray_suspended = self.tray_mode_event.is_set()
             poll_interval = polling_interval_seconds(
-                window_focused=self.window_focused_event.is_set(),
-                tray_suspended=self.tray_mode_event.is_set(),
+                window_focused=window_focused,
+                tray_suspended=tray_suspended,
+            )
+            muted_poll_interval = (
+                muted_inactive_polling_interval_seconds(
+                    window_focused=window_focused,
+                    tray_suspended=tray_suspended,
+                )
+            )
+            valid_room_ids = {room["id"] for room in rooms}
+            muted_inactive_room_ids = (
+                self._muted_chatroom_ids().intersection(valid_room_ids)
+                - {active_room_id}
+            )
+            for room_id in muted_inactive_room_ids:
+                last_poll_times.setdefault(room_id, now)
+            urgent_room_ids.difference_update(
+                muted_inactive_room_ids
             )
 
             if active_room_id != scheduled_active_room_id:
@@ -6911,7 +6992,6 @@ class EncryptedChatClient(QObject):
                         ),
                     ))
 
-            valid_room_ids = {room["id"] for room in rooms}
             for room_id in tuple(last_poll_times):
                 if room_id not in valid_room_ids:
                     last_poll_times.pop(room_id, None)
@@ -6937,6 +7017,10 @@ class EncryptedChatClient(QObject):
                         last_poll_times=last_poll_times,
                         now=now,
                         poll_interval=poll_interval,
+                        muted_inactive_room_ids=(
+                            muted_inactive_room_ids
+                        ),
+                        muted_poll_interval=muted_poll_interval,
                     )
                 )
                 room_to_poll = next(
