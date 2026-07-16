@@ -209,6 +209,40 @@ NOTIFICATION_BUTTON_STYLESHEET = (
     "QPushButton:hover { background-color: #f3c78d; }"
     "QPushButton:pressed { background-color: #efb968; }"
 )
+WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET = (
+    "QPushButton {"
+    " background-color: #f8d8ad;"
+    " color: #000000;"
+    " border-top: 2px solid #ffffff;"
+    " border-left: 2px solid #ffffff;"
+    " border-right: 2px solid #000000;"
+    " border-bottom: 2px solid #000000;"
+    " border-radius: 0px;"
+    " padding: 3px 8px;"
+    " min-height: 18px;"
+    "}"
+    "QPushButton:hover { background-color: #f3c78d; }"
+    "QPushButton:pressed, QPushButton:checked {"
+    " background-color: #efb968;"
+    " border-top: 2px solid #000000;"
+    " border-left: 2px solid #000000;"
+    " border-right: 2px solid #ffffff;"
+    " border-bottom: 2px solid #ffffff;"
+    " padding-top: 4px;"
+    " padding-left: 9px;"
+    " padding-right: 7px;"
+    " padding-bottom: 2px;"
+    "}"
+)
+
+
+def notification_button_stylesheet(windows_classic: bool) -> str:
+    return (
+        WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET
+        if windows_classic
+        else NOTIFICATION_BUTTON_STYLESHEET
+    )
+
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
@@ -3993,7 +4027,9 @@ class EncryptedChatClient(QObject):
         )
         if has_visible_unread:
             self.chatrooms_toggle.setStyleSheet(
-                NOTIFICATION_BUTTON_STYLESHEET
+                notification_button_stylesheet(
+                    self._is_windows_classic_theme()
+                )
             )
         else:
             self.chatrooms_toggle.setStyleSheet("")
@@ -4003,7 +4039,9 @@ class EncryptedChatClient(QObject):
             return
         if self.available_update is not None:
             self.config_toggle.setStyleSheet(
-                NOTIFICATION_BUTTON_STYLESHEET
+                notification_button_stylesheet(
+                    self._is_windows_classic_theme()
+                )
             )
             self.config_toggle.setToolTip(
                 f"SpriteLink {self.available_update.version} is available."
@@ -4020,7 +4058,9 @@ class EncryptedChatClient(QObject):
             and self.update_button.isEnabled()
         ):
             self.update_button.setStyleSheet(
-                NOTIFICATION_BUTTON_STYLESHEET
+                notification_button_stylesheet(
+                    self._is_windows_classic_theme()
+                )
             )
         else:
             self.update_button.setStyleSheet("")
