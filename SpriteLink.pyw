@@ -298,6 +298,7 @@ SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS = 2 * 60
 MAX_SUBSCRIPTION_SIGNAL_QUEUE = 1024
 CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
 IMMEDIATE_CHATROOM_SWITCH_LIMIT = 2
+CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS = 3
 REQUEST_TIMEOUT_SECONDS = 10
 AUTO_HISTORY_SECONDS = 48 * 60 * 60
 GAP_SEPARATOR_SECONDS = 6 * 60 * 60
@@ -2569,6 +2570,31 @@ def network_idle_wait_seconds(
         return 0.0
     ready_at = last_global_poll_at + max(0.0, poll_interval)
     return max(0.0, min(60.0, ready_at - now))
+
+
+def immediate_poll_borrowed_seconds(
+    *,
+    now: float,
+    last_global_poll_at: float | None,
+    poll_interval: float,
+) -> float:
+    if last_global_poll_at is None:
+        return 0.0
+    interval = max(0.0, poll_interval)
+    return max(
+        0.0,
+        min(interval, last_global_poll_at + interval - now),
+    )
+
+
+def background_repayment_delay_seconds(
+    *,
+    borrowed_seconds: float,
+    checks_remaining: int,
+) -> float:
+    if checks_remaining <= 0:
+        return 0.0
+    return max(0.0, borrowed_seconds) / checks_remaining
 
 
 def next_poll_room_id(
@@ -6447,6 +6473,11 @@ class EncryptedChatClient(QObject):
         last_global_poll_at: float | None = None
         urgent_room_ids: set[str] = set()
         scheduled_active_room_id = ""
+        forced_active_poll_room_id = ""
+        background_delay_debt = 0.0
+        background_repayment_checks = 0
+        background_delay_until: float | None = None
+        background_delay_slice = 0.0
 
         while not self.stop_event.is_set():
             latest_control: dict[str, Any] | None = None
@@ -6489,6 +6520,11 @@ class EncryptedChatClient(QObject):
             if active_room_id != scheduled_active_room_id:
                 scheduled_active_room_id = active_room_id
                 urgent_room_ids.add(active_room_id)
+            if (
+                forced_active_poll_room_id
+                and forced_active_poll_room_id != active_room_id
+            ):
+                forced_active_poll_room_id = ""
 
             if latest_control is not None:
                 requested_room_id = str(latest_control.get("room_id", ""))
@@ -6499,6 +6535,20 @@ class EncryptedChatClient(QObject):
                     )
                     if poll_immediately:
                         urgent_room_ids.add(active_room_id)
+                        forced_active_poll_room_id = active_room_id
+                        background_delay_debt += (
+                            immediate_poll_borrowed_seconds(
+                                now=now,
+                                last_global_poll_at=last_global_poll_at,
+                                poll_interval=poll_interval,
+                            )
+                        )
+                        background_repayment_checks = max(
+                            background_repayment_checks,
+                            CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS,
+                        )
+                        background_delay_until = None
+                        background_delay_slice = 0.0
                     else:
                         last_poll_times[active_room_id] = now
                     self._queue_ui_event((
@@ -6516,19 +6566,27 @@ class EncryptedChatClient(QObject):
                     last_poll_times.pop(room_id, None)
             urgent_room_ids.intersection_update(valid_room_ids)
 
-            global_poll_due = (
+            force_active_poll = (
+                forced_active_poll_room_id == active_room_id
+            )
+            global_poll_due = force_active_poll or (
                 last_global_poll_at is None
                 or now - last_global_poll_at >= poll_interval
             )
             room_to_poll: dict[str, str] | None = None
+            repay_background_after_poll = False
             if global_poll_due:
-                room_id_to_poll = next_poll_room_id(
-                    room_ids=[room["id"] for room in rooms],
-                    active_room_id=active_room_id,
-                    urgent_room_ids=urgent_room_ids,
-                    last_poll_times=last_poll_times,
-                    now=now,
-                    poll_interval=poll_interval,
+                room_id_to_poll = (
+                    active_room_id
+                    if force_active_poll
+                    else next_poll_room_id(
+                        room_ids=[room["id"] for room in rooms],
+                        active_room_id=active_room_id,
+                        urgent_room_ids=urgent_room_ids,
+                        last_poll_times=last_poll_times,
+                        now=now,
+                        poll_interval=poll_interval,
+                    )
                 )
                 room_to_poll = next(
                     (
@@ -6537,6 +6595,28 @@ class EncryptedChatClient(QObject):
                     ),
                     None,
                 )
+                if (
+                    room_to_poll is not None
+                    and room_to_poll["id"] != active_room_id
+                    and background_delay_debt > 0.0
+                    and background_repayment_checks > 0
+                ):
+                    if background_delay_until is None:
+                        background_delay_slice = (
+                            background_repayment_delay_seconds(
+                                borrowed_seconds=background_delay_debt,
+                                checks_remaining=(
+                                    background_repayment_checks
+                                ),
+                            )
+                        )
+                        background_delay_until = (
+                            now + background_delay_slice
+                        )
+                    if now < background_delay_until:
+                        room_to_poll = None
+                    else:
+                        repay_background_after_poll = True
 
             if room_to_poll is not None:
                 poll_is_active = room_to_poll["id"] == active_room_id
@@ -6548,12 +6628,31 @@ class EncryptedChatClient(QObject):
                 last_global_poll_at = completed_at
                 last_poll_times[room_to_poll["id"]] = completed_at
                 urgent_room_ids.discard(room_to_poll["id"])
+                if poll_is_active:
+                    forced_active_poll_room_id = ""
+                    background_delay_until = None
+                    background_delay_slice = 0.0
+                elif repay_background_after_poll:
+                    background_delay_debt = max(
+                        0.0,
+                        background_delay_debt - background_delay_slice,
+                    )
+                    background_repayment_checks -= 1
+                    background_delay_until = None
+                    background_delay_slice = 0.0
 
-            wait_seconds = network_idle_wait_seconds(
-                now=time.monotonic(),
-                last_global_poll_at=last_global_poll_at,
-                poll_interval=poll_interval,
-            )
+            wait_now = time.monotonic()
+            if room_to_poll is None and background_delay_until is not None:
+                wait_seconds = max(
+                    0.0,
+                    min(60.0, background_delay_until - wait_now),
+                )
+            else:
+                wait_seconds = network_idle_wait_seconds(
+                    now=wait_now,
+                    last_global_poll_at=last_global_poll_at,
+                    poll_interval=poll_interval,
+                )
             self.network_wakeup_event.wait(max(0.01, wait_seconds))
             self.network_wakeup_event.clear()
 
