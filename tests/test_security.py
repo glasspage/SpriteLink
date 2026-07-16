@@ -228,19 +228,13 @@ class RuntimeOptimizationTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient.eventFilter
         )
         self.assertIn("_tray_notification_pending = True", mark_source)
-        self.assertIn("self.root.isVisible()", sync_source)
-        self.assertIn("not self.root.isMinimized()", sync_source)
+        self.assertIn("self._window_minimized", mark_source)
+        self.assertIn("self._window_minimized", sync_source)
         self.assertIn("self._tray_ui_suspended", sync_source)
         self.assertIn("_tray_icon_is_notification = True", sync_source)
-        self.assertLess(
-            mark_source.index("self.root.isVisible()"),
-            mark_source.index("self.tray_icon.isVisible()"),
-        )
-        self.assertLess(
-            sync_source.index("self.root.isVisible()"),
-            sync_source.index("self.tray_icon.isVisible()"),
-        )
-        self.assertIn("_sync_tray_notification_icon", event_source)
+        self.assertNotIn("self.root.", mark_source)
+        self.assertNotIn("self.root.", sync_source)
+        self.assertIn("_sync_window_state", event_source)
 
     def test_network_worker_waits_until_real_work_is_due(self) -> None:
         self.assertEqual(
