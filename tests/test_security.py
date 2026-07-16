@@ -275,6 +275,33 @@ class RuntimeOptimizationTests(unittest.TestCase):
             ),
             6.0,
         )
+        self.assertEqual(
+            SPRITELINK.immediate_poll_borrowed_seconds(
+                now=101.0,
+                last_global_poll_at=100.0,
+                poll_interval=6.0,
+            ),
+            5.0,
+        )
+        self.assertEqual(
+            SPRITELINK.immediate_poll_borrowed_seconds(
+                now=101.0,
+                last_global_poll_at=None,
+                poll_interval=6.0,
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            SPRITELINK.background_repayment_delay_seconds(
+                borrowed_seconds=6.0,
+                checks_remaining=3,
+            ),
+            2.0,
+        )
+        self.assertEqual(
+            SPRITELINK.CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS,
+            3,
+        )
 
         self.assertEqual(
             SPRITELINK.next_poll_room_id(
@@ -395,6 +422,9 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("last_global_poll_at", loop_source)
         self.assertIn("next_poll_room_id", loop_source)
         self.assertIn("subscription_room_queue", loop_source)
+        self.assertIn("forced_active_poll_room_id", loop_source)
+        self.assertIn("background_delay_debt", loop_source)
+        self.assertIn("background_repayment_delay_seconds", loop_source)
         self.assertNotIn("last_background_poll_at", loop_source)
         self.assertNotIn("wait(0.08)", loop_source)
 
