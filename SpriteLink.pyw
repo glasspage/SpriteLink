@@ -8901,6 +8901,21 @@ class EncryptedChatClient(QObject):
                 top_align_height=top_align_height,
             ),
         )
+        body_font_metrics = QFontMetrics(
+            self._make_message_font(font_name)
+        )
+        username_font_metrics = QFontMetrics(
+            self._make_message_font(font_name, bold=True)
+        )
+        message_body_indent = (
+            username_font_metrics.horizontalAdvance(username)
+            + body_font_metrics.horizontalAdvance(status_suffix + ": ")
+        )
+        if has_profile_icon:
+            message_body_indent += (
+                PROFILE_ICON_SIZE
+                + body_font_metrics.horizontalAdvance(" ")
+            )
 
         visible_text_without_images = message_text_without_image_links(
             display_text,
@@ -8947,17 +8962,24 @@ class EncryptedChatClient(QObject):
                 self._text_format("#b00020", font_name=font_name),
             )
 
-        # Explicit newlines create additional QTextBlocks. A full-width extra
-        # selection paints each block to the viewport edges independently of
-        # the paragraph margins that keep the text itself padded.
+        # Explicit newlines create additional QTextBlocks. Give every block
+        # the row color and message-body margin, then pull only the first line
+        # back for the icon/username prefix to create a hanging indent.
         document = cursor.document()
         block = document.findBlock(message_start_position)
+        first_message_block_number = block.blockNumber()
         final_block_number = cursor.block().blockNumber()
         while block.isValid() and block.blockNumber() <= final_block_number:
             block_cursor = QTextCursor(block)
             block_format = block.blockFormat()
-            block_format.setLeftMargin(10)
+            block_format.setLeftMargin(10 + message_body_indent)
+            block_format.setTextIndent(
+                -message_body_indent
+                if block.blockNumber() == first_message_block_number
+                else 0
+            )
             block_format.setRightMargin(10)
+            block_format.setBackground(QColor(background_color))
             block_cursor.setBlockFormat(block_format)
 
             selection = QTextEdit.ExtraSelection()
