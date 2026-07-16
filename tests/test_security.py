@@ -604,6 +604,27 @@ class RuntimeOptimizationTests(unittest.TestCase):
             12.0,
         )
         self.assertEqual(
+            SPRITELINK.muted_inactive_polling_interval_seconds(
+                window_focused=True,
+                tray_suspended=False,
+            ),
+            5 * 60.0,
+        )
+        self.assertEqual(
+            SPRITELINK.muted_inactive_polling_interval_seconds(
+                window_focused=False,
+                tray_suspended=False,
+            ),
+            7.5 * 60.0,
+        )
+        self.assertEqual(
+            SPRITELINK.muted_inactive_polling_interval_seconds(
+                window_focused=False,
+                tray_suspended=True,
+            ),
+            10 * 60.0,
+        )
+        self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
                 now=100.0,
                 last_global_poll_at=95.0,
@@ -744,6 +765,44 @@ class RuntimeOptimizationTests(unittest.TestCase):
             "active",
         )
 
+        # A stream signal cannot make a muted inactive room urgent.
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "ordinary", "muted"],
+                active_room_id="active",
+                urgent_room_ids={"muted"},
+                last_poll_times={
+                    "active": 199.0,
+                    "ordinary": 198.0,
+                    "muted": 100.0,
+                },
+                now=200.0,
+                poll_interval=6.0,
+                muted_inactive_room_ids={"muted"},
+                muted_poll_interval=300.0,
+            ),
+            "ordinary",
+        )
+        # Once its own timer expires, the muted room gets a request slot
+        # without needing a stream signal.
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "ordinary", "muted"],
+                active_room_id="active",
+                urgent_room_ids=set(),
+                last_poll_times={
+                    "active": 199.0,
+                    "ordinary": 198.0,
+                    "muted": -100.0,
+                },
+                now=200.0,
+                poll_interval=6.0,
+                muted_inactive_room_ids={"muted"},
+                muted_poll_interval=300.0,
+            ),
+            "muted",
+        )
+
         self.assertFalse(
             SPRITELINK.poll_message_should_notify(
                 {"ntfy_time": 99},
@@ -777,6 +836,15 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("forced_active_poll_room_id", loop_source)
         self.assertIn("background_delay_debt", loop_source)
         self.assertIn("background_repayment_delay_seconds", loop_source)
+        self.assertIn("muted_inactive_room_ids", loop_source)
+        self.assertIn(
+            "urgent_room_ids.difference_update",
+            loop_source,
+        )
+        self.assertIn(
+            "last_poll_times.setdefault(room_id, now)",
+            loop_source,
+        )
         self.assertNotIn("last_background_poll_at", loop_source)
         self.assertNotIn("wait(0.08)", loop_source)
 
@@ -1074,9 +1142,14 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
             (),
         )
 
-    def test_subscription_snapshot_groups_all_room_topics(self) -> None:
+    def test_subscription_omits_muted_inactive_room_topics(self) -> None:
         client = mock.Mock()
         client.config_data = {"server_url": "https://ntfy.sh"}
+        client.active_chatroom_id = "room-a"
+        client._muted_chatroom_ids.return_value = {
+            "room-a",
+            "room-b",
+        }
         client._chatroom_definitions.return_value = [
             {"id": "room-a", "key": "key-a"},
             {"id": "room-b", "key": "key-b"},
@@ -1098,8 +1171,9 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
         self.assertEqual(
             topic_rooms,
             {
+                # The muted active room remains responsive. The muted
+                # inactive room-b is absent from the subscription.
                 "topic-a": ("room-a", "room-c"),
-                "topic-b": ("room-b",),
             },
         )
 
@@ -1134,6 +1208,8 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._add_chatroom,
             SPRITELINK.EncryptedChatClient._edit_chatroom,
             SPRITELINK.EncryptedChatClient._remove_chatroom,
+            SPRITELINK.EncryptedChatClient._set_chatroom_muted,
+            SPRITELINK.EncryptedChatClient._switch_active_chatroom,
             SPRITELINK.EncryptedChatClient._save_and_reconnect,
         ):
             self.assertIn(
