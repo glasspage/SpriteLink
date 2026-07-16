@@ -379,12 +379,51 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._process_ui_queue
         )
         self.assertIn("_pause_animated_media()", suspend_source)
+        self.assertIn(
+            "_release_message_sound_resources()",
+            suspend_source,
+        )
         self.assertIn("image_preview_cache.clear()", suspend_source)
         self.assertIn("_reset_chat_document()", suspend_source)
         self.assertIn("QPixmapCache.clear()", suspend_source)
+        self.assertIn("setUpdatesEnabled(False)", suspend_source)
+        self.assertIn("setUpdatesEnabled(True)", resume_source)
         self.assertIn("_render_message_log", resume_source)
         self.assertIn("_tray_ui_suspended", render_source)
         self.assertIn("_tray_ui_suspended", queue_source)
+
+    def test_tray_mode_fully_detaches_multimedia_backends(self) -> None:
+        controller_source = inspect.getsource(
+            SPRITELINK.AnimatedMediaController.stop
+        )
+        audio_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._release_message_sound_resources
+        )
+        self.assertIn("player.setVideoSink(None)", controller_source)
+        self.assertIn("player.setSource(QUrl())", controller_source)
+        self.assertIn("video_sink.deleteLater()", controller_source)
+        self.assertIn("_buffer.setData(QByteArray())", controller_source)
+        self.assertIn("effect.setSource(QUrl())", audio_source)
+        self.assertIn("player.setAudioOutput(None)", audio_source)
+        self.assertIn("message_sound_effects.clear()", audio_source)
+
+    def test_tray_audio_is_released_after_notifications(self) -> None:
+        wav_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._on_message_sound_effect_playing_changed
+        )
+        compressed_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._on_compressed_message_sound_state_changed
+        )
+        self.assertIn("_tray_ui_suspended", wav_source)
+        self.assertIn("_release_message_sound_resources", wav_source)
+        self.assertIn("_tray_ui_suspended", compressed_source)
+        self.assertIn(
+            "_release_message_sound_resources",
+            compressed_source,
+        )
 
 
 class ProfileIconTests(unittest.TestCase):
