@@ -208,40 +208,96 @@ class BehaviorSettingsTests(unittest.TestCase):
 
 
 class RuntimeOptimizationTests(unittest.TestCase):
+    def test_chatroom_unread_rows_are_never_top_level_windows(self) -> None:
+        row_source = inspect.getsource(SPRITELINK.ChatroomListRow.__init__)
+        refresh_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._refresh_chatroom_list
+        )
+        self.assertIn("parent: QWidget", row_source)
+        self.assertIn("super().__init__(parent)", row_source)
+        self.assertIn("self.chatrooms_list,", refresh_source)
+        self.assertIn("QLabel(nickname, self)", row_source)
+        self.assertIn(
+            'QLabel(f"({unread_count})", self)',
+            row_source,
+        )
+        self.assertLess(
+            row_source.index("layout.addWidget(unread_label)"),
+            row_source.index("unread_label.setVisible"),
+        )
+
     def test_network_worker_waits_until_real_work_is_due(self) -> None:
+        self.assertEqual(
+            SPRITELINK.polling_interval_seconds(
+                window_focused=True,
+                tray_suspended=False,
+            ),
+            6.0,
+        )
+        self.assertEqual(
+            SPRITELINK.polling_interval_seconds(
+                window_focused=False,
+                tray_suspended=False,
+            ),
+            10.0,
+        )
+        self.assertEqual(
+            SPRITELINK.polling_interval_seconds(
+                window_focused=False,
+                tray_suspended=True,
+            ),
+            20.0,
+        )
         self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
                 now=100.0,
-                active_last_polled=95.0,
-                background_last_polled=90.0,
-                active_interval=6.0,
-                background_interval=45.0,
-                has_background_rooms=True,
+                last_global_poll_at=95.0,
+                poll_interval=6.0,
             ),
             1.0,
         )
         self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
                 now=100.0,
-                active_last_polled=99.0,
-                background_last_polled=None,
-                active_interval=6.0,
-                background_interval=45.0,
-                has_background_rooms=True,
+                last_global_poll_at=None,
+                poll_interval=6.0,
             ),
             0.0,
         )
         self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
                 now=100.0,
-                active_last_polled=100.0,
-                background_last_polled=100.0,
-                active_interval=6.0,
-                background_interval=45.0,
-                has_background_rooms=True,
-                force_active_poll=True,
+                last_global_poll_at=100.0,
+                poll_interval=6.0,
             ),
-            0.0,
+            6.0,
+        )
+
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "older", "urgent"],
+                active_room_id="active",
+                urgent_room_ids={"urgent"},
+                last_poll_times={
+                    "active": 90.0,
+                    "older": 10.0,
+                    "urgent": 99.0,
+                },
+            ),
+            "urgent",
+        )
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "older", "newer"],
+                active_room_id="active",
+                urgent_room_ids=set(),
+                last_poll_times={
+                    "active": 90.0,
+                    "older": 10.0,
+                    "newer": 80.0,
+                },
+            ),
+            "older",
         )
 
         loop_source = inspect.getsource(
@@ -249,6 +305,10 @@ class RuntimeOptimizationTests(unittest.TestCase):
         )
         self.assertIn("network_idle_wait_seconds", loop_source)
         self.assertIn("network_wakeup_event.wait", loop_source)
+        self.assertIn("last_global_poll_at", loop_source)
+        self.assertIn("next_poll_room_id", loop_source)
+        self.assertIn("subscription_room_queue", loop_source)
+        self.assertNotIn("last_background_poll_at", loop_source)
         self.assertNotIn("wait(0.08)", loop_source)
 
     def test_network_wakes_immediately_for_send_config_and_focus(self) -> None:
@@ -321,6 +381,125 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("_tooltip_for_message_item", show_source)
 
 
+class MultiTopicSubscriptionTests(unittest.TestCase):
+    def test_subscription_reconnects_leave_request_budget_headroom(
+        self,
+    ) -> None:
+        self.assertGreaterEqual(
+            SPRITELINK.SUBSCRIPTION_RECONNECT_DELAY_SECONDS,
+            30.0,
+        )
+
+    def test_message_records_route_by_opaque_topic(self) -> None:
+        topic_rooms = {
+            "topic-a": ("room-a",),
+            "topic-b": ("room-b", "room-c"),
+        }
+        self.assertEqual(
+            SPRITELINK.subscription_room_ids(
+                {
+                    "event": "message",
+                    "topic": "topic-b",
+                    "message": "opaque",
+                },
+                topic_rooms,
+            ),
+            ("room-b", "room-c"),
+        )
+        self.assertEqual(
+            SPRITELINK.subscription_room_ids(
+                {"event": "keepalive", "topic": "topic-b"},
+                topic_rooms,
+            ),
+            (),
+        )
+        self.assertEqual(
+            SPRITELINK.subscription_room_ids(
+                {"event": "message", "topic": "unknown"},
+                topic_rooms,
+            ),
+            (),
+        )
+
+    def test_subscription_snapshot_groups_all_room_topics(self) -> None:
+        client = mock.Mock()
+        client.config_data = {"server_url": "https://ntfy.sh"}
+        client._chatroom_definitions.return_value = [
+            {"id": "room-a", "key": "key-a"},
+            {"id": "room-b", "key": "key-b"},
+            {"id": "room-c", "key": "key-a"},
+        ]
+
+        with mock.patch.object(
+            SPRITELINK,
+            "derive_ntfy_topic",
+            side_effect=lambda key: f"topic-{key[-1]}",
+        ):
+            server_url, topic_rooms = (
+                SPRITELINK.EncryptedChatClient._subscription_snapshot(
+                    client
+                )
+            )
+
+        self.assertEqual(server_url, "https://ntfy.sh")
+        self.assertEqual(
+            topic_rooms,
+            {
+                "topic-a": ("room-a", "room-c"),
+                "topic-b": ("room-b",),
+            },
+        )
+
+    def test_one_stream_covers_all_topics_and_wakes_secure_polls(self) -> None:
+        stream_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._subscription_loop
+        )
+        network_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._network_loop
+        )
+        start_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._start_network_thread
+        )
+
+        self.assertIn('topics = ",".join(topic_rooms)', stream_source)
+        self.assertIn('params={"since": "latest"}', stream_source)
+        self.assertIn("stream=True", stream_source)
+        self.assertIn("response.iter_lines()", stream_source)
+        self.assertIn("subscription_room_ids(", stream_source)
+        self.assertIn("subscription_room_queue.put_nowait", stream_source)
+        self.assertNotIn("open_opaque_packet", stream_source)
+        self.assertIn("subscription_room_queue.get_nowait", network_source)
+        self.assertIn("self._network_poll(", network_source)
+        self.assertIn('"SpriteLinkSubscription"', start_source)
+
+    def test_subscription_restarts_when_topics_or_server_change(self) -> None:
+        for method in (
+            SPRITELINK.EncryptedChatClient._add_chatroom,
+            SPRITELINK.EncryptedChatClient._edit_chatroom,
+            SPRITELINK.EncryptedChatClient._remove_chatroom,
+            SPRITELINK.EncryptedChatClient._save_and_reconnect,
+        ):
+            self.assertIn(
+                "_request_subscription_refresh",
+                inspect.getsource(method),
+            )
+
+    def test_tray_state_selects_the_thirty_second_interval(self) -> None:
+        suspend_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._suspend_for_tray
+        )
+        resume_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._resume_from_tray
+        )
+        loop_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._network_loop
+        )
+        self.assertIn("tray_mode_event.set()", suspend_source)
+        self.assertIn("tray_mode_event.clear()", resume_source)
+        self.assertIn("tray_mode_event.is_set()", loop_source)
+
+
+
 class TrayLifecycleOptimizationTests(unittest.TestCase):
     def test_tray_icon_is_always_visible_while_running(self) -> None:
         build_source = inspect.getsource(
@@ -353,14 +532,15 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
         self.assertIn("minimize_to_tray_var.get()", can_hide_source)
         self.assertNotIn("minimize_to_tray_var.get()", build_source)
 
-    def test_notifications_work_for_normal_minimize(self) -> None:
+    def test_notifications_work_while_open_or_minimized(self) -> None:
         mark_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._mark_tray_notification
         )
         event_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient.eventFilter
         )
-        self.assertIn("window_focused_event.is_set()", mark_source)
+        self.assertNotIn("window_focused_event.is_set()", mark_source)
+        self.assertIn("tray_icon.isVisible()", mark_source)
         self.assertNotIn("_minimized_to_tray", mark_source)
         self.assertIn("_clear_tray_notification", event_source)
         self.assertIn("WindowStateChange", event_source)
