@@ -211,6 +211,55 @@ class BehaviorSettingsTests(unittest.TestCase):
 
 
 class RuntimeOptimizationTests(unittest.TestCase):
+    def test_status_line_uses_chatroom_name_and_delayed_error(self) -> None:
+        self.assertEqual(
+            SPRITELINK.chatroom_connection_label(
+                "Global",
+                connection_error=False,
+            ),
+            "Global",
+        )
+        self.assertEqual(
+            SPRITELINK.chatroom_connection_label(
+                "Global",
+                connection_error=True,
+            ),
+            "Global - Connection error",
+        )
+        self.assertEqual(SPRITELINK.CONNECTION_ERROR_DELAY_MS, 15_000)
+
+        title_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._update_window_title
+        )
+        ui_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        timer_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._sync_connection_error_timer
+        )
+        condition_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._connection_error_timer_should_run
+        )
+        restart_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._restart_connection_error_delay
+        )
+        timeout_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._show_connection_error_if_still_disconnected
+        )
+
+        self.assertIn("setWindowTitle(APP_NAME)", title_source)
+        self.assertNotIn("nickname", title_source)
+        self.assertNotIn('QLabel("Status:")', ui_source)
+        self.assertIn("_on_connection_status_changed", ui_source)
+        self.assertIn("connection_error_timer.isActive()", timer_source)
+        self.assertIn('status_var.get()) == "Connected"', timer_source)
+        self.assertIn("window_focused_event.is_set()", condition_source)
+        self.assertIn('!= "Connected"', condition_source)
+        self.assertNotIn("_connection_error_visible = False", restart_source)
+        self.assertNotIn("_connection_error_visible = False", timeout_source)
+
     def test_chatroom_unread_rows_are_never_top_level_windows(self) -> None:
         row_source = inspect.getsource(SPRITELINK.ChatroomListRow.__init__)
         refresh_source = inspect.getsource(
