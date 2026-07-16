@@ -2322,6 +2322,21 @@ class ChatroomListWidget(QListWidget):
         event.accept()
 
 
+def vertical_range_is_near_viewport(
+    top: int,
+    bottom: int,
+    viewport_height: int,
+) -> bool:
+    visible_height = max(1, int(viewport_height))
+    preload_margin = (
+        visible_height * VIEWPORT_MEDIA_PRELOAD_SCREENS
+    )
+    return (
+        int(bottom) >= -preload_margin
+        and int(top) <= visible_height + preload_margin
+    )
+
+
 class ThemeComboBox(QComboBox):
     """Config combo box with Classic styling and no wheel changes."""
 
@@ -6789,11 +6804,6 @@ class EncryptedChatClient(QObject):
             return
         viewport = self.chat_display.viewport()
         viewport_height = max(1, viewport.height())
-        preload_margin = (
-            viewport_height * VIEWPORT_MEDIA_PRELOAD_SCREENS
-        )
-        near_top = -preload_margin
-        near_bottom = viewport_height + preload_margin
         document = self.chat_display.document()
         maximum_position = max(0, document.characterCount() - 1)
         desired_urls: set[str] = set()
@@ -6805,9 +6815,10 @@ class EncryptedChatClient(QObject):
                     max(0, min(int(position), maximum_position))
                 )
                 rect = self.chat_display.cursorRect(cursor)
-                if (
-                    rect.bottom() >= near_top
-                    and rect.top() <= near_bottom
+                if vertical_range_is_near_viewport(
+                    rect.top(),
+                    rect.bottom(),
+                    viewport_height,
                 ):
                     desired_urls.add(url)
                     break
