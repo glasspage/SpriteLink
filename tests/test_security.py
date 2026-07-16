@@ -18,6 +18,75 @@ sys.modules[SPEC.name] = SPRITELINK
 LOADER.exec_module(SPRITELINK)
 
 
+class LazyViewportMediaTests(unittest.TestCase):
+    def test_config_dropdowns_ignore_mouse_wheel_changes(self) -> None:
+        source = inspect.getsource(SPRITELINK.ThemeComboBox.wheelEvent)
+        self.assertIn("event.ignore()", source)
+        self.assertNotIn("setCurrentIndex", source)
+
+    def test_viewport_range_preloads_one_screen_each_direction(self) -> None:
+        self.assertEqual(SPRITELINK.VIEWPORT_MEDIA_PRELOAD_SCREENS, 1)
+        self.assertTrue(
+            SPRITELINK.vertical_range_is_near_viewport(-500, -450, 500)
+        )
+        self.assertTrue(
+            SPRITELINK.vertical_range_is_near_viewport(950, 1000, 500)
+        )
+        self.assertFalse(
+            SPRITELINK.vertical_range_is_near_viewport(-700, -501, 500)
+        )
+        self.assertFalse(
+            SPRITELINK.vertical_range_is_near_viewport(1001, 1050, 500)
+        )
+
+    def test_only_nearby_media_is_fetched_and_embedded(self) -> None:
+        viewport_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._update_viewport_media
+        )
+        self.assertIn("rendered_image_candidates", viewport_source)
+        self.assertIn("cursorRect", viewport_source)
+        self.assertIn(
+            "vertical_range_is_near_viewport",
+            viewport_source,
+        )
+        self.assertIn("_schedule_image_preview_fetch(url)", viewport_source)
+
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertIn("active_image_urls", insert_source)
+        self.assertIn("viewport_embedded_image_urls", insert_source)
+        self.assertNotIn("_schedule_image_preview_fetch", insert_source)
+
+    def test_scroll_resize_and_render_refresh_lazy_media(self) -> None:
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        self.assertIn("verticalScrollBar().valueChanged.connect", build_source)
+        event_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        self.assertIn("QEvent.Type.Resize", event_source)
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._render_message_log
+        )
+        self.assertIn("viewport_media_timer.start", render_source)
+
+    def test_far_animations_are_stopped_and_removed(self) -> None:
+        viewport_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._update_viewport_media
+        )
+        self.assertIn(
+            "cached_desired_urls != currently_rendered_urls",
+            viewport_source,
+        )
+        clear_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._clear_visible_room
+        )
+        self.assertIn("viewport_embedded_image_urls.clear()", clear_source)
+        self.assertIn("controller.stop()", clear_source)
+
+
 class BehaviorSettingsTests(unittest.TestCase):
     def test_behavior_defaults_and_history_options(self) -> None:
         config = SPRITELINK.default_config()
