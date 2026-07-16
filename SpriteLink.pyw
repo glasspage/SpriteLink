@@ -3673,19 +3673,24 @@ class EncryptedChatClient(QObject):
         self._tray_icon_is_notification = False
 
     def _mark_tray_notification(self) -> None:
-        if (
-            self.window_focused_event.is_set()
-            or not self.tray_icon.isVisible()
-        ):
+        if self.window_focused_event.is_set():
             return
         self._tray_notification_pending = True
+        if (
+            self.root.isVisible()
+            and not self.root.isMinimized()
+            and not self._tray_ui_suspended
+        ):
+            # Do not even query QSystemTrayIcon while the full window is
+            # visible. On Windows, touching Qt's native tray helper here can
+            # briefly expose its otherwise-hidden blank window.
+            return
+        if not self.tray_icon.isVisible():
+            return
         self._sync_tray_notification_icon()
 
     def _sync_tray_notification_icon(self) -> None:
-        if (
-            not self._tray_notification_pending
-            or not self.tray_icon.isVisible()
-        ):
+        if not self._tray_notification_pending:
             return
         if (
             self.root.isVisible()
@@ -3696,6 +3701,8 @@ class EncryptedChatClient(QObject):
             # hidden tray-helper window on Windows. The orange indicator is
             # needed while SpriteLink is minimized or hidden, not while the
             # full main window is already visible.
+            return
+        if not self.tray_icon.isVisible():
             return
         if not self._tray_notification_icon.isNull():
             self.tray_icon.setIcon(self._tray_notification_icon)
