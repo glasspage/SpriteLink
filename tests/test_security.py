@@ -242,14 +242,14 @@ class RuntimeOptimizationTests(unittest.TestCase):
                 window_focused=False,
                 tray_suspended=False,
             ),
-            10.0,
+            9.0,
         )
         self.assertEqual(
             SPRITELINK.polling_interval_seconds(
                 window_focused=False,
                 tray_suspended=True,
             ),
-            20.0,
+            12.0,
         )
         self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
@@ -294,13 +294,13 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertEqual(
             SPRITELINK.background_repayment_delay_seconds(
                 borrowed_seconds=6.0,
-                checks_remaining=3,
+                checks_remaining=6,
             ),
-            2.0,
+            1.0,
         )
         self.assertEqual(
             SPRITELINK.CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS,
-            3,
+            6,
         )
 
         self.assertEqual(
@@ -619,7 +619,7 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
                 inspect.getsource(method),
             )
 
-    def test_tray_state_selects_the_thirty_second_interval(self) -> None:
+    def test_tray_state_selects_the_tray_poll_interval(self) -> None:
         suspend_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._suspend_for_tray
         )
