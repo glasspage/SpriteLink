@@ -269,6 +269,8 @@ IMAGE_PREVIEW_CACHE_LIMIT = 128
 MAX_REMOTE_MEDIA_CACHE_BYTES = 64 * 1024 * 1024
 MAX_ACTIVE_ANIMATED_MEDIA = 12
 INLINE_MEDIA_NO_UPSCALE_EDGE = 64
+VIEWPORT_MEDIA_PRELOAD_SCREENS = 1
+VIEWPORT_MEDIA_UPDATE_DELAY_MS = 100
 MAX_UNCOMPRESSED_MESSAGE_BYTES = 32 * 1024
 MAX_ENCRYPTED_PACKET_CHARS = NTFY_MAX_BODY_BYTES - 1
 MESSAGE_AUTH_VERSION = 1
@@ -2321,7 +2323,12 @@ class ChatroomListWidget(QListWidget):
 
 
 class ThemeComboBox(QComboBox):
-    """Draw a guaranteed-visible Classic arrow above Qt's styled control."""
+    """Config combo box with Classic styling and no wheel changes."""
+
+    def wheelEvent(self, event: Any) -> None:
+        # Let a containing scroll area handle the wheel without changing the
+        # selected setting under the pointer.
+        event.ignore()
 
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
@@ -2784,6 +2791,8 @@ class EncryptedChatClient(QObject):
         self.rendered_tooltips: dict[str, str] = {}
         self.rendered_image_links: dict[str, str] = {}
         self.rendered_image_positions: dict[str, list[int]] = {}
+        self.rendered_image_candidates: dict[str, list[int]] = {}
+        self.viewport_embedded_image_urls: set[str] = set()
         self.image_preview_cache: dict[str, RemoteMediaPreview | None] = {}
         self.pending_image_previews: set[str] = set()
         self.animated_media_controllers: dict[
@@ -2908,6 +2917,12 @@ class EncryptedChatClient(QObject):
         self.compressed_message_sound_player: QMediaPlayer | None = None
         self.compressed_message_sound_name = ""
         self.compressed_message_sound_report_errors = False
+
+        self.viewport_media_timer = QTimer(self)
+        self.viewport_media_timer.setSingleShot(True)
+        self.viewport_media_timer.timeout.connect(
+            self._update_viewport_media
+        )
 
         self.chat_tooltip_timer = QTimer(self)
         self.chat_tooltip_timer.setSingleShot(True)
@@ -4004,6 +4019,11 @@ class EncryptedChatClient(QObject):
         self.chat_display.document().setDefaultTextOption(text_option)
         self.chat_display.viewport().setMouseTracking(True)
         self.chat_display.viewport().installEventFilter(self)
+        self.chat_display.verticalScrollBar().valueChanged.connect(
+            lambda _value: self.viewport_media_timer.start(
+                VIEWPORT_MEDIA_UPDATE_DELAY_MS
+            )
+        )
         content_layout.addWidget(self.chat_display, 1)
 
         composer_actions = QHBoxLayout()
@@ -6204,10 +6224,9 @@ class EncryptedChatClient(QObject):
                             oldest_url,
                             None,
                         )
-                    if media is not None and any(
-                        url in str(item.get("message", {}).get("m", ""))
-                        for item in self.message_log
-                        if isinstance(item, dict)
+                    if (
+                        media is not None
+                        and url in self.viewport_embedded_image_urls
                     ):
                         self._rerender_preserving_scroll()
 
@@ -6765,6 +6784,50 @@ class EncryptedChatClient(QObject):
         )
         menu.exec(global_position)
 
+    def _update_viewport_media(self) -> None:
+        if self._closing or not hasattr(self, "chat_display"):
+            return
+        viewport = self.chat_display.viewport()
+        viewport_height = max(1, viewport.height())
+        preload_margin = (
+            viewport_height * VIEWPORT_MEDIA_PRELOAD_SCREENS
+        )
+        near_top = -preload_margin
+        near_bottom = viewport_height + preload_margin
+        document = self.chat_display.document()
+        maximum_position = max(0, document.characterCount() - 1)
+        desired_urls: set[str] = set()
+
+        for url, positions in self.rendered_image_candidates.items():
+            for position in positions:
+                cursor = QTextCursor(document)
+                cursor.setPosition(
+                    max(0, min(int(position), maximum_position))
+                )
+                rect = self.chat_display.cursorRect(cursor)
+                if (
+                    rect.bottom() >= near_top
+                    and rect.top() <= near_bottom
+                ):
+                    desired_urls.add(url)
+                    break
+
+        self.viewport_embedded_image_urls = desired_urls
+        for url in desired_urls:
+            self._schedule_image_preview_fetch(url)
+
+        cached_desired_urls = {
+            url
+            for url in desired_urls
+            if isinstance(
+                self.image_preview_cache.get(url),
+                RemoteMediaPreview,
+            )
+        }
+        currently_rendered_urls = set(self.rendered_image_positions)
+        if cached_desired_urls != currently_rendered_urls:
+            self._rerender_preserving_scroll()
+
     def _schedule_image_preview_fetch(self, url: str) -> None:
         if (
             url in self.image_preview_cache
@@ -7002,7 +7065,12 @@ class EncryptedChatClient(QObject):
             hasattr(self, "chat_display")
             and watched is self.chat_display.viewport()
         ):
-            if event.type() == QEvent.Type.MouseMove:
+            if event.type() == QEvent.Type.Resize:
+                self.viewport_media_timer.start(
+                    VIEWPORT_MEDIA_UPDATE_DELAY_MS
+                )
+
+            elif event.type() == QEvent.Type.MouseMove:
                 anchor = self.chat_display.anchorAt(event.position().toPoint())
                 message_id = self._message_id_from_anchor(anchor)
 
@@ -7535,6 +7603,7 @@ class EncryptedChatClient(QObject):
         self.rendered_tooltips.clear()
         self.rendered_image_links.clear()
         self.rendered_image_positions.clear()
+        self.rendered_image_candidates.clear()
         self.chat_display.clear()
         self.chat_display.row_background_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
@@ -7639,6 +7708,9 @@ class EncryptedChatClient(QObject):
         if scroll_to_bottom:
             scrollbar = self.chat_display.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
+        self.viewport_media_timer.start(
+            VIEWPORT_MEDIA_UPDATE_DELAY_MS
+        )
 
     def _insert_message_item(
         self,
@@ -7714,6 +7786,22 @@ class EncryptedChatClient(QObject):
                 if url in embedded_image_url_set
             ]
         )
+        for image_url in image_urls:
+            self.rendered_image_candidates.setdefault(
+                image_url,
+                [],
+            ).append(message_start_position)
+        active_image_urls = [
+            image_url
+            for image_url in image_urls
+            if (
+                image_url in self.viewport_embedded_image_urls
+                and isinstance(
+                    self.image_preview_cache.get(image_url),
+                    RemoteMediaPreview,
+                )
+            )
+        ]
 
         username_color = (
             self._blend_toward_chat_background(original_color)
@@ -7766,13 +7854,13 @@ class EncryptedChatClient(QObject):
         top_align_height = 0
         if (
             not is_collapsed
-            and bool(image_urls)
+            and bool(active_image_urls)
             and not message_text_without_image_links(
                 display_text,
                 set(image_urls),
             ).strip()
         ):
-            for url in image_urls:
+            for url in active_image_urls:
                 cached_media = self.image_preview_cache.get(url)
                 if isinstance(cached_media, RemoteMediaPreview):
                     preview_height = self._embedded_media_preview(
@@ -7839,14 +7927,12 @@ class EncryptedChatClient(QObject):
             set(image_urls),
         )
         add_image_line_break = (
-            bool(image_urls)
+            bool(active_image_urls)
             and bool(visible_text_without_images.strip())
             and not visible_text_without_images.rstrip(" \t").endswith(
                 ("\n", "\r")
             )
         )
-        for image_url in image_urls:
-            self._schedule_image_preview_fetch(image_url)
         if is_collapsed:
             cursor.insertText(
                 display_text,
@@ -7871,7 +7957,7 @@ class EncryptedChatClient(QObject):
         cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
         if add_image_line_break:
             cursor.insertBlock()
-        for image_url in image_urls:
+        for image_url in active_image_urls:
             self._insert_embedded_image_preview(cursor, image_url)
 
         if item.get("warning") and not is_collapsed:
@@ -7949,6 +8035,13 @@ class EncryptedChatClient(QObject):
         self.rendered_tooltips.clear()
         self.rendered_image_links.clear()
         self.rendered_image_positions.clear()
+        self.rendered_image_candidates.clear()
+        self.viewport_embedded_image_urls.clear()
+        self.viewport_media_timer.stop()
+        for controller in self.animated_media_controllers.values():
+            controller.stop()
+        self.animated_media_controllers.clear()
+        self.last_inline_animation_frame_at.clear()
         self.chat_display.row_background_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
         self.chat_display.setExtraSelections([])
@@ -8181,6 +8274,7 @@ class EncryptedChatClient(QObject):
         QToolTip.hideText()
         self.update_check_timer.stop()
         self.background_history_prune_timer.stop()
+        self.viewport_media_timer.stop()
         self.message_sound_stop_timer.stop()
         self._stop_message_sound()
         self.tray_icon.hide()
