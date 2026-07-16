@@ -6673,11 +6673,22 @@ class EncryptedChatClient(QObject):
         self.subscription_refresh_event.set()
         with self.subscription_response_lock:
             response = self.subscription_response
-        if response is not None:
+        if response is None:
+            return
+
+        def close_response() -> None:
             try:
                 response.close()
             except Exception:
                 pass
+
+        # Closing a streaming requests response can wait for the socket reader.
+        # Never let a chatroom or server change block Qt's GUI thread.
+        threading.Thread(
+            target=close_response,
+            name="SpriteLinkSubscriptionRefreshClose",
+            daemon=True,
+        ).start()
 
     def _start_network_thread(self) -> None:
         if not self.network_thread or not self.network_thread.is_alive():

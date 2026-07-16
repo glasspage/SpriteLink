@@ -797,6 +797,40 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
                 inspect.getsource(method),
             )
 
+    def test_subscription_refresh_does_not_wait_for_stream_close(
+        self,
+    ) -> None:
+        close_started = SPRITELINK.threading.Event()
+        allow_close = SPRITELINK.threading.Event()
+
+        class BlockingResponse:
+            def close(self) -> None:
+                close_started.set()
+                allow_close.wait(2.0)
+
+        client = mock.Mock()
+        client.subscription_refresh_event = mock.Mock()
+        client.subscription_response_lock = SPRITELINK.threading.Lock()
+        client.subscription_response = BlockingResponse()
+
+        started_at = SPRITELINK.time.monotonic()
+        try:
+            SPRITELINK.EncryptedChatClient._request_subscription_refresh(
+                client
+            )
+            elapsed = SPRITELINK.time.monotonic() - started_at
+            self.assertLess(elapsed, 0.5)
+            client.subscription_refresh_event.set.assert_called_once_with()
+            self.assertTrue(close_started.wait(0.5))
+        finally:
+            allow_close.set()
+
+        refresh_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._request_subscription_refresh
+        )
+        self.assertIn('"SpriteLinkSubscriptionRefreshClose"', refresh_source)
+        self.assertIn("daemon=True", refresh_source)
+
     def test_tray_state_selects_the_tray_poll_interval(self) -> None:
         suspend_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._suspend_for_tray
