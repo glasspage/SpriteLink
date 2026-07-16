@@ -319,6 +319,21 @@ class RuntimeOptimizationTests(unittest.TestCase):
                 now=100.0,
                 poll_interval=10.0,
             ),
+            "active",
+        )
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "overdue", "urgent"],
+                active_room_id="active",
+                urgent_room_ids={"active", "urgent"},
+                last_poll_times={
+                    "active": 100.0,
+                    "overdue": 60.0,
+                    "urgent": 99.0,
+                },
+                now=110.0,
+                poll_interval=10.0,
+            ),
             "overdue",
         )
         self.assertEqual(
@@ -327,13 +342,27 @@ class RuntimeOptimizationTests(unittest.TestCase):
                 active_room_id="active",
                 urgent_room_ids={"active", "urgent"},
                 last_poll_times={
-                    "active": 95.0,
+                    "active": 100.0,
                     "urgent": 99.0,
                 },
-                now=100.0,
+                now=106.0,
                 poll_interval=10.0,
             ),
             "unchecked",
+        )
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "background"],
+                active_room_id="active",
+                urgent_room_ids=set(),
+                last_poll_times={
+                    "active": 88.0,
+                    "background": 99.0,
+                },
+                now=100.0,
+                poll_interval=6.0,
+            ),
+            "active",
         )
 
         self.assertFalse(
@@ -368,6 +397,15 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("subscription_room_queue", loop_source)
         self.assertNotIn("last_background_poll_at", loop_source)
         self.assertNotIn("wait(0.08)", loop_source)
+
+        subscription_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._subscription_loop
+        )
+        self.assertIn(
+            "SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS",
+            subscription_source,
+        )
+        self.assertNotIn('"since": "latest"', subscription_source)
 
         background_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._accept_background_messages
