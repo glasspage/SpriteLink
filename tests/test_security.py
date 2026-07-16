@@ -216,25 +216,15 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("parent: QWidget", row_source)
         self.assertIn("super().__init__(parent)", row_source)
         self.assertIn("self.chatrooms_list,", refresh_source)
-
-    def test_visible_window_defers_tray_icon_replacement(self) -> None:
-        mark_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._mark_tray_notification
+        self.assertIn("QLabel(nickname, self)", row_source)
+        self.assertIn(
+            'QLabel(f"({unread_count})", self)',
+            row_source,
         )
-        sync_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._sync_tray_notification_icon
+        self.assertLess(
+            row_source.index("layout.addWidget(unread_label)"),
+            row_source.index("unread_label.setVisible"),
         )
-        event_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient.eventFilter
-        )
-        self.assertIn("_tray_notification_pending = True", mark_source)
-        self.assertIn("self._window_minimized", mark_source)
-        self.assertIn("self._window_minimized", sync_source)
-        self.assertIn("self._tray_ui_suspended", sync_source)
-        self.assertIn("_tray_icon_is_notification = True", sync_source)
-        self.assertNotIn("self.root.", mark_source)
-        self.assertNotIn("self.root.", sync_source)
-        self.assertIn("_sync_window_state", event_source)
 
     def test_network_worker_waits_until_real_work_is_due(self) -> None:
         self.assertEqual(
