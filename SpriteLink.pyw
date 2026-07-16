@@ -8913,15 +8913,6 @@ class EncryptedChatClient(QObject):
                 top_align_height=top_align_height,
             ),
         )
-        message_continuation_indent = 0
-        if has_profile_icon:
-            message_continuation_indent = (
-                PROFILE_ICON_SIZE
-                + QFontMetrics(
-                    self._make_message_font(font_name)
-                ).horizontalAdvance(" ")
-            )
-
         visible_text_without_images = message_text_without_image_links(
             display_text,
             set(image_urls),
@@ -8968,21 +8959,16 @@ class EncryptedChatClient(QObject):
             )
 
         # Explicit newlines create additional QTextBlocks. Give every block
-        # the row color and username-aligned margin, then pull only the first
-        # line back for the profile icon to create a hanging indent.
+        # the same row color and left edge so continuations align with the
+        # profile icon, or with the username when no icon is present.
         document = cursor.document()
         block = document.findBlock(message_start_position)
-        first_message_block_number = block.blockNumber()
         final_block_number = cursor.block().blockNumber()
         while block.isValid() and block.blockNumber() <= final_block_number:
             block_cursor = QTextCursor(block)
             block_format = block.blockFormat()
-            block_format.setLeftMargin(10 + message_continuation_indent)
-            block_format.setTextIndent(
-                -message_continuation_indent
-                if block.blockNumber() == first_message_block_number
-                else 0
-            )
+            block_format.setLeftMargin(10)
+            block_format.setTextIndent(0)
             block_format.setRightMargin(10)
             block_format.setBackground(QColor(background_color))
             block_cursor.setBlockFormat(block_format)
