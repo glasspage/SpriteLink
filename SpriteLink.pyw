@@ -3512,6 +3512,8 @@ class EncryptedChatClient(QObject):
         return outlined_icon
 
     def _build_tray_icon(self) -> None:
+        self._tray_notification_pending = False
+        self._tray_icon_is_notification = False
         self._tray_normal_icon = QIcon(str(WINDOW_ICON_PATH))
         if self._tray_normal_icon.isNull():
             self._tray_normal_icon = self.root.windowIcon()
@@ -3662,9 +3664,13 @@ class EncryptedChatClient(QObject):
             QTimer.singleShot(0, self._sync_window_activity)
 
     def _clear_tray_notification(self) -> None:
+        self._tray_notification_pending = False
+        if not self._tray_icon_is_notification:
+            return
         if not self._tray_normal_icon.isNull():
             self.tray_icon.setIcon(self._tray_normal_icon)
         self.tray_icon.setToolTip(APP_NAME)
+        self._tray_icon_is_notification = False
 
     def _mark_tray_notification(self) -> None:
         if (
@@ -3672,9 +3678,29 @@ class EncryptedChatClient(QObject):
             or not self.tray_icon.isVisible()
         ):
             return
+        self._tray_notification_pending = True
+        self._sync_tray_notification_icon()
+
+    def _sync_tray_notification_icon(self) -> None:
+        if (
+            not self._tray_notification_pending
+            or not self.tray_icon.isVisible()
+        ):
+            return
+        if (
+            self.root.isVisible()
+            and not self.root.isMinimized()
+            and not self._tray_ui_suspended
+        ):
+            # Replacing a visible QSystemTrayIcon can briefly expose Qt's
+            # hidden tray-helper window on Windows. The orange indicator is
+            # needed while SpriteLink is minimized or hidden, not while the
+            # full main window is already visible.
+            return
         if not self._tray_notification_icon.isNull():
             self.tray_icon.setIcon(self._tray_notification_icon)
         self.tray_icon.setToolTip(f"{APP_NAME} — new messages")
+        self._tray_icon_is_notification = True
 
     def _on_tray_icon_activated(
         self,
@@ -7777,6 +7803,7 @@ class EncryptedChatClient(QObject):
                 self.network_wakeup_event.set()
             elif event.type() == QEvent.Type.WindowStateChange:
                 QTimer.singleShot(0, self._sync_window_activity)
+                QTimer.singleShot(0, self._sync_tray_notification_icon)
 
         if (
             watched is getattr(self, "chat_content", None)
