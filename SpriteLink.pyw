@@ -3587,6 +3587,8 @@ class EncryptedChatClient(QObject):
         )
         if self._tray_available():
             self.tray_icon.show()
+            if self._has_unread_messages():
+                self._mark_tray_notification()
 
     def _tray_available(self) -> bool:
         return (
