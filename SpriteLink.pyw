@@ -3667,10 +3667,7 @@ class EncryptedChatClient(QObject):
         self.tray_icon.setToolTip(APP_NAME)
 
     def _mark_tray_notification(self) -> None:
-        if (
-            self.window_focused_event.is_set()
-            or not self.tray_icon.isVisible()
-        ):
+        if not self.tray_icon.isVisible():
             return
         if not self._tray_notification_icon.isNull():
             self.tray_icon.setIcon(self._tray_notification_icon)
