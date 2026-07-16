@@ -563,7 +563,11 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
         )
 
         self.assertIn('topics = ",".join(topic_rooms)', stream_source)
-        self.assertIn('params={"since": "latest"}', stream_source)
+        self.assertIn(
+            "SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS",
+            stream_source,
+        )
+        self.assertNotIn('"since": "latest"', stream_source)
         self.assertIn("stream=True", stream_source)
         self.assertIn("response.iter_lines()", stream_source)
         self.assertIn("subscription_room_ids(", stream_source)
