@@ -193,6 +193,7 @@ except ImportError:
 
 UPDATE_REPOSITORY = "glasspage/SpriteLink"
 UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000
+CONNECTION_ERROR_DELAY_MS = 15 * 1000
 UPDATE_DIRECTORY = Path(
     os.environ.get("LOCALAPPDATA")
     or os.environ.get("APPDATA")
@@ -242,6 +243,15 @@ def notification_button_stylesheet(windows_classic: bool) -> str:
         if windows_classic
         else NOTIFICATION_BUTTON_STYLESHEET
     )
+
+
+def chatroom_connection_label(
+    room_name: str,
+    *,
+    connection_error: bool,
+) -> str:
+    suffix = " - Connection error" if connection_error else ""
+    return f"{room_name}{suffix}"
 
 
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
@@ -3229,6 +3239,7 @@ class EncryptedChatClient(QObject):
         self._config_snapshot_at_open: tuple[Any, ...] | None = None
         self._message_font_cache: dict[tuple[str, bool, bool], QFont] = {}
         self._loading_profile_controls = False
+        self._connection_error_visible = False
         self.active_chatroom_id = str(
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
         )
@@ -3283,6 +3294,13 @@ class EncryptedChatClient(QObject):
             bool(self.config_data["minimize_to_tray"])
         )
         self.status_var = ValueModel("Connecting")
+
+        self.connection_error_timer = QTimer(self)
+        self.connection_error_timer.setSingleShot(True)
+        self.connection_error_timer.setInterval(CONNECTION_ERROR_DELAY_MS)
+        self.connection_error_timer.timeout.connect(
+            self._show_connection_error_if_still_disconnected
+        )
 
         self.profile_save_timer = QTimer(self)
         self.profile_save_timer.setSingleShot(True)
@@ -3998,8 +4016,49 @@ class EncryptedChatClient(QObject):
         return identity_client_id(self._identity_private_key())
 
     def _update_window_title(self) -> None:
+        self.root.setWindowTitle(APP_NAME)
+        self._update_connection_status_label()
+
+    def _update_connection_status_label(self) -> None:
+        if not hasattr(self, "status_label"):
+            return
         room_name = self._active_chatroom()["nickname"]
-        self.root.setWindowTitle(f"{APP_NAME} ({room_name})")
+        self.status_label.setText(chatroom_connection_label(
+            room_name,
+            connection_error=self._connection_error_visible,
+        ))
+
+    def _connection_error_timer_should_run(self) -> bool:
+        return (
+            str(self.status_var.get()) != "Connected"
+            and self.window_focused_event.is_set()
+            and self.root.isActiveWindow()
+        )
+
+    def _sync_connection_error_timer(self) -> None:
+        if str(self.status_var.get()) == "Connected":
+            self.connection_error_timer.stop()
+            self._connection_error_visible = False
+        elif not self._connection_error_timer_should_run():
+            self.connection_error_timer.stop()
+        elif (
+            not self._connection_error_visible
+            and not self.connection_error_timer.isActive()
+        ):
+            self.connection_error_timer.start()
+        self._update_connection_status_label()
+
+    def _show_connection_error_if_still_disconnected(self) -> None:
+        if self._connection_error_timer_should_run():
+            self._connection_error_visible = True
+        self._update_connection_status_label()
+
+    def _on_connection_status_changed(self, _status: Any) -> None:
+        self._sync_connection_error_timer()
+
+    def _restart_connection_error_delay(self) -> None:
+        self.connection_error_timer.stop()
+        self._sync_connection_error_timer()
 
     def _identity_presets(self) -> list[dict[str, str]]:
         raw_presets = self.config_data.get("identity_presets", [])
@@ -4532,6 +4591,7 @@ class EncryptedChatClient(QObject):
         self._load_saved_history_for_current_room()
         self.connected = False
         self.status_var.set("Connecting")
+        self._restart_connection_error_delay()
         self._request_network_refresh(
             poll_immediately=poll_immediately
         )
@@ -4556,13 +4616,11 @@ class EncryptedChatClient(QObject):
         status_layout.addWidget(self.chatrooms_toggle)
         self._update_chatrooms_toggle_unread_style()
 
-        status_layout.addWidget(QLabel("Status:"))
-
         self.status_label = QLabel()
         self.status_label.setFont(
             self._make_font("Segoe UI", 9, bold=True)
         )
-        self.status_var.bind(self.status_label.setText)
+        self.status_var.bind(self._on_connection_status_changed)
         status_layout.addWidget(self.status_label)
         status_layout.addStretch(1)
 
@@ -6020,6 +6078,7 @@ class EncryptedChatClient(QObject):
             room["id"] for room in self._chatroom_definitions()
         )
         self.status_var.set("Reconnecting")
+        self._restart_connection_error_delay()
         self._request_subscription_refresh()
         self._request_network_refresh(poll_immediately=True)
         return True
@@ -7966,11 +8025,13 @@ class EncryptedChatClient(QObject):
             if event.type() == QEvent.Type.WindowActivate:
                 self.window_focused_event.set()
                 self.network_wakeup_event.set()
+                self._sync_connection_error_timer()
                 if hasattr(self, "tray_icon"):
                     self._clear_tray_notification_if_no_unread()
             elif event.type() == QEvent.Type.WindowDeactivate:
                 self.window_focused_event.clear()
                 self.network_wakeup_event.set()
+                self._sync_connection_error_timer()
             elif event.type() == QEvent.Type.WindowStateChange:
                 QTimer.singleShot(0, self._sync_window_activity)
 
@@ -9242,6 +9303,7 @@ class EncryptedChatClient(QObject):
         self.background_history_prune_timer.stop()
         self.viewport_media_timer.stop()
         self.message_sound_stop_timer.stop()
+        self.connection_error_timer.stop()
         self._release_message_sound_resources()
         self.tray_icon.hide()
 
