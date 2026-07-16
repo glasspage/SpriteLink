@@ -232,6 +232,14 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("not self.root.isMinimized()", sync_source)
         self.assertIn("self._tray_ui_suspended", sync_source)
         self.assertIn("_tray_icon_is_notification = True", sync_source)
+        self.assertLess(
+            mark_source.index("self.root.isVisible()"),
+            mark_source.index("self.tray_icon.isVisible()"),
+        )
+        self.assertLess(
+            sync_source.index("self.root.isVisible()"),
+            sync_source.index("self.tray_icon.isVisible()"),
+        )
         self.assertIn("_sync_tray_notification_icon", event_source)
 
     def test_network_worker_waits_until_real_work_is_due(self) -> None:
