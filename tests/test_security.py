@@ -211,15 +211,24 @@ class BehaviorSettingsTests(unittest.TestCase):
 
 
 class RuntimeOptimizationTests(unittest.TestCase):
-    def test_wrapped_messages_keep_body_indent_and_row_background(self) -> None:
+    def test_wrapped_messages_align_to_username_and_keep_background(self) -> None:
         source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_message_item
         )
-        self.assertIn("message_body_indent", source)
-        self.assertIn("setLeftMargin(10 + message_body_indent)", source)
+        self.assertIn("message_continuation_indent", source)
+        self.assertIn("PROFILE_ICON_SIZE", source)
+        self.assertNotIn("horizontalAdvance(username)", source)
+        self.assertIn(
+            "setLeftMargin(10 + message_continuation_indent)",
+            source,
+        )
         self.assertIn("setTextIndent(", source)
-        self.assertIn("-message_body_indent", source)
+        self.assertIn("-message_continuation_indent", source)
         self.assertIn("setBackground(QColor(background_color))", source)
+
+        paint_source = inspect.getsource(SPRITELINK.MessageLogBrowser.paintEvent)
+        self.assertIn("block.blockFormat().rightMargin()", paint_source)
+        self.assertIn("viewport_width - right_width", paint_source)
 
     def test_status_line_uses_chatroom_name_and_delayed_error(self) -> None:
         self.assertEqual(
