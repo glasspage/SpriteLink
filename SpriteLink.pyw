@@ -39,6 +39,7 @@ import threading
 import time
 import traceback
 import sys
+import unicodedata
 import uuid
 import zlib
 from urllib.parse import parse_qs, urljoin, urlsplit
@@ -291,6 +292,8 @@ VIEWPORT_MEDIA_PRELOAD_SCREENS = 1
 VIEWPORT_MEDIA_UPDATE_DELAY_MS = 100
 MAX_UNCOMPRESSED_MESSAGE_BYTES = 32 * 1024
 MAX_ENCRYPTED_PACKET_CHARS = NTFY_MAX_BODY_BYTES - 1
+MAX_DECRYPT_ATTEMPTS_PER_POLL = 25
+MESSAGE_CLOCK_TOLERANCE_SECONDS = 10 * 60
 MESSAGE_AUTH_VERSION = 1
 ED25519_PRIVATE_KEY_BYTES = 32
 ED25519_PUBLIC_KEY_BYTES = 32
@@ -422,7 +425,7 @@ LIKELY_NSFW_IMAGE_DOMAINS = (
     "xbooru.com",
     "yande.re",
 )
-MESSAGE_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+MESSAGE_URL_PATTERN = re.compile(r"https://[^\s<>\"']+", re.IGNORECASE)
 MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
 DEFAULT_MESSAGE_FONT = "Segoe UI"
@@ -743,6 +746,49 @@ def normalize_profile_icon(value: Any, fallback: str = "") -> str:
     return encoded
 
 
+FORBIDDEN_USERNAME_UNICODE_CATEGORIES = frozenset({
+    "Cc",  # Control characters, including tabs and CR/LF.
+    "Cf",  # Formatting controls, including zero-width and bidi controls.
+    "Cs",  # Lone UTF-16 surrogate code points.
+    "Zl",  # Unicode line separator.
+    "Zp",  # Unicode paragraph separator.
+})
+FORBIDDEN_USERNAME_BIDI_CLASSES = frozenset({
+    "LRE",
+    "RLE",
+    "LRO",
+    "RLO",
+    "PDF",
+    "LRI",
+    "RLI",
+    "FSI",
+    "PDI",
+})
+
+
+def is_forbidden_username_character(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        unicodedata.category(character)
+        in FORBIDDEN_USERNAME_UNICODE_CATEGORIES
+        or unicodedata.bidirectional(character)
+        in FORBIDDEN_USERNAME_BIDI_CLASSES
+        or codepoint == 0x034F  # Combining grapheme joiner.
+        or 0x180B <= codepoint <= 0x180F
+        or 0xFE00 <= codepoint <= 0xFE0F
+        or 0xE0100 <= codepoint <= 0xE01EF
+    )
+
+
+def sanitize_username(value: Any, fallback: str = "User") -> str:
+    cleaned = "".join(
+        character
+        for character in str(value)
+        if not is_forbidden_username_character(character)
+    ).strip()
+    return cleaned[:32] or fallback
+
+
 def default_room_profile() -> dict[str, str]:
     return {
         "username": "User",
@@ -768,9 +814,10 @@ def normalize_identity_preset(value: Any) -> dict[str, str]:
     preset_id = str(raw.get("id", fallback["id"])).strip()
     if not preset_id:
         preset_id = fallback["id"]
-    username = str(raw.get("username", fallback["username"])).strip()
-    if not username:
-        username = fallback["username"]
+    username = sanitize_username(
+        raw.get("username", fallback["username"]),
+        fallback["username"],
+    )
     username_color = QColor(
         str(raw.get("username_color", fallback["username_color"]))
     )
@@ -782,7 +829,7 @@ def normalize_identity_preset(value: Any) -> dict[str, str]:
     )
     return {
         "id": preset_id[:64],
-        "username": username[:32],
+        "username": username,
         "username_color": username_color.name(),
         "profile_icon": profile_icon,
     }
@@ -813,9 +860,10 @@ def normalize_room_profile(
     base = dict(fallback or default_room_profile())
     raw = profile if isinstance(profile, dict) else {}
 
-    username = str(raw.get("username", base["username"])).strip()
-    if not username:
-        username = base["username"]
+    username = sanitize_username(
+        raw.get("username", base["username"]),
+        base["username"],
+    )
 
     username_color = QColor(
         str(raw.get("username_color", base["username_color"]))
@@ -845,7 +893,7 @@ def normalize_room_profile(
     ).strip()[:64]
 
     return {
-        "username": username[:32],
+        "username": username,
         "username_color": username_color.name(),
         "font": font,
         "text_color": text_color.name(),
@@ -1012,7 +1060,7 @@ def is_direct_image_url(url: str) -> bool:
     )
     hostname = (parsed.hostname or "").casefold().rstrip(".")
     return (
-        parsed.scheme.casefold() in {"http", "https"}
+        parsed.scheme.casefold() == "https"
         and (
             parsed.path.casefold().endswith(IMAGE_LINK_EXTENSIONS)
             or f".{query_format}" in IMAGE_LINK_EXTENSIONS
@@ -1053,7 +1101,7 @@ def is_tenor_video_url(url: str) -> bool:
         return False
     hostname = (parsed.hostname or "").casefold().rstrip(".")
     return (
-        parsed.scheme.casefold() in {"http", "https"}
+        parsed.scheme.casefold() == "https"
         and hostname in TENOR_MEDIA_HOSTS
         and _url_has_video_extension(parsed)
     )
@@ -1340,7 +1388,15 @@ def identity_client_id(encoded_private_key: str) -> str:
 
 
 def visible_user_id(client_id: str) -> str:
-    return str(client_id)[:VISIBLE_USER_ID_CHARS].upper()
+    normalized_client_id = str(client_id).strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", normalized_client_id):
+        return ""
+    digest = bytes.fromhex(normalized_client_id)
+    return (
+        base64.b32encode(digest)
+        .decode("ascii")
+        .rstrip("=")[:VISIBLE_USER_ID_CHARS]
+    )
 
 
 def _signed_message_payload(
@@ -2027,6 +2083,27 @@ def parse_ntfy_ndjson(response: requests.Response) -> list[dict[str, Any]]:
 
     return records
 
+
+def newest_first_ntfy_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    def sort_key(
+        indexed_record: tuple[int, dict[str, Any]],
+    ) -> tuple[int, int]:
+        record_index, record = indexed_record
+        record_time = record.get("time")
+        if type(record_time) is not int:
+            record_time = -1
+        return record_time, record_index
+
+    return [
+        record
+        for _index, record in sorted(
+            enumerate(records),
+            key=sort_key,
+            reverse=True,
+        )
+    ]
 
 
 class ValueModel:
@@ -2885,6 +2962,10 @@ class EncryptedChatClient(QObject):
         self.network_control_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.ui_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.send_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.pending_ntfy_poll_batches: dict[
+            str,
+            dict[str, Any],
+        ] = {}
 
         self.network_thread: threading.Thread | None = None
         self.connected = False
@@ -4556,7 +4637,7 @@ class EncryptedChatClient(QObject):
         if self._loading_profile_controls:
             return
         preset = self._active_identity_preset()
-        preset["username"] = value.strip()[:32] or "User"
+        preset["username"] = sanitize_username(value)
         self._commit_identity_preset_changes(preset)
 
     def _normalize_identity_username_entry(self) -> None:
@@ -6186,62 +6267,105 @@ class EncryptedChatClient(QObject):
         try:
             topic = derive_ntfy_topic(encryption_key)
             scope_id = room_scope_id(server_url, encryption_key)
+            for pending_scope_id, pending_batch in tuple(
+                self.pending_ntfy_poll_batches.items()
+            ):
+                if (
+                    pending_scope_id != scope_id
+                    and pending_batch.get("room_id") == room_id
+                ):
+                    self.pending_ntfy_poll_batches.pop(
+                        pending_scope_id,
+                        None,
+                    )
+
             state = self.config_data.setdefault("room_state", {}).setdefault(
                 scope_id,
                 {},
             )
-            was_initial_history_scan = (
-                room_id in self.initial_history_pending_rooms
-            )
-            since_value = self._current_poll_since(state, room_id)
-
-            response = self.session.get(
-                f"{server_url}/{topic}/json",
-                params={
-                    "poll": "1",
-                    "since": since_value,
-                },
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            records = parse_ntfy_ndjson(response)
-            if self._find_chatroom(room_id) is None:
-                return
-            self.initial_history_pending_rooms.discard(room_id)
-
-            if was_initial_history_scan:
-                completed_at = int(time.time())
-                state["history_scan_start_time"] = max(
-                    0,
-                    completed_at - AUTO_HISTORY_SECONDS,
+            pending_batch = self.pending_ntfy_poll_batches.get(scope_id)
+            if pending_batch is None:
+                was_initial_history_scan = (
+                    room_id in self.initial_history_pending_rooms
                 )
-                state["history_scan_completed_at"] = completed_at
+                response = self.session.get(
+                    f"{server_url}/{topic}/json",
+                    params={
+                        "poll": "1",
+                        "since": self._current_poll_since(state, room_id),
+                    },
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                records = newest_first_ntfy_records(
+                    parse_ntfy_ndjson(response)
+                )
+                if self._find_chatroom(room_id) is None:
+                    return
 
+                newest_record_id: str | None = None
+                newest_record_time = int(
+                    state.get("newest_time", 0) or 0
+                )
+                for record in records:
+                    ntfy_id = record.get("id")
+                    ntfy_time = record.get("time")
+                    if (
+                        isinstance(ntfy_id, str)
+                        and bool(ntfy_id)
+                        and type(ntfy_time) is int
+                    ):
+                        newest_record_id = ntfy_id
+                        newest_record_time = max(
+                            newest_record_time,
+                            ntfy_time,
+                        )
+                        break
+
+                pending_batch = {
+                    "room_id": room_id,
+                    "records": records,
+                    "newest_ntfy_id": newest_record_id,
+                    "newest_time": newest_record_time,
+                    "history_scan": was_initial_history_scan,
+                }
+                self.pending_ntfy_poll_batches[scope_id] = pending_batch
+
+            records = pending_batch.get("records", [])
+            if not isinstance(records, list):
+                records = []
+            was_initial_history_scan = bool(
+                pending_batch.get("history_scan", False)
+            )
             decoded_messages: list[dict[str, Any]] = []
             failed_decryptions = 0
-            newest_record_id: str | None = None
-            newest_record_time = int(state.get("newest_time", 0) or 0)
+            decrypt_attempts = 0
+            remaining_records: list[dict[str, Any]] = []
 
-            for record in records:
+            for record_index, record in enumerate(records):
+                if not isinstance(record, dict):
+                    continue
                 ntfy_id = record.get("id")
                 ntfy_time = record.get("time")
                 packet = record.get("message")
 
-                if not isinstance(ntfy_id, str):
+                if not isinstance(ntfy_id, str) or not ntfy_id:
                     continue
-                if not isinstance(ntfy_time, int):
+                if type(ntfy_time) is not int:
                     continue
                 if not isinstance(packet, str):
                     continue
+                if decrypt_attempts >= MAX_DECRYPT_ATTEMPTS_PER_POLL:
+                    remaining_records.extend(records[record_index:])
+                    break
 
-                newest_record_id = ntfy_id
-                newest_record_time = max(newest_record_time, ntfy_time)
-
+                decrypt_attempts += 1
                 try:
                     message = open_opaque_packet(packet, encryption_key)
                     self._validate_decrypted_message(
                         message,
                         encryption_key,
+                        ntfy_time=ntfy_time,
                     )
                 except Exception:
                     failed_decryptions += 1
@@ -6253,15 +6377,32 @@ class EncryptedChatClient(QObject):
                     "message": message,
                 })
 
-            if newest_record_id:
-                state["newest_ntfy_id"] = newest_record_id
-                state["newest_time"] = newest_record_time
+            pending_batch["records"] = remaining_records
+            batch_complete = not remaining_records
 
-            if newest_record_id or was_initial_history_scan:
-                try:
-                    save_config(self.config_data)
-                except Exception:
-                    pass
+            if batch_complete:
+                self.pending_ntfy_poll_batches.pop(scope_id, None)
+                newest_record_id = pending_batch.get("newest_ntfy_id")
+                if isinstance(newest_record_id, str) and newest_record_id:
+                    state["newest_ntfy_id"] = newest_record_id
+                    state["newest_time"] = int(
+                        pending_batch.get("newest_time", 0) or 0
+                    )
+
+                if was_initial_history_scan:
+                    self.initial_history_pending_rooms.discard(room_id)
+                    completed_at = int(time.time())
+                    state["history_scan_start_time"] = max(
+                        0,
+                        completed_at - AUTO_HISTORY_SECONDS,
+                    )
+                    state["history_scan_completed_at"] = completed_at
+
+                if newest_record_id or was_initial_history_scan:
+                    try:
+                        save_config(self.config_data)
+                    except Exception:
+                        pass
 
             if (
                 is_active
@@ -6274,7 +6415,10 @@ class EncryptedChatClient(QObject):
                     ("Connected", server_url, room_id),
                 ))
 
-            if decoded_messages or was_initial_history_scan:
+            if (
+                decoded_messages
+                or (was_initial_history_scan and batch_complete)
+            ):
                 self._queue_ui_event((
                     "messages",
                     {
@@ -6298,10 +6442,13 @@ class EncryptedChatClient(QObject):
                     ("Disconnected", str(exc), room_id),
                 ))
 
+
     @staticmethod
     def _validate_decrypted_message(
         message: dict[str, Any],
         encryption_key: str,
+        *,
+        ntfy_time: int | None = None,
     ) -> None:
         required = {
             "a": int,
@@ -6330,6 +6477,8 @@ class EncryptedChatClient(QObject):
             raise ValueError("Client ID is invalid.")
         if len(message["u"]) > 32:
             raise ValueError("Username is too long.")
+        if message["u"] != sanitize_username(message["u"], ""):
+            raise ValueError("Username contains unsupported characters.")
         if len(message["m"]) > MAX_MESSAGE_CHARS:
             raise ValueError("Message text is too long.")
         if not QColor(message["k"]).isValid():
@@ -6353,6 +6502,17 @@ class EncryptedChatClient(QObject):
             decode_profile_icon(profile_icon)
 
         verify_message_identity(message, encryption_key)
+
+        if ntfy_time is not None:
+            if type(ntfy_time) is not int:
+                raise ValueError("Ntfy record time has the wrong type.")
+            if (
+                abs(message["t"] - ntfy_time)
+                > MESSAGE_CLOCK_TOLERANCE_SECONDS
+            ):
+                raise ValueError(
+                    "Signed message time differs too far from Ntfy time."
+                )
 
     def _queue_ui_event(self, event: tuple[str, Any]) -> None:
         self.ui_queue.put(event)
@@ -6705,10 +6865,18 @@ class EncryptedChatClient(QObject):
             if not isinstance(message, dict):
                 continue
 
+            stored_ntfy_time = int(
+                item.get("ntfy_time", message.get("t", 0)) or 0
+            )
             try:
                 self._validate_decrypted_message(
                     message,
                     encryption_key,
+                    ntfy_time=(
+                        stored_ntfy_time
+                        if stored_ntfy_time > 0
+                        else None
+                    ),
                 )
             except Exception:
                 continue
@@ -6731,7 +6899,7 @@ class EncryptedChatClient(QObject):
                 ),
                 "warning": None,
                 "ntfy_id": ntfy_id,
-                "ntfy_time": int(item.get("ntfy_time", message.get("t", 0)) or 0),
+                "ntfy_time": stored_ntfy_time,
             })
 
         self.message_log.sort(key=self._message_sort_key)
@@ -7017,21 +7185,30 @@ class EncryptedChatClient(QObject):
     @staticmethod
     def _open_url_in_browser(url: str) -> None:
         parsed = QUrl(url)
-        if parsed.isValid() and parsed.scheme().casefold() in {"http", "https"}:
+        if parsed.isValid() and parsed.scheme().casefold() == "https":
             QDesktopServices.openUrl(parsed)
 
     def _image_url_from_anchor(self, anchor: str) -> str | None:
         prefix = "spritelink-image:"
         if not anchor.startswith(prefix):
             return None
-        return self.rendered_image_links.get(anchor[len(prefix):])
+        image_url = self.rendered_image_links.get(anchor[len(prefix):])
+        if not image_url:
+            return None
+        try:
+            parsed = urlsplit(image_url)
+        except ValueError:
+            return None
+        if parsed.scheme.casefold() != "https":
+            return None
+        return image_url
 
     def _link_url_from_anchor(self, anchor: str) -> str | None:
         image_url = self._image_url_from_anchor(anchor)
         if image_url:
             return image_url
         parsed = QUrl(anchor)
-        if parsed.isValid() and parsed.scheme().casefold() in {"http", "https"}:
+        if parsed.isValid() and parsed.scheme().casefold() == "https":
             return anchor
         return None
 
