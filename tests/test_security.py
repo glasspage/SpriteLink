@@ -208,6 +208,15 @@ class BehaviorSettingsTests(unittest.TestCase):
 
 
 class RuntimeOptimizationTests(unittest.TestCase):
+    def test_chatroom_unread_rows_are_never_top_level_windows(self) -> None:
+        row_source = inspect.getsource(SPRITELINK.ChatroomListRow.__init__)
+        refresh_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._refresh_chatroom_list
+        )
+        self.assertIn("parent: QWidget", row_source)
+        self.assertIn("super().__init__(parent)", row_source)
+        self.assertIn("self.chatrooms_list,", refresh_source)
+
     def test_network_worker_waits_until_real_work_is_due(self) -> None:
         self.assertEqual(
             SPRITELINK.polling_interval_seconds(
