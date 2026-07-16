@@ -287,10 +287,12 @@ THEMES = (
     "Windows Classic",
 )
 
-FOCUSED_ACTIVE_POLL_INTERVAL_SECONDS = 6.0
-UNFOCUSED_ACTIVE_POLL_INTERVAL_SECONDS = 15.0
-FOCUSED_BACKGROUND_POLL_INTERVAL_SECONDS = 30.0
-UNFOCUSED_BACKGROUND_POLL_INTERVAL_SECONDS = 45.0
+FOCUSED_POLL_INTERVAL_SECONDS = 6.0
+UNFOCUSED_POLL_INTERVAL_SECONDS = 15.0
+TRAY_POLL_INTERVAL_SECONDS = 30.0
+SUBSCRIPTION_RECONNECT_DELAY_SECONDS = 1.0
+SUBSCRIPTION_READ_TIMEOUT_SECONDS = 75
+MAX_SUBSCRIPTION_SIGNAL_QUEUE = 1024
 CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
 IMMEDIATE_CHATROOM_SWITCH_LIMIT = 2
 REQUEST_TIMEOUT_SECONDS = 10
@@ -2541,37 +2543,51 @@ def vertical_range_is_near_viewport(
     )
 
 
+def polling_interval_seconds(
+    *,
+    window_focused: bool,
+    tray_suspended: bool,
+) -> float:
+    if tray_suspended:
+        return TRAY_POLL_INTERVAL_SECONDS
+    if window_focused:
+        return FOCUSED_POLL_INTERVAL_SECONDS
+    return UNFOCUSED_POLL_INTERVAL_SECONDS
+
+
 def network_idle_wait_seconds(
     *,
     now: float,
-    active_last_polled: float | None,
-    background_last_polled: float | None,
-    active_interval: float,
-    background_interval: float,
-    has_background_rooms: bool,
-    force_active_poll: bool = False,
-    deferred_active_poll_started_at: float | None = None,
+    last_poll_times: dict[str, float],
+    room_ids: list[str],
+    poll_interval: float,
+    has_urgent_poll: bool = False,
 ) -> float:
-    if force_active_poll:
+    if has_urgent_poll:
         return 0.0
-    active_ready_at = (
-        now
-        if active_last_polled is None
-        else active_last_polled + max(0.0, active_interval)
-    )
-    if deferred_active_poll_started_at is not None:
-        active_ready_at = max(
-            active_ready_at,
-            deferred_active_poll_started_at + max(0.0, active_interval),
-        )
-    deadlines = [active_ready_at]
-    if has_background_rooms:
-        deadlines.append(
+    if not room_ids:
+        return min(60.0, max(0.01, poll_interval))
+    ready_times = [
+        (
             now
-            if background_last_polled is None
-            else background_last_polled + max(0.0, background_interval)
+            if room_id not in last_poll_times
+            else last_poll_times[room_id] + max(0.0, poll_interval)
         )
-    return max(0.0, min(60.0, min(deadlines) - now))
+        for room_id in room_ids
+    ]
+    return max(0.0, min(60.0, min(ready_times) - now))
+
+
+def subscription_room_ids(
+    record: dict[str, Any],
+    topic_rooms: dict[str, tuple[str, ...]],
+) -> tuple[str, ...]:
+    if record.get("event") != "message":
+        return ()
+    topic = record.get("topic")
+    if not isinstance(topic, str):
+        return ()
+    return topic_rooms.get(topic, ())
 
 
 class ThemeComboBox(QComboBox):
@@ -3053,20 +3069,33 @@ class EncryptedChatClient(QObject):
             "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
             "Accept": "application/json, application/x-ndjson",
         })
+        self.subscription_session = requests.Session()
+        self.subscription_session.headers.update({
+            "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
+            "Accept": "application/x-ndjson, application/json",
+        })
 
         self.stop_event = threading.Event()
         self.network_wakeup_event = threading.Event()
         self.window_focused_event = threading.Event()
         self.window_focused_event.set()
+        self.tray_mode_event = threading.Event()
+        self.subscription_refresh_event = threading.Event()
+        self.subscription_response_lock = threading.Lock()
+        self.subscription_response: requests.Response | None = None
         self.network_control_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.ui_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.send_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.subscription_room_queue: queue.Queue[str] = queue.Queue(
+            maxsize=MAX_SUBSCRIPTION_SIGNAL_QUEUE
+        )
         self.pending_ntfy_poll_batches: dict[
             str,
             dict[str, Any],
         ] = {}
 
         self.network_thread: threading.Thread | None = None
+        self.subscription_thread: threading.Thread | None = None
         self.connected = False
 
         self.seen_client_message_ids: set[str] = set()
@@ -3555,6 +3584,8 @@ class EncryptedChatClient(QObject):
         if self._tray_ui_suspended:
             return
         self._tray_ui_suspended = True
+        self.tray_mode_event.set()
+        self.network_wakeup_event.set()
         self.viewport_media_timer.stop()
         self._hide_chat_tooltip()
         if self.image_preview_overlay.isVisible():
@@ -3584,6 +3615,8 @@ class EncryptedChatClient(QObject):
         if not self._tray_ui_suspended:
             return
         self._tray_ui_suspended = False
+        self.tray_mode_event.clear()
+        self.network_wakeup_event.set()
         self.root.setUpdatesEnabled(True)
         self._render_message_log(scroll_to_bottom=True)
         self._sync_window_activity()
@@ -4135,6 +4168,7 @@ class EncryptedChatClient(QObject):
             )
             return
 
+        self._request_subscription_refresh()
         self._refresh_chatroom_list()
         self._activate_chatroom(room_id)
 
@@ -4221,6 +4255,8 @@ class EncryptedChatClient(QObject):
             )
             return
 
+        if key_changed:
+            self._request_subscription_refresh()
         if room_id == self.active_chatroom_id and key_changed:
             self._switch_active_chatroom()
         else:
@@ -4301,6 +4337,7 @@ class EncryptedChatClient(QObject):
         self._unread_counts().pop(room_id, None)
         self.config_data.get("room_profiles", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
+        self._request_subscription_refresh()
 
         if self.active_chatroom_id == room_id:
             self.active_chatroom_id = GLOBAL_CHATROOM_ID
@@ -5854,6 +5891,7 @@ class EncryptedChatClient(QObject):
             room["id"] for room in self._chatroom_definitions()
         )
         self.status_var.set("Reconnecting")
+        self._request_subscription_refresh()
         self._request_network_refresh(poll_immediately=True)
         return True
 
@@ -6158,22 +6196,149 @@ class EncryptedChatClient(QObject):
         self.seen_client_message_ids.add(message["i"])
         self._add_message_to_log(message, is_local=True)
 
-    def _start_network_thread(self) -> None:
-        if self.network_thread and self.network_thread.is_alive():
-            return
-
-        self.network_thread = threading.Thread(
-            target=self._network_loop,
-            name="SpriteLinkNetwork",
-            daemon=True,
+    def _subscription_snapshot(
+        self,
+    ) -> tuple[str, dict[str, tuple[str, ...]]]:
+        server_url = normalize_server_url(
+            str(self.config_data.get("server_url", ""))
         )
-        self.network_thread.start()
+        if not server_url:
+            return "", {}
+
+        topic_room_lists: dict[str, list[str]] = {}
+        for room in self._chatroom_definitions():
+            encryption_key = room.get("key", "")
+            if not encryption_key:
+                continue
+            try:
+                topic = derive_ntfy_topic(encryption_key)
+            except Exception:
+                continue
+            topic_room_lists.setdefault(topic, []).append(room["id"])
+
+        return server_url, {
+            topic: tuple(room_ids)
+            for topic, room_ids in topic_room_lists.items()
+        }
+
+    def _request_subscription_refresh(self) -> None:
+        self.subscription_refresh_event.set()
+        with self.subscription_response_lock:
+            response = self.subscription_response
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def _start_network_thread(self) -> None:
+        if not self.network_thread or not self.network_thread.is_alive():
+            self.network_thread = threading.Thread(
+                target=self._network_loop,
+                name="SpriteLinkNetwork",
+                daemon=True,
+            )
+            self.network_thread.start()
+
+        if (
+            not self.subscription_thread
+            or not self.subscription_thread.is_alive()
+        ):
+            self.subscription_thread = threading.Thread(
+                target=self._subscription_loop,
+                name="SpriteLinkSubscription",
+                daemon=True,
+            )
+            self.subscription_thread.start()
+
+    def _subscription_loop(self) -> None:
+        while not self.stop_event.is_set():
+            self.subscription_refresh_event.clear()
+            server_url, topic_rooms = self._subscription_snapshot()
+            if not server_url or not topic_rooms:
+                self.subscription_refresh_event.wait(
+                    SUBSCRIPTION_RECONNECT_DELAY_SECONDS
+                )
+                continue
+
+            topics = ",".join(topic_rooms)
+            response: requests.Response | None = None
+            try:
+                response = self.subscription_session.get(
+                    f"{server_url}/{topics}/json",
+                    params={"since": "latest"},
+                    stream=True,
+                    timeout=(
+                        REQUEST_TIMEOUT_SECONDS,
+                        SUBSCRIPTION_READ_TIMEOUT_SECONDS,
+                    ),
+                )
+                response.raise_for_status()
+                with self.subscription_response_lock:
+                    self.subscription_response = response
+
+                for raw_line in response.iter_lines():
+                    if (
+                        self.stop_event.is_set()
+                        or self.subscription_refresh_event.is_set()
+                    ):
+                        break
+                    if not raw_line:
+                        continue
+                    if isinstance(raw_line, bytes):
+                        line = raw_line.decode("utf-8", errors="replace")
+                    else:
+                        line = str(raw_line)
+                    if len(line) > MAX_ENCRYPTED_PACKET_CHARS + 2048:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+
+                    queued_signal = False
+                    for room_id in subscription_room_ids(
+                        record,
+                        topic_rooms,
+                    ):
+                        try:
+                            self.subscription_room_queue.put_nowait(room_id)
+                        except queue.Full:
+                            break
+                        else:
+                            queued_signal = True
+                    if queued_signal:
+                        self.network_wakeup_event.set()
+
+                    current_snapshot = self._subscription_snapshot()
+                    if current_snapshot != (server_url, topic_rooms):
+                        break
+
+            except Exception:
+                pass
+            finally:
+                with self.subscription_response_lock:
+                    if self.subscription_response is response:
+                        self.subscription_response = None
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+
+            if not self.stop_event.is_set():
+                self.subscription_refresh_event.wait(
+                    0.0
+                    if self.subscription_refresh_event.is_set()
+                    else SUBSCRIPTION_RECONNECT_DELAY_SECONDS
+                )
 
     def _network_loop(self) -> None:
         last_poll_times: dict[str, float] = {}
-        last_background_poll_at: float | None = None
+        urgent_room_ids: set[str] = set()
         force_active_poll = True
-        deferred_active_poll_started_at: float | None = None
         scheduled_active_room_id = ""
 
         while not self.stop_event.is_set():
@@ -6181,6 +6346,14 @@ class EncryptedChatClient(QObject):
             while True:
                 try:
                     latest_control = self.network_control_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+            while True:
+                try:
+                    urgent_room_ids.add(
+                        self.subscription_room_queue.get_nowait()
+                    )
                 except queue.Empty:
                     break
 
@@ -6201,17 +6374,15 @@ class EncryptedChatClient(QObject):
                 rooms[0],
             )
             active_room_id = active_room["id"]
-            window_focused = self.window_focused_event.is_set()
-            active_interval = (
-                FOCUSED_ACTIVE_POLL_INTERVAL_SECONDS
-                if window_focused
-                else UNFOCUSED_ACTIVE_POLL_INTERVAL_SECONDS
+            poll_interval = polling_interval_seconds(
+                window_focused=self.window_focused_event.is_set(),
+                tray_suspended=self.tray_mode_event.is_set(),
             )
-            background_interval = (
-                FOCUSED_BACKGROUND_POLL_INTERVAL_SECONDS
-                if window_focused
-                else UNFOCUSED_BACKGROUND_POLL_INTERVAL_SECONDS
-            )
+
+            if active_room_id != scheduled_active_room_id:
+                scheduled_active_room_id = active_room_id
+                if latest_control is None:
+                    force_active_poll = True
 
             if latest_control is not None:
                 requested_room_id = str(latest_control.get("room_id", ""))
@@ -6220,11 +6391,12 @@ class EncryptedChatClient(QObject):
                     poll_immediately = bool(
                         latest_control.get("poll_immediately", False)
                     )
-                    force_active_poll = poll_immediately
-                    deferred_active_poll_started_at = (
-                        None if poll_immediately else now
-                    )
-                    scheduled_active_room_id = active_room_id
+                    if poll_immediately:
+                        force_active_poll = True
+                        urgent_room_ids.add(active_room_id)
+                    else:
+                        force_active_poll = False
+                        last_poll_times[active_room_id] = now
                     self._queue_ui_event((
                         "status",
                         (
@@ -6234,74 +6406,66 @@ class EncryptedChatClient(QObject):
                         ),
                     ))
 
-            if active_room_id != scheduled_active_room_id:
-                scheduled_active_room_id = active_room_id
-                force_active_poll = True
-                deferred_active_poll_started_at = None
-
             valid_room_ids = {room["id"] for room in rooms}
             for room_id in tuple(last_poll_times):
                 if room_id not in valid_room_ids:
                     last_poll_times.pop(room_id, None)
-
-            active_last_polled = last_poll_times.get(active_room_id)
-            active_poll_due = force_active_poll or (
-                (
-                    deferred_active_poll_started_at is None
-                    or now - deferred_active_poll_started_at
-                    >= active_interval
-                )
-                and (
-                    active_last_polled is None
-                    or now - active_last_polled >= active_interval
-                )
-            )
-            background_rooms = [
-                room for room in rooms
-                if room["id"] != active_room_id
-            ]
-            background_poll_due = bool(background_rooms) and (
-                last_background_poll_at is None
-                or now - last_background_poll_at >= background_interval
-            )
+            urgent_room_ids.intersection_update(valid_room_ids)
 
             room_to_poll: dict[str, str] | None = None
-            poll_is_active = False
-            if active_poll_due:
+            if force_active_poll:
                 room_to_poll = active_room
-                poll_is_active = True
-            elif background_poll_due:
-                room_to_poll = min(
-                    background_rooms,
-                    key=lambda room: last_poll_times.get(
-                        room["id"],
-                        float("-inf"),
+            else:
+                room_to_poll = next(
+                    (
+                        room for room in rooms
+                        if room["id"] in urgent_room_ids
                     ),
+                    None,
                 )
 
+            if room_to_poll is None:
+                due_rooms = [
+                    room
+                    for room in rooms
+                    if (
+                        room["id"] not in last_poll_times
+                        or now - last_poll_times[room["id"]]
+                        >= poll_interval
+                    )
+                ]
+                if due_rooms:
+                    room_to_poll = (
+                        active_room
+                        if active_room in due_rooms
+                        else min(
+                            due_rooms,
+                            key=lambda room: last_poll_times.get(
+                                room["id"],
+                                float("-inf"),
+                            ),
+                        )
+                    )
+
             if room_to_poll is not None:
+                poll_is_active = room_to_poll["id"] == active_room_id
                 self._network_poll(
                     room_to_poll,
                     is_active=poll_is_active,
                 )
                 completed_at = time.monotonic()
                 last_poll_times[room_to_poll["id"]] = completed_at
+                urgent_room_ids.discard(room_to_poll["id"])
                 if poll_is_active:
                     force_active_poll = False
-                    deferred_active_poll_started_at = None
-                else:
-                    last_background_poll_at = completed_at
 
             wait_seconds = network_idle_wait_seconds(
                 now=time.monotonic(),
-                active_last_polled=last_poll_times.get(active_room_id),
-                background_last_polled=last_background_poll_at,
-                active_interval=active_interval,
-                background_interval=background_interval,
-                has_background_rooms=bool(background_rooms),
-                force_active_poll=force_active_poll,
-                deferred_active_poll_started_at=(
-                    deferred_active_poll_started_at
+                last_poll_times=last_poll_times,
+                room_ids=[room["id"] for room in rooms],
+                poll_interval=poll_interval,
+                has_urgent_poll=(
+                    force_active_poll or bool(urgent_room_ids)
                 ),
             )
             self.network_wakeup_event.wait(max(0.01, wait_seconds))
@@ -8894,10 +9058,18 @@ class EncryptedChatClient(QObject):
 
         self.stop_event.set()
         self.network_wakeup_event.set()
+        self._request_subscription_refresh()
         network_thread = self.network_thread
         if network_thread is not None and network_thread.is_alive():
             network_thread.join(timeout=0.25)
+        subscription_thread = self.subscription_thread
+        if (
+            subscription_thread is not None
+            and subscription_thread.is_alive()
+        ):
+            subscription_thread.join(timeout=0.25)
         self.session.close()
+        self.subscription_session.close()
         for controller in self.animated_media_controllers.values():
             controller.stop()
         self.animated_media_controllers.clear()
