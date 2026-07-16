@@ -2986,6 +2986,18 @@ class MessageLogBrowser(QTextBrowser):
                         height + 1,
                         background,
                     )
+                right_width = max(
+                    0,
+                    round(block.blockFormat().rightMargin()),
+                )
+                if right_width > 0:
+                    painter.fillRect(
+                        max(0, viewport_width - right_width),
+                        top,
+                        right_width,
+                        height + 1,
+                        background,
+                    )
 
             if fade_background is not None:
                 color_key = int(fade_background.rgba())
@@ -8901,20 +8913,13 @@ class EncryptedChatClient(QObject):
                 top_align_height=top_align_height,
             ),
         )
-        body_font_metrics = QFontMetrics(
-            self._make_message_font(font_name)
-        )
-        username_font_metrics = QFontMetrics(
-            self._make_message_font(font_name, bold=True)
-        )
-        message_body_indent = (
-            username_font_metrics.horizontalAdvance(username)
-            + body_font_metrics.horizontalAdvance(status_suffix + ": ")
-        )
+        message_continuation_indent = 0
         if has_profile_icon:
-            message_body_indent += (
+            message_continuation_indent = (
                 PROFILE_ICON_SIZE
-                + body_font_metrics.horizontalAdvance(" ")
+                + QFontMetrics(
+                    self._make_message_font(font_name)
+                ).horizontalAdvance(" ")
             )
 
         visible_text_without_images = message_text_without_image_links(
@@ -8963,8 +8968,8 @@ class EncryptedChatClient(QObject):
             )
 
         # Explicit newlines create additional QTextBlocks. Give every block
-        # the row color and message-body margin, then pull only the first line
-        # back for the icon/username prefix to create a hanging indent.
+        # the row color and username-aligned margin, then pull only the first
+        # line back for the profile icon to create a hanging indent.
         document = cursor.document()
         block = document.findBlock(message_start_position)
         first_message_block_number = block.blockNumber()
@@ -8972,9 +8977,9 @@ class EncryptedChatClient(QObject):
         while block.isValid() and block.blockNumber() <= final_block_number:
             block_cursor = QTextCursor(block)
             block_format = block.blockFormat()
-            block_format.setLeftMargin(10 + message_body_indent)
+            block_format.setLeftMargin(10 + message_continuation_indent)
             block_format.setTextIndent(
-                -message_body_indent
+                -message_continuation_indent
                 if block.blockNumber() == first_message_block_number
                 else 0
             )
