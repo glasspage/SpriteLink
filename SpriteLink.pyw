@@ -193,6 +193,7 @@ except ImportError:
 
 UPDATE_REPOSITORY = "glasspage/SpriteLink"
 UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000
+CONNECTION_ERROR_DELAY_MS = 15 * 1000
 UPDATE_DIRECTORY = Path(
     os.environ.get("LOCALAPPDATA")
     or os.environ.get("APPDATA")
@@ -244,6 +245,15 @@ def notification_button_stylesheet(windows_classic: bool) -> str:
     )
 
 
+def chatroom_connection_label(
+    room_name: str,
+    *,
+    connection_error: bool,
+) -> str:
+    suffix = " - Connection error" if connection_error else ""
+    return f"{room_name}{suffix}"
+
+
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
 GLOBAL_CHATROOM_ID = "global"
@@ -288,15 +298,17 @@ THEMES = (
 )
 
 FOCUSED_POLL_INTERVAL_SECONDS = 6.0
-UNFOCUSED_POLL_INTERVAL_SECONDS = 10.0
-TRAY_POLL_INTERVAL_SECONDS = 20.0
+UNFOCUSED_POLL_INTERVAL_SECONDS = 9.0
+TRAY_POLL_INTERVAL_SECONDS = 12.0
 # Focused catch-up polls use most of ntfy's sustained request allowance.
 # Leave the remaining budget for reconnecting the long-lived stream.
 SUBSCRIPTION_RECONNECT_DELAY_SECONDS = 30.0
 SUBSCRIPTION_READ_TIMEOUT_SECONDS = 75
+SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS = 2 * 60
 MAX_SUBSCRIPTION_SIGNAL_QUEUE = 1024
 CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
 IMMEDIATE_CHATROOM_SWITCH_LIMIT = 2
+CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS = 6
 REQUEST_TIMEOUT_SECONDS = 10
 AUTO_HISTORY_SECONDS = 48 * 60 * 60
 GAP_SEPARATOR_SECONDS = 6 * 60 * 60
@@ -2570,6 +2582,31 @@ def network_idle_wait_seconds(
     return max(0.0, min(60.0, ready_at - now))
 
 
+def immediate_poll_borrowed_seconds(
+    *,
+    now: float,
+    last_global_poll_at: float | None,
+    poll_interval: float,
+) -> float:
+    if last_global_poll_at is None:
+        return 0.0
+    interval = max(0.0, poll_interval)
+    return max(
+        0.0,
+        min(interval, last_global_poll_at + interval - now),
+    )
+
+
+def background_repayment_delay_seconds(
+    *,
+    borrowed_seconds: float,
+    checks_remaining: int,
+) -> float:
+    if checks_remaining <= 0:
+        return 0.0
+    return max(0.0, borrowed_seconds) / checks_remaining
+
+
 def next_poll_room_id(
     *,
     room_ids: list[str],
@@ -2582,6 +2619,20 @@ def next_poll_room_id(
     if not room_ids:
         return None
     valid_urgent_room_ids = urgent_room_ids.intersection(room_ids)
+
+    active_last_poll = last_poll_times.get(active_room_id)
+    if active_last_poll is None:
+        return active_room_id
+    latest_poll_time = max(last_poll_times.values(), default=float("-inf"))
+    active_was_last_polled = active_last_poll >= latest_poll_time
+    active_poll_deadline = max(0.0, poll_interval) * 2
+    if (
+        active_room_id in valid_urgent_room_ids
+        and not active_was_last_polled
+    ):
+        return active_room_id
+    if now - active_last_poll >= active_poll_deadline:
+        return active_room_id
 
     # Finish the first manual pass before stream activity can favor rooms
     # that have already been checked.
@@ -2604,20 +2655,20 @@ def next_poll_room_id(
     manual_check_deadline = (
         max(0.0, poll_interval) * max(1, len(room_ids))
     )
-    # Stream signals can reorder fresh rooms, but an overdue room always gets
-    # the next global request slot. This guarantees one manual check per
-    # nominal round even when another room continuously produces signals.
+    # Once the active-room reservation is satisfied, an overdue room gets the
+    # next global request slot so passive background checks keep progressing.
     if (
         now - last_poll_times[oldest_room_id]
         >= manual_check_deadline
     ):
         return oldest_room_id
 
-    if active_room_id in valid_urgent_room_ids:
-        return active_room_id
-    if valid_urgent_room_ids:
+    background_urgent_room_ids = (
+        valid_urgent_room_ids - {active_room_id}
+    )
+    if background_urgent_room_ids:
         return min(
-            valid_urgent_room_ids,
+            background_urgent_room_ids,
             key=lambda room_id: last_poll_times[room_id],
         )
     return oldest_room_id
@@ -2935,6 +2986,18 @@ class MessageLogBrowser(QTextBrowser):
                         height + 1,
                         background,
                     )
+                right_width = max(
+                    0,
+                    round(block.blockFormat().rightMargin()),
+                )
+                if right_width > 0:
+                    painter.fillRect(
+                        max(0, viewport_width - right_width),
+                        top,
+                        right_width,
+                        height + 1,
+                        background,
+                    )
 
             if fade_background is not None:
                 color_key = int(fade_background.rgba())
@@ -3188,6 +3251,7 @@ class EncryptedChatClient(QObject):
         self._config_snapshot_at_open: tuple[Any, ...] | None = None
         self._message_font_cache: dict[tuple[str, bool, bool], QFont] = {}
         self._loading_profile_controls = False
+        self._connection_error_visible = False
         self.active_chatroom_id = str(
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
         )
@@ -3210,6 +3274,7 @@ class EncryptedChatClient(QObject):
                 pass
         self._closing = False
         self._force_quit = False
+        self._tray_quit_pending = False
         self._minimized_to_tray = False
         self._tray_ui_suspended = False
         self.available_update: ReleaseInfo | None = None
@@ -3241,6 +3306,13 @@ class EncryptedChatClient(QObject):
             bool(self.config_data["minimize_to_tray"])
         )
         self.status_var = ValueModel("Connecting")
+
+        self.connection_error_timer = QTimer(self)
+        self.connection_error_timer.setSingleShot(True)
+        self.connection_error_timer.setInterval(CONNECTION_ERROR_DELAY_MS)
+        self.connection_error_timer.timeout.connect(
+            self._show_connection_error_if_still_disconnected
+        )
 
         self.profile_save_timer = QTimer(self)
         self.profile_save_timer.setSingleShot(True)
@@ -3586,6 +3658,8 @@ class EncryptedChatClient(QObject):
         )
         if self._tray_available():
             self.tray_icon.show()
+            if self._has_unread_messages():
+                self._mark_tray_notification()
 
     def _tray_available(self) -> bool:
         return (
@@ -3684,14 +3758,14 @@ class EncryptedChatClient(QObject):
 
     def _hide_to_tray(self) -> None:
         self._minimized_to_tray = True
-        self._clear_tray_notification()
+        self._clear_tray_notification_if_no_unread()
         self._suspend_for_tray()
         self.root.hide()
 
     def _restore_from_tray(self) -> None:
         was_suspended = self._tray_ui_suspended
         self._minimized_to_tray = False
-        self._clear_tray_notification()
+        self._clear_tray_notification_if_no_unread()
         self.root.showNormal()
         self.root.raise_()
         self.root.activateWindow()
@@ -3704,6 +3778,19 @@ class EncryptedChatClient(QObject):
         if not self._tray_normal_icon.isNull():
             self.tray_icon.setIcon(self._tray_normal_icon)
         self.tray_icon.setToolTip(APP_NAME)
+
+    def _has_unread_messages(self) -> bool:
+        for unread_count in self._unread_counts().values():
+            try:
+                if int(unread_count) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def _clear_tray_notification_if_no_unread(self) -> None:
+        if not self._has_unread_messages():
+            self._clear_tray_notification()
 
     def _mark_tray_notification(self) -> None:
         if not self.tray_icon.isVisible():
@@ -3723,7 +3810,16 @@ class EncryptedChatClient(QObject):
             self._restore_from_tray()
 
     def _quit_from_tray(self) -> None:
+        if self._closing or self._tray_quit_pending:
+            return
         self._force_quit = True
+        self._tray_quit_pending = True
+        # Let the native tray menu finish handling its action before closing
+        # its owner window and stopping the Qt event loop.
+        QTimer.singleShot(0, self._finish_quit_from_tray)
+
+    def _finish_quit_from_tray(self) -> None:
+        self._tray_quit_pending = False
         self.root.close()
         if not self._closing:
             return
@@ -3932,8 +4028,49 @@ class EncryptedChatClient(QObject):
         return identity_client_id(self._identity_private_key())
 
     def _update_window_title(self) -> None:
+        self.root.setWindowTitle(APP_NAME)
+        self._update_connection_status_label()
+
+    def _update_connection_status_label(self) -> None:
+        if not hasattr(self, "status_label"):
+            return
         room_name = self._active_chatroom()["nickname"]
-        self.root.setWindowTitle(f"{APP_NAME} ({room_name})")
+        self.status_label.setText(chatroom_connection_label(
+            room_name,
+            connection_error=self._connection_error_visible,
+        ))
+
+    def _connection_error_timer_should_run(self) -> bool:
+        return (
+            str(self.status_var.get()) != "Connected"
+            and self.window_focused_event.is_set()
+            and self.root.isActiveWindow()
+        )
+
+    def _sync_connection_error_timer(self) -> None:
+        if str(self.status_var.get()) == "Connected":
+            self.connection_error_timer.stop()
+            self._connection_error_visible = False
+        elif not self._connection_error_timer_should_run():
+            self.connection_error_timer.stop()
+        elif (
+            not self._connection_error_visible
+            and not self.connection_error_timer.isActive()
+        ):
+            self.connection_error_timer.start()
+        self._update_connection_status_label()
+
+    def _show_connection_error_if_still_disconnected(self) -> None:
+        if self._connection_error_timer_should_run():
+            self._connection_error_visible = True
+        self._update_connection_status_label()
+
+    def _on_connection_status_changed(self, _status: Any) -> None:
+        self._sync_connection_error_timer()
+
+    def _restart_connection_error_delay(self) -> None:
+        self.connection_error_timer.stop()
+        self._sync_connection_error_timer()
 
     def _identity_presets(self) -> list[dict[str, str]]:
         raw_presets = self.config_data.get("identity_presets", [])
@@ -4167,8 +4304,10 @@ class EncryptedChatClient(QObject):
     def _mark_chatroom_read(self, room_id: str) -> None:
         unread_counts = self._unread_counts()
         if room_id not in unread_counts:
+            self._clear_tray_notification_if_no_unread()
             return
         unread_counts.pop(room_id, None)
+        self._clear_tray_notification_if_no_unread()
         try:
             save_config(self.config_data)
         except Exception:
@@ -4394,6 +4533,7 @@ class EncryptedChatClient(QObject):
         muted_ids.discard(room_id)
         self.config_data["muted_chatrooms"] = sorted(muted_ids)
         self._unread_counts().pop(room_id, None)
+        self._clear_tray_notification_if_no_unread()
         self.config_data.get("room_profiles", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
         self._request_subscription_refresh()
@@ -4452,6 +4592,7 @@ class EncryptedChatClient(QObject):
         poll_immediately: bool = True,
     ) -> None:
         self._unread_counts().pop(self.active_chatroom_id, None)
+        self._clear_tray_notification_if_no_unread()
         self._update_window_title()
         try:
             save_config(self.config_data)
@@ -4462,6 +4603,7 @@ class EncryptedChatClient(QObject):
         self._load_saved_history_for_current_room()
         self.connected = False
         self.status_var.set("Connecting")
+        self._restart_connection_error_delay()
         self._request_network_refresh(
             poll_immediately=poll_immediately
         )
@@ -4486,13 +4628,11 @@ class EncryptedChatClient(QObject):
         status_layout.addWidget(self.chatrooms_toggle)
         self._update_chatrooms_toggle_unread_style()
 
-        status_layout.addWidget(QLabel("Status:"))
-
         self.status_label = QLabel()
         self.status_label.setFont(
             self._make_font("Segoe UI", 9, bold=True)
         )
-        self.status_var.bind(self.status_label.setText)
+        self.status_var.bind(self._on_connection_status_changed)
         status_layout.addWidget(self.status_label)
         status_layout.addStretch(1)
 
@@ -5950,6 +6090,7 @@ class EncryptedChatClient(QObject):
             room["id"] for room in self._chatroom_definitions()
         )
         self.status_var.set("Reconnecting")
+        self._restart_connection_error_delay()
         self._request_subscription_refresh()
         self._request_network_refresh(poll_immediately=True)
         return True
@@ -6325,7 +6466,11 @@ class EncryptedChatClient(QObject):
             try:
                 response = self.subscription_session.get(
                     f"{server_url}/{topics}/json",
-                    params={"since": "latest"},
+                    params={
+                        "since": (
+                            f"{SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS}s"
+                        ),
+                    },
                     stream=True,
                     timeout=(
                         REQUEST_TIMEOUT_SECONDS,
@@ -6399,6 +6544,11 @@ class EncryptedChatClient(QObject):
         last_global_poll_at: float | None = None
         urgent_room_ids: set[str] = set()
         scheduled_active_room_id = ""
+        forced_active_poll_room_id = ""
+        background_delay_debt = 0.0
+        background_repayment_checks = 0
+        background_delay_until: float | None = None
+        background_delay_slice = 0.0
 
         while not self.stop_event.is_set():
             latest_control: dict[str, Any] | None = None
@@ -6441,6 +6591,11 @@ class EncryptedChatClient(QObject):
             if active_room_id != scheduled_active_room_id:
                 scheduled_active_room_id = active_room_id
                 urgent_room_ids.add(active_room_id)
+            if (
+                forced_active_poll_room_id
+                and forced_active_poll_room_id != active_room_id
+            ):
+                forced_active_poll_room_id = ""
 
             if latest_control is not None:
                 requested_room_id = str(latest_control.get("room_id", ""))
@@ -6451,6 +6606,20 @@ class EncryptedChatClient(QObject):
                     )
                     if poll_immediately:
                         urgent_room_ids.add(active_room_id)
+                        forced_active_poll_room_id = active_room_id
+                        background_delay_debt += (
+                            immediate_poll_borrowed_seconds(
+                                now=now,
+                                last_global_poll_at=last_global_poll_at,
+                                poll_interval=poll_interval,
+                            )
+                        )
+                        background_repayment_checks = max(
+                            background_repayment_checks,
+                            CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS,
+                        )
+                        background_delay_until = None
+                        background_delay_slice = 0.0
                     else:
                         last_poll_times[active_room_id] = now
                     self._queue_ui_event((
@@ -6468,19 +6637,27 @@ class EncryptedChatClient(QObject):
                     last_poll_times.pop(room_id, None)
             urgent_room_ids.intersection_update(valid_room_ids)
 
-            global_poll_due = (
+            force_active_poll = (
+                forced_active_poll_room_id == active_room_id
+            )
+            global_poll_due = force_active_poll or (
                 last_global_poll_at is None
                 or now - last_global_poll_at >= poll_interval
             )
             room_to_poll: dict[str, str] | None = None
+            repay_background_after_poll = False
             if global_poll_due:
-                room_id_to_poll = next_poll_room_id(
-                    room_ids=[room["id"] for room in rooms],
-                    active_room_id=active_room_id,
-                    urgent_room_ids=urgent_room_ids,
-                    last_poll_times=last_poll_times,
-                    now=now,
-                    poll_interval=poll_interval,
+                room_id_to_poll = (
+                    active_room_id
+                    if force_active_poll
+                    else next_poll_room_id(
+                        room_ids=[room["id"] for room in rooms],
+                        active_room_id=active_room_id,
+                        urgent_room_ids=urgent_room_ids,
+                        last_poll_times=last_poll_times,
+                        now=now,
+                        poll_interval=poll_interval,
+                    )
                 )
                 room_to_poll = next(
                     (
@@ -6489,6 +6666,28 @@ class EncryptedChatClient(QObject):
                     ),
                     None,
                 )
+                if (
+                    room_to_poll is not None
+                    and room_to_poll["id"] != active_room_id
+                    and background_delay_debt > 0.0
+                    and background_repayment_checks > 0
+                ):
+                    if background_delay_until is None:
+                        background_delay_slice = (
+                            background_repayment_delay_seconds(
+                                borrowed_seconds=background_delay_debt,
+                                checks_remaining=(
+                                    background_repayment_checks
+                                ),
+                            )
+                        )
+                        background_delay_until = (
+                            now + background_delay_slice
+                        )
+                    if now < background_delay_until:
+                        room_to_poll = None
+                    else:
+                        repay_background_after_poll = True
 
             if room_to_poll is not None:
                 poll_is_active = room_to_poll["id"] == active_room_id
@@ -6500,12 +6699,31 @@ class EncryptedChatClient(QObject):
                 last_global_poll_at = completed_at
                 last_poll_times[room_to_poll["id"]] = completed_at
                 urgent_room_ids.discard(room_to_poll["id"])
+                if poll_is_active:
+                    forced_active_poll_room_id = ""
+                    background_delay_until = None
+                    background_delay_slice = 0.0
+                elif repay_background_after_poll:
+                    background_delay_debt = max(
+                        0.0,
+                        background_delay_debt - background_delay_slice,
+                    )
+                    background_repayment_checks -= 1
+                    background_delay_until = None
+                    background_delay_slice = 0.0
 
-            wait_seconds = network_idle_wait_seconds(
-                now=time.monotonic(),
-                last_global_poll_at=last_global_poll_at,
-                poll_interval=poll_interval,
-            )
+            wait_now = time.monotonic()
+            if room_to_poll is None and background_delay_until is not None:
+                wait_seconds = max(
+                    0.0,
+                    min(60.0, background_delay_until - wait_now),
+                )
+            else:
+                wait_seconds = network_idle_wait_seconds(
+                    now=wait_now,
+                    last_global_poll_at=last_global_poll_at,
+                    poll_interval=poll_interval,
+                )
             self.network_wakeup_event.wait(max(0.01, wait_seconds))
             self.network_wakeup_event.clear()
 
@@ -7819,11 +8037,13 @@ class EncryptedChatClient(QObject):
             if event.type() == QEvent.Type.WindowActivate:
                 self.window_focused_event.set()
                 self.network_wakeup_event.set()
+                self._sync_connection_error_timer()
                 if hasattr(self, "tray_icon"):
-                    self._clear_tray_notification()
+                    self._clear_tray_notification_if_no_unread()
             elif event.type() == QEvent.Type.WindowDeactivate:
                 self.window_focused_event.clear()
                 self.network_wakeup_event.set()
+                self._sync_connection_error_timer()
             elif event.type() == QEvent.Type.WindowStateChange:
                 QTimer.singleShot(0, self._sync_window_activity)
 
@@ -8693,7 +8913,6 @@ class EncryptedChatClient(QObject):
                 top_align_height=top_align_height,
             ),
         )
-
         visible_text_without_images = message_text_without_image_links(
             display_text,
             set(image_urls),
@@ -8739,9 +8958,9 @@ class EncryptedChatClient(QObject):
                 self._text_format("#b00020", font_name=font_name),
             )
 
-        # Explicit newlines create additional QTextBlocks. A full-width extra
-        # selection paints each block to the viewport edges independently of
-        # the paragraph margins that keep the text itself padded.
+        # Explicit newlines create additional QTextBlocks. Give every block
+        # the same row color and left edge so continuations align with the
+        # profile icon, or with the username when no icon is present.
         document = cursor.document()
         block = document.findBlock(message_start_position)
         final_block_number = cursor.block().blockNumber()
@@ -8749,7 +8968,9 @@ class EncryptedChatClient(QObject):
             block_cursor = QTextCursor(block)
             block_format = block.blockFormat()
             block_format.setLeftMargin(10)
+            block_format.setTextIndent(0)
             block_format.setRightMargin(10)
+            block_format.setBackground(QColor(background_color))
             block_cursor.setBlockFormat(block_format)
 
             selection = QTextEdit.ExtraSelection()
@@ -9095,6 +9316,7 @@ class EncryptedChatClient(QObject):
         self.background_history_prune_timer.stop()
         self.viewport_media_timer.stop()
         self.message_sound_stop_timer.stop()
+        self.connection_error_timer.stop()
         self._release_message_sound_resources()
         self.tray_icon.hide()
 
@@ -9107,18 +9329,15 @@ class EncryptedChatClient(QObject):
 
         self.stop_event.set()
         self.network_wakeup_event.set()
-        self._request_subscription_refresh()
-        network_thread = self.network_thread
-        if network_thread is not None and network_thread.is_alive():
-            network_thread.join(timeout=0.25)
-        subscription_thread = self.subscription_thread
-        if (
-            subscription_thread is not None
-            and subscription_thread.is_alive()
-        ):
-            subscription_thread.join(timeout=0.25)
+        self.subscription_refresh_event.set()
+        # Network workers are daemons. Do not block the GUI thread waiting on
+        # a request or streaming response while the application is exiting.
         self.session.close()
-        self.subscription_session.close()
+        threading.Thread(
+            target=self.subscription_session.close,
+            name="SpriteLinkSubscriptionClose",
+            daemon=True,
+        ).start()
         for controller in self.animated_media_controllers.values():
             controller.stop()
         self.animated_media_controllers.clear()

@@ -204,10 +204,76 @@ class BehaviorSettingsTests(unittest.TestCase):
         restore_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._restore_from_tray
         )
-        self.assertIn("_clear_tray_notification", restore_source)
+        self.assertIn(
+            "_clear_tray_notification_if_no_unread",
+            restore_source,
+        )
 
 
 class RuntimeOptimizationTests(unittest.TestCase):
+    def test_wrapped_messages_align_to_row_edge_and_keep_background(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertNotIn("message_continuation_indent", source)
+        self.assertNotIn("horizontalAdvance(username)", source)
+        self.assertIn("setLeftMargin(10)", source)
+        self.assertIn("setTextIndent(0)", source)
+        self.assertIn("setBackground(QColor(background_color))", source)
+
+        paint_source = inspect.getsource(SPRITELINK.MessageLogBrowser.paintEvent)
+        self.assertIn("block.blockFormat().rightMargin()", paint_source)
+        self.assertIn("viewport_width - right_width", paint_source)
+
+    def test_status_line_uses_chatroom_name_and_delayed_error(self) -> None:
+        self.assertEqual(
+            SPRITELINK.chatroom_connection_label(
+                "Global",
+                connection_error=False,
+            ),
+            "Global",
+        )
+        self.assertEqual(
+            SPRITELINK.chatroom_connection_label(
+                "Global",
+                connection_error=True,
+            ),
+            "Global - Connection error",
+        )
+        self.assertEqual(SPRITELINK.CONNECTION_ERROR_DELAY_MS, 15_000)
+
+        title_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._update_window_title
+        )
+        ui_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        timer_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._sync_connection_error_timer
+        )
+        condition_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._connection_error_timer_should_run
+        )
+        restart_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._restart_connection_error_delay
+        )
+        timeout_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._show_connection_error_if_still_disconnected
+        )
+
+        self.assertIn("setWindowTitle(APP_NAME)", title_source)
+        self.assertNotIn("nickname", title_source)
+        self.assertNotIn('QLabel("Status:")', ui_source)
+        self.assertIn("_on_connection_status_changed", ui_source)
+        self.assertIn("connection_error_timer.isActive()", timer_source)
+        self.assertIn('status_var.get()) == "Connected"', timer_source)
+        self.assertIn("window_focused_event.is_set()", condition_source)
+        self.assertIn('!= "Connected"', condition_source)
+        self.assertNotIn("_connection_error_visible = False", restart_source)
+        self.assertNotIn("_connection_error_visible = False", timeout_source)
+
     def test_chatroom_unread_rows_are_never_top_level_windows(self) -> None:
         row_source = inspect.getsource(SPRITELINK.ChatroomListRow.__init__)
         refresh_source = inspect.getsource(
@@ -239,14 +305,14 @@ class RuntimeOptimizationTests(unittest.TestCase):
                 window_focused=False,
                 tray_suspended=False,
             ),
-            10.0,
+            9.0,
         )
         self.assertEqual(
             SPRITELINK.polling_interval_seconds(
                 window_focused=False,
                 tray_suspended=True,
             ),
-            20.0,
+            12.0,
         )
         self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
@@ -271,6 +337,33 @@ class RuntimeOptimizationTests(unittest.TestCase):
                 poll_interval=6.0,
             ),
             6.0,
+        )
+        self.assertEqual(
+            SPRITELINK.immediate_poll_borrowed_seconds(
+                now=101.0,
+                last_global_poll_at=100.0,
+                poll_interval=6.0,
+            ),
+            5.0,
+        )
+        self.assertEqual(
+            SPRITELINK.immediate_poll_borrowed_seconds(
+                now=101.0,
+                last_global_poll_at=None,
+                poll_interval=6.0,
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            SPRITELINK.background_repayment_delay_seconds(
+                borrowed_seconds=6.0,
+                checks_remaining=6,
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            SPRITELINK.CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS,
+            6,
         )
 
         self.assertEqual(
@@ -316,6 +409,21 @@ class RuntimeOptimizationTests(unittest.TestCase):
                 now=100.0,
                 poll_interval=10.0,
             ),
+            "active",
+        )
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "overdue", "urgent"],
+                active_room_id="active",
+                urgent_room_ids={"active", "urgent"},
+                last_poll_times={
+                    "active": 100.0,
+                    "overdue": 60.0,
+                    "urgent": 99.0,
+                },
+                now=110.0,
+                poll_interval=10.0,
+            ),
             "overdue",
         )
         self.assertEqual(
@@ -324,13 +432,27 @@ class RuntimeOptimizationTests(unittest.TestCase):
                 active_room_id="active",
                 urgent_room_ids={"active", "urgent"},
                 last_poll_times={
-                    "active": 95.0,
+                    "active": 100.0,
                     "urgent": 99.0,
                 },
-                now=100.0,
+                now=106.0,
                 poll_interval=10.0,
             ),
             "unchecked",
+        )
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "background"],
+                active_room_id="active",
+                urgent_room_ids=set(),
+                last_poll_times={
+                    "active": 88.0,
+                    "background": 99.0,
+                },
+                now=100.0,
+                poll_interval=6.0,
+            ),
+            "active",
         )
 
         self.assertFalse(
@@ -363,8 +485,20 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("last_global_poll_at", loop_source)
         self.assertIn("next_poll_room_id", loop_source)
         self.assertIn("subscription_room_queue", loop_source)
+        self.assertIn("forced_active_poll_room_id", loop_source)
+        self.assertIn("background_delay_debt", loop_source)
+        self.assertIn("background_repayment_delay_seconds", loop_source)
         self.assertNotIn("last_background_poll_at", loop_source)
         self.assertNotIn("wait(0.08)", loop_source)
+
+        subscription_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._subscription_loop
+        )
+        self.assertIn(
+            "SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS",
+            subscription_source,
+        )
+        self.assertNotIn('"since": "latest"', subscription_source)
 
         background_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._accept_background_messages
@@ -522,7 +656,11 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
         )
 
         self.assertIn('topics = ",".join(topic_rooms)', stream_source)
-        self.assertIn('params={"since": "latest"}', stream_source)
+        self.assertIn(
+            "SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS",
+            stream_source,
+        )
+        self.assertNotIn('"since": "latest"', stream_source)
         self.assertIn("stream=True", stream_source)
         self.assertIn("response.iter_lines()", stream_source)
         self.assertIn("subscription_room_ids(", stream_source)
@@ -544,7 +682,7 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
                 inspect.getsource(method),
             )
 
-    def test_tray_state_selects_the_thirty_second_interval(self) -> None:
+    def test_tray_state_selects_the_tray_poll_interval(self) -> None:
         suspend_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._suspend_for_tray
         )
@@ -602,8 +740,45 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
         self.assertNotIn("window_focused_event.is_set()", mark_source)
         self.assertIn("tray_icon.isVisible()", mark_source)
         self.assertNotIn("_minimized_to_tray", mark_source)
-        self.assertIn("_clear_tray_notification", event_source)
+        self.assertIn(
+            "_clear_tray_notification_if_no_unread",
+            event_source,
+        )
+        self.assertNotIn(
+            "self._clear_tray_notification()",
+            event_source,
+        )
         self.assertIn("WindowStateChange", event_source)
+
+    def test_tray_outline_is_kept_until_all_unread_are_cleared(self) -> None:
+        client = mock.Mock()
+        unread_counts: dict[str, int] = {"background": 2}
+        client._unread_counts.side_effect = lambda: unread_counts
+        client._has_unread_messages.side_effect = lambda: (
+            SPRITELINK.EncryptedChatClient._has_unread_messages(client)
+        )
+
+        SPRITELINK.EncryptedChatClient._clear_tray_notification_if_no_unread(
+            client
+        )
+        client._clear_tray_notification.assert_not_called()
+
+        unread_counts.clear()
+        SPRITELINK.EncryptedChatClient._clear_tray_notification_if_no_unread(
+            client
+        )
+        client._clear_tray_notification.assert_called_once_with()
+
+    def test_existing_unread_is_shown_when_tray_icon_starts(self) -> None:
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_tray_icon
+        )
+        self.assertIn("self._has_unread_messages()", build_source)
+        self.assertIn("self._mark_tray_notification()", build_source)
+        self.assertLess(
+            build_source.index("self.tray_icon.show()"),
+            build_source.index("self._has_unread_messages()"),
+        )
 
     def test_hidden_tray_mode_releases_heavy_render_state(self) -> None:
         suspend_source = inspect.getsource(
@@ -669,12 +844,20 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
         quit_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._quit_from_tray
         )
+        finish_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._finish_quit_from_tray
+        )
         close_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._on_close
         )
-        self.assertIn("QApplication.instance()", quit_source)
-        self.assertIn("app.quit()", quit_source)
-        self.assertIn("network_thread.join", close_source)
+        self.assertIn("QTimer.singleShot", quit_source)
+        self.assertNotIn("self.root.close()", quit_source)
+        self.assertIn("self.root.close()", finish_source)
+        self.assertIn("QApplication.instance()", finish_source)
+        self.assertIn("app.quit()", finish_source)
+        self.assertNotIn(".join(", close_source)
+        self.assertIn("self.subscription_refresh_event.set()", close_source)
+        self.assertIn("daemon=True", close_source)
         self.assertIn("self.session.close()", close_source)
         self.assertIn(
             "_release_message_sound_resources()",
