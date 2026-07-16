@@ -239,6 +239,18 @@ class RichTextFormattingTests(unittest.TestCase):
         )
         self.assertEqual(plain, "text</b></i></u>")
 
+    def test_unclosed_tags_do_not_affect_the_next_message(self) -> None:
+        first_plain, first_runs = SPRITELINK.parse_message_rich_text(
+            "<b>unfinished"
+        )
+        second_plain, second_runs = SPRITELINK.parse_message_rich_text(
+            "next message"
+        )
+        self.assertEqual(first_plain, "unfinished")
+        self.assertTrue(all(run.bold for run in first_runs))
+        self.assertEqual(second_plain, "next message")
+        self.assertTrue(all(not run.bold for run in second_runs))
+
     def test_composer_segments_serialize_to_balanced_tags(self) -> None:
         markup = SPRITELINK.serialize_message_rich_text([
             ("bold", True, False, False),
@@ -289,6 +301,28 @@ class RichTextFormattingTests(unittest.TestCase):
         )
         self.assertIn("to_message_text()", send_source)
         self.assertIn("to_message_text()", size_source)
+
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertIn(
+            "cursor.setCharFormat(QTextCharFormat())",
+            render_source,
+        )
+        username_format_start = render_source.index(
+            "cursor.insertText(\n            username,"
+        )
+        username_format_end = render_source.index(
+            "        if status_suffix:",
+            username_format_start,
+        )
+        username_format = render_source[
+            username_format_start:username_format_end
+        ]
+        self.assertIn("bold=False", username_format)
+        self.assertIn("italic=False", username_format)
+        self.assertIn("underline=False", username_format)
+        self.assertNotIn("bold=True", username_format)
 
 
 class RuntimeOptimizationTests(unittest.TestCase):
