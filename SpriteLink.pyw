@@ -112,6 +112,7 @@ try:
         QSlider,
         QSizePolicy,
         QStyleFactory,
+        QSystemTrayIcon,
         QTextBrowser,
         QTextEdit,
         QToolTip,
@@ -163,7 +164,7 @@ except ImportError as exc:
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
-CONFIG_FORMAT_VERSION = 22
+CONFIG_FORMAT_VERSION = 23
 WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
 
@@ -216,6 +217,10 @@ BUILTIN_MESSAGE_SOUND_FILES = {
 }
 CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
 COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
+MESSAGE_HISTORY_OPTIONS = (100, 500, 1000, 10000)
+DEFAULT_MESSAGE_HISTORY_LIMIT = 1000
+BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
+TRAY_NOTIFICATION_OUTLINE_COLOR = "#ff7a00"
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
@@ -1390,6 +1395,35 @@ def verify_message_identity(
     )
 
 
+def normalize_message_history_limit(value: Any) -> int:
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        candidate = DEFAULT_MESSAGE_HISTORY_LIMIT
+    return (
+        candidate
+        if candidate in MESSAGE_HISTORY_OPTIONS
+        else DEFAULT_MESSAGE_HISTORY_LIMIT
+    )
+
+
+def prune_local_history_map(
+    history_by_scope: dict[str, Any],
+    maximum_messages: int,
+    *,
+    excluded_scope_id: str | None = None,
+) -> bool:
+    limit = normalize_message_history_limit(maximum_messages)
+    changed = False
+    for scope_id, entries in list(history_by_scope.items()):
+        if scope_id == excluded_scope_id or not isinstance(entries, list):
+            continue
+        if len(entries) > limit:
+            history_by_scope[scope_id] = entries[-limit:]
+            changed = True
+    return changed
+
+
 def default_config() -> dict[str, Any]:
     global_profile = default_room_profile()
     default_preset = default_identity_preset()
@@ -1402,6 +1436,8 @@ def default_config() -> dict[str, Any]:
         "message_sound": DEFAULT_MESSAGE_SOUND,
         "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
         "custom_message_sound_path": "",
+        "message_history_limit": DEFAULT_MESSAGE_HISTORY_LIMIT,
+        "minimize_to_tray": False,
         "identity_private_key": generate_identity_private_key(),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
@@ -1494,6 +1530,20 @@ def load_config() -> dict[str, Any]:
         custom_message_sound_path
         if isinstance(custom_message_sound_path, str)
         else ""
+    )
+    config["message_history_limit"] = normalize_message_history_limit(
+        config.get("message_history_limit", DEFAULT_MESSAGE_HISTORY_LIMIT)
+    )
+    config["minimize_to_tray"] = bool(
+        config.get("minimize_to_tray", False)
+    )
+    stored_history = config.get("history")
+    if not isinstance(stored_history, dict):
+        stored_history = {}
+    config["history"] = stored_history
+    prune_local_history_map(
+        stored_history,
+        config["message_history_limit"],
     )
     config.pop("automatic_update_checks", None)
     config.pop("chime_enabled", None)
@@ -2585,9 +2635,13 @@ class MainWindow(QMainWindow):
         self.close_callback: Any = None
 
     def closeEvent(self, event: Any) -> None:
+        should_close = True
         if self.close_callback is not None:
-            self.close_callback()
-        event.accept()
+            should_close = bool(self.close_callback())
+        if should_close:
+            event.accept()
+        else:
+            event.ignore()
 
 
 @dataclass
@@ -2768,6 +2822,8 @@ class EncryptedChatClient(QObject):
             except Exception:
                 pass
         self._closing = False
+        self._force_quit = False
+        self._minimized_to_tray = False
         self.available_update: ReleaseInfo | None = None
         self._update_check_in_progress = False
         self._update_download_in_progress = False
@@ -2789,6 +2845,12 @@ class EncryptedChatClient(QObject):
         )
         self.custom_message_sound_path_var = ValueModel(
             str(self.config_data["custom_message_sound_path"])
+        )
+        self.message_history_limit_var = ValueModel(
+            int(self.config_data["message_history_limit"])
+        )
+        self.minimize_to_tray_var = ValueModel(
+            bool(self.config_data["minimize_to_tray"])
         )
         self.status_var = ValueModel("Connecting")
 
@@ -2816,6 +2878,14 @@ class EncryptedChatClient(QObject):
         self.message_sound_stop_timer.setSingleShot(True)
         self.message_sound_stop_timer.timeout.connect(
             self._stop_message_sound
+        )
+
+        self.background_history_prune_timer = QTimer(self)
+        self.background_history_prune_timer.setInterval(
+            BACKGROUND_HISTORY_PRUNE_INTERVAL_MS
+        )
+        self.background_history_prune_timer.timeout.connect(
+            self._prune_background_local_histories
         )
 
         self.update_check_timer = QTimer(self)
@@ -2852,6 +2922,7 @@ class EncryptedChatClient(QObject):
         self._apply_theme()
         self._apply_application_font_strategy()
         self._build_ui()
+        self._build_tray_icon()
         self._schedule_utc_midnight_reset()
         self._apply_server_preset_state()
         self._load_saved_history_for_current_room()
@@ -2860,6 +2931,7 @@ class EncryptedChatClient(QObject):
         QTimer.singleShot(0, self._apply_titlebar_theme)
         QTimer.singleShot(0, self._check_for_updates)
         self.update_check_timer.start()
+        self.background_history_prune_timer.start()
         self._start_network_thread()
 
     def _font_style_strategy(self) -> QFont.StyleStrategy:
@@ -3032,6 +3104,122 @@ class EncryptedChatClient(QObject):
             lambda: self._apply_window_titlebar_theme(dialog),
         )
         return int(dialog.exec())
+
+    def _build_tray_notification_icon(self, base_icon: QIcon) -> QIcon:
+        outlined_icon = QIcon()
+        outline_color = QColor(TRAY_NOTIFICATION_OUTLINE_COLOR)
+        for icon_size in (16, 20, 24, 32, 48):
+            inner_size = max(1, icon_size - 2)
+            source = base_icon.pixmap(
+                inner_size,
+                inner_size,
+            ).toImage().convertToFormat(
+                QImage.Format.Format_ARGB32
+            )
+            canvas = QImage(
+                icon_size,
+                icon_size,
+                QImage.Format.Format_ARGB32,
+            )
+            canvas.fill(Qt.GlobalColor.transparent)
+
+            for source_y in range(source.height()):
+                for source_x in range(source.width()):
+                    source_color = source.pixelColor(source_x, source_y)
+                    if source_color.alpha() == 0:
+                        continue
+                    center_x = source_x + 1
+                    center_y = source_y + 1
+                    for offset_y in (-1, 0, 1):
+                        for offset_x in (-1, 0, 1):
+                            if offset_x == 0 and offset_y == 0:
+                                continue
+                            canvas.setPixelColor(
+                                center_x + offset_x,
+                                center_y + offset_y,
+                                outline_color,
+                            )
+
+            for source_y in range(source.height()):
+                for source_x in range(source.width()):
+                    source_color = source.pixelColor(source_x, source_y)
+                    if source_color.alpha() != 0:
+                        canvas.setPixelColor(
+                            source_x + 1,
+                            source_y + 1,
+                            source_color,
+                        )
+            outlined_icon.addPixmap(QPixmap.fromImage(canvas))
+        return outlined_icon
+
+    def _build_tray_icon(self) -> None:
+        self._tray_normal_icon = QIcon(str(WINDOW_ICON_PATH))
+        if self._tray_normal_icon.isNull():
+            self._tray_normal_icon = self.root.windowIcon()
+        self._tray_notification_icon = (
+            self._build_tray_notification_icon(self._tray_normal_icon)
+            if not self._tray_normal_icon.isNull()
+            else QIcon()
+        )
+        self.tray_icon = QSystemTrayIcon(
+            self._tray_normal_icon,
+            self.root,
+        )
+        self.tray_icon.setToolTip(APP_NAME)
+        self.tray_menu = QMenu()
+        show_action = self.tray_menu.addAction("Show SpriteLink")
+        show_action.triggered.connect(self._restore_from_tray)
+        self.tray_menu.addSeparator()
+        exit_action = self.tray_menu.addAction("Exit")
+        exit_action.triggered.connect(self._quit_from_tray)
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(
+            self._on_tray_icon_activated
+        )
+
+    def _can_minimize_to_tray(self) -> bool:
+        return (
+            bool(self.minimize_to_tray_var.get())
+            and QSystemTrayIcon.isSystemTrayAvailable()
+            and not self._tray_normal_icon.isNull()
+        )
+
+    def _hide_to_tray(self) -> None:
+        self._minimized_to_tray = True
+        self.tray_icon.setIcon(self._tray_normal_icon)
+        self.tray_icon.setToolTip(APP_NAME)
+        self.tray_icon.show()
+        self.root.hide()
+
+    def _restore_from_tray(self) -> None:
+        self._minimized_to_tray = False
+        self.tray_icon.setIcon(self._tray_normal_icon)
+        self.tray_icon.setToolTip(APP_NAME)
+        self.tray_icon.hide()
+        self.root.showNormal()
+        self.root.raise_()
+        self.root.activateWindow()
+
+    def _mark_tray_notification(self) -> None:
+        if not self._minimized_to_tray or not self.tray_icon.isVisible():
+            return
+        if not self._tray_notification_icon.isNull():
+            self.tray_icon.setIcon(self._tray_notification_icon)
+        self.tray_icon.setToolTip(f"{APP_NAME} — new messages")
+
+    def _on_tray_icon_activated(
+        self,
+        reason: QSystemTrayIcon.ActivationReason,
+    ) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self._restore_from_tray()
+
+    def _quit_from_tray(self) -> None:
+        self._force_quit = True
+        self.root.close()
 
     def _apply_titlebar_theme(self) -> None:
         self._apply_window_titlebar_theme(self.root)
@@ -4625,7 +4813,7 @@ class EncryptedChatClient(QObject):
         layout.addWidget(self._separator(), row, 0, 1, 3)
         row += 1
         layout.addWidget(
-            self._heading("Notifications and rendering"),
+            self._heading("Behavior"),
             row,
             0,
             1,
@@ -4687,6 +4875,53 @@ class EncryptedChatClient(QObject):
             1,
         )
         layout.addWidget(message_sound_volume_control, row, 2)
+        row += 1
+
+        layout.addWidget(QLabel("Message History"), row, 0)
+        self.message_history_combo = ThemeComboBox()
+        self.message_history_combo.addItems([
+            str(option) for option in MESSAGE_HISTORY_OPTIONS
+        ])
+        self.message_history_combo.setCurrentText(
+            str(self.message_history_limit_var.get())
+        )
+        self.message_history_combo.currentTextChanged.connect(
+            lambda value: self.message_history_limit_var.set(
+                normalize_message_history_limit(value)
+            )
+        )
+        self.message_history_limit_var.bind(
+            lambda value: self.message_history_combo.setCurrentText(
+                str(value)
+            )
+        )
+        layout.addWidget(self.message_history_combo, row, 1, 1, 2)
+        row += 1
+
+        self.minimize_to_tray_checkbox = QCheckBox("Minimize to Tray")
+        self.minimize_to_tray_checkbox.setChecked(
+            bool(self.minimize_to_tray_var.get())
+        )
+        self.minimize_to_tray_checkbox.setEnabled(
+            QSystemTrayIcon.isSystemTrayAvailable()
+        )
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.minimize_to_tray_checkbox.setToolTip(
+                "The Windows notification area is unavailable."
+            )
+        self.minimize_to_tray_checkbox.toggled.connect(
+            self.minimize_to_tray_var.set
+        )
+        self.minimize_to_tray_var.bind(
+            self.minimize_to_tray_checkbox.setChecked
+        )
+        layout.addWidget(
+            self.minimize_to_tray_checkbox,
+            row,
+            0,
+            1,
+            3,
+        )
         row += 1
 
         layout.addWidget(self._separator(), row, 0, 1, 3)
@@ -5017,6 +5252,7 @@ class EncryptedChatClient(QObject):
         self.update_button.setText("Installing...")
         self.update_button.setEnabled(False)
         self._update_update_button_style()
+        self._force_quit = True
         QTimer.singleShot(250, self.root.close)
 
     def _sync_config_overlay_geometry(self) -> None:
@@ -5029,6 +5265,8 @@ class EncryptedChatClient(QObject):
             str(self.message_sound_var.get()),
             int(self.message_sound_volume_var.get()),
             str(self.custom_message_sound_path_var.get()),
+            int(self.message_history_limit_var.get()),
+            bool(self.minimize_to_tray_var.get()),
         )
 
     def _set_config_toggle_checked(self, checked: bool) -> None:
@@ -5147,12 +5385,21 @@ class EncryptedChatClient(QObject):
         self.config_data["custom_message_sound_path"] = str(
             self.custom_message_sound_path_var.get()
         )
+        self.config_data["message_history_limit"] = (
+            normalize_message_history_limit(
+                self.message_history_limit_var.get()
+            )
+        )
+        self.config_data["minimize_to_tray"] = bool(
+            self.minimize_to_tray_var.get()
+        )
         self.config_data.pop("automatic_update_checks", None)
         self.config_data.pop("chime_enabled", None)
 
     def _save_settings(self) -> bool:
         try:
             self._copy_ui_to_config()
+            self._apply_message_history_limit()
             save_config(self.config_data)
         except Exception as exc:
             messagebox.showerror(
@@ -6061,10 +6308,16 @@ class EncryptedChatClient(QObject):
 
             if not history_scan and not is_local:
                 unread_added += 1
+                sender_id = str(message.get("c", ""))
+                is_muted_notification = (
+                    self._is_chatroom_muted(room_id)
+                    or sender_id in muted_user_ids
+                )
+                if not is_muted_notification:
+                    self._mark_tray_notification()
                 if (
                     self._should_play_message_sound(room_id)
-                    and not self._is_chatroom_muted(room_id)
-                    and str(message.get("c", "")) not in muted_user_ids
+                    and not is_muted_notification
                 ):
                     self._play_message_sound()
 
@@ -6072,7 +6325,8 @@ class EncryptedChatClient(QObject):
             return
 
         history.sort(key=self._message_sort_key)
-        all_history[scope_id] = history[-1000:]
+        # Inactive rooms are pruned by the hourly maintenance timer.
+        all_history[scope_id] = history
         if unread_added:
             unread_counts = self._unread_counts()
             unread_counts[room_id] = (
@@ -6120,14 +6374,14 @@ class EncryptedChatClient(QObject):
             render=render,
         )
 
-        if (
-            play_chime
-            and not is_local
-            and self._should_play_message_sound(self.active_chatroom_id)
-            and not self._is_chatroom_muted(self.active_chatroom_id)
-            and not self._is_user_muted(str(message["c"]))
-        ):
-            self._play_message_sound()
+        is_muted_notification = (
+            self._is_chatroom_muted(self.active_chatroom_id)
+            or self._is_user_muted(str(message["c"]))
+        )
+        if play_chime and not is_local and not is_muted_notification:
+            self._mark_tray_notification()
+            if self._should_play_message_sound(self.active_chatroom_id):
+                self._play_message_sound()
 
         return True
 
@@ -6160,6 +6414,9 @@ class EncryptedChatClient(QObject):
         })
 
         self.message_log.sort(key=self._message_sort_key)
+        history_limit = self._message_history_limit()
+        if len(self.message_log) > history_limit:
+            del self.message_log[:-history_limit]
         if persist:
             self._persist_local_history()
         if render:
@@ -6181,7 +6438,7 @@ class EncryptedChatClient(QObject):
         if not isinstance(entries, list):
             return
 
-        for item in entries[-1000:]:
+        for item in entries[-self._message_history_limit():]:
             if not isinstance(item, dict):
                 continue
 
@@ -6235,7 +6492,8 @@ class EncryptedChatClient(QObject):
             return
 
         serializable = []
-        for item in self.message_log[-1000:]:
+        history_limit = self._message_history_limit()
+        for item in self.message_log[-history_limit:]:
             serializable.append({
                 "message": item["message"],
                 "warning": item.get("warning"),
@@ -6248,6 +6506,42 @@ class EncryptedChatClient(QObject):
             save_config(self.config_data)
         except Exception:
             pass
+
+    def _message_history_limit(self) -> int:
+        value = (
+            self.message_history_limit_var.get()
+            if hasattr(self, "message_history_limit_var")
+            else self.config_data.get(
+                "message_history_limit",
+                DEFAULT_MESSAGE_HISTORY_LIMIT,
+            )
+        )
+        return normalize_message_history_limit(value)
+
+    def _apply_message_history_limit(self) -> None:
+        history_limit = self._message_history_limit()
+        self.config_data["message_history_limit"] = history_limit
+        prune_local_history_map(
+            self.config_data.setdefault("history", {}),
+            history_limit,
+        )
+        if len(self.message_log) > history_limit:
+            del self.message_log[:-history_limit]
+            if hasattr(self, "chat_display"):
+                self._render_message_log(scroll_to_bottom=True)
+
+    def _prune_background_local_histories(self) -> None:
+        history_by_scope = self.config_data.setdefault("history", {})
+        active_scope_id = self._current_room_scope_id()
+        if prune_local_history_map(
+            history_by_scope,
+            self._message_history_limit(),
+            excluded_scope_id=active_scope_id,
+        ):
+            try:
+                save_config(self.config_data)
+            except Exception:
+                pass
 
     @staticmethod
     def _display_timestamp_for_item(item: dict[str, Any]) -> int:
@@ -7873,17 +8167,27 @@ class EncryptedChatClient(QObject):
                     parent=self.root,
                 )
 
-    def _on_close(self) -> None:
+    def _on_close(self) -> bool:
         if self._closing:
-            return
+            return True
+        if not self._force_quit and self._can_minimize_to_tray():
+            if not self._save_settings():
+                return False
+            self._hide_to_tray()
+            return False
+
         self._closing = True
+        self._minimized_to_tray = False
         QToolTip.hideText()
         self.update_check_timer.stop()
+        self.background_history_prune_timer.stop()
         self.message_sound_stop_timer.stop()
         self._stop_message_sound()
+        self.tray_icon.hide()
 
         try:
             self._copy_ui_to_config()
+            self._apply_message_history_limit()
             save_config(self.config_data)
         except Exception:
             pass
@@ -7898,6 +8202,7 @@ class EncryptedChatClient(QObject):
             wait=False,
             cancel_futures=True,
         )
+        return True
 
 def _write_crash_log(error_text: str) -> Path | None:
     try:
