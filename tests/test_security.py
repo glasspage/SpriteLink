@@ -217,6 +217,23 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("super().__init__(parent)", row_source)
         self.assertIn("self.chatrooms_list,", refresh_source)
 
+    def test_visible_window_defers_tray_icon_replacement(self) -> None:
+        mark_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._mark_tray_notification
+        )
+        sync_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._sync_tray_notification_icon
+        )
+        event_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        self.assertIn("_tray_notification_pending = True", mark_source)
+        self.assertIn("self.root.isVisible()", sync_source)
+        self.assertIn("not self.root.isMinimized()", sync_source)
+        self.assertIn("self._tray_ui_suspended", sync_source)
+        self.assertIn("_tray_icon_is_notification = True", sync_source)
+        self.assertIn("_sync_tray_notification_icon", event_source)
+
     def test_network_worker_waits_until_real_work_is_due(self) -> None:
         self.assertEqual(
             SPRITELINK.polling_interval_seconds(
