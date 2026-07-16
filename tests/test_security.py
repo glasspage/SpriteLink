@@ -280,9 +280,11 @@ class RuntimeOptimizationTests(unittest.TestCase):
                 urgent_room_ids={"urgent"},
                 last_poll_times={
                     "active": 90.0,
-                    "older": 10.0,
+                    "older": 80.0,
                     "urgent": 99.0,
                 },
+                now=100.0,
+                poll_interval=10.0,
             ),
             "urgent",
         )
@@ -296,8 +298,61 @@ class RuntimeOptimizationTests(unittest.TestCase):
                     "older": 10.0,
                     "newer": 80.0,
                 },
+                now=100.0,
+                poll_interval=10.0,
             ),
             "older",
+        )
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "overdue", "urgent"],
+                active_room_id="active",
+                urgent_room_ids={"active", "urgent"},
+                last_poll_times={
+                    "active": 95.0,
+                    "overdue": 60.0,
+                    "urgent": 99.0,
+                },
+                now=100.0,
+                poll_interval=10.0,
+            ),
+            "overdue",
+        )
+        self.assertEqual(
+            SPRITELINK.next_poll_room_id(
+                room_ids=["active", "unchecked", "urgent"],
+                active_room_id="active",
+                urgent_room_ids={"active", "urgent"},
+                last_poll_times={
+                    "active": 95.0,
+                    "urgent": 99.0,
+                },
+                now=100.0,
+                poll_interval=10.0,
+            ),
+            "unchecked",
+        )
+
+        self.assertFalse(
+            SPRITELINK.poll_message_should_notify(
+                {"ntfy_time": 99},
+                history_scan=True,
+                notification_started_at=100,
+            )
+        )
+        self.assertTrue(
+            SPRITELINK.poll_message_should_notify(
+                {"ntfy_time": 100},
+                history_scan=True,
+                notification_started_at=100,
+            )
+        )
+        self.assertTrue(
+            SPRITELINK.poll_message_should_notify(
+                {"ntfy_time": 1},
+                history_scan=False,
+                notification_started_at=100,
+            )
         )
 
         loop_source = inspect.getsource(
@@ -310,6 +365,11 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("subscription_room_queue", loop_source)
         self.assertNotIn("last_background_poll_at", loop_source)
         self.assertNotIn("wait(0.08)", loop_source)
+
+        background_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._accept_background_messages
+        )
+        self.assertIn("poll_message_should_notify", background_source)
 
     def test_network_wakes_immediately_for_send_config_and_focus(self) -> None:
         refresh_source = inspect.getsource(
