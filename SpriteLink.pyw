@@ -2391,8 +2391,9 @@ class ChatroomListRow(QWidget):
         nickname: str,
         unread_count: int,
         muted: bool,
+        parent: QWidget,
     ) -> None:
-        super().__init__()
+        super().__init__(parent)
         self.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents,
             True,
@@ -4027,6 +4028,7 @@ class EncryptedChatClient(QObject):
                 room["nickname"],
                 unread_counts.get(room["id"], 0),
                 room["id"] in muted_ids,
+                self.chatrooms_list,
             )
             item.setSizeHint(row.sizeHint())
             self.chatrooms_list.setItemWidget(item, row)
