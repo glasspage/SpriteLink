@@ -2521,8 +2521,8 @@ class RemoveChatroomDialog(QDialog):
         )
         message = QLabel(
             "This chatroom and its locally stored history will be removed "
-            "from your view; existing messages will remain available to "
-            "other participants."
+            "from your computer. Existing messages will still be visible "
+            "for other participants."
         )
         message.setWordWrap(True)
         message_row.addWidget(message, 1)
