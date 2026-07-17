@@ -50,6 +50,7 @@ try:
         QIODevice,
         QObject,
         QPoint,
+        QPointF,
         QSize,
         QTimer,
         Qt,
@@ -79,6 +80,7 @@ try:
         QTextDocument,
         QTextFormat,
         QTextImageFormat,
+        QTextLayout,
         QTextOption,
     )
     from PySide6.QtWidgets import (
@@ -331,6 +333,12 @@ MAX_PROFILE_ICON_GIF_BYTES = 2048
 MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
+TOOLTIP_SEPARATOR_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMA"
+    "AA9hAAAPYQGoP6dpAAAADUlEQVQImWPo6Oj4DwAFzAKYEBSlCAAAAA"
+    "BJRU5ErkJggg=="
+)
 EMBEDDED_IMAGE_MAX_EDGE = 96
 NSFW_IMAGE_PLACEHOLDER_SIZE = 64
 TOP_ALIGNED_PROFILE_ICON_PADDING = 3
@@ -1187,9 +1195,14 @@ def message_storage_status(
     return "Stored locally"
 
 
+def notification_tag_for_chatroom(room_id: str) -> str:
+    return hashlib.sha256(str(room_id).encode("utf-8")).hexdigest()[:32]
+
+
 def silent_windows_notification_command(
     title: str,
     body: str,
+    tag: str,
 ) -> list[str]:
     title_base64 = base64.b64encode(
         str(title).encode("utf-8")
@@ -1197,18 +1210,25 @@ def silent_windows_notification_command(
     body_base64 = base64.b64encode(
         str(body).encode("utf-8")
     ).decode("ascii")
+    tag_base64 = base64.b64encode(
+        str(tag).encode("utf-8")
+    ).decode("ascii")
     script = f"""
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
 $title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{title_base64}'))
 $body = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{body_base64}'))
-$safeTitle = [Security.SecurityElement]::Escape($title)
-$safeBody = [Security.SecurityElement]::Escape($body)
-$toastXml = '<toast><visual><binding template="ToastGeneric"><text>{0}</text><text>{1}</text></binding></visual><audio silent="true"/></toast>' -f $safeTitle, $safeBody
+$tag = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{tag_base64}'))
+$toastXml = '<toast><visual><binding template="ToastGeneric"><text></text><text></text></binding></visual><audio silent="true"/></toast>'
 $xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
 $xml.LoadXml($toastXml)
+$textNodes = $xml.GetElementsByTagName('text')
+$textNodes.Item(0).AppendChild($xml.CreateTextNode($title)) | Out-Null
+$textNodes.Item(1).AppendChild($xml.CreateTextNode($body)) | Out-Null
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+$toast.Tag = $tag
+$toast.Group = 'SpriteLink.Chatrooms'
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{WINDOWS_APP_USER_MODEL_ID}').Show($toast)
 """.strip()
     encoded_script = base64.b64encode(
@@ -1225,12 +1245,16 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
     ]
 
 
-def show_silent_windows_notification(title: str, body: str) -> bool:
+def show_silent_windows_notification(
+    title: str,
+    body: str,
+    tag: str,
+) -> bool:
     if os.name != "nt":
         return False
     try:
         subprocess.Popen(
-            silent_windows_notification_command(title, body),
+            silent_windows_notification_command(title, body, tag),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1272,6 +1296,29 @@ def serialize_message_rich_text(
     for tag in reversed(active_tags):
         output.append(f"</{tag}>")
     return "".join(output)
+
+
+def trim_message_text(text: str) -> str:
+    plain_text, runs = parse_message_rich_text(str(text))
+    trimmed_plain_text = plain_text.rstrip()
+    if len(trimmed_plain_text) == len(plain_text):
+        return str(text)
+    if not trimmed_plain_text:
+        return ""
+
+    trimmed_length = len(trimmed_plain_text)
+    trimmed_segments: list[tuple[str, bool, bool, bool]] = []
+    for run in runs:
+        if run.start >= trimmed_length:
+            break
+        segment_end = min(run.end, trimmed_length)
+        trimmed_segments.append((
+            trimmed_plain_text[run.start:segment_end],
+            run.bold,
+            run.italic,
+            run.underline,
+        ))
+    return serialize_message_rich_text(trimmed_segments)
 
 
 def is_direct_image_url(url: str) -> bool:
@@ -3008,7 +3055,7 @@ class TextShadowProxyStyle(QProxyStyle):
             and bool(app.property("spritelinkTextShadows"))
         ):
             shadow_color = QColor(0, 0, 0)
-            shadow_color.setAlphaF(0.35)
+            shadow_color.setAlphaF(0.20)
             shadow_palette = QPalette(palette)
             painter.save()
             if text_role == QPalette.ColorRole.NoRole:
@@ -3268,8 +3315,73 @@ class MessageLogBrowser(QTextBrowser):
         self._lock_horizontal_scroll()
         super().scrollContentsBy(0, dy)
 
+    def _paint_text_shadows(self, event: Any) -> None:
+        app = QApplication.instance()
+        if (
+            app is None
+            or not bool(app.property("spritelinkTextShadows"))
+            or self.textCursor().hasSelection()
+        ):
+            return
+
+        viewport = self.viewport()
+        viewport_width = viewport.width()
+        viewport_height = viewport.height()
+        if viewport_width <= 0 or viewport_height <= 0:
+            return
+
+        paint_rect = event.rect()
+        first_block = self.cursorForPosition(QPoint(
+            0,
+            max(0, paint_rect.top()),
+        )).block().blockNumber()
+        last_block = self.cursorForPosition(QPoint(
+            max(0, viewport_width - 1),
+            min(viewport_height - 1, paint_rect.bottom()),
+        )).block().blockNumber()
+        first_block = max(0, first_block - 1)
+        last_block = min(
+            self.document().blockCount() - 1,
+            last_block + 1,
+        )
+
+        shadow_color = QColor(0, 0, 0)
+        shadow_color.setAlphaF(0.20)
+        shadow_format = QTextCharFormat()
+        shadow_format.setForeground(shadow_color)
+        painter = QPainter(viewport)
+        painter.setClipRegion(event.region())
+
+        for block_number in range(first_block, last_block + 1):
+            block = self.document().findBlockByNumber(block_number)
+            if not block.isValid() or block.length() <= 1:
+                continue
+            layout = block.layout()
+            if layout is None or layout.lineCount() <= 0:
+                continue
+
+            block_cursor = QTextCursor(block)
+            cursor_rect = self.cursorRect(block_cursor)
+            first_line_position = layout.lineAt(0).position()
+            layout_origin = (
+                QPointF(cursor_rect.topLeft()) - first_line_position
+            )
+            shadow_range = QTextLayout.FormatRange()
+            shadow_range.start = 0
+            shadow_range.length = block.length() - 1
+            shadow_range.format = shadow_format
+
+            painter.save()
+            painter.translate(1, 1)
+            layout.draw(painter, layout_origin, [shadow_range])
+            painter.restore()
+            layout.draw(painter, layout_origin)
+
+        painter.end()
+
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
+        self._paint_text_shadows(event)
         if not self.row_background_blocks and not self.collapsed_fade_blocks:
             return
 
@@ -6637,6 +6749,7 @@ class EncryptedChatClient(QObject):
 
     def _build_draft_message(self, text: str) -> dict[str, Any]:
         profile = self._active_room_profile()
+        text = trim_message_text(text)
 
         message = {
             "v": APP_VERSION,
@@ -6705,7 +6818,7 @@ class EncryptedChatClient(QObject):
 
     def _run_message_size_check(self) -> None:
         self.message_size_check_pending = False
-        text = self.message_entry.to_message_text()
+        text = trim_message_text(self.message_entry.to_message_text())
 
         try:
             draft_message = self._build_draft_message(text)
@@ -6841,10 +6954,10 @@ class EncryptedChatClient(QObject):
         )
 
     def _send_current_message(self) -> None:
-        plain_text = self.message_entry.toPlainText()
-        text = self.message_entry.to_message_text()
+        text = trim_message_text(self.message_entry.to_message_text())
+        plain_text = message_plain_text(text)
 
-        if not plain_text.strip():
+        if not plain_text:
             return
 
         if len(text) > MAX_MESSAGE_CHARS:
@@ -7635,6 +7748,7 @@ class EncryptedChatClient(QObject):
                 raise ValueError(
                     "Signed message time differs too far from Ntfy time."
                 )
+        message["m"] = trim_message_text(message["m"])
 
     def _queue_ui_event(self, event: tuple[str, Any]) -> None:
         self.ui_queue.put(event)
@@ -8291,20 +8405,24 @@ class EncryptedChatClient(QObject):
         tooltip_icon_uri = profile_icon_tooltip_data_uri(
             str(message.get("p", ""))
         )
-        icon_html = (
-            f'<img src="{tooltip_icon_uri}" width="64" height="64"><br>'
+        icon_row = (
+            '<tr><td align="center">'
+            f'<img src="{tooltip_icon_uri}" width="64" height="64">'
+            "</td></tr>"
             if tooltip_icon_uri
             else ""
         )
         return (
-            '<div align="center">'
-            f"{icon_html}"
             '<table align="center" cellspacing="0" cellpadding="0">'
+            f"{icon_row}"
             f'<tr><td align="center">User ID: {user_id_preview}</td></tr>'
-            '<tr><td height="1" bgcolor="#888888"></td></tr>'
+            '<tr><td align="center" valign="top" height="1">'
+            f'<img src="{TOOLTIP_SEPARATOR_DATA_URI}" '
+            'width="112" height="1">'
+            "</td></tr>"
             f'<tr><td align="center">{hover_timestamp}</td></tr>'
             f'<tr><td align="center">{storage_status}</td></tr>'
-            "</table></div>"
+            "</table>"
         )
 
     def _hide_chat_tooltip(self) -> None:
@@ -9724,7 +9842,11 @@ class EncryptedChatClient(QObject):
         )
         if len(body) > 1024:
             body = body[:1023] + "…"
-        show_silent_windows_notification(room["nickname"], body)
+        show_silent_windows_notification(
+            room["nickname"],
+            body,
+            notification_tag_for_chatroom(room_id),
+        )
 
     def _message_sound_path(self, sound_name: str) -> Path | None:
         if sound_name == "Custom":

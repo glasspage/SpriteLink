@@ -2404,12 +2404,22 @@ class Version110ReleaseTests(unittest.TestCase):
         )
         self.assertEqual(SPRITELINK.DEFAULT_MESSAGE_FONT, "Arial")
 
-    def test_text_shadow_style_is_one_pixel_and_35_percent(self) -> None:
+    def test_text_shadows_are_one_pixel_at_20_percent(self) -> None:
         source = inspect.getsource(
             SPRITELINK.TextShadowProxyStyle.drawItemText
         )
-        self.assertIn("setAlphaF(0.35)", source)
+        self.assertIn("setAlphaF(0.20)", source)
         self.assertIn("rect.translated(1, 1)", source)
+        chat_shadow_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_text_shadows
+        )
+        self.assertIn("setAlphaF(0.20)", chat_shadow_source)
+        self.assertIn("painter.translate(1, 1)", chat_shadow_source)
+        self.assertIn("layout.draw", chat_shadow_source)
+        paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser.paintEvent
+        )
+        self.assertIn("_paint_text_shadows(event)", paint_source)
         apply_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._apply_theme
         )
@@ -2430,12 +2440,25 @@ class Version110ReleaseTests(unittest.TestCase):
         command = SPRITELINK.silent_windows_notification_command(
             'Room "One"',
             "User: <hello> & goodbye",
+            "room-tag",
         )
         self.assertEqual(command[0], "powershell.exe")
         script = base64.b64decode(command[-1]).decode("utf-16-le")
         self.assertIn('<audio silent="true"/>', script)
         self.assertIn(SPRITELINK.WINDOWS_APP_USER_MODEL_ID, script)
-        self.assertIn("SecurityElement]::Escape", script)
+        self.assertIn("CreateTextNode($title)", script)
+        self.assertIn("CreateTextNode($body)", script)
+        self.assertIn("$toast.Tag = $tag", script)
+        self.assertIn("$toast.Group = 'SpriteLink.Chatrooms'", script)
+        self.assertNotIn("<text>{0}</text>", script)
+        self.assertEqual(
+            SPRITELINK.notification_tag_for_chatroom("room-one"),
+            SPRITELINK.notification_tag_for_chatroom("room-one"),
+        )
+        self.assertNotEqual(
+            SPRITELINK.notification_tag_for_chatroom("room-one"),
+            SPRITELINK.notification_tag_for_chatroom("room-two"),
+        )
 
         client = mock.Mock()
         client.desktop_notifications_var.get.return_value = True
@@ -2453,6 +2476,7 @@ class Version110ReleaseTests(unittest.TestCase):
         show_notification.assert_called_once_with(
             "Room One",
             "User: Hello",
+            SPRITELINK.notification_tag_for_chatroom("room-one"),
         )
 
     def test_desktop_notifications_require_an_unfocused_window(self) -> None:
@@ -2508,6 +2532,9 @@ class Version110ReleaseTests(unittest.TestCase):
             tooltip_source.index("{hover_timestamp}</td>"),
         )
         self.assertIn('height="1"', tooltip_source)
+        self.assertIn('width="112" height="1"', tooltip_source)
+        self.assertNotIn("<br>", tooltip_source)
+        self.assertNotIn("bgcolor", tooltip_source)
         self.assertIn("storage_status", tooltip_source)
 
     def test_each_message_resets_its_non_breakable_block_format(self) -> None:
@@ -2522,6 +2549,36 @@ class Version110ReleaseTests(unittest.TestCase):
         self.assertNotIn(
             "collapsed_block_format = cursor.blockFormat()",
             source,
+        )
+
+    def test_message_text_trims_after_its_last_visible_character(self) -> None:
+        self.assertEqual(
+            SPRITELINK.trim_message_text("Hello   \n\n"),
+            "Hello",
+        )
+        self.assertEqual(
+            SPRITELINK.trim_message_text(
+                "<b>Hello <i>there   \n</i></b>"
+            ),
+            "<b>Hello <i>there</i></b>",
+        )
+        self.assertEqual(
+            SPRITELINK.trim_message_text("  leading space"),
+            "  leading space",
+        )
+
+        send_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._send_current_message
+        )
+        self.assertIn("text = trim_message_text", send_source)
+        receive_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._validate_decrypted_message
+        )
+        self.assertLess(
+            receive_source.index("verify_message_identity"),
+            receive_source.index(
+                'message["m"] = trim_message_text(message["m"])'
+            ),
         )
 
     def test_windows_package_defaults_to_version_110(self) -> None:
