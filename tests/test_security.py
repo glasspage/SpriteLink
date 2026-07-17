@@ -2421,6 +2421,13 @@ class Version110ReleaseTests(unittest.TestCase):
             chat_shadow_source,
         )
         self.assertNotIn("cursorRect", chat_shadow_source)
+        image_clip_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._text_shadow_clip_region
+        )
+        self.assertIn('"\\ufffc"', image_clip_source)
+        self.assertIn("isImageFormat", image_clip_source)
+        self.assertIn("clip_region.subtracted", image_clip_source)
+        self.assertIn("_text_shadow_clip_region", chat_shadow_source)
         paint_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser.paintEvent
         )
@@ -2476,20 +2483,48 @@ class Version110ReleaseTests(unittest.TestCase):
         client.desktop_notifications_var.get.return_value = True
         client.window_focused_event.is_set.return_value = False
         client._find_chatroom.return_value = {"nickname": "Room One"}
+        client.pending_desktop_notifications = {}
+        client.desktop_notification_timer = mock.Mock()
+        SPRITELINK.EncryptedChatClient._show_desktop_notification(
+            client,
+            "room-one",
+            {"u": "User", "m": "<b>Newest</b>", "t": 2, "i": "b"},
+            sort_key=(2, 2, "b"),
+        )
+        SPRITELINK.EncryptedChatClient._show_desktop_notification(
+            client,
+            "room-one",
+            {"u": "User", "m": "Older", "t": 1, "i": "a"},
+            sort_key=(1, 1, "a"),
+        )
         with mock.patch.object(
             SPRITELINK,
             "show_silent_windows_notification",
         ) as show_notification:
-            SPRITELINK.EncryptedChatClient._show_desktop_notification(
-                client,
-                "room-one",
-                {"u": "User", "m": "<b>Hello</b>"},
+            SPRITELINK.EncryptedChatClient._flush_desktop_notifications(
+                client
             )
         show_notification.assert_called_once_with(
             "Room One",
-            "User: Hello",
+            "User: Newest",
             SPRITELINK.notification_tag_for_chatroom("room-one"),
         )
+        self.assertEqual(client.pending_desktop_notifications, {})
+
+    def test_notification_sounds_have_a_two_second_cooldown(self) -> None:
+        client = mock.Mock()
+        client.last_notification_sound_at = float("-inf")
+        with mock.patch.object(
+            SPRITELINK.time,
+            "monotonic",
+            side_effect=(10.0, 11.9, 12.0),
+        ):
+            for _ in range(3):
+                SPRITELINK.EncryptedChatClient._play_notification_sound(
+                    client
+                )
+        self.assertEqual(client._play_message_sound.call_count, 2)
+        self.assertEqual(SPRITELINK.MESSAGE_SOUND_COOLDOWN_SECONDS, 2.0)
 
     def test_desktop_notifications_require_an_unfocused_window(self) -> None:
         client = mock.Mock()

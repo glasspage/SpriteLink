@@ -51,6 +51,7 @@ try:
         QObject,
         QPoint,
         QPointF,
+        QRectF,
         QSize,
         QTimer,
         Qt,
@@ -74,6 +75,7 @@ try:
         QPixmap,
         QPixmapCache,
         QPolygon,
+        QRegion,
         QTextBlockFormat,
         QTextCharFormat,
         QTextCursor,
@@ -286,7 +288,9 @@ BUILTIN_MESSAGE_SOUND_FILES = {
     "Blip": "blip.wav",
 }
 CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
+MESSAGE_SOUND_COOLDOWN_SECONDS = 2.0
 COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
+DESKTOP_NOTIFICATION_DEBOUNCE_MS = 250
 CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
@@ -3311,6 +3315,48 @@ class MessageLogBrowser(QTextBrowser):
         scrollbar.setValue(0)
         scrollbar.blockSignals(signals_were_blocked)
 
+    def _text_shadow_clip_region(
+        self,
+        event: Any,
+        block: Any,
+        layout: QTextLayout,
+    ) -> QRegion:
+        """Exclude inline images while retaining their layout space."""
+        clip_region = event.region()
+        block_text = block.text()
+        if "\ufffc" not in block_text:
+            return clip_region
+
+        scroll_x = self.horizontalScrollBar().value()
+        scroll_y = self.verticalScrollBar().value()
+        for offset, character in enumerate(block_text):
+            if character != "\ufffc":
+                continue
+            image_cursor = QTextCursor(block)
+            image_cursor.setPosition(block.position() + offset)
+            image_cursor.movePosition(
+                QTextCursor.MoveOperation.NextCharacter,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            character_format = image_cursor.charFormat()
+            if not character_format.isImageFormat():
+                continue
+            image_format = QTextImageFormat(character_format)
+            line = layout.lineForTextPosition(offset)
+            if not line.isValid():
+                continue
+            image_x = line.cursorToX(offset)[0]
+            image_width = max(1.0, image_format.width())
+            image_height = max(line.height(), image_format.height())
+            image_rect = QRectF(
+                layout.position().x() + image_x - scroll_x + 1,
+                layout.position().y() + line.y() - scroll_y + 1,
+                image_width,
+                image_height,
+            ).toAlignedRect().adjusted(-1, -1, 1, 1)
+            clip_region = clip_region.subtracted(QRegion(image_rect))
+        return clip_region
+
     def scrollContentsBy(self, _dx: int, dy: int) -> None:
         self._lock_horizontal_scroll()
         super().scrollContentsBy(0, dy)
@@ -3374,6 +3420,10 @@ class MessageLogBrowser(QTextBrowser):
             shadow_range.format = shadow_format
 
             painter.save()
+            painter.setClipRegion(
+                self._text_shadow_clip_region(event, block, layout),
+                Qt.ClipOperation.ReplaceClip,
+            )
             painter.translate(1, 1)
             layout.draw(painter, layout_origin, [shadow_range])
             painter.restore()
@@ -3767,6 +3817,11 @@ class EncryptedChatClient(QObject):
         self.desktop_notifications_var = ValueModel(
             bool(self.config_data.get("desktop_notifications", False))
         )
+        self.pending_desktop_notifications: dict[
+            str,
+            tuple[tuple[int, int, str], str, str, str],
+        ] = {}
+        self.last_notification_sound_at = float("-inf")
         self.chatroom_history_limit_var = ValueModel(
             int(self.config_data["chatroom_history_limit"])
         )
@@ -3806,6 +3861,15 @@ class EncryptedChatClient(QObject):
         self.message_sound_stop_timer.setSingleShot(True)
         self.message_sound_stop_timer.timeout.connect(
             self._stop_message_sound
+        )
+
+        self.desktop_notification_timer = QTimer(self)
+        self.desktop_notification_timer.setSingleShot(True)
+        self.desktop_notification_timer.setInterval(
+            DESKTOP_NOTIFICATION_DEBOUNCE_MS
+        )
+        self.desktop_notification_timer.timeout.connect(
+            self._flush_desktop_notifications
         )
 
         self.background_history_prune_timer = QTimer(self)
@@ -7978,12 +8042,16 @@ class EncryptedChatClient(QObject):
                 )
                 if not is_muted_notification:
                     self._mark_tray_notification()
-                    self._show_desktop_notification(room_id, message)
+                    self._show_desktop_notification(
+                        room_id,
+                        message,
+                        sort_key=self._message_sort_key(item),
+                    )
                 if (
                     self._should_play_message_sound(room_id)
                     and not is_muted_notification
                 ):
-                    self._play_message_sound()
+                    self._play_notification_sound()
 
         if not added:
             return
@@ -8053,9 +8121,10 @@ class EncryptedChatClient(QObject):
             self._show_desktop_notification(
                 self.active_chatroom_id,
                 message,
+                sort_key=self._message_sort_key(item),
             )
             if self._should_play_message_sound(self.active_chatroom_id):
-                self._play_message_sound()
+                self._play_notification_sound()
 
         return True
 
@@ -9841,6 +9910,8 @@ class EncryptedChatClient(QObject):
         self,
         room_id: str,
         message: dict[str, Any],
+        *,
+        sort_key: tuple[int, int, str] | None = None,
     ) -> None:
         if (
             not bool(self.desktop_notifications_var.get())
@@ -9856,11 +9927,33 @@ class EncryptedChatClient(QObject):
         )
         if len(body) > 1024:
             body = body[:1023] + "…"
-        show_silent_windows_notification(
-            room["nickname"],
+        notification = (
+            sort_key
+            if sort_key is not None
+            else (
+                int(message.get("t", 0) or 0),
+                int(message.get("t", 0) or 0),
+                str(message.get("i", "")),
+            ),
+            str(room["nickname"]),
             body,
             notification_tag_for_chatroom(room_id),
         )
+        pending = self.pending_desktop_notifications.get(room_id)
+        if pending is None or notification[0] >= pending[0]:
+            self.pending_desktop_notifications[room_id] = notification
+        self.desktop_notification_timer.start()
+
+    def _flush_desktop_notifications(self) -> None:
+        pending = list(self.pending_desktop_notifications.values())
+        self.pending_desktop_notifications.clear()
+        if (
+            not bool(self.desktop_notifications_var.get())
+            or self.window_focused_event.is_set()
+        ):
+            return
+        for _sort_key, title, body, tag in pending:
+            show_silent_windows_notification(title, body, tag)
 
     def _message_sound_path(self, sound_name: str) -> Path | None:
         if sound_name == "Custom":
@@ -10113,6 +10206,16 @@ class EncryptedChatClient(QObject):
                     parent=self.root,
                 )
 
+    def _play_notification_sound(self) -> None:
+        now = time.monotonic()
+        if (
+            now - self.last_notification_sound_at
+            < MESSAGE_SOUND_COOLDOWN_SECONDS
+        ):
+            return
+        self.last_notification_sound_at = now
+        self._play_message_sound()
+
     def _on_close(self) -> bool:
         if self._closing:
             return True
@@ -10129,6 +10232,8 @@ class EncryptedChatClient(QObject):
         self.background_history_prune_timer.stop()
         self.viewport_media_timer.stop()
         self.message_sound_stop_timer.stop()
+        self.desktop_notification_timer.stop()
+        self.pending_desktop_notifications.clear()
         self.connection_error_timer.stop()
         self._release_message_sound_resources()
         self.tray_icon.hide()
