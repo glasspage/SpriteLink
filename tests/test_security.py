@@ -2404,18 +2404,23 @@ class Version110ReleaseTests(unittest.TestCase):
         )
         self.assertEqual(SPRITELINK.DEFAULT_MESSAGE_FONT, "Arial")
 
-    def test_text_shadows_are_one_pixel_at_20_percent(self) -> None:
+    def test_text_shadows_are_one_pixel_at_15_percent(self) -> None:
         source = inspect.getsource(
             SPRITELINK.TextShadowProxyStyle.drawItemText
         )
-        self.assertIn("setAlphaF(0.20)", source)
+        self.assertIn("setAlphaF(0.15)", source)
         self.assertIn("rect.translated(1, 1)", source)
         chat_shadow_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_text_shadows
         )
-        self.assertIn("setAlphaF(0.20)", chat_shadow_source)
+        self.assertIn("setAlphaF(0.15)", chat_shadow_source)
         self.assertIn("painter.translate(1, 1)", chat_shadow_source)
         self.assertIn("layout.draw", chat_shadow_source)
+        self.assertIn(
+            "-self.verticalScrollBar().value()",
+            chat_shadow_source,
+        )
+        self.assertNotIn("cursorRect", chat_shadow_source)
         paint_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser.paintEvent
         )
@@ -2424,6 +2429,13 @@ class Version110ReleaseTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._apply_theme
         )
         self.assertIn("spritelinkTextShadows", apply_source)
+        toggle_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_text_shadows_toggled
+        )
+        self.assertLess(
+            toggle_source.index("_apply_theme()"),
+            toggle_source.index("_apply_application_font_strategy()"),
+        )
 
     def test_taskbar_and_tray_icons_share_unread_state(self) -> None:
         mark_source = inspect.getsource(

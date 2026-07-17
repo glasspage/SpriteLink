@@ -3055,7 +3055,7 @@ class TextShadowProxyStyle(QProxyStyle):
             and bool(app.property("spritelinkTextShadows"))
         ):
             shadow_color = QColor(0, 0, 0)
-            shadow_color.setAlphaF(0.20)
+            shadow_color.setAlphaF(0.15)
             shadow_palette = QPalette(palette)
             painter.save()
             if text_role == QPalette.ColorRole.NoRole:
@@ -3346,11 +3346,19 @@ class MessageLogBrowser(QTextBrowser):
         )
 
         shadow_color = QColor(0, 0, 0)
-        shadow_color.setAlphaF(0.20)
+        shadow_color.setAlphaF(0.15)
         shadow_format = QTextCharFormat()
         shadow_format.setForeground(shadow_color)
         painter = QPainter(viewport)
         painter.setClipRegion(event.region())
+        # QTextLayout already retains its absolute document position.  The
+        # draw origin must therefore contain only the viewport's scroll
+        # offset; adding each block position again makes the shadow drift
+        # downward by another line for every message.
+        layout_origin = QPointF(
+            -self.horizontalScrollBar().value(),
+            -self.verticalScrollBar().value(),
+        )
 
         for block_number in range(first_block, last_block + 1):
             block = self.document().findBlockByNumber(block_number)
@@ -3360,12 +3368,6 @@ class MessageLogBrowser(QTextBrowser):
             if layout is None or layout.lineCount() <= 0:
                 continue
 
-            block_cursor = QTextCursor(block)
-            cursor_rect = self.cursorRect(block_cursor)
-            first_line_position = layout.lineAt(0).position()
-            layout_origin = (
-                QPointF(cursor_rect.topLeft()) - first_line_position
-            )
             shadow_range = QTextLayout.FormatRange()
             shadow_range.start = 0
             shadow_range.length = block.length() - 1
@@ -6668,6 +6670,10 @@ class EncryptedChatClient(QObject):
     def _on_text_shadows_toggled(self, enabled: bool) -> None:
         self.text_shadows_var.set(bool(enabled))
         self._apply_theme()
+        # Replacing the application style can reset explicitly assigned
+        # widget fonts. Restore the active theme's font family, especially
+        # Tahoma for Windows Classic headings and the chatroom title.
+        self._apply_application_font_strategy()
 
     def _validate_current_settings(self) -> str:
         server_url = normalize_server_url(str(self.server_url_var.get()))
