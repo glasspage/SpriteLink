@@ -1196,7 +1196,7 @@ def message_storage_status(
         <= SERVER_HISTORY_RETENTION_SECONDS
     ):
         return "Stored on server"
-    return "Stored locally"
+    return "Expired"
 
 
 def notification_tag_for_chatroom(room_id: str) -> str:

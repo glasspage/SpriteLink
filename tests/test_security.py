@@ -2560,7 +2560,7 @@ class Version110ReleaseTests(unittest.TestCase):
                 1_000_000 - retention - 1,
                 now=1_000_000,
             ),
-            "Stored locally",
+            "Expired",
         )
         poll_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._current_poll_since
