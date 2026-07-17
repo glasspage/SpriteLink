@@ -333,11 +333,11 @@ MAX_PROFILE_ICON_GIF_BYTES = 2048
 MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
-TOOLTIP_SEPARATOR_DATA_URI = (
+TOOLTIP_SPACER_DATA_URI = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMA"
-    "AA9hAAAPYQGoP6dpAAAADUlEQVQImWPo6Oj4DwAFzAKYEBSlCAAAAA"
-    "BJRU5ErkJggg=="
+    "AA7EAAAOxAGVKw4bAAAAC0lEQVQImWNgAAIAAAUAAWJVMogAAAAASUV"
+    "ORK5CYII="
 )
 EMBEDDED_IMAGE_MAX_EDGE = 96
 NSFW_IMAGE_PLACEHOLDER_SIZE = 64
@@ -8422,9 +8422,17 @@ class EncryptedChatClient(QObject):
             '<table align="center" cellspacing="0" cellpadding="0">'
             f"{icon_row}"
             f'<tr><td align="center">User ID: {user_id_preview}</td></tr>'
-            '<tr><td align="center" valign="top" height="1">'
-            f'<img src="{TOOLTIP_SEPARATOR_DATA_URI}" '
-            'width="112" height="1">'
+            '<tr><td height="3">'
+            f'<img src="{TOOLTIP_SPACER_DATA_URI}" '
+            'width="1" height="3">'
+            "</td></tr>"
+            '<tr><td bgcolor="#888888" height="1">'
+            f'<img src="{TOOLTIP_SPACER_DATA_URI}" '
+            'width="1" height="1">'
+            "</td></tr>"
+            '<tr><td height="3">'
+            f'<img src="{TOOLTIP_SPACER_DATA_URI}" '
+            'width="1" height="3">'
             "</td></tr>"
             f'<tr><td align="center">{hover_timestamp}</td></tr>'
             f'<tr><td align="center">{storage_status}</td></tr>'

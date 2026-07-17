@@ -2543,10 +2543,10 @@ class Version110ReleaseTests(unittest.TestCase):
             tooltip_source.index("User ID:"),
             tooltip_source.index("{hover_timestamp}</td>"),
         )
-        self.assertIn('height="1"', tooltip_source)
-        self.assertIn('width="112" height="1"', tooltip_source)
+        self.assertEqual(tooltip_source.count('height="3"'), 4)
+        self.assertIn('bgcolor="#888888" height="1"', tooltip_source)
+        self.assertIn('width="1" height="1"', tooltip_source)
         self.assertNotIn("<br>", tooltip_source)
-        self.assertNotIn("bgcolor", tooltip_source)
         self.assertIn("storage_status", tooltip_source)
 
     def test_each_message_resets_its_non_breakable_block_format(self) -> None:
