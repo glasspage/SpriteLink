@@ -50,6 +50,8 @@ try:
         QIODevice,
         QObject,
         QPoint,
+        QPointF,
+        QRectF,
         QSize,
         QTimer,
         Qt,
@@ -73,12 +75,14 @@ try:
         QPixmap,
         QPixmapCache,
         QPolygon,
+        QRegion,
         QTextBlockFormat,
         QTextCharFormat,
         QTextCursor,
         QTextDocument,
         QTextFormat,
         QTextImageFormat,
+        QTextLayout,
         QTextOption,
     )
     from PySide6.QtWidgets import (
@@ -102,6 +106,7 @@ try:
         QMessageBox,
         QPlainTextEdit,
         QProgressBar,
+        QProxyStyle,
         QPushButton,
         QScrollArea,
         QSlider,
@@ -283,7 +288,9 @@ BUILTIN_MESSAGE_SOUND_FILES = {
     "Blip": "blip.wav",
 }
 CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
+MESSAGE_SOUND_COOLDOWN_SECONDS = 2.0
 COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
+DESKTOP_NOTIFICATION_DEBOUNCE_MS = 250
 CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
@@ -317,7 +324,7 @@ CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
 IMMEDIATE_CHATROOM_SWITCH_LIMIT = 2
 CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS = 6
 REQUEST_TIMEOUT_SECONDS = 10
-AUTO_HISTORY_SECONDS = 48 * 60 * 60
+SERVER_HISTORY_RETENTION_SECONDS = 12 * 60 * 60
 GAP_SEPARATOR_SECONDS = 6 * 60 * 60
 MAX_MESSAGE_CHARS = 4000
 NTFY_MAX_BODY_BYTES = 4096
@@ -330,6 +337,12 @@ MAX_PROFILE_ICON_GIF_BYTES = 2048
 MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
+TOOLTIP_SPACER_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMA"
+    "AA7EAAAOxAGVKw4bAAAAC0lEQVQImWNgAAIAAAUAAWJVMogAAAAASUV"
+    "ORK5CYII="
+)
 EMBEDDED_IMAGE_MAX_EDGE = 96
 NSFW_IMAGE_PLACEHOLDER_SIZE = 64
 TOP_ALIGNED_PROFILE_ICON_PADDING = 3
@@ -484,7 +497,7 @@ LIKELY_NSFW_IMAGE_DOMAINS = (
 MESSAGE_URL_PATTERN = re.compile(r"https://[^\s<>\"']+", re.IGNORECASE)
 MESSAGE_ENTRY_MIN_LINES = 1
 MESSAGE_ENTRY_MAX_LINES = 6
-DEFAULT_MESSAGE_FONT = "Segoe UI"
+DEFAULT_MESSAGE_FONT = "Arial"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
@@ -1171,6 +1184,91 @@ def message_plain_text(text: str) -> str:
     return parse_message_rich_text(text)[0]
 
 
+def message_storage_status(
+    timestamp: int,
+    *,
+    now: int | None = None,
+) -> str:
+    current_time = int(time.time()) if now is None else int(now)
+    if (
+        int(timestamp) > 0
+        and current_time - int(timestamp)
+        <= SERVER_HISTORY_RETENTION_SECONDS
+    ):
+        return "Stored on server"
+    return "Expired"
+
+
+def notification_tag_for_chatroom(room_id: str) -> str:
+    return hashlib.sha256(str(room_id).encode("utf-8")).hexdigest()[:32]
+
+
+def silent_windows_notification_command(
+    title: str,
+    body: str,
+    tag: str,
+) -> list[str]:
+    title_base64 = base64.b64encode(
+        str(title).encode("utf-8")
+    ).decode("ascii")
+    body_base64 = base64.b64encode(
+        str(body).encode("utf-8")
+    ).decode("ascii")
+    tag_base64 = base64.b64encode(
+        str(tag).encode("utf-8")
+    ).decode("ascii")
+    script = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{title_base64}'))
+$body = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{body_base64}'))
+$tag = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{tag_base64}'))
+$toastXml = '<toast><visual><binding template="ToastGeneric"><text></text><text></text></binding></visual><audio silent="true"/></toast>'
+$xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
+$xml.LoadXml($toastXml)
+$textNodes = $xml.GetElementsByTagName('text')
+$textNodes.Item(0).AppendChild($xml.CreateTextNode($title)) | Out-Null
+$textNodes.Item(1).AppendChild($xml.CreateTextNode($body)) | Out-Null
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+$toast.Tag = $tag
+$toast.Group = 'SpriteLink.Chatrooms'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{WINDOWS_APP_USER_MODEL_ID}').Show($toast)
+""".strip()
+    encoded_script = base64.b64encode(
+        script.encode("utf-16-le")
+    ).decode("ascii")
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-EncodedCommand",
+        encoded_script,
+    ]
+
+
+def show_silent_windows_notification(
+    title: str,
+    body: str,
+    tag: str,
+) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        subprocess.Popen(
+            silent_windows_notification_command(title, body, tag),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError:
+        return False
+    return True
+
+
 def serialize_message_rich_text(
     segments: list[tuple[str, bool, bool, bool]],
 ) -> str:
@@ -1202,6 +1300,29 @@ def serialize_message_rich_text(
     for tag in reversed(active_tags):
         output.append(f"</{tag}>")
     return "".join(output)
+
+
+def trim_message_text(text: str) -> str:
+    plain_text, runs = parse_message_rich_text(str(text))
+    trimmed_plain_text = plain_text.rstrip()
+    if len(trimmed_plain_text) == len(plain_text):
+        return str(text)
+    if not trimmed_plain_text:
+        return ""
+
+    trimmed_length = len(trimmed_plain_text)
+    trimmed_segments: list[tuple[str, bool, bool, bool]] = []
+    for run in runs:
+        if run.start >= trimmed_length:
+            break
+        segment_end = min(run.end, trimmed_length)
+        trimmed_segments.append((
+            trimmed_plain_text[run.start:segment_end],
+            run.bold,
+            run.italic,
+            run.underline,
+        ))
+    return serialize_message_rich_text(trimmed_segments)
 
 
 def is_direct_image_url(url: str) -> bool:
@@ -1767,9 +1888,11 @@ def default_config() -> dict[str, Any]:
         "server_preset": DEFAULT_SERVER_PRESET,
         "server_url": DEFAULT_SERVER_URL,
         "theme": DEFAULT_THEME,
+        "text_shadows": True,
         "message_sound": DEFAULT_MESSAGE_SOUND,
         "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
         "custom_message_sound_path": "",
+        "desktop_notifications": False,
         "chatroom_history_limit": DEFAULT_CHATROOM_HISTORY_LIMIT,
         "minimize_to_tray": False,
         "identity_private_key": generate_identity_private_key(),
@@ -1829,6 +1952,10 @@ def load_config() -> dict[str, Any]:
         custom_message_sound_path
         if isinstance(custom_message_sound_path, str)
         else ""
+    )
+    config["text_shadows"] = bool(config.get("text_shadows", True))
+    config["desktop_notifications"] = bool(
+        config.get("desktop_notifications", False)
     )
     config["chatroom_history_limit"] = normalize_chatroom_history_limit(
         config.get(
@@ -2912,6 +3039,63 @@ def subscription_room_ids(
     return topic_rooms.get(topic, ())
 
 
+class TextShadowProxyStyle(QProxyStyle):
+    """Draw standard Qt widget text with a subtle one-pixel shadow."""
+
+    def drawItemText(
+        self,
+        painter: QPainter,
+        rect: Any,
+        flags: int,
+        palette: QPalette,
+        enabled: bool,
+        text: str,
+        text_role: QPalette.ColorRole = QPalette.ColorRole.NoRole,
+    ) -> None:
+        app = QApplication.instance()
+        if (
+            text
+            and app is not None
+            and bool(app.property("spritelinkTextShadows"))
+        ):
+            shadow_color = QColor(0, 0, 0)
+            shadow_color.setAlphaF(0.15)
+            shadow_palette = QPalette(palette)
+            painter.save()
+            if text_role == QPalette.ColorRole.NoRole:
+                painter.setPen(shadow_color)
+            else:
+                for color_group in (
+                    QPalette.ColorGroup.Active,
+                    QPalette.ColorGroup.Inactive,
+                    QPalette.ColorGroup.Disabled,
+                ):
+                    shadow_palette.setColor(
+                        color_group,
+                        text_role,
+                        shadow_color,
+                    )
+            super().drawItemText(
+                painter,
+                rect.translated(1, 1),
+                flags,
+                shadow_palette,
+                enabled,
+                text,
+                text_role,
+            )
+            painter.restore()
+        super().drawItemText(
+            painter,
+            rect,
+            flags,
+            palette,
+            enabled,
+            text,
+            text_role,
+        )
+
+
 class ThemeComboBox(QComboBox):
     """Config combo box with Classic styling and no wheel changes."""
 
@@ -3131,12 +3315,125 @@ class MessageLogBrowser(QTextBrowser):
         scrollbar.setValue(0)
         scrollbar.blockSignals(signals_were_blocked)
 
+    def _text_shadow_clip_region(
+        self,
+        event: Any,
+        block: Any,
+        layout: QTextLayout,
+    ) -> QRegion:
+        """Exclude inline images while retaining their layout space."""
+        clip_region = event.region()
+        block_text = block.text()
+        if "\ufffc" not in block_text:
+            return clip_region
+
+        scroll_x = self.horizontalScrollBar().value()
+        scroll_y = self.verticalScrollBar().value()
+        for offset, character in enumerate(block_text):
+            if character != "\ufffc":
+                continue
+            image_cursor = QTextCursor(block)
+            image_cursor.setPosition(block.position() + offset)
+            image_cursor.movePosition(
+                QTextCursor.MoveOperation.NextCharacter,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            character_format = image_cursor.charFormat()
+            if not character_format.isImageFormat():
+                continue
+            image_format = QTextImageFormat(character_format)
+            line = layout.lineForTextPosition(offset)
+            if not line.isValid():
+                continue
+            image_x = line.cursorToX(offset)[0]
+            image_width = max(1.0, image_format.width())
+            image_height = max(line.height(), image_format.height())
+            image_rect = QRectF(
+                layout.position().x() + image_x - scroll_x + 1,
+                layout.position().y() + line.y() - scroll_y + 1,
+                image_width,
+                image_height,
+            ).toAlignedRect().adjusted(-1, -1, 1, 1)
+            clip_region = clip_region.subtracted(QRegion(image_rect))
+        return clip_region
+
     def scrollContentsBy(self, _dx: int, dy: int) -> None:
         self._lock_horizontal_scroll()
         super().scrollContentsBy(0, dy)
 
+    def _paint_text_shadows(self, event: Any) -> None:
+        app = QApplication.instance()
+        if (
+            app is None
+            or not bool(app.property("spritelinkTextShadows"))
+            or self.textCursor().hasSelection()
+        ):
+            return
+
+        viewport = self.viewport()
+        viewport_width = viewport.width()
+        viewport_height = viewport.height()
+        if viewport_width <= 0 or viewport_height <= 0:
+            return
+
+        paint_rect = event.rect()
+        first_block = self.cursorForPosition(QPoint(
+            0,
+            max(0, paint_rect.top()),
+        )).block().blockNumber()
+        last_block = self.cursorForPosition(QPoint(
+            max(0, viewport_width - 1),
+            min(viewport_height - 1, paint_rect.bottom()),
+        )).block().blockNumber()
+        first_block = max(0, first_block - 1)
+        last_block = min(
+            self.document().blockCount() - 1,
+            last_block + 1,
+        )
+
+        shadow_color = QColor(0, 0, 0)
+        shadow_color.setAlphaF(0.15)
+        shadow_format = QTextCharFormat()
+        shadow_format.setForeground(shadow_color)
+        painter = QPainter(viewport)
+        painter.setClipRegion(event.region())
+        # QTextLayout already retains its absolute document position.  The
+        # draw origin must therefore contain only the viewport's scroll
+        # offset; adding each block position again makes the shadow drift
+        # downward by another line for every message.
+        layout_origin = QPointF(
+            -self.horizontalScrollBar().value(),
+            -self.verticalScrollBar().value(),
+        )
+
+        for block_number in range(first_block, last_block + 1):
+            block = self.document().findBlockByNumber(block_number)
+            if not block.isValid() or block.length() <= 1:
+                continue
+            layout = block.layout()
+            if layout is None or layout.lineCount() <= 0:
+                continue
+
+            shadow_range = QTextLayout.FormatRange()
+            shadow_range.start = 0
+            shadow_range.length = block.length() - 1
+            shadow_range.format = shadow_format
+
+            painter.save()
+            painter.setClipRegion(
+                self._text_shadow_clip_region(event, block, layout),
+                Qt.ClipOperation.ReplaceClip,
+            )
+            painter.translate(1, 1)
+            layout.draw(painter, layout_origin, [shadow_range])
+            painter.restore()
+            layout.draw(painter, layout_origin)
+
+        painter.end()
+
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
+        self._paint_text_shadows(event)
         if not self.row_background_blocks and not self.collapsed_fade_blocks:
             return
 
@@ -3395,6 +3692,9 @@ class EncryptedChatClient(QObject):
         self._basic_palette = (
             QPalette(app.palette()) if app is not None else QPalette()
         )
+        self._basic_application_font = (
+            QFont(app.font()) if app is not None else QFont()
+        )
         self._basic_application_stylesheet = (
             app.styleSheet() if app is not None else ""
         )
@@ -3502,6 +3802,9 @@ class EncryptedChatClient(QObject):
         self.theme_var = ValueModel(
             self.config_data.get("theme", DEFAULT_THEME)
         )
+        self.text_shadows_var = ValueModel(
+            bool(self.config_data.get("text_shadows", True))
+        )
         self.message_sound_var = ValueModel(
             str(self.config_data["message_sound"])
         )
@@ -3511,6 +3814,14 @@ class EncryptedChatClient(QObject):
         self.custom_message_sound_path_var = ValueModel(
             str(self.config_data["custom_message_sound_path"])
         )
+        self.desktop_notifications_var = ValueModel(
+            bool(self.config_data.get("desktop_notifications", False))
+        )
+        self.pending_desktop_notifications: dict[
+            str,
+            tuple[tuple[int, int, str], str, str, str],
+        ] = {}
+        self.last_notification_sound_at = float("-inf")
         self.chatroom_history_limit_var = ValueModel(
             int(self.config_data["chatroom_history_limit"])
         )
@@ -3550,6 +3861,15 @@ class EncryptedChatClient(QObject):
         self.message_sound_stop_timer.setSingleShot(True)
         self.message_sound_stop_timer.timeout.connect(
             self._stop_message_sound
+        )
+
+        self.desktop_notification_timer = QTimer(self)
+        self.desktop_notification_timer.setSingleShot(True)
+        self.desktop_notification_timer.setInterval(
+            DESKTOP_NOTIFICATION_DEBOUNCE_MS
+        )
+        self.desktop_notification_timer.timeout.connect(
+            self._flush_desktop_notifications
         )
 
         self.background_history_prune_timer = QTimer(self)
@@ -3665,14 +3985,21 @@ class EncryptedChatClient(QObject):
             return
 
         strategy = self._font_style_strategy()
-        application_font = QFont(app.font())
+        application_font = QFont(self._basic_application_font)
+        application_font.setFamily(self._ui_font_family())
         application_font.setStyleStrategy(strategy)
         app.setFont(application_font)
         for widget in app.allWidgets():
             widget_font = QFont(widget.font())
+            widget_font.setFamily(self._ui_font_family())
             widget_font.setStyleStrategy(strategy)
             widget.setFont(widget_font)
         self._refresh_message_font_combo_fonts()
+
+    def _ui_font_family(self) -> str:
+        if self._is_windows_classic_theme():
+            return "Tahoma"
+        return self._basic_application_font.family()
 
     def _is_windows_classic_theme(self) -> bool:
         return self.theme_var.get() == "Windows Classic"
@@ -3870,8 +4197,8 @@ class EncryptedChatClient(QObject):
         )
         if self._tray_available():
             self.tray_icon.show()
-            if self._has_unread_messages():
-                self._mark_tray_notification()
+        if self._has_unread_messages():
+            self._mark_tray_notification()
 
     def _tray_available(self) -> bool:
         return (
@@ -3990,6 +4317,10 @@ class EncryptedChatClient(QObject):
     def _clear_tray_notification(self) -> None:
         if not self._tray_normal_icon.isNull():
             self.tray_icon.setIcon(self._tray_normal_icon)
+            self.root.setWindowIcon(self._tray_normal_icon)
+            app = QApplication.instance()
+            if app is not None:
+                app.setWindowIcon(self._tray_normal_icon)
         self.tray_icon.setToolTip(APP_NAME)
 
     def _has_unread_messages(self) -> bool:
@@ -4006,11 +4337,15 @@ class EncryptedChatClient(QObject):
             self._clear_tray_notification()
 
     def _mark_tray_notification(self) -> None:
-        if not self.tray_icon.isVisible():
-            return
         if not self._tray_notification_icon.isNull():
-            self.tray_icon.setIcon(self._tray_notification_icon)
-        self.tray_icon.setToolTip(f"{APP_NAME} — new messages")
+            self.root.setWindowIcon(self._tray_notification_icon)
+            app = QApplication.instance()
+            if app is not None:
+                app.setWindowIcon(self._tray_notification_icon)
+            if self.tray_icon.isVisible():
+                self.tray_icon.setIcon(self._tray_notification_icon)
+        if self.tray_icon.isVisible():
+            self.tray_icon.setToolTip(f"{APP_NAME} — new messages")
 
     def _on_tray_icon_activated(
         self,
@@ -4048,30 +4383,33 @@ class EncryptedChatClient(QObject):
         if app is None:
             return
 
+        available_styles = {
+            name.casefold(): name for name in QStyleFactory.keys()
+        }
         if self._is_windows_classic_theme():
-            available_styles = {
-                name.casefold(): name for name in QStyleFactory.keys()
-            }
-            app.setStyle(
-                available_styles.get(
-                    "windows",
-                    available_styles.get("fusion", "Fusion"),
-                )
+            style_name = available_styles.get(
+                "windows",
+                available_styles.get("fusion", "Fusion"),
             )
             app.setPalette(self._windows_classic_palette())
             app.setStyleSheet(WINDOWS_CLASSIC_STYLESHEET)
         else:
-            available_styles = {
-                name.casefold(): name for name in QStyleFactory.keys()
-            }
-            basic_style = available_styles.get(
+            style_name = available_styles.get(
                 self._basic_style_name.casefold()
             )
-            if basic_style is not None:
-                app.setStyle(basic_style)
             app.setPalette(QPalette(self._basic_palette))
             app.setStyleSheet(self._basic_application_stylesheet)
 
+        text_shadows_enabled = bool(self.text_shadows_var.get())
+        app.setProperty("spritelinkTextShadows", text_shadows_enabled)
+        if style_name is not None:
+            base_style = QStyleFactory.create(style_name)
+            if base_style is not None:
+                app.setStyle(
+                    TextShadowProxyStyle(base_style)
+                    if text_shadows_enabled
+                    else base_style
+                )
         app.setProperty(
             "spritelinkWindowsClassic",
             self._is_windows_classic_theme(),
@@ -4104,7 +4442,11 @@ class EncryptedChatClient(QObject):
 
     def _heading(self, text: str) -> QLabel:
         label = QLabel(text)
-        label.setFont(self._make_font("Segoe UI", 10, bold=True))
+        label.setFont(self._make_font(
+            self._ui_font_family(),
+            10,
+            bold=True,
+        ))
         return label
 
     @staticmethod
@@ -4867,7 +5209,7 @@ class EncryptedChatClient(QObject):
 
         self.status_label = QLabel()
         self.status_label.setFont(
-            self._make_font("Segoe UI", 9, bold=True)
+            self._make_font(self._ui_font_family(), 9, bold=True)
         )
         self.status_var.bind(self._on_connection_status_changed)
         status_layout.addWidget(self.status_label)
@@ -4895,7 +5237,9 @@ class EncryptedChatClient(QObject):
         self.chat_display.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.chat_display.setFont(self._make_font("Segoe UI", 10))
+        self.chat_display.setFont(
+            self._make_font(self._ui_font_family(), 10)
+        )
         self.chat_display.setViewportMargins(0, 0, 0, 0)
         self.chat_display.document().setDocumentMargin(0)
         text_option = self.chat_display.document().defaultTextOption()
@@ -5801,6 +6145,25 @@ class EncryptedChatClient(QObject):
         layout.addWidget(self.theme_combo, row, 1, 1, 2)
         row += 1
 
+        self.text_shadows_checkbox = QCheckBox("Text Shadows")
+        self.text_shadows_checkbox.setChecked(
+            bool(self.text_shadows_var.get())
+        )
+        self.text_shadows_checkbox.toggled.connect(
+            self._on_text_shadows_toggled
+        )
+        self.text_shadows_var.bind(
+            self.text_shadows_checkbox.setChecked
+        )
+        layout.addWidget(
+            self.text_shadows_checkbox,
+            row,
+            0,
+            1,
+            3,
+        )
+        row += 1
+
         layout.addWidget(self._separator(), row, 0, 1, 3)
         row += 1
         layout.addWidget(
@@ -5866,6 +6229,27 @@ class EncryptedChatClient(QObject):
             1,
         )
         layout.addWidget(message_sound_volume_control, row, 2)
+        row += 1
+
+        self.desktop_notifications_checkbox = QCheckBox(
+            "Desktop Notifications"
+        )
+        self.desktop_notifications_checkbox.setChecked(
+            bool(self.desktop_notifications_var.get())
+        )
+        self.desktop_notifications_checkbox.toggled.connect(
+            self.desktop_notifications_var.set
+        )
+        self.desktop_notifications_var.bind(
+            self.desktop_notifications_checkbox.setChecked
+        )
+        layout.addWidget(
+            self.desktop_notifications_checkbox,
+            row,
+            0,
+            1,
+            3,
+        )
         row += 1
 
         layout.addWidget(QLabel("Chatroom History"), row, 0)
@@ -6014,8 +6398,8 @@ class EncryptedChatClient(QObject):
         advanced_layout.addWidget(
             self._description(
                 "ntfy.sh is selected by default. On startup, the client "
-                "requests up to 48 hours of cached encrypted history, "
-                "subject to the server's actual retention period."
+                "requests up to 12 hours of cached encrypted history, "
+                "matching the public ntfy server's data retention period."
             ),
             advanced_row,
             0,
@@ -6253,9 +6637,11 @@ class EncryptedChatClient(QObject):
         return (
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
+            bool(self.text_shadows_var.get()),
             str(self.message_sound_var.get()),
             int(self.message_sound_volume_var.get()),
             str(self.custom_message_sound_path_var.get()),
+            bool(self.desktop_notifications_var.get()),
             int(self.chatroom_history_limit_var.get()),
             bool(self.minimize_to_tray_var.get()),
         )
@@ -6345,6 +6731,14 @@ class EncryptedChatClient(QObject):
                 parent=self.root,
             )
 
+    def _on_text_shadows_toggled(self, enabled: bool) -> None:
+        self.text_shadows_var.set(bool(enabled))
+        self._apply_theme()
+        # Replacing the application style can reset explicitly assigned
+        # widget fonts. Restore the active theme's font family, especially
+        # Tahoma for Windows Classic headings and the chatroom title.
+        self._apply_application_font_strategy()
+
     def _validate_current_settings(self) -> str:
         server_url = normalize_server_url(str(self.server_url_var.get()))
 
@@ -6363,6 +6757,9 @@ class EncryptedChatClient(QObject):
         self.config_data["theme"] = (
             theme if theme in THEMES else DEFAULT_THEME
         )
+        self.config_data["text_shadows"] = bool(
+            self.text_shadows_var.get()
+        )
         message_sound = str(self.message_sound_var.get())
         self.config_data["message_sound"] = (
             message_sound
@@ -6375,6 +6772,9 @@ class EncryptedChatClient(QObject):
         )
         self.config_data["custom_message_sound_path"] = str(
             self.custom_message_sound_path_var.get()
+        )
+        self.config_data["desktop_notifications"] = bool(
+            self.desktop_notifications_var.get()
         )
         self.config_data["chatroom_history_limit"] = (
             normalize_chatroom_history_limit(
@@ -6419,6 +6819,7 @@ class EncryptedChatClient(QObject):
 
     def _build_draft_message(self, text: str) -> dict[str, Any]:
         profile = self._active_room_profile()
+        text = trim_message_text(text)
 
         message = {
             "v": APP_VERSION,
@@ -6487,7 +6888,7 @@ class EncryptedChatClient(QObject):
 
     def _run_message_size_check(self) -> None:
         self.message_size_check_pending = False
-        text = self.message_entry.to_message_text()
+        text = trim_message_text(self.message_entry.to_message_text())
 
         try:
             draft_message = self._build_draft_message(text)
@@ -6623,10 +7024,10 @@ class EncryptedChatClient(QObject):
         )
 
     def _send_current_message(self) -> None:
-        plain_text = self.message_entry.toPlainText()
-        text = self.message_entry.to_message_text()
+        text = trim_message_text(self.message_entry.to_message_text())
+        plain_text = message_plain_text(text)
 
-        if not plain_text.strip():
+        if not plain_text:
             return
 
         if len(text) > MAX_MESSAGE_CHARS:
@@ -7129,13 +7530,13 @@ class EncryptedChatClient(QObject):
         room_id: str,
     ) -> str:
         if room_id in self.initial_history_pending_rooms:
-            return f"{AUTO_HISTORY_SECONDS}s"
+            return f"{SERVER_HISTORY_RETENTION_SECONDS}s"
 
         newest_id = state.get("newest_ntfy_id")
         if isinstance(newest_id, str) and newest_id:
             return newest_id
 
-        return f"{AUTO_HISTORY_SECONDS}s"
+        return f"{SERVER_HISTORY_RETENTION_SECONDS}s"
 
     def _network_poll(
         self,
@@ -7298,7 +7699,7 @@ class EncryptedChatClient(QObject):
                     completed_at = int(time.time())
                     state["history_scan_start_time"] = max(
                         0,
-                        completed_at - AUTO_HISTORY_SECONDS,
+                        completed_at - SERVER_HISTORY_RETENTION_SECONDS,
                     )
                     state["history_scan_completed_at"] = completed_at
 
@@ -7417,6 +7818,7 @@ class EncryptedChatClient(QObject):
                 raise ValueError(
                     "Signed message time differs too far from Ntfy time."
                 )
+        message["m"] = trim_message_text(message["m"])
 
     def _queue_ui_event(self, event: tuple[str, Any]) -> None:
         self.ui_queue.put(event)
@@ -7640,11 +8042,16 @@ class EncryptedChatClient(QObject):
                 )
                 if not is_muted_notification:
                     self._mark_tray_notification()
+                    self._show_desktop_notification(
+                        room_id,
+                        message,
+                        sort_key=self._message_sort_key(item),
+                    )
                 if (
                     self._should_play_message_sound(room_id)
                     and not is_muted_notification
                 ):
-                    self._play_message_sound()
+                    self._play_notification_sound()
 
         if not added:
             return
@@ -7711,8 +8118,13 @@ class EncryptedChatClient(QObject):
         )
         if play_chime and not is_local and not is_muted_notification:
             self._mark_tray_notification()
+            self._show_desktop_notification(
+                self.active_chatroom_id,
+                message,
+                sort_key=self._message_sort_key(item),
+            )
             if self._should_play_message_sound(self.active_chatroom_id):
-                self._play_message_sound()
+                self._play_notification_sound()
 
         return True
 
@@ -8059,22 +8471,42 @@ class EncryptedChatClient(QObject):
         item: dict[str, Any],
     ) -> str:
         message = item["message"]
+        display_timestamp = self._display_timestamp_for_item(item)
         hover_timestamp = self._format_hover_timestamp(
-            self._display_timestamp_for_item(item)
+            display_timestamp
         )
+        storage_status = message_storage_status(display_timestamp)
         user_id_preview = visible_user_id(str(message["c"]))
         tooltip_icon_uri = profile_icon_tooltip_data_uri(
             str(message.get("p", ""))
         )
-        if tooltip_icon_uri:
-            return (
-                '<div align="center">'
-                f'<img src="{tooltip_icon_uri}" width="64" height="64">'
-                f"<br>{hover_timestamp}<br>"
-                f"User ID: {user_id_preview}"
-                "</div>"
-            )
-        return f"{hover_timestamp}\nUser ID: {user_id_preview}"
+        icon_row = (
+            '<tr><td align="center">'
+            f'<img src="{tooltip_icon_uri}" width="64" height="64">'
+            "</td></tr>"
+            if tooltip_icon_uri
+            else ""
+        )
+        return (
+            '<table align="center" cellspacing="0" cellpadding="0">'
+            f"{icon_row}"
+            f'<tr><td align="center">User ID: {user_id_preview}</td></tr>'
+            '<tr><td height="3">'
+            f'<img src="{TOOLTIP_SPACER_DATA_URI}" '
+            'width="1" height="3">'
+            "</td></tr>"
+            '<tr><td bgcolor="#888888" height="1">'
+            f'<img src="{TOOLTIP_SPACER_DATA_URI}" '
+            'width="1" height="1">'
+            "</td></tr>"
+            '<tr><td height="3">'
+            f'<img src="{TOOLTIP_SPACER_DATA_URI}" '
+            'width="1" height="3">'
+            "</td></tr>"
+            f'<tr><td align="center">{hover_timestamp}</td></tr>'
+            f'<tr><td align="center">{storage_status}</td></tr>'
+            "</table>"
+        )
 
     def _hide_chat_tooltip(self) -> None:
         self.chat_tooltip_timer.stop()
@@ -8922,7 +9354,11 @@ class EncryptedChatClient(QObject):
         painter.setPen(QColor("#aaaaaa"))
         painter.drawRect(placeholder.rect().adjusted(0, 0, -1, -1))
         painter.setPen(QColor("#555555"))
-        painter.setFont(self._make_font("Segoe UI", 8, bold=True))
+        painter.setFont(self._make_font(
+            self._ui_font_family(),
+            8,
+            bold=True,
+        ))
         painter.drawText(
             placeholder.rect().adjusted(4, 4, -4, -4),
             Qt.AlignmentFlag.AlignCenter,
@@ -8946,7 +9382,11 @@ class EncryptedChatClient(QObject):
         painter.setPen(QColor("#c29a70"))
         painter.drawRect(placeholder.rect().adjusted(0, 0, -1, -1))
         painter.setPen(QColor("#704825"))
-        painter.setFont(self._make_font("Segoe UI", 8, bold=True))
+        painter.setFont(self._make_font(
+            self._ui_font_family(),
+            8,
+            bold=True,
+        ))
         painter.drawText(
             placeholder.rect().adjusted(4, 4, -4, -4),
             Qt.AlignmentFlag.AlignCenter
@@ -9160,10 +9600,9 @@ class EncryptedChatClient(QObject):
 
         is_muted = client_id in muted_ids and not item["is_local"]
         is_collapsed = is_muted or message_id in collapsed_ids
-        if is_collapsed:
-            collapsed_block_format = cursor.blockFormat()
-            collapsed_block_format.setNonBreakableLines(True)
-            cursor.setBlockFormat(collapsed_block_format)
+        message_block_format = QTextBlockFormat()
+        message_block_format.setNonBreakableLines(is_collapsed)
+        cursor.setBlockFormat(message_block_format)
 
         candidate_image_urls = direct_image_urls_in_message(plain_text)
         embedded_image_url_set = {
@@ -9467,6 +9906,55 @@ class EncryptedChatClient(QObject):
             )
         )
 
+    def _show_desktop_notification(
+        self,
+        room_id: str,
+        message: dict[str, Any],
+        *,
+        sort_key: tuple[int, int, str] | None = None,
+    ) -> None:
+        if (
+            not bool(self.desktop_notifications_var.get())
+            or self.window_focused_event.is_set()
+        ):
+            return
+        room = self._find_chatroom(room_id)
+        if room is None:
+            return
+        body = (
+            f"{str(message.get('u', 'Unknown'))}: "
+            f"{message_plain_text(str(message.get('m', '')))}"
+        )
+        if len(body) > 1024:
+            body = body[:1023] + "…"
+        notification = (
+            sort_key
+            if sort_key is not None
+            else (
+                int(message.get("t", 0) or 0),
+                int(message.get("t", 0) or 0),
+                str(message.get("i", "")),
+            ),
+            str(room["nickname"]),
+            body,
+            notification_tag_for_chatroom(room_id),
+        )
+        pending = self.pending_desktop_notifications.get(room_id)
+        if pending is None or notification[0] >= pending[0]:
+            self.pending_desktop_notifications[room_id] = notification
+        self.desktop_notification_timer.start()
+
+    def _flush_desktop_notifications(self) -> None:
+        pending = list(self.pending_desktop_notifications.values())
+        self.pending_desktop_notifications.clear()
+        if (
+            not bool(self.desktop_notifications_var.get())
+            or self.window_focused_event.is_set()
+        ):
+            return
+        for _sort_key, title, body, tag in pending:
+            show_silent_windows_notification(title, body, tag)
+
     def _message_sound_path(self, sound_name: str) -> Path | None:
         if sound_name == "Custom":
             custom_path = str(
@@ -9718,6 +10206,16 @@ class EncryptedChatClient(QObject):
                     parent=self.root,
                 )
 
+    def _play_notification_sound(self) -> None:
+        now = time.monotonic()
+        if (
+            now - self.last_notification_sound_at
+            < MESSAGE_SOUND_COOLDOWN_SECONDS
+        ):
+            return
+        self.last_notification_sound_at = now
+        self._play_message_sound()
+
     def _on_close(self) -> bool:
         if self._closing:
             return True
@@ -9734,6 +10232,8 @@ class EncryptedChatClient(QObject):
         self.background_history_prune_timer.stop()
         self.viewport_media_timer.stop()
         self.message_sound_stop_timer.stop()
+        self.desktop_notification_timer.stop()
+        self.pending_desktop_notifications.clear()
         self.connection_error_timer.stop()
         self._release_message_sound_resources()
         self.tray_icon.hide()

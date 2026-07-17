@@ -1,6 +1,7 @@
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
+import base64
 import copy
 import inspect
 import sys
@@ -2360,6 +2361,287 @@ class UpdateConfigTests(unittest.TestCase):
         self.assertFalse(client.update_button.enabled)
         self.assertEqual(client.update_button.stylesheet, "")
         self.assertIsNone(client.available_update)
+
+
+class Version110ReleaseTests(unittest.TestCase):
+    def test_release_defaults_and_config_control_order(self) -> None:
+        config = SPRITELINK.default_config()
+        self.assertEqual(SPRITELINK.DEFAULT_MESSAGE_FONT, "Arial")
+        self.assertTrue(config["text_shadows"])
+        self.assertFalse(config["desktop_notifications"])
+
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_config_tab
+        )
+        self.assertLess(
+            source.index('QLabel("Themes")'),
+            source.index('QCheckBox("Text Shadows")'),
+        )
+        self.assertLess(
+            source.index('QLabel("Message Sound")'),
+            source.index('"Desktop Notifications"'),
+        )
+        self.assertLess(
+            source.index('"Desktop Notifications"'),
+            source.index('QLabel("Chatroom History")'),
+        )
+
+    def test_windows_classic_uses_tahoma_for_builtin_ui(self) -> None:
+        family_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._ui_font_family
+        )
+        strategy_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._apply_application_font_strategy
+        )
+        self.assertIn('return "Tahoma"', family_source)
+        self.assertIn(
+            "application_font.setFamily(self._ui_font_family())",
+            strategy_source,
+        )
+        self.assertIn(
+            "widget_font.setFamily(self._ui_font_family())",
+            strategy_source,
+        )
+        self.assertEqual(SPRITELINK.DEFAULT_MESSAGE_FONT, "Arial")
+
+    def test_text_shadows_are_one_pixel_at_15_percent(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.TextShadowProxyStyle.drawItemText
+        )
+        self.assertIn("setAlphaF(0.15)", source)
+        self.assertIn("rect.translated(1, 1)", source)
+        chat_shadow_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_text_shadows
+        )
+        self.assertIn("setAlphaF(0.15)", chat_shadow_source)
+        self.assertIn("painter.translate(1, 1)", chat_shadow_source)
+        self.assertIn("layout.draw", chat_shadow_source)
+        self.assertIn(
+            "-self.verticalScrollBar().value()",
+            chat_shadow_source,
+        )
+        self.assertNotIn("cursorRect", chat_shadow_source)
+        image_clip_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._text_shadow_clip_region
+        )
+        self.assertIn('"\\ufffc"', image_clip_source)
+        self.assertIn("isImageFormat", image_clip_source)
+        self.assertIn("clip_region.subtracted", image_clip_source)
+        self.assertIn("_text_shadow_clip_region", chat_shadow_source)
+        paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser.paintEvent
+        )
+        self.assertIn("_paint_text_shadows(event)", paint_source)
+        apply_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._apply_theme
+        )
+        self.assertIn("spritelinkTextShadows", apply_source)
+        toggle_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_text_shadows_toggled
+        )
+        self.assertLess(
+            toggle_source.index("_apply_theme()"),
+            toggle_source.index("_apply_application_font_strategy()"),
+        )
+
+    def test_taskbar_and_tray_icons_share_unread_state(self) -> None:
+        mark_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._mark_tray_notification
+        )
+        clear_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._clear_tray_notification
+        )
+        for source in (mark_source, clear_source):
+            self.assertIn("root.setWindowIcon", source)
+            self.assertIn("app.setWindowIcon", source)
+
+    def test_silent_windows_toast_payload_and_message_format(self) -> None:
+        command = SPRITELINK.silent_windows_notification_command(
+            'Room "One"',
+            "User: <hello> & goodbye",
+            "room-tag",
+        )
+        self.assertEqual(command[0], "powershell.exe")
+        script = base64.b64decode(command[-1]).decode("utf-16-le")
+        self.assertIn('<audio silent="true"/>', script)
+        self.assertIn(SPRITELINK.WINDOWS_APP_USER_MODEL_ID, script)
+        self.assertIn("CreateTextNode($title)", script)
+        self.assertIn("CreateTextNode($body)", script)
+        self.assertIn("$toast.Tag = $tag", script)
+        self.assertIn("$toast.Group = 'SpriteLink.Chatrooms'", script)
+        self.assertNotIn("<text>{0}</text>", script)
+        self.assertEqual(
+            SPRITELINK.notification_tag_for_chatroom("room-one"),
+            SPRITELINK.notification_tag_for_chatroom("room-one"),
+        )
+        self.assertNotEqual(
+            SPRITELINK.notification_tag_for_chatroom("room-one"),
+            SPRITELINK.notification_tag_for_chatroom("room-two"),
+        )
+
+        client = mock.Mock()
+        client.desktop_notifications_var.get.return_value = True
+        client.window_focused_event.is_set.return_value = False
+        client._find_chatroom.return_value = {"nickname": "Room One"}
+        client.pending_desktop_notifications = {}
+        client.desktop_notification_timer = mock.Mock()
+        SPRITELINK.EncryptedChatClient._show_desktop_notification(
+            client,
+            "room-one",
+            {"u": "User", "m": "<b>Newest</b>", "t": 2, "i": "b"},
+            sort_key=(2, 2, "b"),
+        )
+        SPRITELINK.EncryptedChatClient._show_desktop_notification(
+            client,
+            "room-one",
+            {"u": "User", "m": "Older", "t": 1, "i": "a"},
+            sort_key=(1, 1, "a"),
+        )
+        with mock.patch.object(
+            SPRITELINK,
+            "show_silent_windows_notification",
+        ) as show_notification:
+            SPRITELINK.EncryptedChatClient._flush_desktop_notifications(
+                client
+            )
+        show_notification.assert_called_once_with(
+            "Room One",
+            "User: Newest",
+            SPRITELINK.notification_tag_for_chatroom("room-one"),
+        )
+        self.assertEqual(client.pending_desktop_notifications, {})
+
+    def test_notification_sounds_have_a_two_second_cooldown(self) -> None:
+        client = mock.Mock()
+        client.last_notification_sound_at = float("-inf")
+        with mock.patch.object(
+            SPRITELINK.time,
+            "monotonic",
+            side_effect=(10.0, 11.9, 12.0),
+        ):
+            for _ in range(3):
+                SPRITELINK.EncryptedChatClient._play_notification_sound(
+                    client
+                )
+        self.assertEqual(client._play_message_sound.call_count, 2)
+        self.assertEqual(SPRITELINK.MESSAGE_SOUND_COOLDOWN_SECONDS, 2.0)
+
+    def test_desktop_notifications_require_an_unfocused_window(self) -> None:
+        client = mock.Mock()
+        client.desktop_notifications_var.get.return_value = True
+        client.window_focused_event.is_set.return_value = True
+        with mock.patch.object(
+            SPRITELINK,
+            "show_silent_windows_notification",
+        ) as show_notification:
+            SPRITELINK.EncryptedChatClient._show_desktop_notification(
+                client,
+                "room-one",
+                {"u": "User", "m": "Hello"},
+            )
+        show_notification.assert_not_called()
+        client._find_chatroom.assert_not_called()
+
+    def test_server_history_window_and_tooltip_status_match(self) -> None:
+        retention = 12 * 60 * 60
+        self.assertEqual(
+            SPRITELINK.SERVER_HISTORY_RETENTION_SECONDS,
+            retention,
+        )
+        self.assertEqual(
+            SPRITELINK.message_storage_status(
+                1_000_000 - retention,
+                now=1_000_000,
+            ),
+            "Stored on server",
+        )
+        self.assertEqual(
+            SPRITELINK.message_storage_status(
+                1_000_000 - retention - 1,
+                now=1_000_000,
+            ),
+            "Expired",
+        )
+        poll_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._current_poll_since
+        )
+        self.assertIn("SERVER_HISTORY_RETENTION_SECONDS", poll_source)
+        config_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_config_tab
+        )
+        self.assertIn("requests up to 12 hours", config_source)
+
+        tooltip_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._tooltip_for_message_item
+        )
+        self.assertLess(
+            tooltip_source.index("User ID:"),
+            tooltip_source.index("{hover_timestamp}</td>"),
+        )
+        self.assertEqual(tooltip_source.count('height="3"'), 4)
+        self.assertIn('bgcolor="#888888" height="1"', tooltip_source)
+        self.assertIn('width="1" height="1"', tooltip_source)
+        self.assertNotIn("<br>", tooltip_source)
+        self.assertIn("storage_status", tooltip_source)
+
+    def test_each_message_resets_its_non_breakable_block_format(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertIn("message_block_format = QTextBlockFormat()", source)
+        self.assertIn(
+            "message_block_format.setNonBreakableLines(is_collapsed)",
+            source,
+        )
+        self.assertNotIn(
+            "collapsed_block_format = cursor.blockFormat()",
+            source,
+        )
+
+    def test_message_text_trims_after_its_last_visible_character(self) -> None:
+        self.assertEqual(
+            SPRITELINK.trim_message_text("Hello   \n\n"),
+            "Hello",
+        )
+        self.assertEqual(
+            SPRITELINK.trim_message_text(
+                "<b>Hello <i>there   \n</i></b>"
+            ),
+            "<b>Hello <i>there</i></b>",
+        )
+        self.assertEqual(
+            SPRITELINK.trim_message_text("  leading space"),
+            "  leading space",
+        )
+
+        send_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._send_current_message
+        )
+        self.assertIn("text = trim_message_text", send_source)
+        receive_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._validate_decrypted_message
+        )
+        self.assertLess(
+            receive_source.index("verify_message_identity"),
+            receive_source.index(
+                'message["m"] = trim_message_text(message["m"])'
+            ),
+        )
+
+    def test_windows_package_defaults_to_version_110(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        workflow = (
+            project_root / ".github/workflows/windows-package.yml"
+        ).read_text(encoding="utf-8")
+        build_script = (
+            project_root / "packaging/windows/build.ps1"
+        ).read_text(encoding="utf-8")
+        installer = (
+            project_root / "packaging/windows/SpriteLink.iss"
+        ).read_text(encoding="utf-8")
+        self.assertIn('default: "1.1.0"', workflow)
+        self.assertIn('$Version = "1.1.0"', build_script)
+        self.assertIn('#define AppVersion "1.1.0"', installer)
 
 
 if __name__ == "__main__":
