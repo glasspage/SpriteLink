@@ -5268,10 +5268,8 @@ class EncryptedChatClient(QObject):
         width_delta = CHATROOM_SIDEBAR_WIDTH
         old_geometry = self.root.geometry()
         old_frame_geometry = self.root.frameGeometry()
-        frame_offset_x = old_geometry.x() - old_frame_geometry.x()
-        frame_offset_y = old_geometry.y() - old_frame_geometry.y()
-        new_minimum_width = self.root.minimumWidth() + (
-            width_delta if expanded else -width_delta
+        new_minimum_width = MINIMUM_WINDOW_WIDTH + (
+            width_delta if expanded else 0
         )
         new_width = max(
             new_minimum_width,
@@ -5282,20 +5280,30 @@ class EncryptedChatClient(QObject):
         target_frame_x = old_frame_geometry.x() + (
             -width_delta if expanded else width_delta
         )
+        target_frame_width = old_frame_geometry.width() + (
+            new_width - old_geometry.width()
+        )
         # Apply the sidebar and native-window geometry as one paint update.
         # Otherwise the chat log is briefly laid out at the intermediate
         # width and visibly flickers while every line reflows.
         self.root.setUpdatesEnabled(False)
         try:
             self.chatrooms_toggle.setText("‹" if expanded else "›")
-            self.root.setMinimumWidth(new_minimum_width)
-            self.root.setGeometry(
-                target_frame_x + frame_offset_x,
-                old_frame_geometry.y() + frame_offset_y,
-                new_width,
-                old_geometry.height(),
+            # Lower the constraint before shrinking, but do not raise it
+            # before expanding. Raising it first makes Qt resize the window
+            # at its old position before the real move reaches Windows.
+            if not expanded:
+                self.root.setMinimumWidth(new_minimum_width)
+                self.chatrooms_panel.hide()
+            self._set_window_frame_geometry(
+                target_frame_x,
+                old_frame_geometry.y(),
+                target_frame_width,
+                old_frame_geometry.height(),
             )
-            self.chatrooms_panel.setVisible(expanded)
+            if expanded:
+                self.chatrooms_panel.show()
+                self.root.setMinimumWidth(new_minimum_width)
             central_widget = self.root.centralWidget()
             if (
                 central_widget is not None
@@ -5305,6 +5313,47 @@ class EncryptedChatClient(QObject):
         finally:
             self.root.setUpdatesEnabled(True)
             self.root.update()
+
+    def _set_window_frame_geometry(
+        self,
+        frame_x: int,
+        frame_y: int,
+        frame_width: int,
+        frame_height: int,
+    ) -> None:
+        """Move and resize the top-level frame in one native operation."""
+        if os.name == "nt" and hasattr(ctypes, "windll"):
+            try:
+                moved = ctypes.windll.user32.SetWindowPos(
+                    wintypes.HWND(int(self.root.winId())),
+                    wintypes.HWND(0),
+                    int(frame_x),
+                    int(frame_y),
+                    int(frame_width),
+                    int(frame_height),
+                    0x0004 | 0x0010 | 0x0200,
+                )
+                if moved:
+                    return
+            except Exception:
+                pass
+
+        old_geometry = self.root.geometry()
+        old_frame_geometry = self.root.frameGeometry()
+        self.root.setGeometry(
+            frame_x + old_geometry.x() - old_frame_geometry.x(),
+            frame_y + old_geometry.y() - old_frame_geometry.y(),
+            max(
+                1,
+                frame_width
+                - (old_frame_geometry.width() - old_geometry.width()),
+            ),
+            max(
+                1,
+                frame_height
+                - (old_frame_geometry.height() - old_geometry.height()),
+            ),
+        )
 
     def _chatroom_definitions(self) -> list[dict[str, str]]:
         rooms = [{
