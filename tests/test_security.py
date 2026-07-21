@@ -1480,12 +1480,12 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
 
         kernel32.CloseHandle.assert_not_called()
 
-    def test_chatroom_context_menu_order_and_key_copy(self) -> None:
+    def test_chatroom_context_menu_order_and_invite_copy(self) -> None:
         source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._show_chatroom_context_menu
         )
         edit_at = source.index('menu.addAction("Edit")')
-        copy_at = source.index('menu.addAction("Copy Chatroom Key")')
+        copy_at = source.index('menu.addAction("Copy Invite Code")')
         mute_at = source.index(
             'menu.addAction("Unmute" if is_muted else "Mute")'
         )
@@ -1493,7 +1493,7 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
         self.assertLess(edit_at, copy_at)
         self.assertLess(copy_at, mute_at)
         self.assertLess(mute_at, remove_at)
-        self.assertIn("_copy_chatroom_key(room_id)", source)
+        self.assertIn("_copy_chatroom_invite_code(room_id)", source)
 
     def test_user_and_message_context_menus_are_separated(self) -> None:
         user_source = inspect.getsource(
@@ -1709,7 +1709,7 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
 
     def test_subscription_restarts_when_topics_or_server_change(self) -> None:
         for method in (
-            SPRITELINK.EncryptedChatClient._add_chatroom,
+            SPRITELINK.EncryptedChatClient._store_new_chatroom,
             SPRITELINK.EncryptedChatClient._edit_chatroom,
             SPRITELINK.EncryptedChatClient._remove_chatroom,
             SPRITELINK.EncryptedChatClient._set_chatroom_muted,
@@ -2340,6 +2340,131 @@ class RoomKeyTests(unittest.TestCase):
         for key in keys:
             self.assertEqual(len(key), 32)
             self.assertRegex(key, r"^[A-Za-z0-9_-]{32}$")
+
+
+class ChatroomInviteCodeTests(unittest.TestCase):
+    def test_invite_code_round_trip_packs_name_and_key(self) -> None:
+        code = SPRITELINK.make_chatroom_invite_code(
+            "Café Friends",
+            "key with spaces/+ symbols",
+        )
+        self.assertTrue(code.startswith("SL-"))
+        self.assertNotIn("=", code)
+        encoded = code.removeprefix("SL-")
+        payload = base64.urlsafe_b64decode(
+            encoded + ("=" * (-len(encoded) % 4))
+        )
+        self.assertEqual(
+            SPRITELINK.json.loads(payload.decode("utf-8")),
+            {
+                "name": "Café Friends",
+                "key": "key with spaces/+ symbols",
+            },
+        )
+        self.assertEqual(
+            SPRITELINK.parse_chatroom_invite_code(f"  {code}\n"),
+            ("Café Friends", "key with spaces/+ symbols"),
+        )
+
+    def test_invalid_invite_codes_are_rejected(self) -> None:
+        invalid_payloads = (
+            "",
+            "not-an-invite",
+            "SL-",
+            "SL-***",
+            "SL-e30",
+            "SL-W10",
+            "SL-eyJuYW1lIjoiUm9vbSJ9",
+        )
+        for code in invalid_payloads:
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(ValueError, "valid"):
+                    SPRITELINK.parse_chatroom_invite_code(code)
+
+        overlong_name_code = SPRITELINK.INVITE_CODE_PREFIX + (
+            base64.urlsafe_b64encode(
+                SPRITELINK.json.dumps({
+                    "name": "N" * 65,
+                    "key": "key",
+                }).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+        )
+        with self.assertRaisesRegex(ValueError, "valid"):
+            SPRITELINK.parse_chatroom_invite_code(overlong_name_code)
+
+    def test_add_chatroom_dialogs_use_create_and_join_terminology(self) -> None:
+        choice_source = inspect.getsource(
+            SPRITELINK.AddChatroomChoiceDialog
+        )
+        details_source = inspect.getsource(
+            SPRITELINK.ChatroomDetailsDialog
+        )
+        join_source = inspect.getsource(SPRITELINK.JoinChatroomDialog)
+        created_source = inspect.getsource(
+            SPRITELINK.ChatroomCreatedDialog
+        )
+        self.assertIn('QPushButton("Join Chatroom")', choice_source)
+        self.assertIn('QPushButton("Create Chatroom")', choice_source)
+        self.assertIn('QLabel("Name")', details_source)
+        self.assertNotIn("Nickname", details_source)
+        self.assertNotIn("Only share this key", details_source)
+        self.assertIn('QLabel("Invite Code")', join_source)
+        self.assertIn('QPushButton("Join Chatroom")', join_source)
+        self.assertIn('self.setWindowTitle("Chatroom created!")', created_source)
+        self.assertIn(
+            'QPushButton("Copy Invite Code")',
+            created_source,
+        )
+        self.assertIn('QPushButton("OK")', created_source)
+
+    def test_add_chatroom_routes_to_selected_flow(self) -> None:
+        add_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._add_chatroom
+        )
+        create_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._create_chatroom
+        )
+        join_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._join_chatroom
+        )
+        self.assertIn('selected_flow == "create"', add_source)
+        self.assertIn("self._create_chatroom()", add_source)
+        self.assertIn('selected_flow == "join"', add_source)
+        self.assertIn("self._join_chatroom()", add_source)
+        self.assertIn("ChatroomCreatedDialog", create_source)
+        self.assertIn("make_chatroom_invite_code", create_source)
+        self.assertIn("parse_chatroom_invite_code", join_source)
+        self.assertIn("_store_new_chatroom", join_source)
+
+    def test_new_chatroom_stores_invited_name_and_key(self) -> None:
+        client = mock.Mock()
+        client.root = mock.Mock()
+        client.config_data = {"chatrooms": [], "room_profiles": {}}
+        client.initial_history_pending_rooms = set()
+        client._chatroom_definitions.return_value = [{"key": "global-key"}]
+        client._room_profile.return_value = {"username": "User"}
+
+        with mock.patch.object(SPRITELINK, "save_config"):
+            room_id = SPRITELINK.EncryptedChatClient._store_new_chatroom(
+                client,
+                "Friends",
+                "shared-key",
+                error_title="Cannot join chatroom",
+            )
+
+        self.assertIsInstance(room_id, str)
+        self.assertEqual(len(room_id), 32)
+        self.assertEqual(
+            client.config_data["chatrooms"],
+            [{
+                "id": room_id,
+                "nickname": "Friends",
+                "key": "shared-key",
+            }],
+        )
+        client._request_subscription_refresh.assert_called_once_with()
+        client._refresh_chatroom_list.assert_called_once_with()
+        client._activate_chatroom.assert_called_once_with(room_id)
 
 
 class PacketLimitTests(unittest.TestCase):

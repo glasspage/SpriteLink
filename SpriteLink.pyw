@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -1797,6 +1798,77 @@ def generate_chatroom_key() -> str:
     return secrets.token_urlsafe(24)
 
 
+INVITE_CODE_PREFIX = "SL-"
+MAX_INVITE_CODE_CHARS = 8192
+MAX_CHATROOM_NAME_CHARS = 64
+
+
+def make_chatroom_invite_code(name: str, chatroom_key: str) -> str:
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise ValueError("The chatroom name cannot be empty.")
+    if len(normalized_name) > MAX_CHATROOM_NAME_CHARS:
+        raise ValueError(
+            f"The chatroom name cannot exceed {MAX_CHATROOM_NAME_CHARS} "
+            "characters."
+        )
+    if not chatroom_key:
+        raise ValueError("The chatroom key cannot be empty.")
+    payload = json.dumps(
+        {"name": normalized_name, "key": chatroom_key},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    invite_code = f"{INVITE_CODE_PREFIX}{encoded}"
+    if len(invite_code) > MAX_INVITE_CODE_CHARS:
+        raise ValueError("The chatroom invite code is too large.")
+    return invite_code
+
+
+def parse_chatroom_invite_code(invite_code: str) -> tuple[str, str]:
+    normalized = invite_code.strip()
+    if (
+        not normalized.startswith(INVITE_CODE_PREFIX)
+        or len(normalized) <= len(INVITE_CODE_PREFIX)
+        or len(normalized) > MAX_INVITE_CODE_CHARS
+    ):
+        raise ValueError("That is not a valid SpriteLink invite code.")
+    encoded = normalized[len(INVITE_CODE_PREFIX):]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", encoded):
+        raise ValueError("That is not a valid SpriteLink invite code.")
+    padded = encoded + ("=" * (-len(encoded) % 4))
+    try:
+        decoded = base64.b64decode(
+            padded,
+            altchars=b"-_",
+            validate=True,
+        ).decode("utf-8")
+        payload = json.loads(decoded)
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise ValueError(
+            "That is not a valid SpriteLink invite code."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("That is not a valid SpriteLink invite code.")
+    name = payload.get("name")
+    chatroom_key = payload.get("key")
+    if not isinstance(name, str) or not isinstance(chatroom_key, str):
+        raise ValueError("That is not a valid SpriteLink invite code.")
+    normalized_name = name.strip()
+    if (
+        not normalized_name
+        or len(normalized_name) > MAX_CHATROOM_NAME_CHARS
+        or not chatroom_key
+    ):
+        raise ValueError("That is not a valid SpriteLink invite code.")
+    return normalized_name, chatroom_key
+
+
 @lru_cache(maxsize=4096)
 def is_likely_nsfw_image_url(url: str) -> bool:
     try:
@@ -3046,14 +3118,36 @@ class RemoveChatroomDialog(QDialog):
         layout.addLayout(buttons)
 
 
-class AddChatroomDialog(QDialog):
+class AddChatroomChoiceDialog(QDialog):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add Chatroom")
+        self.setModal(True)
+        self.setMinimumWidth(330)
+        self.selected_flow = ""
+
+        layout = QVBoxLayout(self)
+        join_button = QPushButton("Join Chatroom")
+        join_button.clicked.connect(lambda: self._select_flow("join"))
+        layout.addWidget(join_button)
+        create_button = QPushButton("Create Chatroom")
+        create_button.clicked.connect(lambda: self._select_flow("create"))
+        layout.addWidget(create_button)
+        join_button.setFocus()
+
+    def _select_flow(self, flow: str) -> None:
+        self.selected_flow = flow
+        self.accept()
+
+
+class ChatroomDetailsDialog(QDialog):
     def __init__(
         self,
         parent: QWidget,
         *,
-        title: str = "Add Chatroom",
-        submit_label: str = "Add Chatroom",
-        nickname: str = "",
+        title: str = "Create Chatroom",
+        submit_label: str = "Create Chatroom",
+        name: str = "",
         chatroom_key: str | None = None,
         history_note: str = "",
     ) -> None:
@@ -3066,11 +3160,11 @@ class AddChatroomDialog(QDialog):
         form = QGridLayout()
         form.setColumnStretch(1, 1)
 
-        form.addWidget(QLabel("Nickname"), 0, 0)
-        self.nickname_entry = QLineEdit()
-        self.nickname_entry.setMaxLength(64)
-        self.nickname_entry.setText(nickname)
-        form.addWidget(self.nickname_entry, 0, 1, 1, 2)
+        form.addWidget(QLabel("Name"), 0, 0)
+        self.name_entry = QLineEdit()
+        self.name_entry.setMaxLength(MAX_CHATROOM_NAME_CHARS)
+        self.name_entry.setText(name)
+        form.addWidget(self.name_entry, 0, 1, 1, 2)
 
         form.addWidget(QLabel("Key"), 1, 0)
         self.key_entry = QLineEdit()
@@ -3092,8 +3186,7 @@ class AddChatroomDialog(QDialog):
         form.addWidget(show_key, 1, 2)
 
         key_hint = QLabel(
-            "32+ characters recommended. Only share this key with others "
-            "you want in the chatroom!"
+            "32+ characters recommended."
             + (f" {history_note}" if history_note else "")
         )
         key_hint.setWordWrap(True)
@@ -3112,13 +3205,76 @@ class AddChatroomDialog(QDialog):
         buttons.addWidget(submit_button)
         layout.addLayout(buttons)
 
-        self.nickname_entry.setFocus()
+        self.name_entry.setFocus()
 
-    def nickname(self) -> str:
-        return self.nickname_entry.text().strip()
+    def name(self) -> str:
+        return self.name_entry.text().strip()
 
     def chatroom_key(self) -> str:
         return self.key_entry.text()
+
+
+class JoinChatroomDialog(QDialog):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Join Chatroom")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+
+        layout = QVBoxLayout(self)
+        form = QGridLayout()
+        form.setColumnStretch(1, 1)
+        form.addWidget(QLabel("Invite Code"), 0, 0)
+        self.invite_code_entry = QLineEdit()
+        self.invite_code_entry.setMaxLength(MAX_INVITE_CODE_CHARS)
+        form.addWidget(self.invite_code_entry, 0, 1)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(cancel_button)
+        join_button = QPushButton("Join Chatroom")
+        join_button.setDefault(True)
+        join_button.clicked.connect(self.accept)
+        buttons.addWidget(join_button)
+        layout.addLayout(buttons)
+        self.invite_code_entry.setFocus()
+
+    def invite_code(self) -> str:
+        return self.invite_code_entry.text().strip()
+
+
+class ChatroomCreatedDialog(QDialog):
+    def __init__(self, parent: QWidget, invite_code: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Chatroom created!")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+        self.invite_code = invite_code
+
+        layout = QVBoxLayout(self)
+        description = QLabel(
+            "Your chatroom has been created. Use the code to invite others "
+            "to this chatroom."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        copy_button = QPushButton("Copy Invite Code")
+        copy_button.clicked.connect(self._copy_invite_code)
+        buttons.addWidget(copy_button)
+        ok_button = QPushButton("OK")
+        ok_button.setDefault(True)
+        ok_button.clicked.connect(self.accept)
+        buttons.addWidget(ok_button)
+        layout.addLayout(buttons)
+
+    def _copy_invite_code(self) -> None:
+        QApplication.clipboard().setText(self.invite_code)
 
 
 class ChatroomListRow(QWidget):
@@ -5497,39 +5653,110 @@ class EncryptedChatClient(QObject):
             pass
 
     def _add_chatroom(self) -> None:
-        dialog = AddChatroomDialog(self.root)
+        dialog = AddChatroomChoiceDialog(self.root)
+        self._apply_window_titlebar_theme(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.selected_flow == "create":
+            self._create_chatroom()
+        elif dialog.selected_flow == "join":
+            self._join_chatroom()
+
+    def _create_chatroom(self) -> None:
+        dialog = ChatroomDetailsDialog(self.root)
         self._apply_window_titlebar_theme(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        nickname = dialog.nickname()
+        name = dialog.name()
         key = dialog.chatroom_key()
-        if not nickname:
+        room_id = self._store_new_chatroom(
+            name,
+            key,
+            error_title="Cannot create chatroom",
+        )
+        if room_id is None:
+            return
+
+        created_dialog = ChatroomCreatedDialog(
+            self.root,
+            make_chatroom_invite_code(name, key),
+        )
+        self._apply_window_titlebar_theme(created_dialog)
+        created_dialog.exec()
+
+    def _join_chatroom(self) -> None:
+        dialog = JoinChatroomDialog(self.root)
+        self._apply_window_titlebar_theme(dialog)
+        while dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                name, key = parse_chatroom_invite_code(
+                    dialog.invite_code()
+                )
+            except ValueError as exc:
+                messagebox.showerror(
+                    "Cannot join chatroom",
+                    str(exc),
+                    parent=self.root,
+                )
+                continue
+            if self._store_new_chatroom(
+                name,
+                key,
+                error_title="Cannot join chatroom",
+            ) is not None:
+                return
+
+    def _store_new_chatroom(
+        self,
+        name: str,
+        key: str,
+        *,
+        error_title: str,
+    ) -> str | None:
+        if not name:
             messagebox.showerror(
-                "Cannot add chatroom",
-                "The chatroom nickname cannot be empty.",
+                error_title,
+                "The chatroom name cannot be empty.",
                 parent=self.root,
             )
-            return
+            return None
+        if len(name) > MAX_CHATROOM_NAME_CHARS:
+            messagebox.showerror(
+                error_title,
+                f"The chatroom name cannot exceed "
+                f"{MAX_CHATROOM_NAME_CHARS} characters.",
+                parent=self.root,
+            )
+            return None
         if not key:
             messagebox.showerror(
-                "Cannot add chatroom",
+                error_title,
                 "The chatroom key cannot be empty.",
                 parent=self.root,
             )
-            return
+            return None
+        try:
+            make_chatroom_invite_code(name, key)
+        except ValueError as exc:
+            messagebox.showerror(
+                error_title,
+                str(exc),
+                parent=self.root,
+            )
+            return None
         if any(room["key"] == key for room in self._chatroom_definitions()):
             messagebox.showerror(
-                "Cannot add chatroom",
+                error_title,
                 "That chatroom key is already in your list.",
                 parent=self.root,
             )
-            return
+            return None
 
         room_id = uuid.uuid4().hex
         self.config_data.setdefault("chatrooms", []).append({
             "id": room_id,
-            "nickname": nickname,
+            "nickname": name,
             "key": key,
         })
         self.config_data.setdefault("room_profiles", {})[room_id] = dict(
@@ -5547,11 +5774,12 @@ class EncryptedChatClient(QObject):
                 str(exc),
                 parent=self.root,
             )
-            return
+            return None
 
         self._request_subscription_refresh()
         self._refresh_chatroom_list()
         self._activate_chatroom(room_id)
+        return room_id
 
     def _edit_chatroom(self, room_id: str) -> None:
         if room_id == GLOBAL_CHATROOM_ID:
@@ -5568,13 +5796,13 @@ class EncryptedChatClient(QObject):
         if room is None:
             return
 
-        old_nickname = str(room.get("nickname", ""))
+        old_name = str(room.get("nickname", ""))
         old_key = str(room.get("key", ""))
-        dialog = AddChatroomDialog(
+        dialog = ChatroomDetailsDialog(
             self.root,
             title="Edit Chatroom",
             submit_label="Save",
-            nickname=old_nickname,
+            name=old_name,
             chatroom_key=old_key,
             history_note=(
                 "All locally stored history will remain here even if the "
@@ -5585,12 +5813,12 @@ class EncryptedChatClient(QObject):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        nickname = dialog.nickname()
+        name = dialog.name()
         key = dialog.chatroom_key()
-        if not nickname:
+        if not name:
             messagebox.showerror(
                 "Cannot edit chatroom",
-                "The chatroom nickname cannot be empty.",
+                "The chatroom name cannot be empty.",
                 parent=self.root,
             )
             return
@@ -5598,6 +5826,15 @@ class EncryptedChatClient(QObject):
             messagebox.showerror(
                 "Cannot edit chatroom",
                 "The chatroom key cannot be empty.",
+                parent=self.root,
+            )
+            return
+        try:
+            make_chatroom_invite_code(name, key)
+        except ValueError as exc:
+            messagebox.showerror(
+                "Cannot edit chatroom",
+                str(exc),
                 parent=self.root,
             )
             return
@@ -5618,14 +5855,14 @@ class EncryptedChatClient(QObject):
         )
         if key_changed and room_id == self.active_chatroom_id:
             self._persist_local_history()
-        room["nickname"] = nickname
+        room["nickname"] = name
         room["key"] = key
         if key_changed:
             self.initial_history_pending_rooms.add(room_id)
         try:
             save_config(self.config_data)
         except Exception as exc:
-            room["nickname"] = old_nickname
+            room["nickname"] = old_name
             room["key"] = old_key
             if not was_initial_history_pending:
                 self.initial_history_pending_rooms.discard(room_id)
@@ -5645,10 +5882,23 @@ class EncryptedChatClient(QObject):
                 self._update_window_title()
             self._refresh_chatroom_list()
 
-    def _copy_chatroom_key(self, room_id: str) -> None:
+    def _copy_chatroom_invite_code(self, room_id: str) -> None:
         room = self._find_chatroom(room_id)
-        if room is not None:
-            QApplication.clipboard().setText(str(room["key"]))
+        if room is None:
+            return
+        try:
+            QApplication.clipboard().setText(
+                make_chatroom_invite_code(
+                    str(room["nickname"]),
+                    str(room["key"]),
+                )
+            )
+        except ValueError as exc:
+            messagebox.showerror(
+                "Cannot copy invite code",
+                str(exc),
+                parent=self.root,
+            )
 
     def _show_chatroom_context_menu(self, position: Any) -> None:
         item = self.chatrooms_list.itemAt(position)
@@ -5666,9 +5916,9 @@ class EncryptedChatClient(QObject):
                 lambda: self._edit_chatroom(room_id)
             )
 
-        copy_key_action = menu.addAction("Copy Chatroom Key")
-        copy_key_action.triggered.connect(
-            lambda: self._copy_chatroom_key(room_id)
+        copy_invite_action = menu.addAction("Copy Invite Code")
+        copy_invite_action.triggered.connect(
+            lambda: self._copy_chatroom_invite_code(room_id)
         )
 
         mute_action = menu.addAction("Unmute" if is_muted else "Mute")
