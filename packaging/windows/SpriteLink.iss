@@ -39,6 +39,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"
 
+[Registry]
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "SpriteLink"; Flags: uninsdeletevalue
+
 [Files]
 Source: "..\..\dist\SpriteLink\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
