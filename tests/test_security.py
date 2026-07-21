@@ -832,40 +832,15 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         sidebar_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._on_chatrooms_toggled
         )
-        self.assertIn("setUpdatesEnabled(False)", sidebar_source)
-        self.assertIn("setUpdatesEnabled(True)", sidebar_source)
-        self.assertIn("central_widget.layout().activate()", sidebar_source)
-        self.assertIn(
-            "self._set_window_redraw_enabled(False)",
-            sidebar_source,
-        )
-        self.assertIn("self.root.setGeometry(", sidebar_source)
-        self.assertNotIn("frameGeometry", sidebar_source)
-        self.assertNotIn("self.root.repaint()", sidebar_source)
-        self.assertNotIn("QTimer.singleShot(", sidebar_source)
-        self.assertLess(
-            sidebar_source.index("if not expanded:"),
-            sidebar_source.index("self.root.setGeometry("),
-        )
-        self.assertLess(
-            sidebar_source.index("self.root.setGeometry("),
-            sidebar_source.index("if expanded:"),
-        )
-        self.assertLess(
-            sidebar_source.index("self.root.setUpdatesEnabled(True)"),
-            sidebar_source.index("self._set_window_redraw_enabled(True)"),
-        )
-
-        redraw_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient
-            ._set_window_redraw_enabled
-        )
-        self.assertIn("SendMessageW", redraw_source)
-        self.assertIn("wm_setredraw", redraw_source)
-        self.assertIn("RedrawWindow", redraw_source)
-        self.assertIn("rdw_allchildren", redraw_source)
-        self.assertIn("rdw_updatenow", redraw_source)
-        self.assertNotIn("SetWindowPos", redraw_source)
+        self.assertIn("chatrooms_panel.setVisible(expanded)", sidebar_source)
+        self.assertIn("chatrooms_toggle.setText", sidebar_source)
+        self.assertNotIn("self.root.setGeometry(", sidebar_source)
+        self.assertNotIn("self.root.setMinimumWidth(", sidebar_source)
+        self.assertNotIn("setUpdatesEnabled", sidebar_source)
+        self.assertFalse(hasattr(
+            SPRITELINK.EncryptedChatClient,
+            "_set_window_redraw_enabled",
+        ))
 
 
 class TrayBehaviorTests(unittest.TestCase):
