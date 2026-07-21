@@ -343,6 +343,7 @@ MAX_PROFILE_ICON_GIF_BYTES = 2048
 MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
+CHAT_TOOLTIP_DISPLAY_TIME_MS = 2_147_483_647
 TOOLTIP_SPACER_DATA_URI = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMA"
@@ -1223,6 +1224,35 @@ def message_items_are_contiguous(
         )
     except Exception:
         return True
+
+
+def message_log_separator_texts(
+    previous_timestamp: int,
+    current_timestamp: int,
+) -> tuple[str, ...]:
+    separators: list[str] = []
+    gap_seconds = int(current_timestamp) - int(previous_timestamp)
+    if gap_seconds >= GAP_SEPARATOR_SECONDS:
+        gap_hours = max(6, int((gap_seconds / 3600.0) + 0.5))
+        separators.append(f"————— {gap_hours} hours later —————")
+
+    try:
+        previous_local_date = datetime.fromtimestamp(
+            previous_timestamp
+        ).date()
+        current_local_datetime = datetime.fromtimestamp(current_timestamp)
+    except Exception:
+        return tuple(separators)
+
+    if current_local_datetime.date() != previous_local_date:
+        separators.append(
+            "————— "
+            f"{current_local_datetime.strftime('%b')} "
+            f"{current_local_datetime.day}, "
+            f"{current_local_datetime.year}"
+            " —————"
+        )
+    return tuple(separators)
 
 
 def group_messages_for_display(
@@ -3158,6 +3188,15 @@ def polling_interval_seconds(
     return UNFOCUSED_POLL_INTERVAL_SECONDS
 
 
+def notification_outline_required(
+    room_id: str,
+    active_room_id: str,
+    *,
+    window_focused: bool,
+) -> bool:
+    return room_id != active_room_id or not window_focused
+
+
 def muted_inactive_polling_interval_seconds(
     *,
     window_focused: bool,
@@ -3722,10 +3761,60 @@ class MessageLogBrowser(QTextBrowser):
 
         painter.end()
 
+    def _paint_row_backgrounds(self, event: Any) -> None:
+        if not self.row_background_blocks:
+            return
+
+        viewport = self.viewport()
+        viewport_width = viewport.width()
+        viewport_height = viewport.height()
+        if viewport_width <= 0 or viewport_height <= 0:
+            return
+
+        paint_rect = event.rect()
+        first_block = self.cursorForPosition(QPoint(
+            0,
+            max(0, paint_rect.top()),
+        )).block().blockNumber()
+        last_block = self.cursorForPosition(QPoint(
+            max(0, viewport_width - 1),
+            min(viewport_height - 1, paint_rect.bottom()),
+        )).block().blockNumber()
+        first_block = max(0, first_block - 1)
+        last_block = min(
+            self.document().blockCount() - 1,
+            last_block + 1,
+        )
+        document_layout = self.document().documentLayout()
+        scroll_y = self.verticalScrollBar().value()
+        painter = QPainter(viewport)
+        painter.setClipRegion(event.region())
+        for block_number in range(first_block, last_block + 1):
+            background = self.row_background_blocks.get(block_number)
+            if background is None:
+                continue
+            block = self.document().findBlockByNumber(block_number)
+            if not block.isValid():
+                continue
+            block_rect = document_layout.blockBoundingRect(block)
+            top = round(block_rect.top()) - scroll_y
+            height = max(1, round(block_rect.height()))
+            if top > paint_rect.bottom() or top + height < paint_rect.top():
+                continue
+            painter.fillRect(
+                0,
+                top,
+                viewport_width,
+                height + 1,
+                background,
+            )
+        painter.end()
+
     def paintEvent(self, event: Any) -> None:
+        self._paint_row_backgrounds(event)
         super().paintEvent(event)
         self._paint_text_shadows(event)
-        if not self.row_background_blocks and not self.collapsed_fade_blocks:
+        if not self.collapsed_fade_blocks:
             return
 
         viewport = self.viewport()
@@ -3757,9 +3846,8 @@ class MessageLogBrowser(QTextBrowser):
         fade_brushes: dict[int, QBrush] = {}
 
         for block_number in range(first_block, last_block + 1):
-            background = self.row_background_blocks.get(block_number)
             fade_background = self.collapsed_fade_blocks.get(block_number)
-            if background is None and fade_background is None:
+            if fade_background is None:
                 continue
 
             block = self.document().findBlockByNumber(block_number)
@@ -3775,54 +3863,30 @@ class MessageLogBrowser(QTextBrowser):
             if top > paint_rect.bottom() or top + height < paint_rect.top():
                 continue
 
-            if background is not None:
-                left_width = max(0, cursor_rect.left())
-                if left_width > 0:
-                    painter.fillRect(
-                        0,
-                        top,
-                        left_width,
-                        height + 1,
-                        background,
-                    )
-                right_width = max(
-                    0,
-                    round(block.blockFormat().rightMargin()),
-                )
-                if right_width > 0:
-                    painter.fillRect(
-                        max(0, viewport_width - right_width),
-                        top,
-                        right_width,
-                        height + 1,
-                        background,
-                    )
-
-            if fade_background is not None:
-                color_key = int(fade_background.rgba())
-                fade_brush = fade_brushes.get(color_key)
-                if fade_brush is None:
-                    transparent = QColor(fade_background)
-                    transparent.setAlpha(0)
-                    opaque = QColor(fade_background)
-                    opaque.setAlpha(255)
-                    gradient = QLinearGradient(
-                        fade_start,
-                        0,
-                        fade_end,
-                        0,
-                    )
-                    gradient.setColorAt(0.0, transparent)
-                    gradient.setColorAt(1.0, opaque)
-                    fade_brush = QBrush(gradient)
-                    fade_brushes[color_key] = fade_brush
-                painter.fillRect(
+            color_key = int(fade_background.rgba())
+            fade_brush = fade_brushes.get(color_key)
+            if fade_brush is None:
+                transparent = QColor(fade_background)
+                transparent.setAlpha(0)
+                opaque = QColor(fade_background)
+                opaque.setAlpha(255)
+                gradient = QLinearGradient(
                     fade_start,
-                    top,
-                    max(0, viewport_width - fade_start),
-                    height + 1,
-                    fade_brush,
+                    0,
+                    fade_end,
+                    0,
                 )
+                gradient.setColorAt(0.0, transparent)
+                gradient.setColorAt(1.0, opaque)
+                fade_brush = QBrush(gradient)
+                fade_brushes[color_key] = fade_brush
+            painter.fillRect(
+                fade_start,
+                top,
+                max(0, viewport_width - fade_start),
+                height + 1,
+                fade_brush,
+            )
         painter.end()
 
 
@@ -5823,6 +5887,7 @@ class EncryptedChatClient(QObject):
         button.blockSignals(previous)
 
     def _on_identity_menu_toggled(self, checked: bool) -> None:
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
         self.identity_menu.setVisible(checked)
         if checked:
             self._set_button_checked(self.font_menu_button, False)
@@ -5830,8 +5895,10 @@ class EncryptedChatClient(QObject):
             self._set_button_checked(self.formatting_menu_button, False)
             self.formatting_menu.hide()
             self.identity_username_entry.setFocus()
+        self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
 
     def _on_font_menu_toggled(self, checked: bool) -> None:
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
         self.font_menu.setVisible(checked)
         if checked:
             self._set_button_checked(self.identity_menu_button, False)
@@ -5839,8 +5906,10 @@ class EncryptedChatClient(QObject):
             self._set_button_checked(self.formatting_menu_button, False)
             self.formatting_menu.hide()
             self.message_font_combo.setFocus()
+        self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
 
     def _on_formatting_menu_toggled(self, checked: bool) -> None:
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
         self.formatting_menu.setVisible(checked)
         if checked:
             self._set_button_checked(self.identity_menu_button, False)
@@ -5849,6 +5918,24 @@ class EncryptedChatClient(QObject):
             self.font_menu.hide()
             self.message_entry.setFocus()
             self._sync_formatting_buttons()
+        self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
+
+    def _chat_is_scrolled_to_bottom(self) -> bool:
+        scrollbar = self.chat_display.verticalScrollBar()
+        return scrollbar.value() >= scrollbar.maximum()
+
+    def _scroll_chat_to_bottom(self) -> None:
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _restore_chat_bottom_after_menu_toggle(
+        self,
+        keep_at_bottom: bool,
+    ) -> None:
+        if not keep_at_bottom:
+            return
+        self._scroll_chat_to_bottom()
+        QTimer.singleShot(0, self._scroll_chat_to_bottom)
 
     def _toggle_composer_formatting(
         self,
@@ -8423,7 +8510,14 @@ class EncryptedChatClient(QObject):
                     or sender_id in muted_user_ids
                 )
                 if not is_muted_notification:
-                    self._mark_tray_notification()
+                    if notification_outline_required(
+                        room_id,
+                        self.active_chatroom_id,
+                        window_focused=(
+                            self.window_focused_event.is_set()
+                        ),
+                    ):
+                        self._mark_tray_notification()
                     self._show_desktop_notification(
                         room_id,
                         message,
@@ -8506,7 +8600,12 @@ class EncryptedChatClient(QObject):
             or self._is_user_muted(str(message["c"]))
         )
         if play_chime and not is_local and not is_muted_notification:
-            self._mark_tray_notification()
+            if notification_outline_required(
+                self.active_chatroom_id,
+                self.active_chatroom_id,
+                window_focused=self.window_focused_event.is_set(),
+            ):
+                self._mark_tray_notification()
             self._show_desktop_notification(
                 self.active_chatroom_id,
                 message,
@@ -8853,6 +8952,8 @@ class EncryptedChatClient(QObject):
                 self._pending_tooltip_global_position,
                 tooltip,
                 self.chat_display.viewport(),
+                self.chat_display.viewport().rect(),
+                CHAT_TOOLTIP_DISPLAY_TIME_MS,
             )
 
     def _tooltip_for_message_item(
@@ -9797,29 +9898,18 @@ class EncryptedChatClient(QObject):
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> bool:
-        previous_block = cursor.block().previous()
-        if (
-            previous_block.isValid()
-            and previous_block.text().startswith("————— ")
-        ):
-            # Consecutive separators represent the same empty span. Keep only
-            # the newest one without adding another striped row.
-            replacement = QTextCursor(previous_block)
-            replacement.movePosition(
-                QTextCursor.MoveOperation.StartOfBlock
-            )
-            replacement.movePosition(
-                QTextCursor.MoveOperation.EndOfBlock,
-                QTextCursor.MoveMode.KeepAnchor,
-            )
-            replacement.insertText(text, self._text_format("#777777"))
-            return False
-
-        cursor.insertBlock()
+        if cursor.block().text():
+            cursor.insertBlock()
         separator_block = QTextBlockFormat()
         separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        separator_block.setTopMargin(7)
-        separator_block.setBottomMargin(7)
+        separator_font_height = QFontMetrics(
+            self._make_message_font(DEFAULT_MESSAGE_FONT)
+        ).height()
+        separator_block.setLineHeight(
+            float(separator_font_height + 14),
+            QTextBlockFormat.LineHeightTypes.FixedHeight.value,
+        )
+        separator_block.setBackground(QColor(background_color))
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
 
@@ -9920,7 +10010,6 @@ class EncryptedChatClient(QObject):
         )
         row_selections: list[QTextEdit.ExtraSelection] = []
         previous_timestamp: int | None = None
-        previous_local_date: Any = None
         first_item = True
         stripe_index = 0
 
@@ -9931,49 +10020,25 @@ class EncryptedChatClient(QObject):
         for group in display_groups:
             item = self._display_item_for_group(group, muted_ids)
             current_timestamp = self._display_timestamp_for_item(group[0])
-            current_local_datetime = self._local_datetime(current_timestamp)
-            current_local_date = (
-                current_local_datetime.date()
-                if current_local_datetime is not None
-                else None
+            separator_texts = (
+                message_log_separator_texts(
+                    previous_timestamp,
+                    current_timestamp,
+                )
+                if previous_timestamp is not None
+                else ()
             )
-
-            if (
-                not first_item
-                and previous_local_date is not None
-                and current_local_date is not None
-                and current_local_date != previous_local_date
-            ):
+            for separator_text in separator_texts:
                 if self._insert_log_separator(
                     cursor,
-                    "————— "
-                    f"{current_local_datetime.strftime('%b')} "
-                    f"{current_local_datetime.day}, "
-                    f"{current_local_datetime.year}"
-                    " —————",
+                    separator_text,
                     MESSAGE_ROW_BACKGROUNDS[
                         stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
                     ],
                     row_selections,
                 ):
                     stripe_index += 1
-            elif (
-                previous_timestamp is not None
-                and current_timestamp - previous_timestamp
-                >= GAP_SEPARATOR_SECONDS
-            ):
-                gap_seconds = current_timestamp - previous_timestamp
-                gap_hours = max(6, int((gap_seconds / 3600.0) + 0.5))
-                if self._insert_log_separator(
-                    cursor,
-                    f"————— {gap_hours} hours later —————",
-                    MESSAGE_ROW_BACKGROUNDS[
-                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
-                    ],
-                    row_selections,
-                ):
-                    stripe_index += 1
-            elif not first_item:
+            if not first_item and not separator_texts:
                 cursor.insertBlock()
 
             self._insert_message_item(
@@ -9990,12 +10055,6 @@ class EncryptedChatClient(QObject):
             stripe_index += 1
             first_item = False
             previous_timestamp = self._display_timestamp_for_item(group[-1])
-            previous_datetime = self._local_datetime(previous_timestamp)
-            previous_local_date = (
-                previous_datetime.date()
-                if previous_datetime is not None
-                else current_local_date
-            )
 
         self.chat_display.row_background_blocks = {
             selection.cursor.block().blockNumber(): QColor(
