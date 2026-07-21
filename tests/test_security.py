@@ -837,12 +837,14 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         self.assertIn("central_widget.layout().activate()", sidebar_source)
         self.assertIn("self.root.setGeometry(", sidebar_source)
         self.assertIn(
-            "self._redraw_window_after_sidebar_resize()",
+            "self._finish_chatrooms_toggle(serial)",
             sidebar_source,
         )
         self.assertNotIn("self.root.update()", sidebar_source)
+        self.assertNotIn("self.root.repaint()", sidebar_source)
         self.assertNotIn("SetWindowPos", sidebar_source)
         self.assertNotIn("frameGeometry", sidebar_source)
+        self.assertIn("QTimer.singleShot(", sidebar_source)
         self.assertLess(
             sidebar_source.index("if not expanded:"),
             sidebar_source.index("self.root.setGeometry("),
@@ -852,14 +854,14 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
             sidebar_source.index("if expanded:"),
         )
 
-        redraw_source = inspect.getsource(
+        finish_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient
-            ._redraw_window_after_sidebar_resize
+            ._finish_chatrooms_toggle
         )
-        self.assertIn("self.root.repaint()", redraw_source)
-        self.assertIn("RedrawWindow", redraw_source)
-        self.assertIn("RDW_UPDATENOW", redraw_source)
-        self.assertNotIn("SetWindowPos", redraw_source)
+        self.assertIn("self.root.setUpdatesEnabled(True)", finish_source)
+        self.assertIn("self.root.repaint()", finish_source)
+        self.assertNotIn("RedrawWindow", finish_source)
+        self.assertNotIn("SetWindowPos", finish_source)
 
 
 class TrayBehaviorTests(unittest.TestCase):
