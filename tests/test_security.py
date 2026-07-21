@@ -800,7 +800,7 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
     def test_composer_menus_keep_a_bottomed_log_at_the_bottom(self) -> None:
         restore_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient
-            ._restore_chat_bottom_after_menu_toggle
+            ._restore_chat_bottom_after_layout_change
         )
         self.assertIn("if not keep_at_bottom", restore_source)
         self.assertIn("self._scroll_chat_to_bottom()", restore_source)
@@ -814,7 +814,7 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
             source = inspect.getsource(handler)
             self.assertIn("_chat_is_scrolled_to_bottom()", source)
             self.assertIn(
-                "_restore_chat_bottom_after_menu_toggle",
+                "_restore_chat_bottom_after_layout_change",
                 source,
             )
 
@@ -834,6 +834,11 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         )
         self.assertIn("chatrooms_panel.setVisible(expanded)", sidebar_source)
         self.assertIn("chatrooms_toggle.setText", sidebar_source)
+        self.assertIn("_chat_is_scrolled_to_bottom()", sidebar_source)
+        self.assertIn(
+            "_restore_chat_bottom_after_layout_change",
+            sidebar_source,
+        )
         self.assertNotIn("self.root.setGeometry(", sidebar_source)
         self.assertNotIn("self.root.setMinimumWidth(", sidebar_source)
         self.assertNotIn("setUpdatesEnabled", sidebar_source)
