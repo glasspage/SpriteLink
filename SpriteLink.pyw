@@ -4457,7 +4457,6 @@ class EncryptedChatClient(QObject):
         self._message_font_cache: dict[tuple[str, bool, bool], QFont] = {}
         self._loading_profile_controls = False
         self._connection_error_visible = False
-        self._sidebar_transition_serial = 0
         self.active_chatroom_id = str(
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
         )
@@ -5280,12 +5279,6 @@ class EncryptedChatClient(QObject):
         target_x = old_geometry.x() + (
             -width_delta if expanded else width_delta
         )
-        # Keep the opposite edge of the window stationary with one Qt
-        # geometry change. Qt coordinates are device-independent; sending
-        # them directly to Win32 APIs breaks on scaled displays and also
-        # makes Qt reconcile a second, stale geometry afterward.
-        self._sidebar_transition_serial += 1
-        transition_serial = self._sidebar_transition_serial
         self.root.setUpdatesEnabled(False)
         try:
             self.chatrooms_toggle.setText("‹" if expanded else "›")
@@ -5295,11 +5288,12 @@ class EncryptedChatClient(QObject):
             if not expanded:
                 self.root.setMinimumWidth(new_minimum_width)
                 self.chatrooms_panel.hide()
-            self.root.setGeometry(
+            self._set_sidebar_window_geometry(
                 target_x,
                 old_geometry.y(),
                 new_width,
                 old_geometry.height(),
+                old_geometry.width(),
             )
             if expanded:
                 self.chatrooms_panel.show()
@@ -5310,29 +5304,61 @@ class EncryptedChatClient(QObject):
                 and central_widget.layout() is not None
             ):
                 central_widget.layout().activate()
-        except Exception:
+        finally:
             self.root.setUpdatesEnabled(True)
-            raise
-
-        # A top-level setGeometry() crosses from Qt's layout system into the
-        # native Windows message queue. Re-enabling or repainting here lets
-        # Qt submit the final child layout while DWM still has the previous
-        # client width. That produces one frame where the whole right side
-        # shifts left and the newly exposed strip is blank. Let the native
-        # resize message finish first, then reveal and repaint the completed
-        # layout on the following event-loop turn.
-        QTimer.singleShot(
-            0,
-            lambda serial=transition_serial: (
-                self._finish_chatrooms_toggle(serial)
-            ),
-        )
-
-    def _finish_chatrooms_toggle(self, transition_serial: int) -> None:
-        if transition_serial != self._sidebar_transition_serial:
-            return
-        self.root.setUpdatesEnabled(True)
         self.root.repaint()
+
+    def _set_sidebar_window_geometry(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        old_width: int,
+    ) -> None:
+        if os.name != "nt" or not hasattr(ctypes, "windll"):
+            self.root.setGeometry(x, y, width, height)
+            return
+
+        # Windows normally preserves and copies portions of the old client
+        # surface during a resize. For this left-edge resize, those copied
+        # pixels belong to different widgets at the new width, producing a
+        # visible frame where the chat log occupies the sidebar (or the
+        # reverse). SWP_NOCOPYBITS makes Windows discard those stale pixels.
+        #
+        # GetWindowRect and SetWindowPos both use native physical pixels.
+        # Derive the target from that rectangle and scale only the requested
+        # Qt width change, rather than passing Qt's device-independent
+        # geometry directly to Win32 as the earlier implementation did.
+        user32 = ctypes.windll.user32
+        hwnd = wintypes.HWND(int(self.root.winId()))
+        window_rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(window_rect)):
+            self.root.setGeometry(x, y, width, height)
+            return
+
+        scale = float(self.root.devicePixelRatioF())
+        native_width_delta = round((width - old_width) * scale)
+        native_width = (
+            window_rect.right - window_rect.left + native_width_delta
+        )
+        native_x = window_rect.right - native_width
+        native_y = window_rect.top
+        native_height = window_rect.bottom - window_rect.top
+        swp_nozorder = 0x0004
+        swp_noactivate = 0x0010
+        swp_nocopybits = 0x0100
+        applied = user32.SetWindowPos(
+            hwnd,
+            None,
+            native_x,
+            native_y,
+            native_width,
+            native_height,
+            swp_nozorder | swp_noactivate | swp_nocopybits,
+        )
+        if not applied:
+            self.root.setGeometry(x, y, width, height)
 
     def _chatroom_definitions(self) -> list[dict[str, str]]:
         rooms = [{
