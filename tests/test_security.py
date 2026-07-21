@@ -630,6 +630,64 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         self.assertLess(boundary, insert_block)
         self.assertLess(insert_block, message_start)
 
+    def test_hour_and_date_separators_are_both_retained(self) -> None:
+        same_day_start = int(
+            SPRITELINK.datetime(2026, 7, 20, 8, 0).timestamp()
+        )
+        same_day_end = int(
+            SPRITELINK.datetime(2026, 7, 20, 15, 0).timestamp()
+        )
+        self.assertEqual(
+            SPRITELINK.message_log_separator_texts(
+                same_day_start,
+                same_day_end,
+            ),
+            ("————— 7 hours later —————",),
+        )
+
+        previous_day = int(
+            SPRITELINK.datetime(2026, 7, 20, 20, 0).timestamp()
+        )
+        next_day = int(
+            SPRITELINK.datetime(2026, 7, 21, 3, 0).timestamp()
+        )
+        separators = SPRITELINK.message_log_separator_texts(
+            previous_day,
+            next_day,
+        )
+        self.assertEqual(separators[0], "————— 7 hours later —————")
+        self.assertIn("Jul 21, 2026", separators[1])
+
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_log_separator
+        )
+        self.assertIn("if cursor.block().text():", insert_source)
+        self.assertIn("setLineHeight", insert_source)
+        self.assertIn("setBackground", insert_source)
+        self.assertNotIn("setTopMargin", insert_source)
+        self.assertNotIn("setBottomMargin", insert_source)
+
+    def test_composer_menus_keep_a_bottomed_log_at_the_bottom(self) -> None:
+        restore_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._restore_chat_bottom_after_menu_toggle
+        )
+        self.assertIn("if not keep_at_bottom", restore_source)
+        self.assertIn("self._scroll_chat_to_bottom()", restore_source)
+        self.assertIn("QTimer.singleShot(0", restore_source)
+
+        for handler in (
+            SPRITELINK.EncryptedChatClient._on_identity_menu_toggled,
+            SPRITELINK.EncryptedChatClient._on_font_menu_toggled,
+            SPRITELINK.EncryptedChatClient._on_formatting_menu_toggled,
+        ):
+            source = inspect.getsource(handler)
+            self.assertIn("_chat_is_scrolled_to_bottom()", source)
+            self.assertIn(
+                "_restore_chat_bottom_after_menu_toggle",
+                source,
+            )
+
 
 class TrayBehaviorTests(unittest.TestCase):
     def test_close_can_hide_to_tray_or_exit(self) -> None:
@@ -799,9 +857,18 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("setTextIndent(0)", source)
         self.assertIn("setBackground(QColor(background_color))", source)
 
-        paint_source = inspect.getsource(SPRITELINK.MessageLogBrowser.paintEvent)
-        self.assertIn("block.blockFormat().rightMargin()", paint_source)
-        self.assertIn("viewport_width - right_width", paint_source)
+        background_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_row_backgrounds
+        )
+        self.assertIn("blockBoundingRect(block)", background_source)
+        self.assertIn("viewport_width", background_source)
+        paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser.paintEvent
+        )
+        self.assertLess(
+            paint_source.index("_paint_row_backgrounds(event)"),
+            paint_source.index("super().paintEvent(event)"),
+        )
 
     def test_status_line_uses_chatroom_name_and_delayed_error(self) -> None:
         self.assertEqual(
@@ -1626,6 +1693,37 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
             client
         )
         client._clear_tray_notification.assert_called_once_with()
+
+    def test_active_room_outline_requires_an_unfocused_window(self) -> None:
+        self.assertFalse(
+            SPRITELINK.notification_outline_required(
+                "active",
+                "active",
+                window_focused=True,
+            )
+        )
+        self.assertTrue(
+            SPRITELINK.notification_outline_required(
+                "active",
+                "active",
+                window_focused=False,
+            )
+        )
+        self.assertTrue(
+            SPRITELINK.notification_outline_required(
+                "background",
+                "active",
+                window_focused=True,
+            )
+        )
+        active_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._accept_network_message
+        )
+        background_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._accept_background_messages
+        )
+        self.assertIn("notification_outline_required", active_source)
+        self.assertIn("notification_outline_required", background_source)
 
     def test_existing_unread_is_shown_when_tray_icon_starts(self) -> None:
         build_source = inspect.getsource(
@@ -2941,6 +3039,16 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertIn('width="1" height="1"', tooltip_source)
         self.assertNotIn("<br>", tooltip_source)
         self.assertIn("storage_status", tooltip_source)
+
+        show_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_pending_chat_tooltip
+        )
+        self.assertIn("CHAT_TOOLTIP_DISPLAY_TIME_MS", show_source)
+        self.assertIn("self.chat_display.viewport().rect()", show_source)
+        self.assertEqual(
+            SPRITELINK.CHAT_TOOLTIP_DISPLAY_TIME_MS,
+            2_147_483_647,
+        )
 
     def test_each_message_resets_its_non_breakable_block_format(self) -> None:
         source = inspect.getsource(
