@@ -41,7 +41,7 @@ import sys
 import unicodedata
 import uuid
 import zlib
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 try:
     from PySide6.QtCore import (
         QBuffer,
@@ -191,6 +191,8 @@ APP_VERSION = 1
 CONFIG_FORMAT_VERSION = 24
 WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
+WINDOWS_NOTIFICATION_PROTOCOL = "spritelink"
+WINDOWS_NOTIFICATION_GROUP = "SpriteLink.Chatrooms"
 WINDOWS_SINGLE_INSTANCE_MUTEX_NAME = (
     r"Local\SpriteLink-{D2EB08B2-F3E3-4F88-8D9E-51DC7A8754A0}"
 )
@@ -969,6 +971,7 @@ APP_DATA_DIR = Path(
 
 CONFIG_PATH = APP_DATA_DIR / "settings.bin"
 CHATROOM_HISTORY_DIRECTORY = APP_DATA_DIR / "history"
+NOTIFICATION_ACTIVATION_PATH = APP_DATA_DIR / "notification-activation.txt"
 SETTINGS_DPAPI_ENTROPY = b"SpriteLink-v1-settings"
 CHATROOM_HISTORY_DPAPI_ENTROPY = b"SpriteLink-v1-chatroom-history"
 
@@ -1266,8 +1269,22 @@ def message_item_sort_key(
     return (
         int(item.get("ntfy_time", message.get("t", 0)) or 0),
         int(message.get("t", 0) or 0),
-        str(item.get("ntfy_id") or message.get("i", "")),
+        # New message IDs begin with a monotonic send-order value. Ntfy's
+        # record IDs are unique but not chronological, so using them here can
+        # visibly reorder messages sent within the same whole second.
+        str(message.get("i") or item.get("ntfy_id", "")),
     )
+
+
+def ordered_message_id(
+    previous_order: int,
+    *,
+    now_ns: int | None = None,
+) -> tuple[str, int]:
+    """Return a fixed-width ID that increases in composer submission order."""
+    current_ns = time.time_ns() if now_ns is None else int(now_ns)
+    order = max(current_ns, int(previous_order) + 1)
+    return f"{order:016x}{secrets.token_hex(8)}", order
 
 
 def consecutive_duplicate_message_ordinal(
@@ -1328,10 +1345,102 @@ def notification_tag_for_chatroom(room_id: str) -> str:
     return hashlib.sha256(str(room_id).encode("utf-8")).hexdigest()[:32]
 
 
+def notification_uri_for_chatroom(room_id: str) -> str:
+    return (
+        f"{WINDOWS_NOTIFICATION_PROTOCOL}://chatroom/"
+        f"{quote(str(room_id), safe='')}"
+    )
+
+
+def chatroom_id_from_notification_uri(uri: str) -> str | None:
+    parsed = urlsplit(str(uri))
+    if (
+        parsed.scheme.lower() != WINDOWS_NOTIFICATION_PROTOCOL
+        or parsed.netloc.lower() != "chatroom"
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    room_id = unquote(parsed.path.lstrip("/"))
+    if room_id == GLOBAL_CHATROOM_ID or re.fullmatch(r"[0-9a-f]{32}", room_id):
+        return room_id
+    return None
+
+
+def notification_uri_from_arguments(arguments: list[str]) -> str | None:
+    for index, argument in enumerate(arguments):
+        if argument == "--notification-uri" and index + 1 < len(arguments):
+            return arguments[index + 1]
+        if str(argument).lower().startswith(
+            f"{WINDOWS_NOTIFICATION_PROTOCOL}://"
+        ):
+            return str(argument)
+    return None
+
+
+def write_notification_activation(room_id: str) -> bool:
+    if chatroom_id_from_notification_uri(
+        notification_uri_for_chatroom(room_id)
+    ) is None:
+        return False
+    try:
+        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary_path = NOTIFICATION_ACTIVATION_PATH.with_suffix(".tmp")
+        temporary_path.write_text(str(room_id), encoding="utf-8")
+        os.replace(temporary_path, NOTIFICATION_ACTIVATION_PATH)
+    except OSError:
+        return False
+    return True
+
+
+def register_windows_notification_protocol() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+
+        if getattr(sys, "frozen", False):
+            executable_parts = [sys.executable]
+        else:
+            python_executable = Path(sys.executable)
+            pythonw_executable = python_executable.with_name("pythonw.exe")
+            executable_parts = [
+                str(
+                    pythonw_executable
+                    if pythonw_executable.exists()
+                    else python_executable
+                ),
+                str(Path(__file__).resolve()),
+            ]
+        command = (
+            subprocess.list2cmdline(executable_parts)
+            + ' --notification-uri "%1"'
+        )
+        protocol_path = (
+            rf"Software\Classes\{WINDOWS_NOTIFICATION_PROTOCOL}"
+        )
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, protocol_path) as key:
+            winreg.SetValueEx(
+                key,
+                None,
+                0,
+                winreg.REG_SZ,
+                "URL:SpriteLink Chatroom",
+            )
+            winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+        command_path = protocol_path + r"\shell\open\command"
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, command_path) as key:
+            winreg.SetValueEx(key, None, 0, winreg.REG_SZ, command)
+    except (OSError, ImportError):
+        return False
+    return True
+
+
 def silent_windows_notification_command(
     title: str,
     body: str,
     tag: str,
+    room_id: str,
 ) -> list[str]:
     title_base64 = base64.b64encode(
         str(title).encode("utf-8")
@@ -1342,6 +1451,9 @@ def silent_windows_notification_command(
     tag_base64 = base64.b64encode(
         str(tag).encode("utf-8")
     ).decode("ascii")
+    launch_uri_base64 = base64.b64encode(
+        notification_uri_for_chatroom(room_id).encode("utf-8")
+    ).decode("ascii")
     script = f"""
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
@@ -1349,15 +1461,17 @@ def silent_windows_notification_command(
 $title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{title_base64}'))
 $body = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{body_base64}'))
 $tag = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{tag_base64}'))
-$toastXml = '<toast><visual><binding template="ToastGeneric"><text></text><text></text></binding></visual><audio silent="true"/></toast>'
+$launchUri = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{launch_uri_base64}'))
+$toastXml = '<toast activationType="protocol"><visual><binding template="ToastGeneric"><text></text><text></text></binding></visual><audio silent="true"/></toast>'
 $xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
 $xml.LoadXml($toastXml)
+$xml.DocumentElement.SetAttribute('launch', $launchUri)
 $textNodes = $xml.GetElementsByTagName('text')
 $textNodes.Item(0).AppendChild($xml.CreateTextNode($title)) | Out-Null
 $textNodes.Item(1).AppendChild($xml.CreateTextNode($body)) | Out-Null
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 $toast.Tag = $tag
-$toast.Group = 'SpriteLink.Chatrooms'
+$toast.Group = '{WINDOWS_NOTIFICATION_GROUP}'
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{WINDOWS_APP_USER_MODEL_ID}').Show($toast)
 """.strip()
     encoded_script = base64.b64encode(
@@ -1378,12 +1492,52 @@ def show_silent_windows_notification(
     title: str,
     body: str,
     tag: str,
+    room_id: str,
 ) -> bool:
     if os.name != "nt":
         return False
     try:
         subprocess.Popen(
-            silent_windows_notification_command(title, body, tag),
+            silent_windows_notification_command(title, body, tag, room_id),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError:
+        return False
+    return True
+
+
+def clear_windows_notification_command(tag: str) -> list[str]:
+    tag_base64 = base64.b64encode(
+        str(tag).encode("utf-8")
+    ).decode("ascii")
+    script = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+$tag = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{tag_base64}'))
+[Windows.UI.Notifications.ToastNotificationManager]::History.Remove($tag, '{WINDOWS_NOTIFICATION_GROUP}', '{WINDOWS_APP_USER_MODEL_ID}')
+""".strip()
+    encoded_script = base64.b64encode(
+        script.encode("utf-16-le")
+    ).decode("ascii")
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-EncodedCommand",
+        encoded_script,
+    ]
+
+
+def clear_windows_notification(tag: str) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        subprocess.Popen(
+            clear_windows_notification_command(tag),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -3873,6 +4027,7 @@ class EncryptedChatClient(QObject):
         self.seen_ntfy_message_ids: set[str] = set()
         self.message_log: list[dict[str, Any]] = []
         self.draft_message_id = uuid.uuid4().hex
+        self._last_outbound_message_order = 0
         self.current_estimated_packet_size = 0
         self.message_size_check_pending = False
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
@@ -3956,8 +4111,9 @@ class EncryptedChatClient(QObject):
         )
         self.pending_desktop_notifications: dict[
             str,
-            tuple[tuple[int, int, str], str, str, str],
+            tuple[tuple[int, int, str], str, str, str, str],
         ] = {}
+        self.delivered_desktop_notification_rooms: set[str] = set()
         self.last_notification_sound_at = float("-inf")
         self.chatroom_history_limit_var = ValueModel(
             int(self.config_data["chatroom_history_limit"])
@@ -4007,6 +4163,20 @@ class EncryptedChatClient(QObject):
         )
         self.desktop_notification_timer.timeout.connect(
             self._flush_desktop_notifications
+        )
+
+        self.notification_activation_timer = QTimer(self)
+        self.notification_activation_timer.setInterval(250)
+        self.notification_activation_timer.timeout.connect(
+            self._consume_notification_activation
+        )
+        self.notification_activation_timer.start()
+        QTimer.singleShot(
+            0,
+            lambda: self._clear_desktop_notification(
+                self.active_chatroom_id,
+                force=True,
+            ),
         )
 
         self.background_history_prune_timer = QTimer(self)
@@ -4460,6 +4630,25 @@ class EncryptedChatClient(QObject):
             QTimer.singleShot(0, self._resume_from_tray)
         else:
             QTimer.singleShot(0, self._sync_window_activity)
+
+    def _open_notification_chatroom(self, room_id: str) -> None:
+        if self._find_chatroom(room_id) is None:
+            return
+        self._restore_from_tray()
+        self._activate_chatroom(room_id)
+
+    def _consume_notification_activation(self) -> None:
+        try:
+            room_id = NOTIFICATION_ACTIVATION_PATH.read_text(
+                encoding="utf-8"
+            ).strip()
+            NOTIFICATION_ACTIVATION_PATH.unlink(missing_ok=True)
+        except OSError:
+            return
+        if chatroom_id_from_notification_uri(
+            notification_uri_for_chatroom(room_id)
+        ) is not None:
+            self._open_notification_chatroom(room_id)
 
     def _clear_tray_notification(self) -> None:
         if not self._tray_normal_icon.isNull():
@@ -5003,7 +5192,40 @@ class EncryptedChatClient(QObject):
             self.config_data["unread_counts"] = unread_counts
         return unread_counts
 
+    def _clear_desktop_notification(
+        self,
+        room_id: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        had_pending = room_id in self.pending_desktop_notifications
+        try:
+            had_unread = int(
+                self._unread_counts().get(room_id, 0) or 0
+            ) > 0
+        except (TypeError, ValueError):
+            had_unread = False
+        delivered_rooms = getattr(
+            self,
+            "delivered_desktop_notification_rooms",
+            set(),
+        )
+        had_delivered = (
+            isinstance(delivered_rooms, set)
+            and room_id in delivered_rooms
+        )
+        self.pending_desktop_notifications.pop(room_id, None)
+        if isinstance(delivered_rooms, set):
+            delivered_rooms.discard(room_id)
+        if not self.pending_desktop_notifications:
+            self.desktop_notification_timer.stop()
+        if force or had_pending or had_unread or had_delivered:
+            clear_windows_notification(
+                notification_tag_for_chatroom(room_id)
+            )
+
     def _mark_chatroom_read(self, room_id: str) -> None:
+        self._clear_desktop_notification(room_id)
         unread_counts = self._unread_counts()
         if room_id not in unread_counts:
             self._clear_tray_notification_if_no_unread()
@@ -5247,6 +5469,7 @@ class EncryptedChatClient(QObject):
         muted_ids = self._muted_chatroom_ids()
         muted_ids.discard(room_id)
         self.config_data["muted_chatrooms"] = sorted(muted_ids)
+        self._clear_desktop_notification(room_id)
         self._unread_counts().pop(room_id, None)
         self._clear_tray_notification_if_no_unread()
         self.config_data.get("room_profiles", {}).pop(room_id, None)
@@ -5313,8 +5536,7 @@ class EncryptedChatClient(QObject):
         poll_immediately: bool = True,
         refresh_subscription: bool = False,
     ) -> None:
-        self._unread_counts().pop(self.active_chatroom_id, None)
-        self._clear_tray_notification_if_no_unread()
+        self._mark_chatroom_read(self.active_chatroom_id)
         self._update_window_title()
         try:
             save_config(self.config_data)
@@ -7206,6 +7428,10 @@ class EncryptedChatClient(QObject):
             return
 
         message = self._build_draft_message(text)
+        (
+            message["i"],
+            self._last_outbound_message_order,
+        ) = ordered_message_id(self._last_outbound_message_order)
         message["t"] = int(time.time())
         sign_message_identity(
             message,
@@ -7251,6 +7477,8 @@ class EncryptedChatClient(QObject):
             )
             return
 
+        # The network worker consumes this FIFO queue synchronously. A newer
+        # message never starts its POST until every earlier one has finished.
         self.send_queue.put({
             "server_url": server_url,
             "encryption_key": encryption_key,
@@ -8986,7 +9214,7 @@ class EncryptedChatClient(QObject):
                 self.network_wakeup_event.set()
                 self._sync_connection_error_timer()
                 if hasattr(self, "tray_icon"):
-                    self._clear_tray_notification_if_no_unread()
+                    self._mark_chatroom_read(self.active_chatroom_id)
             elif event.type() == QEvent.Type.WindowDeactivate:
                 self.window_focused_event.clear()
                 self.network_wakeup_event.set()
@@ -9808,6 +10036,11 @@ class EncryptedChatClient(QObject):
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
+        # Separator replacement and embedded-media paths can leave the cursor
+        # on a populated block. Enforce the row boundary here so one sender's
+        # username can never continue after another sender's message.
+        if cursor.block().text():
+            cursor.insertBlock()
         # Never allow a previous message's character format to carry over.
         cursor.setCharFormat(QTextCharFormat())
         message_start_position = cursor.position()
@@ -10179,6 +10412,7 @@ class EncryptedChatClient(QObject):
             str(room["nickname"]),
             body,
             notification_tag_for_chatroom(room_id),
+            room_id,
         )
         pending = self.pending_desktop_notifications.get(room_id)
         if pending is None or notification[0] >= pending[0]:
@@ -10193,8 +10427,14 @@ class EncryptedChatClient(QObject):
             or self.window_focused_event.is_set()
         ):
             return
-        for _sort_key, title, body, tag in pending:
-            show_silent_windows_notification(title, body, tag)
+        for _sort_key, title, body, tag, room_id in pending:
+            if show_silent_windows_notification(
+                title,
+                body,
+                tag,
+                room_id,
+            ):
+                self.delivered_desktop_notification_rooms.add(room_id)
 
     def _message_sound_path(self, sound_name: str) -> Path | None:
         if sound_name == "Custom":
@@ -10512,7 +10752,9 @@ class EncryptedChatClient(QObject):
         self.viewport_media_timer.stop()
         self.message_sound_stop_timer.stop()
         self.desktop_notification_timer.stop()
+        self.notification_activation_timer.stop()
         self.pending_desktop_notifications.clear()
+        self.delivered_desktop_notification_rooms.clear()
         self.connection_error_timer.stop()
         self._release_message_sound_resources()
         self.tray_icon.hide()
@@ -10596,9 +10838,19 @@ def _write_crash_log(error_text: str) -> Path | None:
 
 
 def main() -> None:
+    notification_uri = notification_uri_from_arguments(sys.argv)
+    notification_room_id = (
+        chatroom_id_from_notification_uri(notification_uri)
+        if notification_uri is not None
+        else None
+    )
     if os.name == "nt":
+        register_windows_notification_protocol()
         try:
             if not acquire_single_instance_lock():
+                if notification_room_id is not None:
+                    write_notification_activation(notification_room_id)
+                    return
                 ctypes.windll.user32.MessageBoxW(
                     None,
                     "SpriteLink is already running.",
@@ -10659,7 +10911,7 @@ def main() -> None:
         return
 
     try:
-        EncryptedChatClient(root)
+        client = EncryptedChatClient(root)
     except Exception:
         error_text = traceback.format_exc()
         crash_path = _write_crash_log(error_text)
@@ -10676,6 +10928,13 @@ def main() -> None:
         return
 
     root.show()
+    if notification_room_id is not None:
+        QTimer.singleShot(
+            0,
+            lambda: client._open_notification_chatroom(
+                notification_room_id
+            ),
+        )
     app.exec()
 
 
