@@ -835,33 +835,32 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         self.assertIn("setUpdatesEnabled(False)", sidebar_source)
         self.assertIn("setUpdatesEnabled(True)", sidebar_source)
         self.assertIn("central_widget.layout().activate()", sidebar_source)
-        self.assertIn("self.root.setGeometry(", sidebar_source)
         self.assertIn(
-            "self._finish_chatrooms_toggle(serial)",
+            "self._set_sidebar_window_geometry(",
             sidebar_source,
         )
-        self.assertNotIn("self.root.update()", sidebar_source)
-        self.assertNotIn("self.root.repaint()", sidebar_source)
-        self.assertNotIn("SetWindowPos", sidebar_source)
         self.assertNotIn("frameGeometry", sidebar_source)
-        self.assertIn("QTimer.singleShot(", sidebar_source)
+        self.assertIn("self.root.repaint()", sidebar_source)
+        self.assertNotIn("QTimer.singleShot(", sidebar_source)
         self.assertLess(
             sidebar_source.index("if not expanded:"),
-            sidebar_source.index("self.root.setGeometry("),
+            sidebar_source.index("self._set_sidebar_window_geometry("),
         )
         self.assertLess(
-            sidebar_source.index("self.root.setGeometry("),
+            sidebar_source.index("self._set_sidebar_window_geometry("),
             sidebar_source.index("if expanded:"),
         )
 
-        finish_source = inspect.getsource(
+        geometry_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient
-            ._finish_chatrooms_toggle
+            ._set_sidebar_window_geometry
         )
-        self.assertIn("self.root.setUpdatesEnabled(True)", finish_source)
-        self.assertIn("self.root.repaint()", finish_source)
-        self.assertNotIn("RedrawWindow", finish_source)
-        self.assertNotIn("SetWindowPos", finish_source)
+        self.assertIn("GetWindowRect", geometry_source)
+        self.assertIn("SetWindowPos", geometry_source)
+        self.assertIn("swp_nocopybits", geometry_source)
+        self.assertIn("devicePixelRatioF", geometry_source)
+        self.assertIn("window_rect.right - native_width", geometry_source)
+        self.assertNotIn("frameGeometry", geometry_source)
 
 
 class TrayBehaviorTests(unittest.TestCase):
