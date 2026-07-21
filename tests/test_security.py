@@ -836,31 +836,36 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         self.assertIn("setUpdatesEnabled(True)", sidebar_source)
         self.assertIn("central_widget.layout().activate()", sidebar_source)
         self.assertIn(
-            "self._set_sidebar_window_geometry(",
+            "self._set_window_redraw_enabled(False)",
             sidebar_source,
         )
+        self.assertIn("self.root.setGeometry(", sidebar_source)
         self.assertNotIn("frameGeometry", sidebar_source)
-        self.assertIn("self.root.repaint()", sidebar_source)
+        self.assertNotIn("self.root.repaint()", sidebar_source)
         self.assertNotIn("QTimer.singleShot(", sidebar_source)
         self.assertLess(
             sidebar_source.index("if not expanded:"),
-            sidebar_source.index("self._set_sidebar_window_geometry("),
+            sidebar_source.index("self.root.setGeometry("),
         )
         self.assertLess(
-            sidebar_source.index("self._set_sidebar_window_geometry("),
+            sidebar_source.index("self.root.setGeometry("),
             sidebar_source.index("if expanded:"),
         )
-
-        geometry_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient
-            ._set_sidebar_window_geometry
+        self.assertLess(
+            sidebar_source.index("self.root.setUpdatesEnabled(True)"),
+            sidebar_source.index("self._set_window_redraw_enabled(True)"),
         )
-        self.assertIn("GetWindowRect", geometry_source)
-        self.assertIn("SetWindowPos", geometry_source)
-        self.assertIn("swp_nocopybits", geometry_source)
-        self.assertIn("devicePixelRatioF", geometry_source)
-        self.assertIn("window_rect.right - native_width", geometry_source)
-        self.assertNotIn("frameGeometry", geometry_source)
+
+        redraw_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._set_window_redraw_enabled
+        )
+        self.assertIn("SendMessageW", redraw_source)
+        self.assertIn("wm_setredraw", redraw_source)
+        self.assertIn("RedrawWindow", redraw_source)
+        self.assertIn("rdw_allchildren", redraw_source)
+        self.assertIn("rdw_updatenow", redraw_source)
+        self.assertNotIn("SetWindowPos", redraw_source)
 
 
 class TrayBehaviorTests(unittest.TestCase):
