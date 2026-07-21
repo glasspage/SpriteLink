@@ -128,6 +128,7 @@ class BehaviorSettingsTests(unittest.TestCase):
         self.assertEqual(SPRITELINK.DEFAULT_CHATROOM_HISTORY_LIMIT, 1000)
         self.assertNotIn("history", config)
         self.assertTrue(config["minimize_to_tray"])
+        self.assertFalse(config["start_with_windows"])
 
     def test_each_chatroom_history_uses_a_separate_encrypted_file(
         self,
@@ -241,7 +242,94 @@ class BehaviorSettingsTests(unittest.TestCase):
         self.assertIn('QLabel("Chatroom History")', source)
         self.assertNotIn('QLabel("Message History")', source)
         self.assertIn('QCheckBox("Minimize to Tray")', source)
+        self.assertIn('QCheckBox("Start with Windows")', source)
+        self.assertLess(
+            source.index('QCheckBox("Minimize to Tray")'),
+            source.index('QCheckBox("Start with Windows")'),
+        )
         self.assertIn("CHATROOM_HISTORY_OPTIONS", source)
+
+    def test_start_with_windows_updates_the_current_user_run_key(self) -> None:
+        registry_key = mock.MagicMock()
+        winreg = mock.MagicMock()
+        winreg.HKEY_CURRENT_USER = object()
+        winreg.REG_SZ = 1
+        winreg.CreateKey.return_value.__enter__.return_value = registry_key
+
+        with (
+            mock.patch.object(SPRITELINK.os, "name", "nt"),
+            mock.patch.dict(sys.modules, {"winreg": winreg}),
+            mock.patch.object(
+                SPRITELINK,
+                "windows_startup_command",
+                return_value='"C:\\SpriteLink\\SpriteLink.exe"',
+            ),
+        ):
+            self.assertTrue(SPRITELINK.set_start_with_windows(True))
+            self.assertTrue(SPRITELINK.set_start_with_windows(False))
+
+        winreg.CreateKey.assert_called_with(
+            winreg.HKEY_CURRENT_USER,
+            SPRITELINK.WINDOWS_STARTUP_REGISTRY_PATH,
+        )
+        winreg.SetValueEx.assert_called_once_with(
+            registry_key,
+            SPRITELINK.WINDOWS_STARTUP_VALUE_NAME,
+            0,
+            winreg.REG_SZ,
+            '"C:\\SpriteLink\\SpriteLink.exe"',
+        )
+        winreg.DeleteValue.assert_called_once_with(
+            registry_key,
+            SPRITELINK.WINDOWS_STARTUP_VALUE_NAME,
+        )
+
+        installer = (
+            Path(__file__).resolve().parents[1]
+            / "packaging/windows/SpriteLink.iss"
+        ).read_text(encoding="utf-8")
+        self.assertIn("uninsdeletevalue", installer)
+        self.assertIn('ValueName: "SpriteLink"', installer)
+
+    def test_window_size_is_saved_within_supported_bounds(self) -> None:
+        self.assertEqual(
+            SPRITELINK.normalize_window_size(700, 550),
+            (700, 550),
+        )
+        self.assertEqual(
+            SPRITELINK.normalize_window_size(2000, 1200),
+            (
+                SPRITELINK.DEFAULT_WINDOW_WIDTH,
+                SPRITELINK.DEFAULT_WINDOW_HEIGHT,
+            ),
+        )
+        self.assertEqual(
+            SPRITELINK.normalize_window_size(100, 100),
+            (
+                SPRITELINK.MINIMUM_WINDOW_WIDTH,
+                SPRITELINK.MINIMUM_WINDOW_HEIGHT,
+            ),
+        )
+        config = SPRITELINK.default_config()
+        self.assertEqual(
+            (config["window_width"], config["window_height"]),
+            (
+                SPRITELINK.DEFAULT_WINDOW_WIDTH,
+                SPRITELINK.DEFAULT_WINDOW_HEIGHT,
+            ),
+        )
+
+        init_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.__init__
+        )
+        self.assertIn('self.config_data["window_width"]', init_source)
+        self.assertIn('self.config_data["window_height"]', init_source)
+        copy_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._copy_ui_to_config
+        )
+        self.assertIn("normalize_window_size(", copy_source)
+        self.assertIn('self.config_data["window_width"]', copy_source)
+        self.assertIn('self.config_data["window_height"]', copy_source)
 
     def test_background_history_pruning_runs_hourly(self) -> None:
         self.assertEqual(
@@ -2815,6 +2903,8 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertEqual(SPRITELINK.DEFAULT_MESSAGE_FONT, "Arial")
         self.assertTrue(config["text_shadows"])
         self.assertFalse(config["desktop_notifications"])
+        self.assertEqual(SPRITELINK.DEFAULT_THEME, "Classic")
+        self.assertEqual(SPRITELINK.THEMES, ("Classic", "Modern"))
 
         source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._build_config_tab
@@ -2831,6 +2921,56 @@ class Version120ReleaseTests(unittest.TestCase):
             source.index('"Desktop Notifications"'),
             source.index('QLabel("Chatroom History")'),
         )
+
+    def test_legacy_theme_names_keep_their_equivalent_theme(self) -> None:
+        for legacy_name, expected_name in (
+            ("Windows Classic", "Classic"),
+            ("Modern (Light)", "Modern"),
+        ):
+            with self.subTest(theme=legacy_name):
+                existing_config = SPRITELINK.default_config()
+                existing_config["theme"] = legacy_name
+                config_path = mock.Mock()
+                config_path.exists.return_value = True
+                config_path.read_bytes.return_value = b"settings"
+                with (
+                    mock.patch.object(
+                        SPRITELINK,
+                        "CONFIG_PATH",
+                        config_path,
+                    ),
+                    mock.patch.object(
+                        SPRITELINK,
+                        "_load_dpapi_config",
+                        return_value=existing_config,
+                    ),
+                ):
+                    loaded = SPRITELINK.load_config()
+                self.assertEqual(loaded["theme"], expected_name)
+
+    def test_font_dropdown_removes_only_its_item_focus_outline(self) -> None:
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        self.assertIn(
+            "NoFocusRectItemDelegate(self.message_font_combo)",
+            build_source,
+        )
+        delegate_source = inspect.getsource(
+            SPRITELINK.NoFocusRectItemDelegate.paint
+        )
+        self.assertIn("State_HasFocus", delegate_source)
+        self.assertIn("super().paint", delegate_source)
+
+    def test_volume_slider_can_compress_in_small_config_windows(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_config_tab
+        )
+        self.assertIn(
+            "message_sound_volume_slider.setMinimumWidth(40)",
+            source,
+        )
+        self.assertIn("QSizePolicy.Policy.Expanding", source)
 
     def test_windows_classic_uses_tahoma_for_builtin_ui(self) -> None:
         family_source = inspect.getsource(
