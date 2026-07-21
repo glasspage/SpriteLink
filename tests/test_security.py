@@ -127,7 +127,8 @@ class BehaviorSettingsTests(unittest.TestCase):
         self.assertEqual(config["chatroom_history_limit"], 1000)
         self.assertEqual(SPRITELINK.DEFAULT_CHATROOM_HISTORY_LIMIT, 1000)
         self.assertNotIn("history", config)
-        self.assertFalse(config["minimize_to_tray"])
+        self.assertTrue(config["minimize_to_tray"])
+        self.assertFalse(config["start_with_windows"])
 
     def test_each_chatroom_history_uses_a_separate_encrypted_file(
         self,
@@ -241,7 +242,94 @@ class BehaviorSettingsTests(unittest.TestCase):
         self.assertIn('QLabel("Chatroom History")', source)
         self.assertNotIn('QLabel("Message History")', source)
         self.assertIn('QCheckBox("Minimize to Tray")', source)
+        self.assertIn('QCheckBox("Start with Windows")', source)
+        self.assertLess(
+            source.index('QCheckBox("Minimize to Tray")'),
+            source.index('QCheckBox("Start with Windows")'),
+        )
         self.assertIn("CHATROOM_HISTORY_OPTIONS", source)
+
+    def test_start_with_windows_updates_the_current_user_run_key(self) -> None:
+        registry_key = mock.MagicMock()
+        winreg = mock.MagicMock()
+        winreg.HKEY_CURRENT_USER = object()
+        winreg.REG_SZ = 1
+        winreg.CreateKey.return_value.__enter__.return_value = registry_key
+
+        with (
+            mock.patch.object(SPRITELINK.os, "name", "nt"),
+            mock.patch.dict(sys.modules, {"winreg": winreg}),
+            mock.patch.object(
+                SPRITELINK,
+                "windows_startup_command",
+                return_value='"C:\\SpriteLink\\SpriteLink.exe"',
+            ),
+        ):
+            self.assertTrue(SPRITELINK.set_start_with_windows(True))
+            self.assertTrue(SPRITELINK.set_start_with_windows(False))
+
+        winreg.CreateKey.assert_called_with(
+            winreg.HKEY_CURRENT_USER,
+            SPRITELINK.WINDOWS_STARTUP_REGISTRY_PATH,
+        )
+        winreg.SetValueEx.assert_called_once_with(
+            registry_key,
+            SPRITELINK.WINDOWS_STARTUP_VALUE_NAME,
+            0,
+            winreg.REG_SZ,
+            '"C:\\SpriteLink\\SpriteLink.exe"',
+        )
+        winreg.DeleteValue.assert_called_once_with(
+            registry_key,
+            SPRITELINK.WINDOWS_STARTUP_VALUE_NAME,
+        )
+
+        installer = (
+            Path(__file__).resolve().parents[1]
+            / "packaging/windows/SpriteLink.iss"
+        ).read_text(encoding="utf-8")
+        self.assertIn("uninsdeletevalue", installer)
+        self.assertIn('ValueName: "SpriteLink"', installer)
+
+    def test_window_size_is_saved_within_supported_bounds(self) -> None:
+        self.assertEqual(
+            SPRITELINK.normalize_window_size(700, 550),
+            (700, 550),
+        )
+        self.assertEqual(
+            SPRITELINK.normalize_window_size(2000, 1200),
+            (
+                SPRITELINK.DEFAULT_WINDOW_WIDTH,
+                SPRITELINK.DEFAULT_WINDOW_HEIGHT,
+            ),
+        )
+        self.assertEqual(
+            SPRITELINK.normalize_window_size(100, 100),
+            (
+                SPRITELINK.MINIMUM_WINDOW_WIDTH,
+                SPRITELINK.MINIMUM_WINDOW_HEIGHT,
+            ),
+        )
+        config = SPRITELINK.default_config()
+        self.assertEqual(
+            (config["window_width"], config["window_height"]),
+            (
+                SPRITELINK.DEFAULT_WINDOW_WIDTH,
+                SPRITELINK.DEFAULT_WINDOW_HEIGHT,
+            ),
+        )
+
+        init_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.__init__
+        )
+        self.assertIn('self.config_data["window_width"]', init_source)
+        self.assertIn('self.config_data["window_height"]', init_source)
+        copy_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._copy_ui_to_config
+        )
+        self.assertIn("normalize_window_size(", copy_source)
+        self.assertIn('self.config_data["window_width"]', copy_source)
+        self.assertIn('self.config_data["window_height"]', copy_source)
 
     def test_background_history_pruning_runs_hourly(self) -> None:
         self.assertEqual(
@@ -344,6 +432,412 @@ class BehaviorSettingsTests(unittest.TestCase):
         ):
             self.assertNotIn(removed_upgrade_token, module_source)
 
+    def test_minimize_to_tray_is_enabled_for_new_and_existing_users(
+        self,
+    ) -> None:
+        self.assertTrue(SPRITELINK.default_config()["minimize_to_tray"])
+
+        existing_config = SPRITELINK.default_config()
+        existing_config["minimize_to_tray"] = False
+        existing_config.pop(
+            SPRITELINK.MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY,
+            None,
+        )
+        config_path = mock.Mock()
+        config_path.exists.return_value = True
+        config_path.read_bytes.return_value = b"settings"
+        with (
+            mock.patch.object(SPRITELINK, "CONFIG_PATH", config_path),
+            mock.patch.object(
+                SPRITELINK,
+                "_load_dpapi_config",
+                return_value=existing_config,
+            ),
+        ):
+            migrated = SPRITELINK.load_config()
+
+        self.assertTrue(migrated["minimize_to_tray"])
+        self.assertTrue(
+            migrated[SPRITELINK.MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY]
+        )
+
+        migrated["minimize_to_tray"] = False
+        with (
+            mock.patch.object(SPRITELINK, "CONFIG_PATH", config_path),
+            mock.patch.object(
+                SPRITELINK,
+                "_load_dpapi_config",
+                return_value=migrated,
+            ),
+        ):
+            user_disabled = SPRITELINK.load_config()
+        self.assertFalse(user_disabled["minimize_to_tray"])
+
+    def test_first_tray_close_notice_has_requested_actions(self) -> None:
+        notice_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_minimize_to_tray_notice
+        )
+        self.assertIn(
+            "SpriteLink will keep running in the system tray so it can ",
+            notice_source,
+        )
+        self.assertIn("receive messages in the background.", notice_source)
+        self.assertIn('"Disable and Close"', notice_source)
+        self.assertIn('"OK"', notice_source)
+
+
+class MessageGroupingTests(unittest.TestCase):
+    @staticmethod
+    def _item(
+        client_id: str,
+        text: str,
+        index: int,
+        *,
+        is_local: bool = False,
+    ) -> dict[str, object]:
+        return {
+            "message": {
+                "c": client_id,
+                "m": text,
+                "i": f"message-{index}",
+                "t": 1000 + index,
+            },
+            "is_local": is_local,
+            "warning": None,
+            "ntfy_time": 1000 + index,
+        }
+
+    def test_muted_user_messages_combine_until_another_user_speaks(
+        self,
+    ) -> None:
+        items = [
+            self._item("muted", "one", 1),
+            self._item("muted", "two", 2),
+            self._item("other", "break", 3),
+            self._item("muted", "three", 4),
+        ]
+        groups = SPRITELINK.group_messages_for_display(items, {"muted"})
+        self.assertEqual([len(group) for group in groups], [2, 1, 1])
+
+    def test_remote_duplicate_text_groups_but_local_text_does_not(
+        self,
+    ) -> None:
+        items = [
+            self._item("remote", "hello", 1),
+            self._item("remote", "hello", 2),
+            self._item("local", "hello", 3, is_local=True),
+            self._item("local", "hello", 4, is_local=True),
+        ]
+        groups = SPRITELINK.group_messages_for_display(items, set())
+        self.assertEqual([len(group) for group in groups], [2, 1, 1])
+        self.assertEqual(
+            SPRITELINK.EncryptedChatClient._repeat_prefixed_message_text(
+                "hello",
+                2,
+            ),
+            "[2x] hello",
+        )
+        display_client = mock.Mock()
+        display_client._repeat_prefixed_message_text = (
+            SPRITELINK.EncryptedChatClient._repeat_prefixed_message_text
+        )
+        display_item = (
+            SPRITELINK.EncryptedChatClient._display_item_for_group(
+                display_client,
+                groups[0],
+                set(),
+            )
+        )
+        self.assertEqual(display_item["message"]["m"], "[2x] hello")
+
+    def test_muted_combined_row_keeps_distinct_text_and_repeat_counts(
+        self,
+    ) -> None:
+        items = [
+            self._item("muted", "one", 1),
+            self._item("muted", "two", 2),
+            self._item("muted", "two", 3),
+        ]
+        group = SPRITELINK.group_messages_for_display(
+            items,
+            {"muted"},
+        )[0]
+        display_client = mock.Mock()
+        display_client._repeat_prefixed_message_text = (
+            SPRITELINK.EncryptedChatClient._repeat_prefixed_message_text
+        )
+        display_item = (
+            SPRITELINK.EncryptedChatClient._display_item_for_group(
+                display_client,
+                group,
+                {"muted"},
+            )
+        )
+        self.assertEqual(
+            display_item["message"]["m"],
+            "one | [2x] two",
+        )
+        self.assertEqual(
+            display_item["source_message_ids"],
+            ["message-1", "message-2", "message-3"],
+        )
+
+    def test_duplicate_sound_ordinal_suppresses_only_third_and_later(
+        self,
+    ) -> None:
+        first = self._item("remote", "hello", 1)
+        second = self._item("remote", "hello", 2)
+        third_message = self._item("remote", "hello", 3)["message"]
+        self.assertEqual(
+            SPRITELINK.consecutive_duplicate_message_ordinal(
+                [],
+                first["message"],
+                ntfy_time=1001,
+            ),
+            1,
+        )
+        self.assertEqual(
+            SPRITELINK.consecutive_duplicate_message_ordinal(
+                [first],
+                second["message"],
+                ntfy_time=1002,
+            ),
+            2,
+        )
+        self.assertEqual(
+            SPRITELINK.consecutive_duplicate_message_ordinal(
+                [first, second],
+                third_message,
+                ntfy_time=1003,
+            ),
+            3,
+        )
+
+        future = self._item("remote", "hello", 4)
+        self.assertEqual(
+            SPRITELINK.consecutive_duplicate_message_ordinal(
+                [first, future],
+                second["message"],
+                ntfy_time=1002,
+            ),
+            2,
+        )
+
+        active_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._accept_network_message
+        )
+        background_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._accept_background_messages
+        )
+        self.assertIn("duplicate_ordinal <= 2", active_source)
+        self.assertIn("duplicate_ordinal <= 2", background_source)
+        queue_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._process_ui_queue
+        )
+        self.assertIn(
+            "sorted(items, key=self._message_sort_key)",
+            queue_source,
+        )
+
+    def test_muted_rows_use_ui_font_and_hide_log_icon(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertIn('"" if is_muted else profile_icon', insert_source)
+        self.assertIn("ui_font=is_muted", insert_source)
+        tooltip_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._tooltip_for_message_item
+        )
+        self.assertIn("profile_icon_tooltip_data_uri", tooltip_source)
+
+
+class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
+    def test_rapid_message_ids_preserve_submission_order(self) -> None:
+        first_id, first_order = SPRITELINK.ordered_message_id(
+            0,
+            now_ns=500,
+        )
+        second_id, second_order = SPRITELINK.ordered_message_id(
+            first_order,
+            now_ns=500,
+        )
+        third_id, third_order = SPRITELINK.ordered_message_id(
+            second_order,
+            now_ns=499,
+        )
+        self.assertEqual(
+            (first_order, second_order, third_order),
+            (500, 501, 502),
+        )
+        self.assertEqual(len(first_id), 32)
+        self.assertLess(first_id, second_id)
+        self.assertLess(second_id, third_id)
+
+        items = [
+            {
+                "message": {"i": third_id, "t": 1000},
+                "ntfy_time": 1000,
+                "ntfy_id": "a",
+            },
+            {
+                "message": {"i": first_id, "t": 1000},
+                "ntfy_time": 1000,
+                "ntfy_id": "z",
+            },
+            {
+                "message": {"i": second_id, "t": 1000},
+                "ntfy_time": 1000,
+                "ntfy_id": "m",
+            },
+        ]
+        ordered = sorted(items, key=SPRITELINK.message_item_sort_key)
+        self.assertEqual(
+            [item["message"]["i"] for item in ordered],
+            [first_id, second_id, third_id],
+        )
+
+        send_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._send_current_message
+        )
+        network_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._network_loop
+        )
+        self.assertIn("ordered_message_id", send_source)
+        self.assertLess(
+            network_source.index("self.send_queue.get_nowait()"),
+            network_source.index("self._network_send(outbound)"),
+        )
+
+    def test_new_local_message_stays_after_received_rows(self) -> None:
+        client = mock.Mock()
+        client.message_log = [{
+            "message": {"i": "remote", "t": 1001},
+            "is_local": False,
+            "warning": None,
+            "ntfy_id": "ntfy-remote",
+            "ntfy_time": 1001,
+        }]
+        client._message_sort_key = SPRITELINK.message_item_sort_key
+        client._chatroom_history_limit.return_value = 100
+
+        SPRITELINK.EncryptedChatClient._add_message_to_log(
+            client,
+            {"i": "local", "t": 1000},
+            is_local=True,
+            persist=False,
+            render=False,
+        )
+
+        self.assertEqual(
+            [item["message"]["i"] for item in client.message_log],
+            ["remote", "local"],
+        )
+        self.assertGreater(
+            client.message_log[-1]["display_sort_time"],
+            client.message_log[0]["ntfy_time"],
+        )
+
+    def test_every_rendered_message_enforces_a_new_row_boundary(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        boundary = source.index("if cursor.block().text():")
+        insert_block = source.index("cursor.insertBlock()", boundary)
+        message_start = source.index("message_start_position =", boundary)
+        self.assertLess(boundary, insert_block)
+        self.assertLess(insert_block, message_start)
+
+    def test_hour_separator_is_omitted_beside_a_date_separator(self) -> None:
+        same_day_start = int(
+            SPRITELINK.datetime(2026, 7, 20, 8, 0).timestamp()
+        )
+        same_day_end = int(
+            SPRITELINK.datetime(2026, 7, 20, 15, 0).timestamp()
+        )
+        self.assertEqual(
+            SPRITELINK.message_log_separator_texts(
+                same_day_start,
+                same_day_end,
+            ),
+            ("————— 7 hours later —————",),
+        )
+
+        previous_day = int(
+            SPRITELINK.datetime(2026, 7, 20, 20, 0).timestamp()
+        )
+        next_day = int(
+            SPRITELINK.datetime(2026, 7, 21, 3, 0).timestamp()
+        )
+        separators = SPRITELINK.message_log_separator_texts(
+            previous_day,
+            next_day,
+        )
+        self.assertEqual(len(separators), 1)
+        self.assertIn("Jul 21, 2026", separators[0])
+        self.assertNotIn("hours later", separators[0])
+
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_log_separator
+        )
+        self.assertIn("if cursor.block().text():", insert_source)
+        self.assertIn("setTopMargin(7)", insert_source)
+        self.assertIn("setBottomMargin(7)", insert_source)
+        self.assertIn("setBackground", insert_source)
+        self.assertIn("row_background_padding_blocks", insert_source)
+
+        padding_paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_row_background_padding
+        )
+        self.assertEqual(padding_paint_source.count("painter.fillRect("), 2)
+        paint_event_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser.paintEvent
+        )
+        self.assertGreater(
+            paint_event_source.index("_paint_row_background_padding"),
+            paint_event_source.index("super().paintEvent(event)"),
+        )
+
+    def test_composer_menus_keep_a_bottomed_log_at_the_bottom(self) -> None:
+        restore_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._restore_chat_bottom_after_menu_toggle
+        )
+        self.assertIn("if not keep_at_bottom", restore_source)
+        self.assertIn("self._scroll_chat_to_bottom()", restore_source)
+        self.assertIn("QTimer.singleShot(0", restore_source)
+
+        for handler in (
+            SPRITELINK.EncryptedChatClient._on_identity_menu_toggled,
+            SPRITELINK.EncryptedChatClient._on_font_menu_toggled,
+            SPRITELINK.EncryptedChatClient._on_formatting_menu_toggled,
+        ):
+            source = inspect.getsource(handler)
+            self.assertIn("_chat_is_scrolled_to_bottom()", source)
+            self.assertIn(
+                "_restore_chat_bottom_after_menu_toggle",
+                source,
+            )
+
+        visibility_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._set_composer_menu_visibility
+        )
+        self.assertIn("setUpdatesEnabled(False)", visibility_source)
+        self.assertIn("setUpdatesEnabled(True)", visibility_source)
+        self.assertLess(
+            visibility_source.index("menu.setVisible(should_show)"),
+            visibility_source.index("content_layout.activate()"),
+        )
+
+        sidebar_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_chatrooms_toggled
+        )
+        self.assertIn("setUpdatesEnabled(False)", sidebar_source)
+        self.assertIn("setUpdatesEnabled(True)", sidebar_source)
+        self.assertIn("central_widget.layout().activate()", sidebar_source)
+
+
+class TrayBehaviorTests(unittest.TestCase):
     def test_close_can_hide_to_tray_or_exit(self) -> None:
         close_event_source = inspect.getsource(
             SPRITELINK.MainWindow.closeEvent
@@ -511,9 +1005,18 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("setTextIndent(0)", source)
         self.assertIn("setBackground(QColor(background_color))", source)
 
-        paint_source = inspect.getsource(SPRITELINK.MessageLogBrowser.paintEvent)
-        self.assertIn("block.blockFormat().rightMargin()", paint_source)
-        self.assertIn("viewport_width - right_width", paint_source)
+        background_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_row_backgrounds
+        )
+        self.assertIn("blockBoundingRect(block)", background_source)
+        self.assertIn("viewport_width", background_source)
+        paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser.paintEvent
+        )
+        self.assertLess(
+            paint_source.index("_paint_row_backgrounds(event)"),
+            paint_source.index("super().paintEvent(event)"),
+        )
 
     def test_status_line_uses_chatroom_name_and_delayed_error(self) -> None:
         self.assertEqual(
@@ -977,12 +1480,12 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
 
         kernel32.CloseHandle.assert_not_called()
 
-    def test_chatroom_context_menu_order_and_key_copy(self) -> None:
+    def test_chatroom_context_menu_order_and_invite_copy(self) -> None:
         source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._show_chatroom_context_menu
         )
         edit_at = source.index('menu.addAction("Edit")')
-        copy_at = source.index('menu.addAction("Copy Chatroom Key")')
+        copy_at = source.index('menu.addAction("Copy Invite Code")')
         mute_at = source.index(
             'menu.addAction("Unmute" if is_muted else "Mute")'
         )
@@ -990,7 +1493,7 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
         self.assertLess(edit_at, copy_at)
         self.assertLess(copy_at, mute_at)
         self.assertLess(mute_at, remove_at)
-        self.assertIn("_copy_chatroom_key(room_id)", source)
+        self.assertIn("_copy_chatroom_invite_code(room_id)", source)
 
     def test_user_and_message_context_menus_are_separated(self) -> None:
         user_source = inspect.getsource(
@@ -1206,7 +1709,7 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
 
     def test_subscription_restarts_when_topics_or_server_change(self) -> None:
         for method in (
-            SPRITELINK.EncryptedChatClient._add_chatroom,
+            SPRITELINK.EncryptedChatClient._store_new_chatroom,
             SPRITELINK.EncryptedChatClient._edit_chatroom,
             SPRITELINK.EncryptedChatClient._remove_chatroom,
             SPRITELINK.EncryptedChatClient._set_chatroom_muted,
@@ -1311,7 +1814,7 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
         self.assertIn("tray_icon.isVisible()", mark_source)
         self.assertNotIn("_minimized_to_tray", mark_source)
         self.assertIn(
-            "_clear_tray_notification_if_no_unread",
+            "_mark_chatroom_read(self.active_chatroom_id)",
             event_source,
         )
         self.assertNotIn(
@@ -1338,6 +1841,37 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
             client
         )
         client._clear_tray_notification.assert_called_once_with()
+
+    def test_active_room_outline_requires_an_unfocused_window(self) -> None:
+        self.assertFalse(
+            SPRITELINK.notification_outline_required(
+                "active",
+                "active",
+                window_focused=True,
+            )
+        )
+        self.assertTrue(
+            SPRITELINK.notification_outline_required(
+                "active",
+                "active",
+                window_focused=False,
+            )
+        )
+        self.assertTrue(
+            SPRITELINK.notification_outline_required(
+                "background",
+                "active",
+                window_focused=True,
+            )
+        )
+        active_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._accept_network_message
+        )
+        background_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._accept_background_messages
+        )
+        self.assertIn("notification_outline_required", active_source)
+        self.assertIn("notification_outline_required", background_source)
 
     def test_existing_unread_is_shown_when_tray_icon_starts(self) -> None:
         build_source = inspect.getsource(
@@ -1483,6 +2017,33 @@ class ProfileIconTests(unittest.TestCase):
         )
         self.assertIn("_apply_window_titlebar_theme", themed_source)
         self.assertIn("QTimer.singleShot", themed_source)
+
+    def test_all_non_file_dialogs_receive_active_window_theme(self) -> None:
+        init_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.__init__
+        )
+        self.assertIn("app.installEventFilter(self)", init_source)
+
+        event_filter_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        self.assertIn("isinstance(watched, QDialog)", event_filter_source)
+        self.assertIn(
+            "not isinstance(watched, QFileDialog)",
+            event_filter_source,
+        )
+        self.assertIn("QEvent.Type.Show", event_filter_source)
+        self.assertIn("QEvent.Type.WindowActivate", event_filter_source)
+        self.assertIn(
+            "self._apply_dialog_window_theme(watched)",
+            event_filter_source,
+        )
+
+        helper_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._apply_dialog_window_theme
+        )
+        self.assertIn("_apply_window_titlebar_theme", helper_source)
+        self.assertIn("QTimer.singleShot", helper_source)
 
 
 class ImageTrustTests(unittest.TestCase):
@@ -1806,6 +2367,131 @@ class RoomKeyTests(unittest.TestCase):
         for key in keys:
             self.assertEqual(len(key), 32)
             self.assertRegex(key, r"^[A-Za-z0-9_-]{32}$")
+
+
+class ChatroomInviteCodeTests(unittest.TestCase):
+    def test_invite_code_round_trip_packs_name_and_key(self) -> None:
+        code = SPRITELINK.make_chatroom_invite_code(
+            "Café Friends",
+            "key with spaces/+ symbols",
+        )
+        self.assertTrue(code.startswith("SL-"))
+        self.assertNotIn("=", code)
+        encoded = code.removeprefix("SL-")
+        payload = base64.urlsafe_b64decode(
+            encoded + ("=" * (-len(encoded) % 4))
+        )
+        self.assertEqual(
+            SPRITELINK.json.loads(payload.decode("utf-8")),
+            {
+                "name": "Café Friends",
+                "key": "key with spaces/+ symbols",
+            },
+        )
+        self.assertEqual(
+            SPRITELINK.parse_chatroom_invite_code(f"  {code}\n"),
+            ("Café Friends", "key with spaces/+ symbols"),
+        )
+
+    def test_invalid_invite_codes_are_rejected(self) -> None:
+        invalid_payloads = (
+            "",
+            "not-an-invite",
+            "SL-",
+            "SL-***",
+            "SL-e30",
+            "SL-W10",
+            "SL-eyJuYW1lIjoiUm9vbSJ9",
+        )
+        for code in invalid_payloads:
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(ValueError, "valid"):
+                    SPRITELINK.parse_chatroom_invite_code(code)
+
+        overlong_name_code = SPRITELINK.INVITE_CODE_PREFIX + (
+            base64.urlsafe_b64encode(
+                SPRITELINK.json.dumps({
+                    "name": "N" * 65,
+                    "key": "key",
+                }).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+        )
+        with self.assertRaisesRegex(ValueError, "valid"):
+            SPRITELINK.parse_chatroom_invite_code(overlong_name_code)
+
+    def test_add_chatroom_dialogs_use_create_and_join_terminology(self) -> None:
+        choice_source = inspect.getsource(
+            SPRITELINK.AddChatroomChoiceDialog
+        )
+        details_source = inspect.getsource(
+            SPRITELINK.ChatroomDetailsDialog
+        )
+        join_source = inspect.getsource(SPRITELINK.JoinChatroomDialog)
+        created_source = inspect.getsource(
+            SPRITELINK.ChatroomCreatedDialog
+        )
+        self.assertIn('QPushButton("Join Chatroom")', choice_source)
+        self.assertIn('QPushButton("Create Chatroom")', choice_source)
+        self.assertIn('QLabel("Name")', details_source)
+        self.assertNotIn("Nickname", details_source)
+        self.assertNotIn("Only share this key", details_source)
+        self.assertIn('QLabel("Invite Code")', join_source)
+        self.assertIn('QPushButton("Join Chatroom")', join_source)
+        self.assertIn('self.setWindowTitle("Chatroom created!")', created_source)
+        self.assertIn(
+            'QPushButton("Copy Invite Code")',
+            created_source,
+        )
+        self.assertIn('QPushButton("OK")', created_source)
+
+    def test_add_chatroom_routes_to_selected_flow(self) -> None:
+        add_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._add_chatroom
+        )
+        create_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._create_chatroom
+        )
+        join_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._join_chatroom
+        )
+        self.assertIn('selected_flow == "create"', add_source)
+        self.assertIn("self._create_chatroom()", add_source)
+        self.assertIn('selected_flow == "join"', add_source)
+        self.assertIn("self._join_chatroom()", add_source)
+        self.assertIn("ChatroomCreatedDialog", create_source)
+        self.assertIn("make_chatroom_invite_code", create_source)
+        self.assertIn("parse_chatroom_invite_code", join_source)
+        self.assertIn("_store_new_chatroom", join_source)
+
+    def test_new_chatroom_stores_invited_name_and_key(self) -> None:
+        client = mock.Mock()
+        client.root = mock.Mock()
+        client.config_data = {"chatrooms": [], "room_profiles": {}}
+        client.initial_history_pending_rooms = set()
+        client._chatroom_definitions.return_value = [{"key": "global-key"}]
+        client._room_profile.return_value = {"username": "User"}
+
+        with mock.patch.object(SPRITELINK, "save_config"):
+            room_id = SPRITELINK.EncryptedChatClient._store_new_chatroom(
+                client,
+                "Friends",
+                "shared-key",
+                error_title="Cannot join chatroom",
+            )
+
+        self.assertIsInstance(room_id, str)
+        self.assertEqual(len(room_id), 32)
+        self.assertEqual(
+            client.config_data["chatrooms"],
+            [{
+                "id": room_id,
+                "nickname": "Friends",
+                "key": "shared-key",
+            }],
+        )
+        client._request_subscription_refresh.assert_called_once_with()
+        client._refresh_chatroom_list.assert_called_once_with()
+        client._activate_chatroom.assert_called_once_with(room_id)
 
 
 class PacketLimitTests(unittest.TestCase):
@@ -2363,12 +3049,14 @@ class UpdateConfigTests(unittest.TestCase):
         self.assertIsNone(client.available_update)
 
 
-class Version110ReleaseTests(unittest.TestCase):
+class Version120ReleaseTests(unittest.TestCase):
     def test_release_defaults_and_config_control_order(self) -> None:
         config = SPRITELINK.default_config()
         self.assertEqual(SPRITELINK.DEFAULT_MESSAGE_FONT, "Arial")
         self.assertTrue(config["text_shadows"])
         self.assertFalse(config["desktop_notifications"])
+        self.assertEqual(SPRITELINK.DEFAULT_THEME, "Classic")
+        self.assertEqual(SPRITELINK.THEMES, ("Classic", "Modern"))
 
         source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._build_config_tab
@@ -2385,6 +3073,56 @@ class Version110ReleaseTests(unittest.TestCase):
             source.index('"Desktop Notifications"'),
             source.index('QLabel("Chatroom History")'),
         )
+
+    def test_legacy_theme_names_keep_their_equivalent_theme(self) -> None:
+        for legacy_name, expected_name in (
+            ("Windows Classic", "Classic"),
+            ("Modern (Light)", "Modern"),
+        ):
+            with self.subTest(theme=legacy_name):
+                existing_config = SPRITELINK.default_config()
+                existing_config["theme"] = legacy_name
+                config_path = mock.Mock()
+                config_path.exists.return_value = True
+                config_path.read_bytes.return_value = b"settings"
+                with (
+                    mock.patch.object(
+                        SPRITELINK,
+                        "CONFIG_PATH",
+                        config_path,
+                    ),
+                    mock.patch.object(
+                        SPRITELINK,
+                        "_load_dpapi_config",
+                        return_value=existing_config,
+                    ),
+                ):
+                    loaded = SPRITELINK.load_config()
+                self.assertEqual(loaded["theme"], expected_name)
+
+    def test_font_dropdown_removes_only_its_item_focus_outline(self) -> None:
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        self.assertIn(
+            "NoFocusRectItemDelegate(self.message_font_combo)",
+            build_source,
+        )
+        delegate_source = inspect.getsource(
+            SPRITELINK.NoFocusRectItemDelegate.paint
+        )
+        self.assertIn("State_HasFocus", delegate_source)
+        self.assertIn("super().paint", delegate_source)
+
+    def test_volume_slider_can_compress_in_small_config_windows(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_config_tab
+        )
+        self.assertIn(
+            "message_sound_volume_slider.setMinimumWidth(40)",
+            source,
+        )
+        self.assertIn("QSizePolicy.Policy.Expanding", source)
 
     def test_windows_classic_uses_tahoma_for_builtin_ui(self) -> None:
         family_source = inspect.getsource(
@@ -2460,6 +3198,7 @@ class Version110ReleaseTests(unittest.TestCase):
             'Room "One"',
             "User: <hello> & goodbye",
             "room-tag",
+            "global",
         )
         self.assertEqual(command[0], "powershell.exe")
         script = base64.b64decode(command[-1]).decode("utf-16-le")
@@ -2469,6 +3208,8 @@ class Version110ReleaseTests(unittest.TestCase):
         self.assertIn("CreateTextNode($body)", script)
         self.assertIn("$toast.Tag = $tag", script)
         self.assertIn("$toast.Group = 'SpriteLink.Chatrooms'", script)
+        self.assertIn('activationType="protocol"', script)
+        self.assertIn("SetAttribute('launch', $launchUri)", script)
         self.assertNotIn("<text>{0}</text>", script)
         self.assertEqual(
             SPRITELINK.notification_tag_for_chatroom("room-one"),
@@ -2508,8 +3249,75 @@ class Version110ReleaseTests(unittest.TestCase):
             "Room One",
             "User: Newest",
             SPRITELINK.notification_tag_for_chatroom("room-one"),
+            "room-one",
         )
         self.assertEqual(client.pending_desktop_notifications, {})
+
+    def test_reading_and_clicking_notifications_are_channel_specific(
+        self,
+    ) -> None:
+        room_id = "0123456789abcdef0123456789abcdef"
+        uri = SPRITELINK.notification_uri_for_chatroom(room_id)
+        self.assertEqual(
+            SPRITELINK.chatroom_id_from_notification_uri(uri),
+            room_id,
+        )
+        self.assertEqual(
+            SPRITELINK.notification_uri_from_arguments([
+                "SpriteLink.exe",
+                "--notification-uri",
+                uri,
+            ]),
+            uri,
+        )
+        self.assertIsNone(
+            SPRITELINK.chatroom_id_from_notification_uri(
+                "spritelink://chatroom/not-a-room"
+            )
+        )
+
+        clear_command = SPRITELINK.clear_windows_notification_command(
+            "room-tag"
+        )
+        clear_script = base64.b64decode(clear_command[-1]).decode(
+            "utf-16-le"
+        )
+        self.assertIn("::History.Remove($tag", clear_script)
+        self.assertIn(SPRITELINK.WINDOWS_NOTIFICATION_GROUP, clear_script)
+        self.assertIn(SPRITELINK.WINDOWS_APP_USER_MODEL_ID, clear_script)
+
+        client = mock.Mock()
+        client.pending_desktop_notifications = {room_id: object()}
+        with mock.patch.object(
+            SPRITELINK,
+            "clear_windows_notification",
+        ) as clear_notification:
+            SPRITELINK.EncryptedChatClient._clear_desktop_notification(
+                client,
+                room_id,
+            )
+        self.assertEqual(client.pending_desktop_notifications, {})
+        client.desktop_notification_timer.stop.assert_called_once_with()
+        clear_notification.assert_called_once_with(
+            SPRITELINK.notification_tag_for_chatroom(room_id)
+        )
+
+        open_client = mock.Mock()
+        open_client._find_chatroom.return_value = {"id": room_id}
+        SPRITELINK.EncryptedChatClient._open_notification_chatroom(
+            open_client,
+            room_id,
+        )
+        open_client._restore_from_tray.assert_called_once_with()
+        open_client._activate_chatroom.assert_called_once_with(room_id)
+
+        read_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._mark_chatroom_read
+        )
+        self.assertIn("_clear_desktop_notification(room_id)", read_source)
+        main_source = inspect.getsource(SPRITELINK.main)
+        self.assertIn("write_notification_activation", main_source)
+        self.assertIn("_open_notification_chatroom", main_source)
 
     def test_notification_sounds_have_a_two_second_cooldown(self) -> None:
         client = mock.Mock()
@@ -2553,7 +3361,21 @@ class Version110ReleaseTests(unittest.TestCase):
                 1_000_000 - retention,
                 now=1_000_000,
             ),
-            "Stored on server",
+            "On server (1h)",
+        )
+        self.assertEqual(
+            SPRITELINK.message_storage_status(
+                1_000_000,
+                now=1_000_000,
+            ),
+            "On server (12h)",
+        )
+        self.assertEqual(
+            SPRITELINK.message_storage_status(
+                1_000_000 - 3601,
+                now=1_000_000,
+            ),
+            "On server (11h)",
         )
         self.assertEqual(
             SPRITELINK.message_storage_status(
@@ -2583,6 +3405,16 @@ class Version110ReleaseTests(unittest.TestCase):
         self.assertIn('width="1" height="1"', tooltip_source)
         self.assertNotIn("<br>", tooltip_source)
         self.assertIn("storage_status", tooltip_source)
+
+        show_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_pending_chat_tooltip
+        )
+        self.assertIn("CHAT_TOOLTIP_DISPLAY_TIME_MS", show_source)
+        self.assertIn("self.chat_display.viewport().rect()", show_source)
+        self.assertEqual(
+            SPRITELINK.CHAT_TOOLTIP_DISPLAY_TIME_MS,
+            2_147_483_647,
+        )
 
     def test_each_message_resets_its_non_breakable_block_format(self) -> None:
         source = inspect.getsource(
@@ -2628,7 +3460,7 @@ class Version110ReleaseTests(unittest.TestCase):
             ),
         )
 
-    def test_windows_package_defaults_to_version_110(self) -> None:
+    def test_windows_package_defaults_to_version_120(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         workflow = (
             project_root / ".github/workflows/windows-package.yml"
@@ -2639,9 +3471,9 @@ class Version110ReleaseTests(unittest.TestCase):
         installer = (
             project_root / "packaging/windows/SpriteLink.iss"
         ).read_text(encoding="utf-8")
-        self.assertIn('default: "1.1.0"', workflow)
-        self.assertIn('$Version = "1.1.0"', build_script)
-        self.assertIn('#define AppVersion "1.1.0"', installer)
+        self.assertIn('default: "1.2.0"', workflow)
+        self.assertIn('$Version = "1.2.0"', build_script)
+        self.assertIn('#define AppVersion "1.2.0"', installer)
 
 
 if __name__ == "__main__":

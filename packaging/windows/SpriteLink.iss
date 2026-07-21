@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "1.1.0"
+  #define AppVersion "1.2.0"
 #endif
 
 #define AppName "SpriteLink"
@@ -39,6 +39,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"
 
+[Registry]
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "SpriteLink"; Flags: uninsdeletevalue
+
 [Files]
 Source: "..\..\dist\SpriteLink\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
@@ -48,4 +51,3 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; WorkingDir: "{app}"; Flags: nowait postinstall
-

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -41,7 +42,7 @@ import sys
 import unicodedata
 import uuid
 import zlib
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 try:
     from PySide6.QtCore import (
         QBuffer,
@@ -113,6 +114,8 @@ try:
         QSizePolicy,
         QStyle,
         QStyleFactory,
+        QStyledItemDelegate,
+        QStyleOptionViewItem,
         QSystemTrayIcon,
         QTextBrowser,
         QTextEdit,
@@ -191,6 +194,12 @@ APP_VERSION = 1
 CONFIG_FORMAT_VERSION = 24
 WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
+WINDOWS_NOTIFICATION_PROTOCOL = "spritelink"
+WINDOWS_NOTIFICATION_GROUP = "SpriteLink.Chatrooms"
+WINDOWS_STARTUP_VALUE_NAME = "SpriteLink"
+WINDOWS_STARTUP_REGISTRY_PATH = (
+    r"Software\Microsoft\Windows\CurrentVersion\Run"
+)
 WINDOWS_SINGLE_INSTANCE_MUTEX_NAME = (
     r"Local\SpriteLink-{D2EB08B2-F3E3-4F88-8D9E-51DC7A8754A0}"
 )
@@ -295,6 +304,10 @@ CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 TRAY_NOTIFICATION_OUTLINE_COLOR = "#ff7a00"
+MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY = (
+    "minimize_to_tray_1_2_default_applied"
+)
+MINIMIZE_TO_TRAY_NOTICE_KEY = "minimize_to_tray_notice_shown"
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
@@ -302,11 +315,20 @@ SERVER_PRESETS: dict[str, str] = {
     "Custom ntfy server": "",
 }
 
-DEFAULT_THEME = "Modern (Light)"
+DEFAULT_THEME = "Classic"
 THEMES = (
     DEFAULT_THEME,
-    "Windows Classic",
+    "Modern",
 )
+LEGACY_THEME_NAMES = {
+    "Windows Classic": "Classic",
+    "Modern (Light)": "Modern",
+}
+
+DEFAULT_WINDOW_WIDTH = 840
+DEFAULT_WINDOW_HEIGHT = 650
+MINIMUM_WINDOW_WIDTH = 670
+MINIMUM_WINDOW_HEIGHT = 500
 
 FOCUSED_POLL_INTERVAL_SECONDS = 6.0
 UNFOCUSED_POLL_INTERVAL_SECONDS = 9.0
@@ -337,6 +359,7 @@ MAX_PROFILE_ICON_GIF_BYTES = 2048
 MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
+CHAT_TOOLTIP_DISPLAY_TIME_MS = 2_147_483_647
 TOOLTIP_SPACER_DATA_URI = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMA"
@@ -965,6 +988,7 @@ APP_DATA_DIR = Path(
 
 CONFIG_PATH = APP_DATA_DIR / "settings.bin"
 CHATROOM_HISTORY_DIRECTORY = APP_DATA_DIR / "history"
+NOTIFICATION_ACTIVATION_PATH = APP_DATA_DIR / "notification-activation.txt"
 SETTINGS_DPAPI_ENTROPY = b"SpriteLink-v1-settings"
 CHATROOM_HISTORY_DPAPI_ENTROPY = b"SpriteLink-v1-chatroom-history"
 
@@ -1184,18 +1208,195 @@ def message_plain_text(text: str) -> str:
     return parse_message_rich_text(text)[0]
 
 
+def message_items_are_contiguous(
+    previous_item: dict[str, Any],
+    current_item: dict[str, Any],
+) -> bool:
+    if previous_item.get("warning") or current_item.get("warning"):
+        return False
+
+    previous_timestamp = int(
+        previous_item.get(
+            "ntfy_time",
+            previous_item.get("message", {}).get("t", 0),
+        )
+        or 0
+    )
+    current_timestamp = int(
+        current_item.get(
+            "ntfy_time",
+            current_item.get("message", {}).get("t", 0),
+        )
+        or 0
+    )
+    gap_seconds = current_timestamp - previous_timestamp
+    if gap_seconds < 0 or gap_seconds >= GAP_SEPARATOR_SECONDS:
+        return False
+
+    try:
+        return (
+            datetime.fromtimestamp(previous_timestamp).date()
+            == datetime.fromtimestamp(current_timestamp).date()
+        )
+    except Exception:
+        return True
+
+
+def message_log_separator_texts(
+    previous_timestamp: int,
+    current_timestamp: int,
+) -> tuple[str, ...]:
+    try:
+        previous_local_date = datetime.fromtimestamp(
+            previous_timestamp
+        ).date()
+        current_local_datetime = datetime.fromtimestamp(current_timestamp)
+    except Exception:
+        previous_local_date = None
+        current_local_datetime = None
+
+    # A date row already communicates the break in the conversation. Avoid
+    # placing an elapsed-time row directly beside it as a redundant divider.
+    if (
+        current_local_datetime is not None
+        and current_local_datetime.date() != previous_local_date
+    ):
+        return (
+            "————— "
+            f"{current_local_datetime.strftime('%b')} "
+            f"{current_local_datetime.day}, "
+            f"{current_local_datetime.year}"
+            " —————",
+        )
+
+    gap_seconds = int(current_timestamp) - int(previous_timestamp)
+    if gap_seconds >= GAP_SEPARATOR_SECONDS:
+        gap_hours = max(6, int((gap_seconds / 3600.0) + 0.5))
+        return (f"————— {gap_hours} hours later —————",)
+    return ()
+
+
+def group_messages_for_display(
+    items: list[dict[str, Any]],
+    muted_user_ids: set[str],
+) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    for item in items:
+        message = item.get("message")
+        if not isinstance(message, dict):
+            continue
+        if not groups:
+            groups.append([item])
+            continue
+
+        previous_item = groups[-1][-1]
+        previous_message = previous_item.get("message", {})
+        client_id = str(message.get("c", ""))
+        same_remote_user = (
+            not bool(item.get("is_local", False))
+            and not bool(previous_item.get("is_local", False))
+            and client_id == str(previous_message.get("c", ""))
+        )
+        should_combine = (
+            same_remote_user
+            and message_items_are_contiguous(previous_item, item)
+            and (
+                client_id in muted_user_ids
+                or str(message.get("m", ""))
+                == str(previous_message.get("m", ""))
+            )
+        )
+        if should_combine:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+    return groups
+
+
+def message_item_sort_key(
+    item: dict[str, Any],
+) -> tuple[int, int, str]:
+    message = item["message"]
+    return (
+        int(item.get(
+            "display_sort_time",
+            item.get("ntfy_time", message.get("t", 0)),
+        ) or 0),
+        int(message.get("t", 0) or 0),
+        # New message IDs begin with a monotonic send-order value. Ntfy's
+        # record IDs are unique but not chronological, so using them here can
+        # visibly reorder messages sent within the same whole second.
+        str(message.get("i") or item.get("ntfy_id", "")),
+    )
+
+
+def ordered_message_id(
+    previous_order: int,
+    *,
+    now_ns: int | None = None,
+) -> tuple[str, int]:
+    """Return a fixed-width ID that increases in composer submission order."""
+    current_ns = time.time_ns() if now_ns is None else int(now_ns)
+    order = max(current_ns, int(previous_order) + 1)
+    return f"{order:016x}{secrets.token_hex(8)}", order
+
+
+def consecutive_duplicate_message_ordinal(
+    previous_items: list[dict[str, Any]],
+    message: dict[str, Any],
+    *,
+    ntfy_time: int,
+    ntfy_id: str | None = None,
+) -> int:
+    current_item = {
+        "message": message,
+        "is_local": False,
+        "warning": None,
+        "ntfy_time": ntfy_time,
+        "ntfy_id": ntfy_id,
+    }
+    count = 1
+    for previous_item in reversed(previous_items):
+        previous_message = previous_item.get("message")
+        if not isinstance(previous_message, dict):
+            break
+        if message_item_sort_key(previous_item) > message_item_sort_key(
+            current_item
+        ):
+            continue
+        if (
+            str(previous_message.get("c", ""))
+            != str(message.get("c", ""))
+            or str(previous_message.get("m", ""))
+            != str(message.get("m", ""))
+            or not message_items_are_contiguous(
+                previous_item,
+                current_item,
+            )
+        ):
+            break
+        count += 1
+        current_item = previous_item
+    return count
+
+
 def message_storage_status(
     timestamp: int,
     *,
     now: int | None = None,
 ) -> str:
     current_time = int(time.time()) if now is None else int(now)
+    age_seconds = current_time - int(timestamp)
     if (
         int(timestamp) > 0
-        and current_time - int(timestamp)
-        <= SERVER_HISTORY_RETENTION_SECONDS
+        and age_seconds <= SERVER_HISTORY_RETENTION_SECONDS
     ):
-        return "Stored on server"
+        remaining_seconds = min(
+            SERVER_HISTORY_RETENTION_SECONDS,
+            max(0, SERVER_HISTORY_RETENTION_SECONDS - age_seconds),
+        )
+        remaining_hours = max(1, (remaining_seconds + 3599) // 3600)
+        return f"On server ({remaining_hours}h)"
     return "Expired"
 
 
@@ -1203,10 +1404,102 @@ def notification_tag_for_chatroom(room_id: str) -> str:
     return hashlib.sha256(str(room_id).encode("utf-8")).hexdigest()[:32]
 
 
+def notification_uri_for_chatroom(room_id: str) -> str:
+    return (
+        f"{WINDOWS_NOTIFICATION_PROTOCOL}://chatroom/"
+        f"{quote(str(room_id), safe='')}"
+    )
+
+
+def chatroom_id_from_notification_uri(uri: str) -> str | None:
+    parsed = urlsplit(str(uri))
+    if (
+        parsed.scheme.lower() != WINDOWS_NOTIFICATION_PROTOCOL
+        or parsed.netloc.lower() != "chatroom"
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    room_id = unquote(parsed.path.lstrip("/"))
+    if room_id == GLOBAL_CHATROOM_ID or re.fullmatch(r"[0-9a-f]{32}", room_id):
+        return room_id
+    return None
+
+
+def notification_uri_from_arguments(arguments: list[str]) -> str | None:
+    for index, argument in enumerate(arguments):
+        if argument == "--notification-uri" and index + 1 < len(arguments):
+            return arguments[index + 1]
+        if str(argument).lower().startswith(
+            f"{WINDOWS_NOTIFICATION_PROTOCOL}://"
+        ):
+            return str(argument)
+    return None
+
+
+def write_notification_activation(room_id: str) -> bool:
+    if chatroom_id_from_notification_uri(
+        notification_uri_for_chatroom(room_id)
+    ) is None:
+        return False
+    try:
+        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary_path = NOTIFICATION_ACTIVATION_PATH.with_suffix(".tmp")
+        temporary_path.write_text(str(room_id), encoding="utf-8")
+        os.replace(temporary_path, NOTIFICATION_ACTIVATION_PATH)
+    except OSError:
+        return False
+    return True
+
+
+def register_windows_notification_protocol() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+
+        if getattr(sys, "frozen", False):
+            executable_parts = [sys.executable]
+        else:
+            python_executable = Path(sys.executable)
+            pythonw_executable = python_executable.with_name("pythonw.exe")
+            executable_parts = [
+                str(
+                    pythonw_executable
+                    if pythonw_executable.exists()
+                    else python_executable
+                ),
+                str(Path(__file__).resolve()),
+            ]
+        command = (
+            subprocess.list2cmdline(executable_parts)
+            + ' --notification-uri "%1"'
+        )
+        protocol_path = (
+            rf"Software\Classes\{WINDOWS_NOTIFICATION_PROTOCOL}"
+        )
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, protocol_path) as key:
+            winreg.SetValueEx(
+                key,
+                None,
+                0,
+                winreg.REG_SZ,
+                "URL:SpriteLink Chatroom",
+            )
+            winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+        command_path = protocol_path + r"\shell\open\command"
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, command_path) as key:
+            winreg.SetValueEx(key, None, 0, winreg.REG_SZ, command)
+    except (OSError, ImportError):
+        return False
+    return True
+
+
 def silent_windows_notification_command(
     title: str,
     body: str,
     tag: str,
+    room_id: str,
 ) -> list[str]:
     title_base64 = base64.b64encode(
         str(title).encode("utf-8")
@@ -1217,6 +1510,9 @@ def silent_windows_notification_command(
     tag_base64 = base64.b64encode(
         str(tag).encode("utf-8")
     ).decode("ascii")
+    launch_uri_base64 = base64.b64encode(
+        notification_uri_for_chatroom(room_id).encode("utf-8")
+    ).decode("ascii")
     script = f"""
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
@@ -1224,15 +1520,17 @@ def silent_windows_notification_command(
 $title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{title_base64}'))
 $body = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{body_base64}'))
 $tag = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{tag_base64}'))
-$toastXml = '<toast><visual><binding template="ToastGeneric"><text></text><text></text></binding></visual><audio silent="true"/></toast>'
+$launchUri = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{launch_uri_base64}'))
+$toastXml = '<toast activationType="protocol"><visual><binding template="ToastGeneric"><text></text><text></text></binding></visual><audio silent="true"/></toast>'
 $xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
 $xml.LoadXml($toastXml)
+$xml.DocumentElement.SetAttribute('launch', $launchUri)
 $textNodes = $xml.GetElementsByTagName('text')
 $textNodes.Item(0).AppendChild($xml.CreateTextNode($title)) | Out-Null
 $textNodes.Item(1).AppendChild($xml.CreateTextNode($body)) | Out-Null
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 $toast.Tag = $tag
-$toast.Group = 'SpriteLink.Chatrooms'
+$toast.Group = '{WINDOWS_NOTIFICATION_GROUP}'
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{WINDOWS_APP_USER_MODEL_ID}').Show($toast)
 """.strip()
     encoded_script = base64.b64encode(
@@ -1253,12 +1551,52 @@ def show_silent_windows_notification(
     title: str,
     body: str,
     tag: str,
+    room_id: str,
 ) -> bool:
     if os.name != "nt":
         return False
     try:
         subprocess.Popen(
-            silent_windows_notification_command(title, body, tag),
+            silent_windows_notification_command(title, body, tag, room_id),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError:
+        return False
+    return True
+
+
+def clear_windows_notification_command(tag: str) -> list[str]:
+    tag_base64 = base64.b64encode(
+        str(tag).encode("utf-8")
+    ).decode("ascii")
+    script = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+$tag = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{tag_base64}'))
+[Windows.UI.Notifications.ToastNotificationManager]::History.Remove($tag, '{WINDOWS_NOTIFICATION_GROUP}', '{WINDOWS_APP_USER_MODEL_ID}')
+""".strip()
+    encoded_script = base64.b64encode(
+        script.encode("utf-16-le")
+    ).decode("ascii")
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-EncodedCommand",
+        encoded_script,
+    ]
+
+
+def clear_windows_notification(tag: str) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        subprocess.Popen(
+            clear_windows_notification_command(tag),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1458,6 +1796,77 @@ def is_image_url_trusted_for_sender(
 def generate_chatroom_key() -> str:
     # 24 random bytes encode to exactly 32 URL-safe characters.
     return secrets.token_urlsafe(24)
+
+
+INVITE_CODE_PREFIX = "SL-"
+MAX_INVITE_CODE_CHARS = 8192
+MAX_CHATROOM_NAME_CHARS = 64
+
+
+def make_chatroom_invite_code(name: str, chatroom_key: str) -> str:
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise ValueError("The chatroom name cannot be empty.")
+    if len(normalized_name) > MAX_CHATROOM_NAME_CHARS:
+        raise ValueError(
+            f"The chatroom name cannot exceed {MAX_CHATROOM_NAME_CHARS} "
+            "characters."
+        )
+    if not chatroom_key:
+        raise ValueError("The chatroom key cannot be empty.")
+    payload = json.dumps(
+        {"name": normalized_name, "key": chatroom_key},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    invite_code = f"{INVITE_CODE_PREFIX}{encoded}"
+    if len(invite_code) > MAX_INVITE_CODE_CHARS:
+        raise ValueError("The chatroom invite code is too large.")
+    return invite_code
+
+
+def parse_chatroom_invite_code(invite_code: str) -> tuple[str, str]:
+    normalized = invite_code.strip()
+    if (
+        not normalized.startswith(INVITE_CODE_PREFIX)
+        or len(normalized) <= len(INVITE_CODE_PREFIX)
+        or len(normalized) > MAX_INVITE_CODE_CHARS
+    ):
+        raise ValueError("That is not a valid SpriteLink invite code.")
+    encoded = normalized[len(INVITE_CODE_PREFIX):]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", encoded):
+        raise ValueError("That is not a valid SpriteLink invite code.")
+    padded = encoded + ("=" * (-len(encoded) % 4))
+    try:
+        decoded = base64.b64decode(
+            padded,
+            altchars=b"-_",
+            validate=True,
+        ).decode("utf-8")
+        payload = json.loads(decoded)
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise ValueError(
+            "That is not a valid SpriteLink invite code."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("That is not a valid SpriteLink invite code.")
+    name = payload.get("name")
+    chatroom_key = payload.get("key")
+    if not isinstance(name, str) or not isinstance(chatroom_key, str):
+        raise ValueError("That is not a valid SpriteLink invite code.")
+    normalized_name = name.strip()
+    if (
+        not normalized_name
+        or len(normalized_name) > MAX_CHATROOM_NAME_CHARS
+        or not chatroom_key
+    ):
+        raise ValueError("That is not a valid SpriteLink invite code.")
+    return normalized_name, chatroom_key
 
 
 @lru_cache(maxsize=4096)
@@ -1894,7 +2303,12 @@ def default_config() -> dict[str, Any]:
         "custom_message_sound_path": "",
         "desktop_notifications": False,
         "chatroom_history_limit": DEFAULT_CHATROOM_HISTORY_LIMIT,
-        "minimize_to_tray": False,
+        "minimize_to_tray": True,
+        "start_with_windows": False,
+        "window_width": DEFAULT_WINDOW_WIDTH,
+        "window_height": DEFAULT_WINDOW_HEIGHT,
+        MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY: True,
+        MINIMIZE_TO_TRAY_NOTICE_KEY: False,
         "identity_private_key": generate_identity_private_key(),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
@@ -1915,12 +2329,16 @@ def default_config() -> dict[str, Any]:
 
 def load_config() -> dict[str, Any]:
     config = default_config()
+    apply_minimize_to_tray_1_2_default = False
 
     if CONFIG_PATH.exists():
         try:
             loaded = _load_dpapi_config(CONFIG_PATH.read_bytes())
             if loaded.get("config_version") != CONFIG_FORMAT_VERSION:
                 return config
+            apply_minimize_to_tray_1_2_default = not bool(
+                loaded.get(MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY, False)
+            )
             config.update(loaded)
         except Exception:
             return config
@@ -1963,9 +2381,24 @@ def load_config() -> dict[str, Any]:
             DEFAULT_CHATROOM_HISTORY_LIMIT,
         )
     )
-    config["minimize_to_tray"] = bool(
-        config.get("minimize_to_tray", False)
+    config["minimize_to_tray"] = (
+        True
+        if apply_minimize_to_tray_1_2_default
+        else bool(config.get("minimize_to_tray", True))
     )
+    config[MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY] = True
+    config[MINIMIZE_TO_TRAY_NOTICE_KEY] = bool(
+        config.get(MINIMIZE_TO_TRAY_NOTICE_KEY, False)
+    )
+    config["start_with_windows"] = bool(
+        config.get("start_with_windows", False)
+    )
+    window_width, window_height = normalize_window_size(
+        config.get("window_width", DEFAULT_WINDOW_WIDTH),
+        config.get("window_height", DEFAULT_WINDOW_HEIGHT),
+    )
+    config["window_width"] = window_width
+    config["window_height"] = window_height
     config["identity_private_key"] = normalize_identity_private_key(
         config.get("identity_private_key")
     )
@@ -2089,7 +2522,10 @@ def load_config() -> dict[str, Any]:
     config["room_profiles"] = cleaned_profiles
     config["identity_presets"] = identity_presets
 
-    theme = str(config.get("theme", DEFAULT_THEME))
+    theme = LEGACY_THEME_NAMES.get(
+        str(config.get("theme", DEFAULT_THEME)),
+        str(config.get("theme", DEFAULT_THEME)),
+    )
     config["theme"] = theme if theme in THEMES else DEFAULT_THEME
 
     muted_chatrooms = config.get("muted_chatrooms")
@@ -2128,6 +2564,69 @@ def save_config(config: dict[str, Any]) -> None:
         stored_config,
         SETTINGS_DPAPI_ENTROPY,
     )
+
+
+def normalize_window_size(width: Any, height: Any) -> tuple[int, int]:
+    try:
+        normalized_width = int(width)
+    except (TypeError, ValueError):
+        normalized_width = DEFAULT_WINDOW_WIDTH
+    try:
+        normalized_height = int(height)
+    except (TypeError, ValueError):
+        normalized_height = DEFAULT_WINDOW_HEIGHT
+    return (
+        max(MINIMUM_WINDOW_WIDTH, min(DEFAULT_WINDOW_WIDTH, normalized_width)),
+        max(
+            MINIMUM_WINDOW_HEIGHT,
+            min(DEFAULT_WINDOW_HEIGHT, normalized_height),
+        ),
+    )
+
+
+def windows_startup_command() -> str:
+    if getattr(sys, "frozen", False):
+        executable_parts = [sys.executable]
+    else:
+        python_executable = Path(sys.executable)
+        pythonw_executable = python_executable.with_name("pythonw.exe")
+        executable_parts = [
+            str(
+                pythonw_executable
+                if pythonw_executable.exists()
+                else python_executable
+            ),
+            str(Path(__file__).resolve()),
+        ]
+    return subprocess.list2cmdline(executable_parts)
+
+
+def set_start_with_windows(enabled: bool) -> bool:
+    if os.name != "nt":
+        return not enabled
+    try:
+        import winreg
+
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER,
+            WINDOWS_STARTUP_REGISTRY_PATH,
+        ) as key:
+            if enabled:
+                winreg.SetValueEx(
+                    key,
+                    WINDOWS_STARTUP_VALUE_NAME,
+                    0,
+                    winreg.REG_SZ,
+                    windows_startup_command(),
+                )
+            else:
+                try:
+                    winreg.DeleteValue(key, WINDOWS_STARTUP_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+    except (OSError, ImportError):
+        return False
+    return True
 
 
 def normalize_server_url(url: str) -> str:
@@ -2619,14 +3118,36 @@ class RemoveChatroomDialog(QDialog):
         layout.addLayout(buttons)
 
 
-class AddChatroomDialog(QDialog):
+class AddChatroomChoiceDialog(QDialog):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add Chatroom")
+        self.setModal(True)
+        self.setMinimumWidth(330)
+        self.selected_flow = ""
+
+        layout = QVBoxLayout(self)
+        join_button = QPushButton("Join Chatroom")
+        join_button.clicked.connect(lambda: self._select_flow("join"))
+        layout.addWidget(join_button)
+        create_button = QPushButton("Create Chatroom")
+        create_button.clicked.connect(lambda: self._select_flow("create"))
+        layout.addWidget(create_button)
+        join_button.setFocus()
+
+    def _select_flow(self, flow: str) -> None:
+        self.selected_flow = flow
+        self.accept()
+
+
+class ChatroomDetailsDialog(QDialog):
     def __init__(
         self,
         parent: QWidget,
         *,
-        title: str = "Add Chatroom",
-        submit_label: str = "Add Chatroom",
-        nickname: str = "",
+        title: str = "Create Chatroom",
+        submit_label: str = "Create Chatroom",
+        name: str = "",
         chatroom_key: str | None = None,
         history_note: str = "",
     ) -> None:
@@ -2639,11 +3160,11 @@ class AddChatroomDialog(QDialog):
         form = QGridLayout()
         form.setColumnStretch(1, 1)
 
-        form.addWidget(QLabel("Nickname"), 0, 0)
-        self.nickname_entry = QLineEdit()
-        self.nickname_entry.setMaxLength(64)
-        self.nickname_entry.setText(nickname)
-        form.addWidget(self.nickname_entry, 0, 1, 1, 2)
+        form.addWidget(QLabel("Name"), 0, 0)
+        self.name_entry = QLineEdit()
+        self.name_entry.setMaxLength(MAX_CHATROOM_NAME_CHARS)
+        self.name_entry.setText(name)
+        form.addWidget(self.name_entry, 0, 1, 1, 2)
 
         form.addWidget(QLabel("Key"), 1, 0)
         self.key_entry = QLineEdit()
@@ -2665,8 +3186,7 @@ class AddChatroomDialog(QDialog):
         form.addWidget(show_key, 1, 2)
 
         key_hint = QLabel(
-            "32+ characters recommended. Only share this key with others "
-            "you want in the chatroom!"
+            "32+ characters recommended."
             + (f" {history_note}" if history_note else "")
         )
         key_hint.setWordWrap(True)
@@ -2685,13 +3205,76 @@ class AddChatroomDialog(QDialog):
         buttons.addWidget(submit_button)
         layout.addLayout(buttons)
 
-        self.nickname_entry.setFocus()
+        self.name_entry.setFocus()
 
-    def nickname(self) -> str:
-        return self.nickname_entry.text().strip()
+    def name(self) -> str:
+        return self.name_entry.text().strip()
 
     def chatroom_key(self) -> str:
         return self.key_entry.text()
+
+
+class JoinChatroomDialog(QDialog):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Join Chatroom")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+
+        layout = QVBoxLayout(self)
+        form = QGridLayout()
+        form.setColumnStretch(1, 1)
+        form.addWidget(QLabel("Invite Code"), 0, 0)
+        self.invite_code_entry = QLineEdit()
+        self.invite_code_entry.setMaxLength(MAX_INVITE_CODE_CHARS)
+        form.addWidget(self.invite_code_entry, 0, 1)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(cancel_button)
+        join_button = QPushButton("Join Chatroom")
+        join_button.setDefault(True)
+        join_button.clicked.connect(self.accept)
+        buttons.addWidget(join_button)
+        layout.addLayout(buttons)
+        self.invite_code_entry.setFocus()
+
+    def invite_code(self) -> str:
+        return self.invite_code_entry.text().strip()
+
+
+class ChatroomCreatedDialog(QDialog):
+    def __init__(self, parent: QWidget, invite_code: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Chatroom created!")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+        self.invite_code = invite_code
+
+        layout = QVBoxLayout(self)
+        description = QLabel(
+            "Your chatroom has been created. Use the code to invite others "
+            "to this chatroom."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        copy_button = QPushButton("Copy Invite Code")
+        copy_button.clicked.connect(self._copy_invite_code)
+        buttons.addWidget(copy_button)
+        ok_button = QPushButton("OK")
+        ok_button.setDefault(True)
+        ok_button.clicked.connect(self.accept)
+        buttons.addWidget(ok_button)
+        layout.addLayout(buttons)
+
+    def _copy_invite_code(self) -> None:
+        QApplication.clipboard().setText(self.invite_code)
 
 
 class ChatroomListRow(QWidget):
@@ -2865,6 +3448,15 @@ def polling_interval_seconds(
     if window_focused:
         return FOCUSED_POLL_INTERVAL_SECONDS
     return UNFOCUSED_POLL_INTERVAL_SECONDS
+
+
+def notification_outline_required(
+    room_id: str,
+    active_room_id: str,
+    *,
+    window_focused: bool,
+) -> bool:
+    return room_id != active_room_id or not window_focused
 
 
 def muted_inactive_polling_interval_seconds(
@@ -3126,6 +3718,20 @@ class ThemeComboBox(QComboBox):
         painter.end()
 
 
+class NoFocusRectItemDelegate(QStyledItemDelegate):
+    """Draw selected font entries without Qt's dotted focus rectangle."""
+
+    def paint(
+        self,
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        index: Any,
+    ) -> None:
+        clean_option = QStyleOptionViewItem(option)
+        clean_option.state &= ~QStyle.StateFlag.State_HasFocus
+        super().paint(painter, clean_option, index)
+
+
 class IdentityPresetSelector(QPushButton):
     presetSelected = Signal(str)
     removeRequested = Signal(str)
@@ -3299,6 +3905,10 @@ class MessageLogBrowser(QTextBrowser):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.row_background_blocks: dict[int, QColor] = {}
+        self.row_background_padding_blocks: dict[
+            int,
+            tuple[QColor, int, int],
+        ] = {}
         self.collapsed_fade_blocks: dict[int, QColor] = {}
         self.horizontalScrollBar().rangeChanged.connect(
             self._lock_horizontal_scroll
@@ -3431,10 +4041,106 @@ class MessageLogBrowser(QTextBrowser):
 
         painter.end()
 
+    def _paint_row_backgrounds(self, event: Any) -> None:
+        if not self.row_background_blocks:
+            return
+
+        viewport = self.viewport()
+        viewport_width = viewport.width()
+        viewport_height = viewport.height()
+        if viewport_width <= 0 or viewport_height <= 0:
+            return
+
+        paint_rect = event.rect()
+        first_block = self.cursorForPosition(QPoint(
+            0,
+            max(0, paint_rect.top()),
+        )).block().blockNumber()
+        last_block = self.cursorForPosition(QPoint(
+            max(0, viewport_width - 1),
+            min(viewport_height - 1, paint_rect.bottom()),
+        )).block().blockNumber()
+        first_block = max(0, first_block - 1)
+        last_block = min(
+            self.document().blockCount() - 1,
+            last_block + 1,
+        )
+        document_layout = self.document().documentLayout()
+        scroll_y = self.verticalScrollBar().value()
+        painter = QPainter(viewport)
+        painter.setClipRegion(event.region())
+        for block_number in range(first_block, last_block + 1):
+            background = self.row_background_blocks.get(block_number)
+            if background is None:
+                continue
+            block = self.document().findBlockByNumber(block_number)
+            if not block.isValid():
+                continue
+            block_rect = document_layout.blockBoundingRect(block)
+            top = round(block_rect.top()) - scroll_y
+            height = max(1, round(block_rect.height()))
+            if top > paint_rect.bottom() or top + height < paint_rect.top():
+                continue
+            painter.fillRect(
+                0,
+                top,
+                viewport_width,
+                height + 1,
+                background,
+            )
+        painter.end()
+
+    def _paint_row_background_padding(self, event: Any) -> None:
+        """Paint block-margin bands after Qt clears the document viewport."""
+        if not self.row_background_padding_blocks:
+            return
+
+        viewport = self.viewport()
+        viewport_width = viewport.width()
+        document_layout = self.document().documentLayout()
+        scroll_y = self.verticalScrollBar().value()
+        painter = QPainter(viewport)
+        painter.setClipRegion(event.region())
+        for block_number, padding in (
+            self.row_background_padding_blocks.items()
+        ):
+            background, top_padding, bottom_padding = padding
+            block = self.document().findBlockByNumber(block_number)
+            if not block.isValid():
+                continue
+            block_rect = document_layout.blockBoundingRect(block)
+            top = round(block_rect.top()) - scroll_y
+            height = max(1, round(block_rect.height()))
+            if (
+                top > event.rect().bottom()
+                or top + height < event.rect().top()
+            ):
+                continue
+            painter.fillRect(
+                0,
+                top - top_padding,
+                viewport_width,
+                top_padding,
+                background,
+            )
+            painter.fillRect(
+                0,
+                top + height,
+                viewport_width,
+                bottom_padding,
+                background,
+            )
+        painter.end()
+
     def paintEvent(self, event: Any) -> None:
+        self._paint_row_backgrounds(event)
         super().paintEvent(event)
+        # QTextDocument paints block backgrounds only behind the text line,
+        # not inside block margins. These bands contain no text, so they can
+        # safely be completed after the base document paint.
+        self._paint_row_background_padding(event)
         self._paint_text_shadows(event)
-        if not self.row_background_blocks and not self.collapsed_fade_blocks:
+        if not self.collapsed_fade_blocks:
             return
 
         viewport = self.viewport()
@@ -3466,9 +4172,8 @@ class MessageLogBrowser(QTextBrowser):
         fade_brushes: dict[int, QBrush] = {}
 
         for block_number in range(first_block, last_block + 1):
-            background = self.row_background_blocks.get(block_number)
             fade_background = self.collapsed_fade_blocks.get(block_number)
-            if background is None and fade_background is None:
+            if fade_background is None:
                 continue
 
             block = self.document().findBlockByNumber(block_number)
@@ -3484,54 +4189,30 @@ class MessageLogBrowser(QTextBrowser):
             if top > paint_rect.bottom() or top + height < paint_rect.top():
                 continue
 
-            if background is not None:
-                left_width = max(0, cursor_rect.left())
-                if left_width > 0:
-                    painter.fillRect(
-                        0,
-                        top,
-                        left_width,
-                        height + 1,
-                        background,
-                    )
-                right_width = max(
-                    0,
-                    round(block.blockFormat().rightMargin()),
-                )
-                if right_width > 0:
-                    painter.fillRect(
-                        max(0, viewport_width - right_width),
-                        top,
-                        right_width,
-                        height + 1,
-                        background,
-                    )
-
-            if fade_background is not None:
-                color_key = int(fade_background.rgba())
-                fade_brush = fade_brushes.get(color_key)
-                if fade_brush is None:
-                    transparent = QColor(fade_background)
-                    transparent.setAlpha(0)
-                    opaque = QColor(fade_background)
-                    opaque.setAlpha(255)
-                    gradient = QLinearGradient(
-                        fade_start,
-                        0,
-                        fade_end,
-                        0,
-                    )
-                    gradient.setColorAt(0.0, transparent)
-                    gradient.setColorAt(1.0, opaque)
-                    fade_brush = QBrush(gradient)
-                    fade_brushes[color_key] = fade_brush
-                painter.fillRect(
+            color_key = int(fade_background.rgba())
+            fade_brush = fade_brushes.get(color_key)
+            if fade_brush is None:
+                transparent = QColor(fade_background)
+                transparent.setAlpha(0)
+                opaque = QColor(fade_background)
+                opaque.setAlpha(255)
+                gradient = QLinearGradient(
                     fade_start,
-                    top,
-                    max(0, viewport_width - fade_start),
-                    height + 1,
-                    fade_brush,
+                    0,
+                    fade_end,
+                    0,
                 )
+                gradient.setColorAt(0.0, transparent)
+                gradient.setColorAt(1.0, opaque)
+                fade_brush = QBrush(gradient)
+                fade_brushes[color_key] = fade_brush
+            painter.fillRect(
+                fade_start,
+                top,
+                max(0, viewport_width - fade_start),
+                height + 1,
+                fade_brush,
+            )
         painter.end()
 
 
@@ -3677,15 +4358,26 @@ class EncryptedChatClient(QObject):
         super().__init__(root)
         self.root = root
         self.root.setWindowTitle("SpriteLink")
-        self.root.resize(840, 650)
-        self.root.setMinimumSize(670, 500)
-        self.root.installEventFilter(self)
-
         self.config_data = load_config()
+        self.root.setMinimumSize(
+            MINIMUM_WINDOW_WIDTH,
+            MINIMUM_WINDOW_HEIGHT,
+        )
+        self.root.resize(
+            int(self.config_data["window_width"]),
+            int(self.config_data["window_height"]),
+        )
+        self.root.installEventFilter(self)
+        if os.name == "nt":
+            set_start_with_windows(
+                bool(self.config_data.get("start_with_windows", False))
+            )
         # Persist a newly generated signing identity before any messages are
         # created so the authenticated ID survives a crash.
         save_config(self.config_data)
         app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._basic_style_name = (
             app.style().objectName() if app is not None else "Fusion"
         )
@@ -3736,6 +4428,7 @@ class EncryptedChatClient(QObject):
         self.seen_ntfy_message_ids: set[str] = set()
         self.message_log: list[dict[str, Any]] = []
         self.draft_message_id = uuid.uuid4().hex
+        self._last_outbound_message_order = 0
         self.current_estimated_packet_size = 0
         self.message_size_check_pending = False
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
@@ -3819,14 +4512,18 @@ class EncryptedChatClient(QObject):
         )
         self.pending_desktop_notifications: dict[
             str,
-            tuple[tuple[int, int, str], str, str, str],
+            tuple[tuple[int, int, str], str, str, str, str],
         ] = {}
+        self.delivered_desktop_notification_rooms: set[str] = set()
         self.last_notification_sound_at = float("-inf")
         self.chatroom_history_limit_var = ValueModel(
             int(self.config_data["chatroom_history_limit"])
         )
         self.minimize_to_tray_var = ValueModel(
             bool(self.config_data["minimize_to_tray"])
+        )
+        self.start_with_windows_var = ValueModel(
+            bool(self.config_data.get("start_with_windows", False))
         )
         self.status_var = ValueModel("Connecting")
 
@@ -3870,6 +4567,20 @@ class EncryptedChatClient(QObject):
         )
         self.desktop_notification_timer.timeout.connect(
             self._flush_desktop_notifications
+        )
+
+        self.notification_activation_timer = QTimer(self)
+        self.notification_activation_timer.setInterval(250)
+        self.notification_activation_timer.timeout.connect(
+            self._consume_notification_activation
+        )
+        self.notification_activation_timer.start()
+        QTimer.singleShot(
+            0,
+            lambda: self._clear_desktop_notification(
+                self.active_chatroom_id,
+                force=True,
+            ),
         )
 
         self.background_history_prune_timer = QTimer(self)
@@ -3978,6 +4689,16 @@ class EncryptedChatClient(QObject):
             self._message_font_cache[cache_key] = cached
         return cached
 
+    def _make_ui_font(self, *, bold: bool = False) -> QFont:
+        app = QApplication.instance()
+        font = QFont(
+            app.font() if app is not None else self._basic_application_font
+        )
+        font.setFamily(self._ui_font_family())
+        font.setBold(bold)
+        font.setStyleStrategy(self._font_style_strategy())
+        return font
+
     def _apply_application_font_strategy(self) -> None:
         self._message_font_cache.clear()
         app = QApplication.instance()
@@ -4002,7 +4723,7 @@ class EncryptedChatClient(QObject):
         return self._basic_application_font.family()
 
     def _is_windows_classic_theme(self) -> bool:
-        return self.theme_var.get() == "Windows Classic"
+        return self.theme_var.get() == "Classic"
 
     def _windows_classic_palette(self) -> QPalette:
         palette = QPalette()
@@ -4103,6 +4824,16 @@ class EncryptedChatClient(QObject):
         except Exception:
             # Older Windows versions do not expose the color attributes.
             pass
+
+    def _apply_dialog_window_theme(self, dialog: QDialog) -> None:
+        """Apply native theme properties after a dialog window exists."""
+        if isinstance(dialog, QFileDialog):
+            return
+        self._apply_window_titlebar_theme(dialog)
+        QTimer.singleShot(
+            0,
+            lambda dialog=dialog: self._apply_window_titlebar_theme(dialog),
+        )
 
     def _exec_themed_file_dialog(self, dialog: QFileDialog) -> int:
         # Native Windows dialogs are created when exec() starts. Apply once to
@@ -4314,6 +5045,25 @@ class EncryptedChatClient(QObject):
         else:
             QTimer.singleShot(0, self._sync_window_activity)
 
+    def _open_notification_chatroom(self, room_id: str) -> None:
+        if self._find_chatroom(room_id) is None:
+            return
+        self._restore_from_tray()
+        self._activate_chatroom(room_id)
+
+    def _consume_notification_activation(self) -> None:
+        try:
+            room_id = NOTIFICATION_ACTIVATION_PATH.read_text(
+                encoding="utf-8"
+            ).strip()
+            NOTIFICATION_ACTIVATION_PATH.unlink(missing_ok=True)
+        except OSError:
+            return
+        if chatroom_id_from_notification_uri(
+            notification_uri_for_chatroom(room_id)
+        ) is not None:
+            self._open_notification_chatroom(room_id)
+
     def _clear_tray_notification(self) -> None:
         if not self._tray_normal_icon.isNull():
             self.tray_icon.setIcon(self._tray_normal_icon)
@@ -4520,15 +5270,11 @@ class EncryptedChatClient(QObject):
         old_frame_geometry = self.root.frameGeometry()
         frame_offset_x = old_geometry.x() - old_frame_geometry.x()
         frame_offset_y = old_geometry.y() - old_frame_geometry.y()
-        self.chatrooms_toggle.setText("‹" if expanded else "›")
-        self.chatrooms_panel.setVisible(expanded)
-        self.root.setMinimumWidth(
-            self.root.minimumWidth() + (
-                width_delta if expanded else -width_delta
-            )
+        new_minimum_width = self.root.minimumWidth() + (
+            width_delta if expanded else -width_delta
         )
         new_width = max(
-            self.root.minimumWidth(),
+            new_minimum_width,
             old_geometry.width() + (
                 width_delta if expanded else -width_delta
             ),
@@ -4536,12 +5282,29 @@ class EncryptedChatClient(QObject):
         target_frame_x = old_frame_geometry.x() + (
             -width_delta if expanded else width_delta
         )
-        self.root.setGeometry(
-            target_frame_x + frame_offset_x,
-            old_frame_geometry.y() + frame_offset_y,
-            new_width,
-            old_geometry.height(),
-        )
+        # Apply the sidebar and native-window geometry as one paint update.
+        # Otherwise the chat log is briefly laid out at the intermediate
+        # width and visibly flickers while every line reflows.
+        self.root.setUpdatesEnabled(False)
+        try:
+            self.chatrooms_toggle.setText("‹" if expanded else "›")
+            self.root.setMinimumWidth(new_minimum_width)
+            self.root.setGeometry(
+                target_frame_x + frame_offset_x,
+                old_frame_geometry.y() + frame_offset_y,
+                new_width,
+                old_geometry.height(),
+            )
+            self.chatrooms_panel.setVisible(expanded)
+            central_widget = self.root.centralWidget()
+            if (
+                central_widget is not None
+                and central_widget.layout() is not None
+            ):
+                central_widget.layout().activate()
+        finally:
+            self.root.setUpdatesEnabled(True)
+            self.root.update()
 
     def _chatroom_definitions(self) -> list[dict[str, str]]:
         rooms = [{
@@ -4856,7 +5619,40 @@ class EncryptedChatClient(QObject):
             self.config_data["unread_counts"] = unread_counts
         return unread_counts
 
+    def _clear_desktop_notification(
+        self,
+        room_id: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        had_pending = room_id in self.pending_desktop_notifications
+        try:
+            had_unread = int(
+                self._unread_counts().get(room_id, 0) or 0
+            ) > 0
+        except (TypeError, ValueError):
+            had_unread = False
+        delivered_rooms = getattr(
+            self,
+            "delivered_desktop_notification_rooms",
+            set(),
+        )
+        had_delivered = (
+            isinstance(delivered_rooms, set)
+            and room_id in delivered_rooms
+        )
+        self.pending_desktop_notifications.pop(room_id, None)
+        if isinstance(delivered_rooms, set):
+            delivered_rooms.discard(room_id)
+        if not self.pending_desktop_notifications:
+            self.desktop_notification_timer.stop()
+        if force or had_pending or had_unread or had_delivered:
+            clear_windows_notification(
+                notification_tag_for_chatroom(room_id)
+            )
+
     def _mark_chatroom_read(self, room_id: str) -> None:
+        self._clear_desktop_notification(room_id)
         unread_counts = self._unread_counts()
         if room_id not in unread_counts:
             self._clear_tray_notification_if_no_unread()
@@ -4869,39 +5665,110 @@ class EncryptedChatClient(QObject):
             pass
 
     def _add_chatroom(self) -> None:
-        dialog = AddChatroomDialog(self.root)
+        dialog = AddChatroomChoiceDialog(self.root)
+        self._apply_window_titlebar_theme(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.selected_flow == "create":
+            self._create_chatroom()
+        elif dialog.selected_flow == "join":
+            self._join_chatroom()
+
+    def _create_chatroom(self) -> None:
+        dialog = ChatroomDetailsDialog(self.root)
         self._apply_window_titlebar_theme(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        nickname = dialog.nickname()
+        name = dialog.name()
         key = dialog.chatroom_key()
-        if not nickname:
+        room_id = self._store_new_chatroom(
+            name,
+            key,
+            error_title="Cannot create chatroom",
+        )
+        if room_id is None:
+            return
+
+        created_dialog = ChatroomCreatedDialog(
+            self.root,
+            make_chatroom_invite_code(name, key),
+        )
+        self._apply_window_titlebar_theme(created_dialog)
+        created_dialog.exec()
+
+    def _join_chatroom(self) -> None:
+        dialog = JoinChatroomDialog(self.root)
+        self._apply_window_titlebar_theme(dialog)
+        while dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                name, key = parse_chatroom_invite_code(
+                    dialog.invite_code()
+                )
+            except ValueError as exc:
+                messagebox.showerror(
+                    "Cannot join chatroom",
+                    str(exc),
+                    parent=self.root,
+                )
+                continue
+            if self._store_new_chatroom(
+                name,
+                key,
+                error_title="Cannot join chatroom",
+            ) is not None:
+                return
+
+    def _store_new_chatroom(
+        self,
+        name: str,
+        key: str,
+        *,
+        error_title: str,
+    ) -> str | None:
+        if not name:
             messagebox.showerror(
-                "Cannot add chatroom",
-                "The chatroom nickname cannot be empty.",
+                error_title,
+                "The chatroom name cannot be empty.",
                 parent=self.root,
             )
-            return
+            return None
+        if len(name) > MAX_CHATROOM_NAME_CHARS:
+            messagebox.showerror(
+                error_title,
+                f"The chatroom name cannot exceed "
+                f"{MAX_CHATROOM_NAME_CHARS} characters.",
+                parent=self.root,
+            )
+            return None
         if not key:
             messagebox.showerror(
-                "Cannot add chatroom",
+                error_title,
                 "The chatroom key cannot be empty.",
                 parent=self.root,
             )
-            return
+            return None
+        try:
+            make_chatroom_invite_code(name, key)
+        except ValueError as exc:
+            messagebox.showerror(
+                error_title,
+                str(exc),
+                parent=self.root,
+            )
+            return None
         if any(room["key"] == key for room in self._chatroom_definitions()):
             messagebox.showerror(
-                "Cannot add chatroom",
+                error_title,
                 "That chatroom key is already in your list.",
                 parent=self.root,
             )
-            return
+            return None
 
         room_id = uuid.uuid4().hex
         self.config_data.setdefault("chatrooms", []).append({
             "id": room_id,
-            "nickname": nickname,
+            "nickname": name,
             "key": key,
         })
         self.config_data.setdefault("room_profiles", {})[room_id] = dict(
@@ -4919,11 +5786,12 @@ class EncryptedChatClient(QObject):
                 str(exc),
                 parent=self.root,
             )
-            return
+            return None
 
         self._request_subscription_refresh()
         self._refresh_chatroom_list()
         self._activate_chatroom(room_id)
+        return room_id
 
     def _edit_chatroom(self, room_id: str) -> None:
         if room_id == GLOBAL_CHATROOM_ID:
@@ -4940,13 +5808,13 @@ class EncryptedChatClient(QObject):
         if room is None:
             return
 
-        old_nickname = str(room.get("nickname", ""))
+        old_name = str(room.get("nickname", ""))
         old_key = str(room.get("key", ""))
-        dialog = AddChatroomDialog(
+        dialog = ChatroomDetailsDialog(
             self.root,
             title="Edit Chatroom",
             submit_label="Save",
-            nickname=old_nickname,
+            name=old_name,
             chatroom_key=old_key,
             history_note=(
                 "All locally stored history will remain here even if the "
@@ -4957,12 +5825,12 @@ class EncryptedChatClient(QObject):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        nickname = dialog.nickname()
+        name = dialog.name()
         key = dialog.chatroom_key()
-        if not nickname:
+        if not name:
             messagebox.showerror(
                 "Cannot edit chatroom",
-                "The chatroom nickname cannot be empty.",
+                "The chatroom name cannot be empty.",
                 parent=self.root,
             )
             return
@@ -4970,6 +5838,15 @@ class EncryptedChatClient(QObject):
             messagebox.showerror(
                 "Cannot edit chatroom",
                 "The chatroom key cannot be empty.",
+                parent=self.root,
+            )
+            return
+        try:
+            make_chatroom_invite_code(name, key)
+        except ValueError as exc:
+            messagebox.showerror(
+                "Cannot edit chatroom",
+                str(exc),
                 parent=self.root,
             )
             return
@@ -4990,14 +5867,14 @@ class EncryptedChatClient(QObject):
         )
         if key_changed and room_id == self.active_chatroom_id:
             self._persist_local_history()
-        room["nickname"] = nickname
+        room["nickname"] = name
         room["key"] = key
         if key_changed:
             self.initial_history_pending_rooms.add(room_id)
         try:
             save_config(self.config_data)
         except Exception as exc:
-            room["nickname"] = old_nickname
+            room["nickname"] = old_name
             room["key"] = old_key
             if not was_initial_history_pending:
                 self.initial_history_pending_rooms.discard(room_id)
@@ -5017,10 +5894,23 @@ class EncryptedChatClient(QObject):
                 self._update_window_title()
             self._refresh_chatroom_list()
 
-    def _copy_chatroom_key(self, room_id: str) -> None:
+    def _copy_chatroom_invite_code(self, room_id: str) -> None:
         room = self._find_chatroom(room_id)
-        if room is not None:
-            QApplication.clipboard().setText(str(room["key"]))
+        if room is None:
+            return
+        try:
+            QApplication.clipboard().setText(
+                make_chatroom_invite_code(
+                    str(room["nickname"]),
+                    str(room["key"]),
+                )
+            )
+        except ValueError as exc:
+            messagebox.showerror(
+                "Cannot copy invite code",
+                str(exc),
+                parent=self.root,
+            )
 
     def _show_chatroom_context_menu(self, position: Any) -> None:
         item = self.chatrooms_list.itemAt(position)
@@ -5038,9 +5928,9 @@ class EncryptedChatClient(QObject):
                 lambda: self._edit_chatroom(room_id)
             )
 
-        copy_key_action = menu.addAction("Copy Chatroom Key")
-        copy_key_action.triggered.connect(
-            lambda: self._copy_chatroom_key(room_id)
+        copy_invite_action = menu.addAction("Copy Invite Code")
+        copy_invite_action.triggered.connect(
+            lambda: self._copy_chatroom_invite_code(room_id)
         )
 
         mute_action = menu.addAction("Unmute" if is_muted else "Mute")
@@ -5100,6 +5990,7 @@ class EncryptedChatClient(QObject):
         muted_ids = self._muted_chatroom_ids()
         muted_ids.discard(room_id)
         self.config_data["muted_chatrooms"] = sorted(muted_ids)
+        self._clear_desktop_notification(room_id)
         self._unread_counts().pop(room_id, None)
         self._clear_tray_notification_if_no_unread()
         self.config_data.get("room_profiles", {}).pop(room_id, None)
@@ -5166,8 +6057,7 @@ class EncryptedChatClient(QObject):
         poll_immediately: bool = True,
         refresh_subscription: bool = False,
     ) -> None:
-        self._unread_counts().pop(self.active_chatroom_id, None)
-        self._clear_tray_notification_if_no_unread()
+        self._mark_chatroom_read(self.active_chatroom_id)
         self._update_window_title()
         try:
             save_config(self.config_data)
@@ -5342,6 +6232,9 @@ class EncryptedChatClient(QObject):
         font_layout.addWidget(QLabel("Font"))
         self.message_font_combo = ThemeComboBox()
         self.message_font_combo.addItems(list(SELECTABLE_MESSAGE_FONTS))
+        self.message_font_combo.setItemDelegate(
+            NoFocusRectItemDelegate(self.message_font_combo)
+        )
         self._refresh_message_font_combo_fonts()
         self.message_font_combo.currentTextChanged.connect(
             self._on_message_font_changed
@@ -5454,32 +6347,72 @@ class EncryptedChatClient(QObject):
         button.blockSignals(previous)
 
     def _on_identity_menu_toggled(self, checked: bool) -> None:
-        self.identity_menu.setVisible(checked)
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
+        self._set_composer_menu_visibility(
+            self.identity_menu if checked else None
+        )
         if checked:
-            self._set_button_checked(self.font_menu_button, False)
-            self.font_menu.hide()
-            self._set_button_checked(self.formatting_menu_button, False)
-            self.formatting_menu.hide()
             self.identity_username_entry.setFocus()
+        self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
 
     def _on_font_menu_toggled(self, checked: bool) -> None:
-        self.font_menu.setVisible(checked)
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
+        self._set_composer_menu_visibility(
+            self.font_menu if checked else None
+        )
         if checked:
-            self._set_button_checked(self.identity_menu_button, False)
-            self.identity_menu.hide()
-            self._set_button_checked(self.formatting_menu_button, False)
-            self.formatting_menu.hide()
             self.message_font_combo.setFocus()
+        self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
 
     def _on_formatting_menu_toggled(self, checked: bool) -> None:
-        self.formatting_menu.setVisible(checked)
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
+        self._set_composer_menu_visibility(
+            self.formatting_menu if checked else None
+        )
         if checked:
-            self._set_button_checked(self.identity_menu_button, False)
-            self.identity_menu.hide()
-            self._set_button_checked(self.font_menu_button, False)
-            self.font_menu.hide()
             self.message_entry.setFocus()
             self._sync_formatting_buttons()
+        self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
+
+    def _set_composer_menu_visibility(
+        self,
+        visible_menu: QWidget | None,
+    ) -> None:
+        # Direct switching used to show the new panel before hiding the old
+        # one, making the log jump through a two-menu intermediate height.
+        self.chat_content.setUpdatesEnabled(False)
+        try:
+            for menu, button in (
+                (self.identity_menu, self.identity_menu_button),
+                (self.font_menu, self.font_menu_button),
+                (self.formatting_menu, self.formatting_menu_button),
+            ):
+                should_show = menu is visible_menu
+                self._set_button_checked(button, should_show)
+                menu.setVisible(should_show)
+            content_layout = self.chat_content.layout()
+            if content_layout is not None:
+                content_layout.activate()
+        finally:
+            self.chat_content.setUpdatesEnabled(True)
+            self.chat_content.update()
+
+    def _chat_is_scrolled_to_bottom(self) -> bool:
+        scrollbar = self.chat_display.verticalScrollBar()
+        return scrollbar.value() >= scrollbar.maximum()
+
+    def _scroll_chat_to_bottom(self) -> None:
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _restore_chat_bottom_after_menu_toggle(
+        self,
+        keep_at_bottom: bool,
+    ) -> None:
+        if not keep_at_bottom:
+            return
+        self._scroll_chat_to_bottom()
+        QTimer.singleShot(0, self._scroll_chat_to_bottom)
 
     def _toggle_composer_formatting(
         self,
@@ -6206,7 +7139,11 @@ class EncryptedChatClient(QObject):
         self.message_sound_volume_slider.setRange(1, 10)
         self.message_sound_volume_slider.setSingleStep(1)
         self.message_sound_volume_slider.setPageStep(1)
-        self.message_sound_volume_slider.setMinimumWidth(120)
+        self.message_sound_volume_slider.setMinimumWidth(40)
+        self.message_sound_volume_slider.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         self.message_sound_volume_slider.setAccessibleName(
             "Message sound volume"
         )
@@ -6292,6 +7229,30 @@ class EncryptedChatClient(QObject):
         )
         layout.addWidget(
             self.minimize_to_tray_checkbox,
+            row,
+            0,
+            1,
+            3,
+        )
+        row += 1
+
+        self.start_with_windows_checkbox = QCheckBox("Start with Windows")
+        self.start_with_windows_checkbox.setChecked(
+            bool(self.start_with_windows_var.get())
+        )
+        self.start_with_windows_checkbox.setEnabled(os.name == "nt")
+        if os.name != "nt":
+            self.start_with_windows_checkbox.setToolTip(
+                "This option is only available on Windows."
+            )
+        self.start_with_windows_checkbox.toggled.connect(
+            self.start_with_windows_var.set
+        )
+        self.start_with_windows_var.bind(
+            self.start_with_windows_checkbox.setChecked
+        )
+        layout.addWidget(
+            self.start_with_windows_checkbox,
             row,
             0,
             1,
@@ -6644,6 +7605,7 @@ class EncryptedChatClient(QObject):
             bool(self.desktop_notifications_var.get()),
             int(self.chatroom_history_limit_var.get()),
             bool(self.minimize_to_tray_var.get()),
+            bool(self.start_with_windows_var.get()),
         )
 
     def _set_config_toggle_checked(self, checked: bool) -> None:
@@ -6784,10 +7746,25 @@ class EncryptedChatClient(QObject):
         self.config_data["minimize_to_tray"] = bool(
             self.minimize_to_tray_var.get()
         )
+        self.config_data["start_with_windows"] = bool(
+            self.start_with_windows_var.get()
+        )
+        window_width, window_height = normalize_window_size(
+            self.root.width(),
+            self.root.height(),
+        )
+        self.config_data["window_width"] = window_width
+        self.config_data["window_height"] = window_height
 
     def _save_settings(self) -> bool:
         try:
             self._copy_ui_to_config()
+            if not set_start_with_windows(
+                bool(self.config_data["start_with_windows"])
+            ):
+                raise OSError(
+                    "Could not update the Windows startup setting."
+                )
             self._apply_chatroom_history_limit()
             save_config(self.config_data)
         except Exception as exc:
@@ -7059,6 +8036,10 @@ class EncryptedChatClient(QObject):
             return
 
         message = self._build_draft_message(text)
+        (
+            message["i"],
+            self._last_outbound_message_order,
+        ) = ordered_message_id(self._last_outbound_message_order)
         message["t"] = int(time.time())
         sign_message_identity(
             message,
@@ -7104,6 +8085,8 @@ class EncryptedChatClient(QObject):
             )
             return
 
+        # The network worker consumes this FIFO queue synchronously. A newer
+        # message never starts its POST until every earlier one has finished.
         self.send_queue.put({
             "server_url": server_url,
             "encryption_key": encryption_key,
@@ -7847,7 +8830,7 @@ class EncryptedChatClient(QObject):
                         continue
                     added = 0
 
-                    for item in items:
+                    for item in sorted(items, key=self._message_sort_key):
                         if self._accept_network_message(
                             item,
                             persist=False,
@@ -7999,7 +8982,7 @@ class EncryptedChatClient(QObject):
         added = 0
         unread_added = 0
 
-        for item in items:
+        for item in sorted(items, key=self._message_sort_key):
             if not isinstance(item, dict):
                 continue
             ntfy_id = item.get("ntfy_id")
@@ -8018,13 +9001,20 @@ class EncryptedChatClient(QObject):
             seen_ntfy_ids.add(ntfy_id)
             seen_client_message_ids.add(client_message_id)
             is_local = message.get("c") == self._authenticated_client_id()
+            message_ntfy_time = int(
+                item.get("ntfy_time", message.get("t", 0)) or 0
+            )
+            duplicate_ordinal = consecutive_duplicate_message_ordinal(
+                history,
+                message,
+                ntfy_time=message_ntfy_time,
+                ntfy_id=ntfy_id,
+            )
             history.append({
                 "message": message,
                 "warning": None,
                 "ntfy_id": ntfy_id,
-                "ntfy_time": int(
-                    item.get("ntfy_time", message.get("t", 0)) or 0
-                ),
+                "ntfy_time": message_ntfy_time,
             })
             added += 1
 
@@ -8041,7 +9031,14 @@ class EncryptedChatClient(QObject):
                     or sender_id in muted_user_ids
                 )
                 if not is_muted_notification:
-                    self._mark_tray_notification()
+                    if notification_outline_required(
+                        room_id,
+                        self.active_chatroom_id,
+                        window_focused=(
+                            self.window_focused_event.is_set()
+                        ),
+                    ):
+                        self._mark_tray_notification()
                     self._show_desktop_notification(
                         room_id,
                         message,
@@ -8050,6 +9047,7 @@ class EncryptedChatClient(QObject):
                 if (
                     self._should_play_message_sound(room_id)
                     and not is_muted_notification
+                    and duplicate_ordinal <= 2
                 ):
                     self._play_notification_sound()
 
@@ -8101,6 +9099,12 @@ class EncryptedChatClient(QObject):
         self.seen_client_message_ids.add(client_message_id)
 
         is_local = message["c"] == self._authenticated_client_id()
+        duplicate_ordinal = consecutive_duplicate_message_ordinal(
+            self.message_log,
+            message,
+            ntfy_time=int(item["ntfy_time"]),
+            ntfy_id=str(ntfy_id),
+        )
 
         self._add_message_to_log(
             message,
@@ -8117,25 +9121,30 @@ class EncryptedChatClient(QObject):
             or self._is_user_muted(str(message["c"]))
         )
         if play_chime and not is_local and not is_muted_notification:
-            self._mark_tray_notification()
+            if notification_outline_required(
+                self.active_chatroom_id,
+                self.active_chatroom_id,
+                window_focused=self.window_focused_event.is_set(),
+            ):
+                self._mark_tray_notification()
             self._show_desktop_notification(
                 self.active_chatroom_id,
                 message,
                 sort_key=self._message_sort_key(item),
             )
-            if self._should_play_message_sound(self.active_chatroom_id):
+            if (
+                duplicate_ordinal <= 2
+                and self._should_play_message_sound(
+                    self.active_chatroom_id
+                )
+            ):
                 self._play_notification_sound()
 
         return True
 
     @staticmethod
     def _message_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
-        message = item["message"]
-        return (
-            int(item.get("ntfy_time", message.get("t", 0))),
-            int(message.get("t", 0)),
-            str(item.get("ntfy_id") or message.get("i", "")),
-        )
+        return message_item_sort_key(item)
 
     def _add_message_to_log(
         self,
@@ -8148,13 +9157,26 @@ class EncryptedChatClient(QObject):
         persist: bool = True,
         render: bool = True,
     ) -> None:
-        self.message_log.append({
+        item = {
             "message": message,
             "is_local": is_local,
             "warning": warning,
             "ntfy_id": ntfy_id,
             "ntfy_time": ntfy_time or int(message.get("t", time.time())),
-        })
+        }
+        if is_local and self.message_log:
+            newest_received_time = max(
+                int(existing.get(
+                    "ntfy_time",
+                    existing.get("message", {}).get("t", 0),
+                ) or 0)
+                for existing in self.message_log
+            )
+            item["display_sort_time"] = max(
+                int(item["ntfy_time"]),
+                newest_received_time + 1,
+            )
+        self.message_log.append(item)
 
         self.message_log.sort(key=self._message_sort_key)
         history_limit = self._chatroom_history_limit()
@@ -8215,6 +9237,11 @@ class EncryptedChatClient(QObject):
                 "warning": None,
                 "ntfy_id": ntfy_id,
                 "ntfy_time": stored_ntfy_time,
+                **(
+                    {"display_sort_time": int(item["display_sort_time"])}
+                    if type(item.get("display_sort_time")) is int
+                    else {}
+                ),
             })
 
         self.message_log.sort(key=self._message_sort_key)
@@ -8238,6 +9265,11 @@ class EncryptedChatClient(QObject):
                 "warning": item.get("warning"),
                 "ntfy_id": item.get("ntfy_id"),
                 "ntfy_time": int(item.get("ntfy_time", 0) or 0),
+                **(
+                    {"display_sort_time": int(item["display_sort_time"])}
+                    if type(item.get("display_sort_time")) is int
+                    else {}
+                ),
             })
 
         try:
@@ -8464,6 +9496,8 @@ class EncryptedChatClient(QObject):
                 self._pending_tooltip_global_position,
                 tooltip,
                 self.chat_display.viewport(),
+                self.chat_display.viewport().rect(),
+                CHAT_TOOLTIP_DISPLAY_TIME_MS,
             )
 
     def _tooltip_for_message_item(
@@ -8817,6 +9851,16 @@ class EncryptedChatClient(QObject):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if (
+            isinstance(watched, QDialog)
+            and not isinstance(watched, QFileDialog)
+            and event.type() in (
+                QEvent.Type.Show,
+                QEvent.Type.WindowActivate,
+            )
+        ):
+            self._apply_dialog_window_theme(watched)
+
+        if (
             watched is self.root
             and hasattr(self, "window_focused_event")
         ):
@@ -8825,7 +9869,7 @@ class EncryptedChatClient(QObject):
                 self.network_wakeup_event.set()
                 self._sync_connection_error_timer()
                 if hasattr(self, "tray_icon"):
-                    self._clear_tray_notification_if_no_unread()
+                    self._mark_chatroom_read(self.active_chatroom_id)
             elif event.type() == QEvent.Type.WindowDeactivate:
                 self.window_focused_event.clear()
                 self.network_wakeup_event.set()
@@ -9173,13 +10217,16 @@ class EncryptedChatClient(QObject):
         underline: bool = False,
         anchor: str | None = None,
         font_name: str = DEFAULT_MESSAGE_FONT,
+        ui_font: bool = False,
         align_top: bool = False,
         top_align_height: int = 0,
     ) -> QTextCharFormat:
         formatting = QTextCharFormat()
         formatting.setForeground(QColor(color))
         formatting.setFont(
-            self._make_message_font(font_name, bold=bold)
+            self._make_ui_font(bold=bold)
+            if ui_font
+            else self._make_message_font(font_name, bold=bold)
         )
         formatting.setFontItalic(italic)
         formatting.setFontUnderline(underline)
@@ -9206,6 +10253,7 @@ class EncryptedChatClient(QObject):
         font_name: str,
         *,
         muted: bool,
+        ui_font: bool,
         embedded_image_urls: set[str],
         align_top: bool,
         top_align_height: int,
@@ -9237,6 +10285,7 @@ class EncryptedChatClient(QObject):
                     underline=run.underline,
                     anchor=anchor,
                     font_name=font_name,
+                    ui_font=ui_font,
                     align_top=align_top,
                     top_align_height=top_align_height,
                 )
@@ -9403,31 +10452,20 @@ class EncryptedChatClient(QObject):
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> bool:
-        previous_block = cursor.block().previous()
-        if (
-            previous_block.isValid()
-            and previous_block.text().startswith("————— ")
-        ):
-            # Consecutive separators represent the same empty span. Keep only
-            # the newest one without adding another striped row.
-            replacement = QTextCursor(previous_block)
-            replacement.movePosition(
-                QTextCursor.MoveOperation.StartOfBlock
-            )
-            replacement.movePosition(
-                QTextCursor.MoveOperation.EndOfBlock,
-                QTextCursor.MoveMode.KeepAnchor,
-            )
-            replacement.insertText(text, self._text_format("#777777"))
-            return False
-
-        cursor.insertBlock()
+        if cursor.block().text():
+            cursor.insertBlock()
         separator_block = QTextBlockFormat()
         separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Symmetric padding keeps the text vertically centered. The log's
+        # background painter covers the complete block, including margins.
         separator_block.setTopMargin(7)
         separator_block.setBottomMargin(7)
+        separator_block.setBackground(QColor(background_color))
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
+        self.chat_display.row_background_padding_blocks[
+            cursor.block().blockNumber()
+        ] = (QColor(background_color), 7, 7)
 
         selection = QTextEdit.ExtraSelection()
         selection.cursor = QTextCursor(cursor.block())
@@ -9451,6 +10489,59 @@ class EncryptedChatClient(QObject):
         document.setDefaultTextOption(text_option)
         self.chat_display.setDocument(document)
 
+    @staticmethod
+    def _repeat_prefixed_message_text(text: str, count: int) -> str:
+        return f"[{count}x] {text}" if count > 1 else text
+
+    def _display_item_for_group(
+        self,
+        group: list[dict[str, Any]],
+        muted_ids: set[str],
+    ) -> dict[str, Any]:
+        item = dict(group[-1])
+        message = dict(item["message"])
+        item["message"] = message
+        item["source_message_ids"] = [
+            str(source["message"].get("i", ""))
+            for source in group
+        ]
+
+        client_id = str(message.get("c", ""))
+        is_muted = (
+            client_id in muted_ids
+            and not bool(item.get("is_local", False))
+        )
+        if is_muted:
+            combined_parts: list[str] = []
+            repeated_text = ""
+            repeated_count = 0
+            for source in group:
+                source_text = str(source["message"].get("m", ""))
+                if repeated_count and source_text != repeated_text:
+                    combined_parts.append(
+                        self._repeat_prefixed_message_text(
+                            repeated_text,
+                            repeated_count,
+                        )
+                    )
+                    repeated_count = 0
+                repeated_text = source_text
+                repeated_count += 1
+            if repeated_count:
+                combined_parts.append(
+                    self._repeat_prefixed_message_text(
+                        repeated_text,
+                        repeated_count,
+                    )
+                )
+            message["m"] = " | ".join(combined_parts)
+        elif len(group) > 1:
+            message["m"] = self._repeat_prefixed_message_text(
+                str(group[0]["message"].get("m", "")),
+                len(group),
+            )
+        return item
+
     def _render_message_log(self, *, scroll_to_bottom: bool) -> None:
         if self._tray_ui_suspended:
             return
@@ -9462,6 +10553,7 @@ class EncryptedChatClient(QObject):
         self.rendered_image_candidates.clear()
         self.chat_display.clear()
         self.chat_display.row_background_blocks.clear()
+        self.chat_display.row_background_padding_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
 
         cursor = self.chat_display.textCursor()
@@ -9473,55 +10565,35 @@ class EncryptedChatClient(QObject):
         )
         row_selections: list[QTextEdit.ExtraSelection] = []
         previous_timestamp: int | None = None
-        previous_local_date: Any = None
         first_item = True
         stripe_index = 0
 
-        for item in self.message_log:
-            current_timestamp = self._display_timestamp_for_item(item)
-            current_local_datetime = self._local_datetime(current_timestamp)
-            current_local_date = (
-                current_local_datetime.date()
-                if current_local_datetime is not None
-                else None
+        display_groups = group_messages_for_display(
+            self.message_log,
+            muted_ids,
+        )
+        for group in display_groups:
+            item = self._display_item_for_group(group, muted_ids)
+            current_timestamp = self._display_timestamp_for_item(group[0])
+            separator_texts = (
+                message_log_separator_texts(
+                    previous_timestamp,
+                    current_timestamp,
+                )
+                if previous_timestamp is not None
+                else ()
             )
-
-            if (
-                not first_item
-                and previous_local_date is not None
-                and current_local_date is not None
-                and current_local_date != previous_local_date
-            ):
+            for separator_text in separator_texts:
                 if self._insert_log_separator(
                     cursor,
-                    "————— "
-                    f"{current_local_datetime.strftime('%b')} "
-                    f"{current_local_datetime.day}, "
-                    f"{current_local_datetime.year}"
-                    " —————",
+                    separator_text,
                     MESSAGE_ROW_BACKGROUNDS[
                         stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
                     ],
                     row_selections,
                 ):
                     stripe_index += 1
-            elif (
-                previous_timestamp is not None
-                and current_timestamp - previous_timestamp
-                >= GAP_SEPARATOR_SECONDS
-            ):
-                gap_seconds = current_timestamp - previous_timestamp
-                gap_hours = max(6, int((gap_seconds / 3600.0) + 0.5))
-                if self._insert_log_separator(
-                    cursor,
-                    f"————— {gap_hours} hours later —————",
-                    MESSAGE_ROW_BACKGROUNDS[
-                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
-                    ],
-                    row_selections,
-                ):
-                    stripe_index += 1
-            elif not first_item:
+            if not first_item and not separator_texts:
                 cursor.insertBlock()
 
             self._insert_message_item(
@@ -9537,8 +10609,7 @@ class EncryptedChatClient(QObject):
             )
             stripe_index += 1
             first_item = False
-            previous_timestamp = current_timestamp
-            previous_local_date = current_local_date
+            previous_timestamp = self._display_timestamp_for_item(group[-1])
 
         self.chat_display.row_background_blocks = {
             selection.cursor.block().blockNumber(): QColor(
@@ -9579,6 +10650,11 @@ class EncryptedChatClient(QObject):
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
+        # Separator replacement and embedded-media paths can leave the cursor
+        # on a populated block. Enforce the row boundary here so one sender's
+        # username can never continue after another sender's message.
+        if cursor.block().text():
+            cursor.insertBlock()
         # Never allow a previous message's character format to carry over.
         cursor.setCharFormat(QTextCharFormat())
         message_start_position = cursor.position()
@@ -9597,9 +10673,16 @@ class EncryptedChatClient(QObject):
         message_id = str(message["i"])
         client_id = str(message["c"])
         user_id_preview = visible_user_id(client_id)
+        source_message_ids = {
+            str(value)
+            for value in item.get("source_message_ids", [message_id])
+            if str(value)
+        }
 
         is_muted = client_id in muted_ids and not item["is_local"]
-        is_collapsed = is_muted or message_id in collapsed_ids
+        is_collapsed = is_muted or bool(
+            source_message_ids.intersection(collapsed_ids)
+        )
         message_block_format = QTextBlockFormat()
         message_block_format.setNonBreakableLines(is_collapsed)
         cursor.setBlockFormat(message_block_format)
@@ -9718,10 +10801,9 @@ class EncryptedChatClient(QObject):
 
         has_profile_icon = self._insert_profile_icon(
             cursor,
-            profile_icon,
+            "" if is_muted else profile_icon,
             message_id,
             align_top=align_message_top,
-            opacity=MUTED_CONTENT_OPACITY if is_muted else 1.0,
         )
         if has_profile_icon:
             cursor.insertText(
@@ -9730,6 +10812,7 @@ class EncryptedChatClient(QObject):
                     body_color,
                     anchor=f"spritelink:{message_id}",
                     font_name=font_name,
+                    ui_font=is_muted,
                     align_top=align_message_top,
                     top_align_height=top_align_height,
                 ),
@@ -9743,6 +10826,7 @@ class EncryptedChatClient(QObject):
                 underline=False,
                 anchor=f"spritelink:{message_id}",
                 font_name=font_name,
+                ui_font=is_muted,
                 align_top=align_message_top,
                 top_align_height=top_align_height,
             ),
@@ -9753,6 +10837,7 @@ class EncryptedChatClient(QObject):
                 self._text_format(
                     suffix_color,
                     font_name=font_name,
+                    ui_font=is_muted,
                     align_top=align_message_top,
                     top_align_height=top_align_height,
                 ),
@@ -9762,6 +10847,7 @@ class EncryptedChatClient(QObject):
             self._text_format(
                 body_color,
                 font_name=font_name,
+                ui_font=is_muted,
                 align_top=align_message_top,
                 top_align_height=top_align_height,
             ),
@@ -9783,6 +10869,7 @@ class EncryptedChatClient(QObject):
                 self._text_format(
                     body_color,
                     font_name=font_name,
+                    ui_font=is_muted,
                     align_top=align_message_top,
                     top_align_height=top_align_height,
                 ),
@@ -9794,6 +10881,7 @@ class EncryptedChatClient(QObject):
                 body_color,
                 font_name,
                 muted=is_muted,
+                ui_font=is_muted,
                 embedded_image_urls=set(image_urls),
                 align_top=align_message_top,
                 top_align_height=top_align_height,
@@ -9893,6 +10981,7 @@ class EncryptedChatClient(QObject):
         self.animated_media_controllers.clear()
         self.last_inline_animation_frame_at.clear()
         self.chat_display.row_background_blocks.clear()
+        self.chat_display.row_background_padding_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
         self.chat_display.setExtraSelections([])
         self._reset_chat_document()
@@ -9938,6 +11027,7 @@ class EncryptedChatClient(QObject):
             str(room["nickname"]),
             body,
             notification_tag_for_chatroom(room_id),
+            room_id,
         )
         pending = self.pending_desktop_notifications.get(room_id)
         if pending is None or notification[0] >= pending[0]:
@@ -9952,8 +11042,14 @@ class EncryptedChatClient(QObject):
             or self.window_focused_event.is_set()
         ):
             return
-        for _sort_key, title, body, tag in pending:
-            show_silent_windows_notification(title, body, tag)
+        for _sort_key, title, body, tag, room_id in pending:
+            if show_silent_windows_notification(
+                title,
+                body,
+                tag,
+                room_id,
+            ):
+                self.delivered_desktop_notification_rooms.add(room_id)
 
     def _message_sound_path(self, sound_name: str) -> Path | None:
         if sound_name == "Custom":
@@ -10216,14 +11312,52 @@ class EncryptedChatClient(QObject):
         self.last_notification_sound_at = now
         self._play_message_sound()
 
+    def _show_minimize_to_tray_notice(self) -> str | None:
+        dialog = QMessageBox(self.root)
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setWindowTitle("Minimize to Tray")
+        dialog.setText(
+            "SpriteLink will keep running in the system tray so it can "
+            "receive messages in the background."
+        )
+        disable_button = dialog.addButton(
+            "Disable and Close",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        ok_button = dialog.addButton(
+            "OK",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        dialog.setDefaultButton(ok_button)
+        self._apply_window_titlebar_theme(dialog)
+        dialog.exec()
+        clicked_button = dialog.clickedButton()
+        if clicked_button is disable_button:
+            return "disable"
+        if clicked_button is ok_button:
+            return "ok"
+        return None
+
     def _on_close(self) -> bool:
         if self._closing:
             return True
         if not self._force_quit and self._can_minimize_to_tray():
+            if not bool(
+                self.config_data.get(MINIMIZE_TO_TRAY_NOTICE_KEY, False)
+            ):
+                notice_action = self._show_minimize_to_tray_notice()
+                if notice_action is None:
+                    return False
+                self.config_data[MINIMIZE_TO_TRAY_NOTICE_KEY] = True
+                if notice_action == "disable":
+                    self.minimize_to_tray_var.set(False)
             if not self._save_settings():
                 return False
-            self._hide_to_tray()
-            return False
+            if not self._can_minimize_to_tray():
+                self._force_quit = True
+            else:
+                self._hide_to_tray()
+                return False
 
         self._closing = True
         self._minimized_to_tray = False
@@ -10233,7 +11367,9 @@ class EncryptedChatClient(QObject):
         self.viewport_media_timer.stop()
         self.message_sound_stop_timer.stop()
         self.desktop_notification_timer.stop()
+        self.notification_activation_timer.stop()
         self.pending_desktop_notifications.clear()
+        self.delivered_desktop_notification_rooms.clear()
         self.connection_error_timer.stop()
         self._release_message_sound_resources()
         self.tray_icon.hide()
@@ -10317,9 +11453,19 @@ def _write_crash_log(error_text: str) -> Path | None:
 
 
 def main() -> None:
+    notification_uri = notification_uri_from_arguments(sys.argv)
+    notification_room_id = (
+        chatroom_id_from_notification_uri(notification_uri)
+        if notification_uri is not None
+        else None
+    )
     if os.name == "nt":
+        register_windows_notification_protocol()
         try:
             if not acquire_single_instance_lock():
+                if notification_room_id is not None:
+                    write_notification_activation(notification_room_id)
+                    return
                 ctypes.windll.user32.MessageBoxW(
                     None,
                     "SpriteLink is already running.",
@@ -10380,7 +11526,7 @@ def main() -> None:
         return
 
     try:
-        EncryptedChatClient(root)
+        client = EncryptedChatClient(root)
     except Exception:
         error_text = traceback.format_exc()
         crash_path = _write_crash_log(error_text)
@@ -10397,6 +11543,13 @@ def main() -> None:
         return
 
     root.show()
+    if notification_room_id is not None:
+        QTimer.singleShot(
+            0,
+            lambda: client._open_notification_chatroom(
+                notification_room_id
+            ),
+        )
     app.exec()
 
 
