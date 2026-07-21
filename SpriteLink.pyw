@@ -5309,7 +5309,37 @@ class EncryptedChatClient(QObject):
                 central_widget.layout().activate()
         finally:
             self.root.setUpdatesEnabled(True)
-            self.root.update()
+            self._redraw_window_after_sidebar_resize()
+
+    def _redraw_window_after_sidebar_resize(self) -> None:
+        # setUpdatesEnabled(True) only queues a paint. During a top-level
+        # resize Windows can present the old backing-store pixels before
+        # that queued paint runs, copying the chat into the new sidebar (or
+        # the sidebar into the chat). Repaint synchronously while this
+        # toggle handler still owns the transition so DWM only receives the
+        # final child layout.
+        self.root.repaint()
+        if os.name != "nt" or not hasattr(ctypes, "windll"):
+            return
+        try:
+            redraw_window = ctypes.windll.user32.RedrawWindow
+            redraw_window.argtypes = (
+                wintypes.HWND,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                wintypes.UINT,
+            )
+            redraw_window.restype = wintypes.BOOL
+            redraw_window(
+                wintypes.HWND(int(self.root.winId())),
+                None,
+                None,
+                # RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW
+                0x0001 | 0x0080 | 0x0100,
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            # The synchronous Qt repaint above remains the portable path.
+            pass
 
     def _chatroom_definitions(self) -> list[dict[str, str]]:
         rooms = [{
