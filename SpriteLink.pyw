@@ -295,6 +295,10 @@ CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 TRAY_NOTIFICATION_OUTLINE_COLOR = "#ff7a00"
+MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY = (
+    "minimize_to_tray_1_2_default_applied"
+)
+MINIMIZE_TO_TRAY_NOTICE_KEY = "minimize_to_tray_notice_shown"
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
@@ -1184,6 +1188,127 @@ def message_plain_text(text: str) -> str:
     return parse_message_rich_text(text)[0]
 
 
+def message_items_are_contiguous(
+    previous_item: dict[str, Any],
+    current_item: dict[str, Any],
+) -> bool:
+    if previous_item.get("warning") or current_item.get("warning"):
+        return False
+
+    previous_timestamp = int(
+        previous_item.get(
+            "ntfy_time",
+            previous_item.get("message", {}).get("t", 0),
+        )
+        or 0
+    )
+    current_timestamp = int(
+        current_item.get(
+            "ntfy_time",
+            current_item.get("message", {}).get("t", 0),
+        )
+        or 0
+    )
+    gap_seconds = current_timestamp - previous_timestamp
+    if gap_seconds < 0 or gap_seconds >= GAP_SEPARATOR_SECONDS:
+        return False
+
+    try:
+        return (
+            datetime.fromtimestamp(previous_timestamp).date()
+            == datetime.fromtimestamp(current_timestamp).date()
+        )
+    except Exception:
+        return True
+
+
+def group_messages_for_display(
+    items: list[dict[str, Any]],
+    muted_user_ids: set[str],
+) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    for item in items:
+        message = item.get("message")
+        if not isinstance(message, dict):
+            continue
+        if not groups:
+            groups.append([item])
+            continue
+
+        previous_item = groups[-1][-1]
+        previous_message = previous_item.get("message", {})
+        client_id = str(message.get("c", ""))
+        same_remote_user = (
+            not bool(item.get("is_local", False))
+            and not bool(previous_item.get("is_local", False))
+            and client_id == str(previous_message.get("c", ""))
+        )
+        should_combine = (
+            same_remote_user
+            and message_items_are_contiguous(previous_item, item)
+            and (
+                client_id in muted_user_ids
+                or str(message.get("m", ""))
+                == str(previous_message.get("m", ""))
+            )
+        )
+        if should_combine:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+    return groups
+
+
+def message_item_sort_key(
+    item: dict[str, Any],
+) -> tuple[int, int, str]:
+    message = item["message"]
+    return (
+        int(item.get("ntfy_time", message.get("t", 0)) or 0),
+        int(message.get("t", 0) or 0),
+        str(item.get("ntfy_id") or message.get("i", "")),
+    )
+
+
+def consecutive_duplicate_message_ordinal(
+    previous_items: list[dict[str, Any]],
+    message: dict[str, Any],
+    *,
+    ntfy_time: int,
+    ntfy_id: str | None = None,
+) -> int:
+    current_item = {
+        "message": message,
+        "is_local": False,
+        "warning": None,
+        "ntfy_time": ntfy_time,
+        "ntfy_id": ntfy_id,
+    }
+    count = 1
+    for previous_item in reversed(previous_items):
+        previous_message = previous_item.get("message")
+        if not isinstance(previous_message, dict):
+            break
+        if message_item_sort_key(previous_item) > message_item_sort_key(
+            current_item
+        ):
+            continue
+        if (
+            str(previous_message.get("c", ""))
+            != str(message.get("c", ""))
+            or str(previous_message.get("m", ""))
+            != str(message.get("m", ""))
+            or not message_items_are_contiguous(
+                previous_item,
+                current_item,
+            )
+        ):
+            break
+        count += 1
+        current_item = previous_item
+    return count
+
+
 def message_storage_status(
     timestamp: int,
     *,
@@ -1894,7 +2019,9 @@ def default_config() -> dict[str, Any]:
         "custom_message_sound_path": "",
         "desktop_notifications": False,
         "chatroom_history_limit": DEFAULT_CHATROOM_HISTORY_LIMIT,
-        "minimize_to_tray": False,
+        "minimize_to_tray": True,
+        MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY: True,
+        MINIMIZE_TO_TRAY_NOTICE_KEY: False,
         "identity_private_key": generate_identity_private_key(),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
@@ -1915,12 +2042,16 @@ def default_config() -> dict[str, Any]:
 
 def load_config() -> dict[str, Any]:
     config = default_config()
+    apply_minimize_to_tray_1_2_default = False
 
     if CONFIG_PATH.exists():
         try:
             loaded = _load_dpapi_config(CONFIG_PATH.read_bytes())
             if loaded.get("config_version") != CONFIG_FORMAT_VERSION:
                 return config
+            apply_minimize_to_tray_1_2_default = not bool(
+                loaded.get(MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY, False)
+            )
             config.update(loaded)
         except Exception:
             return config
@@ -1963,8 +2094,14 @@ def load_config() -> dict[str, Any]:
             DEFAULT_CHATROOM_HISTORY_LIMIT,
         )
     )
-    config["minimize_to_tray"] = bool(
-        config.get("minimize_to_tray", False)
+    config["minimize_to_tray"] = (
+        True
+        if apply_minimize_to_tray_1_2_default
+        else bool(config.get("minimize_to_tray", True))
+    )
+    config[MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY] = True
+    config[MINIMIZE_TO_TRAY_NOTICE_KEY] = bool(
+        config.get(MINIMIZE_TO_TRAY_NOTICE_KEY, False)
     )
     config["identity_private_key"] = normalize_identity_private_key(
         config.get("identity_private_key")
@@ -3977,6 +4114,16 @@ class EncryptedChatClient(QObject):
             )
             self._message_font_cache[cache_key] = cached
         return cached
+
+    def _make_ui_font(self, *, bold: bool = False) -> QFont:
+        app = QApplication.instance()
+        font = QFont(
+            app.font() if app is not None else self._basic_application_font
+        )
+        font.setFamily(self._ui_font_family())
+        font.setBold(bold)
+        font.setStyleStrategy(self._font_style_strategy())
+        return font
 
     def _apply_application_font_strategy(self) -> None:
         self._message_font_cache.clear()
@@ -7847,7 +7994,7 @@ class EncryptedChatClient(QObject):
                         continue
                     added = 0
 
-                    for item in items:
+                    for item in sorted(items, key=self._message_sort_key):
                         if self._accept_network_message(
                             item,
                             persist=False,
@@ -7999,7 +8146,7 @@ class EncryptedChatClient(QObject):
         added = 0
         unread_added = 0
 
-        for item in items:
+        for item in sorted(items, key=self._message_sort_key):
             if not isinstance(item, dict):
                 continue
             ntfy_id = item.get("ntfy_id")
@@ -8018,13 +8165,20 @@ class EncryptedChatClient(QObject):
             seen_ntfy_ids.add(ntfy_id)
             seen_client_message_ids.add(client_message_id)
             is_local = message.get("c") == self._authenticated_client_id()
+            message_ntfy_time = int(
+                item.get("ntfy_time", message.get("t", 0)) or 0
+            )
+            duplicate_ordinal = consecutive_duplicate_message_ordinal(
+                history,
+                message,
+                ntfy_time=message_ntfy_time,
+                ntfy_id=ntfy_id,
+            )
             history.append({
                 "message": message,
                 "warning": None,
                 "ntfy_id": ntfy_id,
-                "ntfy_time": int(
-                    item.get("ntfy_time", message.get("t", 0)) or 0
-                ),
+                "ntfy_time": message_ntfy_time,
             })
             added += 1
 
@@ -8050,6 +8204,7 @@ class EncryptedChatClient(QObject):
                 if (
                     self._should_play_message_sound(room_id)
                     and not is_muted_notification
+                    and duplicate_ordinal <= 2
                 ):
                     self._play_notification_sound()
 
@@ -8101,6 +8256,12 @@ class EncryptedChatClient(QObject):
         self.seen_client_message_ids.add(client_message_id)
 
         is_local = message["c"] == self._authenticated_client_id()
+        duplicate_ordinal = consecutive_duplicate_message_ordinal(
+            self.message_log,
+            message,
+            ntfy_time=int(item["ntfy_time"]),
+            ntfy_id=str(ntfy_id),
+        )
 
         self._add_message_to_log(
             message,
@@ -8123,19 +8284,19 @@ class EncryptedChatClient(QObject):
                 message,
                 sort_key=self._message_sort_key(item),
             )
-            if self._should_play_message_sound(self.active_chatroom_id):
+            if (
+                duplicate_ordinal <= 2
+                and self._should_play_message_sound(
+                    self.active_chatroom_id
+                )
+            ):
                 self._play_notification_sound()
 
         return True
 
     @staticmethod
     def _message_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
-        message = item["message"]
-        return (
-            int(item.get("ntfy_time", message.get("t", 0))),
-            int(message.get("t", 0)),
-            str(item.get("ntfy_id") or message.get("i", "")),
-        )
+        return message_item_sort_key(item)
 
     def _add_message_to_log(
         self,
@@ -9173,13 +9334,16 @@ class EncryptedChatClient(QObject):
         underline: bool = False,
         anchor: str | None = None,
         font_name: str = DEFAULT_MESSAGE_FONT,
+        ui_font: bool = False,
         align_top: bool = False,
         top_align_height: int = 0,
     ) -> QTextCharFormat:
         formatting = QTextCharFormat()
         formatting.setForeground(QColor(color))
         formatting.setFont(
-            self._make_message_font(font_name, bold=bold)
+            self._make_ui_font(bold=bold)
+            if ui_font
+            else self._make_message_font(font_name, bold=bold)
         )
         formatting.setFontItalic(italic)
         formatting.setFontUnderline(underline)
@@ -9206,6 +9370,7 @@ class EncryptedChatClient(QObject):
         font_name: str,
         *,
         muted: bool,
+        ui_font: bool,
         embedded_image_urls: set[str],
         align_top: bool,
         top_align_height: int,
@@ -9237,6 +9402,7 @@ class EncryptedChatClient(QObject):
                     underline=run.underline,
                     anchor=anchor,
                     font_name=font_name,
+                    ui_font=ui_font,
                     align_top=align_top,
                     top_align_height=top_align_height,
                 )
@@ -9451,6 +9617,59 @@ class EncryptedChatClient(QObject):
         document.setDefaultTextOption(text_option)
         self.chat_display.setDocument(document)
 
+    @staticmethod
+    def _repeat_prefixed_message_text(text: str, count: int) -> str:
+        return f"[{count}x] {text}" if count > 1 else text
+
+    def _display_item_for_group(
+        self,
+        group: list[dict[str, Any]],
+        muted_ids: set[str],
+    ) -> dict[str, Any]:
+        item = dict(group[-1])
+        message = dict(item["message"])
+        item["message"] = message
+        item["source_message_ids"] = [
+            str(source["message"].get("i", ""))
+            for source in group
+        ]
+
+        client_id = str(message.get("c", ""))
+        is_muted = (
+            client_id in muted_ids
+            and not bool(item.get("is_local", False))
+        )
+        if is_muted:
+            combined_parts: list[str] = []
+            repeated_text = ""
+            repeated_count = 0
+            for source in group:
+                source_text = str(source["message"].get("m", ""))
+                if repeated_count and source_text != repeated_text:
+                    combined_parts.append(
+                        self._repeat_prefixed_message_text(
+                            repeated_text,
+                            repeated_count,
+                        )
+                    )
+                    repeated_count = 0
+                repeated_text = source_text
+                repeated_count += 1
+            if repeated_count:
+                combined_parts.append(
+                    self._repeat_prefixed_message_text(
+                        repeated_text,
+                        repeated_count,
+                    )
+                )
+            message["m"] = " | ".join(combined_parts)
+        elif len(group) > 1:
+            message["m"] = self._repeat_prefixed_message_text(
+                str(group[0]["message"].get("m", "")),
+                len(group),
+            )
+        return item
+
     def _render_message_log(self, *, scroll_to_bottom: bool) -> None:
         if self._tray_ui_suspended:
             return
@@ -9477,8 +9696,13 @@ class EncryptedChatClient(QObject):
         first_item = True
         stripe_index = 0
 
-        for item in self.message_log:
-            current_timestamp = self._display_timestamp_for_item(item)
+        display_groups = group_messages_for_display(
+            self.message_log,
+            muted_ids,
+        )
+        for group in display_groups:
+            item = self._display_item_for_group(group, muted_ids)
+            current_timestamp = self._display_timestamp_for_item(group[0])
             current_local_datetime = self._local_datetime(current_timestamp)
             current_local_date = (
                 current_local_datetime.date()
@@ -9537,8 +9761,13 @@ class EncryptedChatClient(QObject):
             )
             stripe_index += 1
             first_item = False
-            previous_timestamp = current_timestamp
-            previous_local_date = current_local_date
+            previous_timestamp = self._display_timestamp_for_item(group[-1])
+            previous_datetime = self._local_datetime(previous_timestamp)
+            previous_local_date = (
+                previous_datetime.date()
+                if previous_datetime is not None
+                else current_local_date
+            )
 
         self.chat_display.row_background_blocks = {
             selection.cursor.block().blockNumber(): QColor(
@@ -9597,9 +9826,16 @@ class EncryptedChatClient(QObject):
         message_id = str(message["i"])
         client_id = str(message["c"])
         user_id_preview = visible_user_id(client_id)
+        source_message_ids = {
+            str(value)
+            for value in item.get("source_message_ids", [message_id])
+            if str(value)
+        }
 
         is_muted = client_id in muted_ids and not item["is_local"]
-        is_collapsed = is_muted or message_id in collapsed_ids
+        is_collapsed = is_muted or bool(
+            source_message_ids.intersection(collapsed_ids)
+        )
         message_block_format = QTextBlockFormat()
         message_block_format.setNonBreakableLines(is_collapsed)
         cursor.setBlockFormat(message_block_format)
@@ -9718,10 +9954,9 @@ class EncryptedChatClient(QObject):
 
         has_profile_icon = self._insert_profile_icon(
             cursor,
-            profile_icon,
+            "" if is_muted else profile_icon,
             message_id,
             align_top=align_message_top,
-            opacity=MUTED_CONTENT_OPACITY if is_muted else 1.0,
         )
         if has_profile_icon:
             cursor.insertText(
@@ -9730,6 +9965,7 @@ class EncryptedChatClient(QObject):
                     body_color,
                     anchor=f"spritelink:{message_id}",
                     font_name=font_name,
+                    ui_font=is_muted,
                     align_top=align_message_top,
                     top_align_height=top_align_height,
                 ),
@@ -9743,6 +9979,7 @@ class EncryptedChatClient(QObject):
                 underline=False,
                 anchor=f"spritelink:{message_id}",
                 font_name=font_name,
+                ui_font=is_muted,
                 align_top=align_message_top,
                 top_align_height=top_align_height,
             ),
@@ -9753,6 +9990,7 @@ class EncryptedChatClient(QObject):
                 self._text_format(
                     suffix_color,
                     font_name=font_name,
+                    ui_font=is_muted,
                     align_top=align_message_top,
                     top_align_height=top_align_height,
                 ),
@@ -9762,6 +10000,7 @@ class EncryptedChatClient(QObject):
             self._text_format(
                 body_color,
                 font_name=font_name,
+                ui_font=is_muted,
                 align_top=align_message_top,
                 top_align_height=top_align_height,
             ),
@@ -9783,6 +10022,7 @@ class EncryptedChatClient(QObject):
                 self._text_format(
                     body_color,
                     font_name=font_name,
+                    ui_font=is_muted,
                     align_top=align_message_top,
                     top_align_height=top_align_height,
                 ),
@@ -9794,6 +10034,7 @@ class EncryptedChatClient(QObject):
                 body_color,
                 font_name,
                 muted=is_muted,
+                ui_font=is_muted,
                 embedded_image_urls=set(image_urls),
                 align_top=align_message_top,
                 top_align_height=top_align_height,
@@ -10216,14 +10457,52 @@ class EncryptedChatClient(QObject):
         self.last_notification_sound_at = now
         self._play_message_sound()
 
+    def _show_minimize_to_tray_notice(self) -> str | None:
+        dialog = QMessageBox(self.root)
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setWindowTitle("Minimize to Tray")
+        dialog.setText(
+            "SpriteLink will keep running in the system tray so it can "
+            "receive messages in the background."
+        )
+        disable_button = dialog.addButton(
+            "Disable and Close",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        ok_button = dialog.addButton(
+            "OK",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        dialog.setDefaultButton(ok_button)
+        self._apply_window_titlebar_theme(dialog)
+        dialog.exec()
+        clicked_button = dialog.clickedButton()
+        if clicked_button is disable_button:
+            return "disable"
+        if clicked_button is ok_button:
+            return "ok"
+        return None
+
     def _on_close(self) -> bool:
         if self._closing:
             return True
         if not self._force_quit and self._can_minimize_to_tray():
+            if not bool(
+                self.config_data.get(MINIMIZE_TO_TRAY_NOTICE_KEY, False)
+            ):
+                notice_action = self._show_minimize_to_tray_notice()
+                if notice_action is None:
+                    return False
+                self.config_data[MINIMIZE_TO_TRAY_NOTICE_KEY] = True
+                if notice_action == "disable":
+                    self.minimize_to_tray_var.set(False)
             if not self._save_settings():
                 return False
-            self._hide_to_tray()
-            return False
+            if not self._can_minimize_to_tray():
+                self._force_quit = True
+            else:
+                self._hide_to_tray()
+                return False
 
         self._closing = True
         self._minimized_to_tray = False

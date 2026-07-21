@@ -127,7 +127,7 @@ class BehaviorSettingsTests(unittest.TestCase):
         self.assertEqual(config["chatroom_history_limit"], 1000)
         self.assertEqual(SPRITELINK.DEFAULT_CHATROOM_HISTORY_LIMIT, 1000)
         self.assertNotIn("history", config)
-        self.assertFalse(config["minimize_to_tray"])
+        self.assertTrue(config["minimize_to_tray"])
 
     def test_each_chatroom_history_uses_a_separate_encrypted_file(
         self,
@@ -344,6 +344,226 @@ class BehaviorSettingsTests(unittest.TestCase):
         ):
             self.assertNotIn(removed_upgrade_token, module_source)
 
+    def test_minimize_to_tray_is_enabled_for_new_and_existing_users(
+        self,
+    ) -> None:
+        self.assertTrue(SPRITELINK.default_config()["minimize_to_tray"])
+
+        existing_config = SPRITELINK.default_config()
+        existing_config["minimize_to_tray"] = False
+        existing_config.pop(
+            SPRITELINK.MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY,
+            None,
+        )
+        config_path = mock.Mock()
+        config_path.exists.return_value = True
+        config_path.read_bytes.return_value = b"settings"
+        with (
+            mock.patch.object(SPRITELINK, "CONFIG_PATH", config_path),
+            mock.patch.object(
+                SPRITELINK,
+                "_load_dpapi_config",
+                return_value=existing_config,
+            ),
+        ):
+            migrated = SPRITELINK.load_config()
+
+        self.assertTrue(migrated["minimize_to_tray"])
+        self.assertTrue(
+            migrated[SPRITELINK.MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY]
+        )
+
+        migrated["minimize_to_tray"] = False
+        with (
+            mock.patch.object(SPRITELINK, "CONFIG_PATH", config_path),
+            mock.patch.object(
+                SPRITELINK,
+                "_load_dpapi_config",
+                return_value=migrated,
+            ),
+        ):
+            user_disabled = SPRITELINK.load_config()
+        self.assertFalse(user_disabled["minimize_to_tray"])
+
+    def test_first_tray_close_notice_has_requested_actions(self) -> None:
+        notice_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_minimize_to_tray_notice
+        )
+        self.assertIn(
+            "SpriteLink will keep running in the system tray so it can ",
+            notice_source,
+        )
+        self.assertIn("receive messages in the background.", notice_source)
+        self.assertIn('"Disable and Close"', notice_source)
+        self.assertIn('"OK"', notice_source)
+
+
+class MessageGroupingTests(unittest.TestCase):
+    @staticmethod
+    def _item(
+        client_id: str,
+        text: str,
+        index: int,
+        *,
+        is_local: bool = False,
+    ) -> dict[str, object]:
+        return {
+            "message": {
+                "c": client_id,
+                "m": text,
+                "i": f"message-{index}",
+                "t": 1000 + index,
+            },
+            "is_local": is_local,
+            "warning": None,
+            "ntfy_time": 1000 + index,
+        }
+
+    def test_muted_user_messages_combine_until_another_user_speaks(
+        self,
+    ) -> None:
+        items = [
+            self._item("muted", "one", 1),
+            self._item("muted", "two", 2),
+            self._item("other", "break", 3),
+            self._item("muted", "three", 4),
+        ]
+        groups = SPRITELINK.group_messages_for_display(items, {"muted"})
+        self.assertEqual([len(group) for group in groups], [2, 1, 1])
+
+    def test_remote_duplicate_text_groups_but_local_text_does_not(
+        self,
+    ) -> None:
+        items = [
+            self._item("remote", "hello", 1),
+            self._item("remote", "hello", 2),
+            self._item("local", "hello", 3, is_local=True),
+            self._item("local", "hello", 4, is_local=True),
+        ]
+        groups = SPRITELINK.group_messages_for_display(items, set())
+        self.assertEqual([len(group) for group in groups], [2, 1, 1])
+        self.assertEqual(
+            SPRITELINK.EncryptedChatClient._repeat_prefixed_message_text(
+                "hello",
+                2,
+            ),
+            "[2x] hello",
+        )
+        display_client = mock.Mock()
+        display_client._repeat_prefixed_message_text = (
+            SPRITELINK.EncryptedChatClient._repeat_prefixed_message_text
+        )
+        display_item = (
+            SPRITELINK.EncryptedChatClient._display_item_for_group(
+                display_client,
+                groups[0],
+                set(),
+            )
+        )
+        self.assertEqual(display_item["message"]["m"], "[2x] hello")
+
+    def test_muted_combined_row_keeps_distinct_text_and_repeat_counts(
+        self,
+    ) -> None:
+        items = [
+            self._item("muted", "one", 1),
+            self._item("muted", "two", 2),
+            self._item("muted", "two", 3),
+        ]
+        group = SPRITELINK.group_messages_for_display(
+            items,
+            {"muted"},
+        )[0]
+        display_client = mock.Mock()
+        display_client._repeat_prefixed_message_text = (
+            SPRITELINK.EncryptedChatClient._repeat_prefixed_message_text
+        )
+        display_item = (
+            SPRITELINK.EncryptedChatClient._display_item_for_group(
+                display_client,
+                group,
+                {"muted"},
+            )
+        )
+        self.assertEqual(
+            display_item["message"]["m"],
+            "one | [2x] two",
+        )
+        self.assertEqual(
+            display_item["source_message_ids"],
+            ["message-1", "message-2", "message-3"],
+        )
+
+    def test_duplicate_sound_ordinal_suppresses_only_third_and_later(
+        self,
+    ) -> None:
+        first = self._item("remote", "hello", 1)
+        second = self._item("remote", "hello", 2)
+        third_message = self._item("remote", "hello", 3)["message"]
+        self.assertEqual(
+            SPRITELINK.consecutive_duplicate_message_ordinal(
+                [],
+                first["message"],
+                ntfy_time=1001,
+            ),
+            1,
+        )
+        self.assertEqual(
+            SPRITELINK.consecutive_duplicate_message_ordinal(
+                [first],
+                second["message"],
+                ntfy_time=1002,
+            ),
+            2,
+        )
+        self.assertEqual(
+            SPRITELINK.consecutive_duplicate_message_ordinal(
+                [first, second],
+                third_message,
+                ntfy_time=1003,
+            ),
+            3,
+        )
+
+        future = self._item("remote", "hello", 4)
+        self.assertEqual(
+            SPRITELINK.consecutive_duplicate_message_ordinal(
+                [first, future],
+                second["message"],
+                ntfy_time=1002,
+            ),
+            2,
+        )
+
+        active_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._accept_network_message
+        )
+        background_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._accept_background_messages
+        )
+        self.assertIn("duplicate_ordinal <= 2", active_source)
+        self.assertIn("duplicate_ordinal <= 2", background_source)
+        queue_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._process_ui_queue
+        )
+        self.assertIn(
+            "sorted(items, key=self._message_sort_key)",
+            queue_source,
+        )
+
+    def test_muted_rows_use_ui_font_and_hide_log_icon(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertIn('"" if is_muted else profile_icon', insert_source)
+        self.assertIn("ui_font=is_muted", insert_source)
+        tooltip_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._tooltip_for_message_item
+        )
+        self.assertIn("profile_icon_tooltip_data_uri", tooltip_source)
+
+
+class TrayBehaviorTests(unittest.TestCase):
     def test_close_can_hide_to_tray_or_exit(self) -> None:
         close_event_source = inspect.getsource(
             SPRITELINK.MainWindow.closeEvent
@@ -2363,7 +2583,7 @@ class UpdateConfigTests(unittest.TestCase):
         self.assertIsNone(client.available_update)
 
 
-class Version110ReleaseTests(unittest.TestCase):
+class Version120ReleaseTests(unittest.TestCase):
     def test_release_defaults_and_config_control_order(self) -> None:
         config = SPRITELINK.default_config()
         self.assertEqual(SPRITELINK.DEFAULT_MESSAGE_FONT, "Arial")
@@ -2628,7 +2848,7 @@ class Version110ReleaseTests(unittest.TestCase):
             ),
         )
 
-    def test_windows_package_defaults_to_version_110(self) -> None:
+    def test_windows_package_defaults_to_version_120(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         workflow = (
             project_root / ".github/workflows/windows-package.yml"
@@ -2639,9 +2859,9 @@ class Version110ReleaseTests(unittest.TestCase):
         installer = (
             project_root / "packaging/windows/SpriteLink.iss"
         ).read_text(encoding="utf-8")
-        self.assertIn('default: "1.1.0"', workflow)
-        self.assertIn('$Version = "1.1.0"', build_script)
-        self.assertIn('#define AppVersion "1.1.0"', installer)
+        self.assertIn('default: "1.2.0"', workflow)
+        self.assertIn('$Version = "1.2.0"', build_script)
+        self.assertIn('#define AppVersion "1.2.0"', installer)
 
 
 if __name__ == "__main__":
