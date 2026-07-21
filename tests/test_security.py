@@ -835,22 +835,17 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         self.assertIn("setUpdatesEnabled(False)", sidebar_source)
         self.assertIn("setUpdatesEnabled(True)", sidebar_source)
         self.assertIn("central_widget.layout().activate()", sidebar_source)
-        self.assertIn("_set_window_frame_geometry", sidebar_source)
+        self.assertIn("self.root.setGeometry(", sidebar_source)
+        self.assertNotIn("SetWindowPos", sidebar_source)
+        self.assertNotIn("frameGeometry", sidebar_source)
         self.assertLess(
             sidebar_source.index("if not expanded:"),
-            sidebar_source.index("_set_window_frame_geometry("),
+            sidebar_source.index("self.root.setGeometry("),
         )
         self.assertLess(
-            sidebar_source.index("_set_window_frame_geometry("),
+            sidebar_source.index("self.root.setGeometry("),
             sidebar_source.index("if expanded:"),
         )
-
-        geometry_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._set_window_frame_geometry
-        )
-        self.assertIn('os.name == "nt"', geometry_source)
-        self.assertIn("SetWindowPos(", geometry_source)
-        self.assertIn("self.root.setGeometry(", geometry_source)
 
 
 class TrayBehaviorTests(unittest.TestCase):
