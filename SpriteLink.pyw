@@ -4457,6 +4457,7 @@ class EncryptedChatClient(QObject):
         self._message_font_cache: dict[tuple[str, bool, bool], QFont] = {}
         self._loading_profile_controls = False
         self._connection_error_visible = False
+        self._sidebar_transition_serial = 0
         self.active_chatroom_id = str(
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
         )
@@ -5283,6 +5284,8 @@ class EncryptedChatClient(QObject):
         # geometry change. Qt coordinates are device-independent; sending
         # them directly to Win32 APIs breaks on scaled displays and also
         # makes Qt reconcile a second, stale geometry afterward.
+        self._sidebar_transition_serial += 1
+        transition_serial = self._sidebar_transition_serial
         self.root.setUpdatesEnabled(False)
         try:
             self.chatrooms_toggle.setText("‹" if expanded else "›")
@@ -5307,39 +5310,29 @@ class EncryptedChatClient(QObject):
                 and central_widget.layout() is not None
             ):
                 central_widget.layout().activate()
-        finally:
+        except Exception:
             self.root.setUpdatesEnabled(True)
-            self._redraw_window_after_sidebar_resize()
+            raise
 
-    def _redraw_window_after_sidebar_resize(self) -> None:
-        # setUpdatesEnabled(True) only queues a paint. During a top-level
-        # resize Windows can present the old backing-store pixels before
-        # that queued paint runs, copying the chat into the new sidebar (or
-        # the sidebar into the chat). Repaint synchronously while this
-        # toggle handler still owns the transition so DWM only receives the
-        # final child layout.
-        self.root.repaint()
-        if os.name != "nt" or not hasattr(ctypes, "windll"):
+        # A top-level setGeometry() crosses from Qt's layout system into the
+        # native Windows message queue. Re-enabling or repainting here lets
+        # Qt submit the final child layout while DWM still has the previous
+        # client width. That produces one frame where the whole right side
+        # shifts left and the newly exposed strip is blank. Let the native
+        # resize message finish first, then reveal and repaint the completed
+        # layout on the following event-loop turn.
+        QTimer.singleShot(
+            0,
+            lambda serial=transition_serial: (
+                self._finish_chatrooms_toggle(serial)
+            ),
+        )
+
+    def _finish_chatrooms_toggle(self, transition_serial: int) -> None:
+        if transition_serial != self._sidebar_transition_serial:
             return
-        try:
-            redraw_window = ctypes.windll.user32.RedrawWindow
-            redraw_window.argtypes = (
-                wintypes.HWND,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                wintypes.UINT,
-            )
-            redraw_window.restype = wintypes.BOOL
-            redraw_window(
-                wintypes.HWND(int(self.root.winId())),
-                None,
-                None,
-                # RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW
-                0x0001 | 0x0080 | 0x0100,
-            )
-        except (AttributeError, OSError, TypeError, ValueError):
-            # The synchronous Qt repaint above remains the portable path.
-            pass
+        self.root.setUpdatesEnabled(True)
+        self.root.repaint()
 
     def _chatroom_definitions(self) -> list[dict[str, str]]:
         rooms = [{
