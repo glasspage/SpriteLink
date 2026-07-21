@@ -113,6 +113,8 @@ try:
         QSizePolicy,
         QStyle,
         QStyleFactory,
+        QStyledItemDelegate,
+        QStyleOptionViewItem,
         QSystemTrayIcon,
         QTextBrowser,
         QTextEdit,
@@ -193,6 +195,10 @@ WINDOW_ICON_PATH = Path(__file__).resolve().parent / "SL.ico"
 WINDOWS_APP_USER_MODEL_ID = "SpriteLink.SpriteLink"
 WINDOWS_NOTIFICATION_PROTOCOL = "spritelink"
 WINDOWS_NOTIFICATION_GROUP = "SpriteLink.Chatrooms"
+WINDOWS_STARTUP_VALUE_NAME = "SpriteLink"
+WINDOWS_STARTUP_REGISTRY_PATH = (
+    r"Software\Microsoft\Windows\CurrentVersion\Run"
+)
 WINDOWS_SINGLE_INSTANCE_MUTEX_NAME = (
     r"Local\SpriteLink-{D2EB08B2-F3E3-4F88-8D9E-51DC7A8754A0}"
 )
@@ -308,11 +314,20 @@ SERVER_PRESETS: dict[str, str] = {
     "Custom ntfy server": "",
 }
 
-DEFAULT_THEME = "Modern (Light)"
+DEFAULT_THEME = "Classic"
 THEMES = (
     DEFAULT_THEME,
-    "Windows Classic",
+    "Modern",
 )
+LEGACY_THEME_NAMES = {
+    "Windows Classic": "Classic",
+    "Modern (Light)": "Modern",
+}
+
+DEFAULT_WINDOW_WIDTH = 840
+DEFAULT_WINDOW_HEIGHT = 650
+MINIMUM_WINDOW_WIDTH = 670
+MINIMUM_WINDOW_HEIGHT = 500
 
 FOCUSED_POLL_INTERVAL_SECONDS = 6.0
 UNFOCUSED_POLL_INTERVAL_SECONDS = 9.0
@@ -2217,6 +2232,9 @@ def default_config() -> dict[str, Any]:
         "desktop_notifications": False,
         "chatroom_history_limit": DEFAULT_CHATROOM_HISTORY_LIMIT,
         "minimize_to_tray": True,
+        "start_with_windows": False,
+        "window_width": DEFAULT_WINDOW_WIDTH,
+        "window_height": DEFAULT_WINDOW_HEIGHT,
         MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY: True,
         MINIMIZE_TO_TRAY_NOTICE_KEY: False,
         "identity_private_key": generate_identity_private_key(),
@@ -2300,6 +2318,15 @@ def load_config() -> dict[str, Any]:
     config[MINIMIZE_TO_TRAY_NOTICE_KEY] = bool(
         config.get(MINIMIZE_TO_TRAY_NOTICE_KEY, False)
     )
+    config["start_with_windows"] = bool(
+        config.get("start_with_windows", False)
+    )
+    window_width, window_height = normalize_window_size(
+        config.get("window_width", DEFAULT_WINDOW_WIDTH),
+        config.get("window_height", DEFAULT_WINDOW_HEIGHT),
+    )
+    config["window_width"] = window_width
+    config["window_height"] = window_height
     config["identity_private_key"] = normalize_identity_private_key(
         config.get("identity_private_key")
     )
@@ -2423,7 +2450,10 @@ def load_config() -> dict[str, Any]:
     config["room_profiles"] = cleaned_profiles
     config["identity_presets"] = identity_presets
 
-    theme = str(config.get("theme", DEFAULT_THEME))
+    theme = LEGACY_THEME_NAMES.get(
+        str(config.get("theme", DEFAULT_THEME)),
+        str(config.get("theme", DEFAULT_THEME)),
+    )
     config["theme"] = theme if theme in THEMES else DEFAULT_THEME
 
     muted_chatrooms = config.get("muted_chatrooms")
@@ -2462,6 +2492,69 @@ def save_config(config: dict[str, Any]) -> None:
         stored_config,
         SETTINGS_DPAPI_ENTROPY,
     )
+
+
+def normalize_window_size(width: Any, height: Any) -> tuple[int, int]:
+    try:
+        normalized_width = int(width)
+    except (TypeError, ValueError):
+        normalized_width = DEFAULT_WINDOW_WIDTH
+    try:
+        normalized_height = int(height)
+    except (TypeError, ValueError):
+        normalized_height = DEFAULT_WINDOW_HEIGHT
+    return (
+        max(MINIMUM_WINDOW_WIDTH, min(DEFAULT_WINDOW_WIDTH, normalized_width)),
+        max(
+            MINIMUM_WINDOW_HEIGHT,
+            min(DEFAULT_WINDOW_HEIGHT, normalized_height),
+        ),
+    )
+
+
+def windows_startup_command() -> str:
+    if getattr(sys, "frozen", False):
+        executable_parts = [sys.executable]
+    else:
+        python_executable = Path(sys.executable)
+        pythonw_executable = python_executable.with_name("pythonw.exe")
+        executable_parts = [
+            str(
+                pythonw_executable
+                if pythonw_executable.exists()
+                else python_executable
+            ),
+            str(Path(__file__).resolve()),
+        ]
+    return subprocess.list2cmdline(executable_parts)
+
+
+def set_start_with_windows(enabled: bool) -> bool:
+    if os.name != "nt":
+        return not enabled
+    try:
+        import winreg
+
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER,
+            WINDOWS_STARTUP_REGISTRY_PATH,
+        ) as key:
+            if enabled:
+                winreg.SetValueEx(
+                    key,
+                    WINDOWS_STARTUP_VALUE_NAME,
+                    0,
+                    winreg.REG_SZ,
+                    windows_startup_command(),
+                )
+            else:
+                try:
+                    winreg.DeleteValue(key, WINDOWS_STARTUP_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+    except (OSError, ImportError):
+        return False
+    return True
 
 
 def normalize_server_url(url: str) -> str:
@@ -3469,6 +3562,20 @@ class ThemeComboBox(QComboBox):
         painter.end()
 
 
+class NoFocusRectItemDelegate(QStyledItemDelegate):
+    """Draw selected font entries without Qt's dotted focus rectangle."""
+
+    def paint(
+        self,
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        index: Any,
+    ) -> None:
+        clean_option = QStyleOptionViewItem(option)
+        clean_option.state &= ~QStyle.StateFlag.State_HasFocus
+        super().paint(painter, clean_option, index)
+
+
 class IdentityPresetSelector(QPushButton):
     presetSelected = Signal(str)
     removeRequested = Signal(str)
@@ -4095,11 +4202,20 @@ class EncryptedChatClient(QObject):
         super().__init__(root)
         self.root = root
         self.root.setWindowTitle("SpriteLink")
-        self.root.resize(840, 650)
-        self.root.setMinimumSize(670, 500)
-        self.root.installEventFilter(self)
-
         self.config_data = load_config()
+        self.root.setMinimumSize(
+            MINIMUM_WINDOW_WIDTH,
+            MINIMUM_WINDOW_HEIGHT,
+        )
+        self.root.resize(
+            int(self.config_data["window_width"]),
+            int(self.config_data["window_height"]),
+        )
+        self.root.installEventFilter(self)
+        if os.name == "nt":
+            set_start_with_windows(
+                bool(self.config_data.get("start_with_windows", False))
+            )
         # Persist a newly generated signing identity before any messages are
         # created so the authenticated ID survives a crash.
         save_config(self.config_data)
@@ -4247,6 +4363,9 @@ class EncryptedChatClient(QObject):
         )
         self.minimize_to_tray_var = ValueModel(
             bool(self.config_data["minimize_to_tray"])
+        )
+        self.start_with_windows_var = ValueModel(
+            bool(self.config_data.get("start_with_windows", False))
         )
         self.status_var = ValueModel("Connecting")
 
@@ -4446,7 +4565,7 @@ class EncryptedChatClient(QObject):
         return self._basic_application_font.family()
 
     def _is_windows_classic_theme(self) -> bool:
-        return self.theme_var.get() == "Windows Classic"
+        return self.theme_var.get() == "Classic"
 
     def _windows_classic_palette(self) -> QPalette:
         palette = QPalette()
@@ -5851,6 +5970,9 @@ class EncryptedChatClient(QObject):
         font_layout.addWidget(QLabel("Font"))
         self.message_font_combo = ThemeComboBox()
         self.message_font_combo.addItems(list(SELECTABLE_MESSAGE_FONTS))
+        self.message_font_combo.setItemDelegate(
+            NoFocusRectItemDelegate(self.message_font_combo)
+        )
         self._refresh_message_font_combo_fonts()
         self.message_font_combo.currentTextChanged.connect(
             self._on_message_font_changed
@@ -6755,7 +6877,11 @@ class EncryptedChatClient(QObject):
         self.message_sound_volume_slider.setRange(1, 10)
         self.message_sound_volume_slider.setSingleStep(1)
         self.message_sound_volume_slider.setPageStep(1)
-        self.message_sound_volume_slider.setMinimumWidth(120)
+        self.message_sound_volume_slider.setMinimumWidth(40)
+        self.message_sound_volume_slider.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         self.message_sound_volume_slider.setAccessibleName(
             "Message sound volume"
         )
@@ -6841,6 +6967,30 @@ class EncryptedChatClient(QObject):
         )
         layout.addWidget(
             self.minimize_to_tray_checkbox,
+            row,
+            0,
+            1,
+            3,
+        )
+        row += 1
+
+        self.start_with_windows_checkbox = QCheckBox("Start with Windows")
+        self.start_with_windows_checkbox.setChecked(
+            bool(self.start_with_windows_var.get())
+        )
+        self.start_with_windows_checkbox.setEnabled(os.name == "nt")
+        if os.name != "nt":
+            self.start_with_windows_checkbox.setToolTip(
+                "This option is only available on Windows."
+            )
+        self.start_with_windows_checkbox.toggled.connect(
+            self.start_with_windows_var.set
+        )
+        self.start_with_windows_var.bind(
+            self.start_with_windows_checkbox.setChecked
+        )
+        layout.addWidget(
+            self.start_with_windows_checkbox,
             row,
             0,
             1,
@@ -7193,6 +7343,7 @@ class EncryptedChatClient(QObject):
             bool(self.desktop_notifications_var.get()),
             int(self.chatroom_history_limit_var.get()),
             bool(self.minimize_to_tray_var.get()),
+            bool(self.start_with_windows_var.get()),
         )
 
     def _set_config_toggle_checked(self, checked: bool) -> None:
@@ -7333,10 +7484,25 @@ class EncryptedChatClient(QObject):
         self.config_data["minimize_to_tray"] = bool(
             self.minimize_to_tray_var.get()
         )
+        self.config_data["start_with_windows"] = bool(
+            self.start_with_windows_var.get()
+        )
+        window_width, window_height = normalize_window_size(
+            self.root.width(),
+            self.root.height(),
+        )
+        self.config_data["window_width"] = window_width
+        self.config_data["window_height"] = window_height
 
     def _save_settings(self) -> bool:
         try:
             self._copy_ui_to_config()
+            if not set_start_with_windows(
+                bool(self.config_data["start_with_windows"])
+            ):
+                raise OSError(
+                    "Could not update the Windows startup setting."
+                )
             self._apply_chatroom_history_limit()
             save_config(self.config_data)
         except Exception as exc:
