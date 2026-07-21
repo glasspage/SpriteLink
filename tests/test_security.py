@@ -2018,6 +2018,33 @@ class ProfileIconTests(unittest.TestCase):
         self.assertIn("_apply_window_titlebar_theme", themed_source)
         self.assertIn("QTimer.singleShot", themed_source)
 
+    def test_all_non_file_dialogs_receive_active_window_theme(self) -> None:
+        init_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.__init__
+        )
+        self.assertIn("app.installEventFilter(self)", init_source)
+
+        event_filter_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        self.assertIn("isinstance(watched, QDialog)", event_filter_source)
+        self.assertIn(
+            "not isinstance(watched, QFileDialog)",
+            event_filter_source,
+        )
+        self.assertIn("QEvent.Type.Show", event_filter_source)
+        self.assertIn("QEvent.Type.WindowActivate", event_filter_source)
+        self.assertIn(
+            "self._apply_dialog_window_theme(watched)",
+            event_filter_source,
+        )
+
+        helper_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._apply_dialog_window_theme
+        )
+        self.assertIn("_apply_window_titlebar_theme", helper_source)
+        self.assertIn("QTimer.singleShot", helper_source)
+
 
 class ImageTrustTests(unittest.TestCase):
     def test_requested_and_common_cdn_hosts_are_trusted(self) -> None:

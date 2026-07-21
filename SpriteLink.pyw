@@ -4376,6 +4376,8 @@ class EncryptedChatClient(QObject):
         # created so the authenticated ID survives a crash.
         save_config(self.config_data)
         app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._basic_style_name = (
             app.style().objectName() if app is not None else "Fusion"
         )
@@ -4822,6 +4824,16 @@ class EncryptedChatClient(QObject):
         except Exception:
             # Older Windows versions do not expose the color attributes.
             pass
+
+    def _apply_dialog_window_theme(self, dialog: QDialog) -> None:
+        """Apply native theme properties after a dialog window exists."""
+        if isinstance(dialog, QFileDialog):
+            return
+        self._apply_window_titlebar_theme(dialog)
+        QTimer.singleShot(
+            0,
+            lambda dialog=dialog: self._apply_window_titlebar_theme(dialog),
+        )
 
     def _exec_themed_file_dialog(self, dialog: QFileDialog) -> int:
         # Native Windows dialogs are created when exec() starts. Apply once to
@@ -9838,6 +9850,16 @@ class EncryptedChatClient(QObject):
             ))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            isinstance(watched, QDialog)
+            and not isinstance(watched, QFileDialog)
+            and event.type() in (
+                QEvent.Type.Show,
+                QEvent.Type.WindowActivate,
+            )
+        ):
+            self._apply_dialog_window_theme(watched)
+
         if (
             watched is self.root
             and hasattr(self, "window_focused_event")
