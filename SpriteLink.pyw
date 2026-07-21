@@ -1230,29 +1230,34 @@ def message_log_separator_texts(
     previous_timestamp: int,
     current_timestamp: int,
 ) -> tuple[str, ...]:
-    separators: list[str] = []
-    gap_seconds = int(current_timestamp) - int(previous_timestamp)
-    if gap_seconds >= GAP_SEPARATOR_SECONDS:
-        gap_hours = max(6, int((gap_seconds / 3600.0) + 0.5))
-        separators.append(f"————— {gap_hours} hours later —————")
-
     try:
         previous_local_date = datetime.fromtimestamp(
             previous_timestamp
         ).date()
         current_local_datetime = datetime.fromtimestamp(current_timestamp)
     except Exception:
-        return tuple(separators)
+        previous_local_date = None
+        current_local_datetime = None
 
-    if current_local_datetime.date() != previous_local_date:
-        separators.append(
+    # A date row already communicates the break in the conversation. Avoid
+    # placing an elapsed-time row directly beside it as a redundant divider.
+    if (
+        current_local_datetime is not None
+        and current_local_datetime.date() != previous_local_date
+    ):
+        return (
             "————— "
             f"{current_local_datetime.strftime('%b')} "
             f"{current_local_datetime.day}, "
             f"{current_local_datetime.year}"
-            " —————"
+            " —————",
         )
-    return tuple(separators)
+
+    gap_seconds = int(current_timestamp) - int(previous_timestamp)
+    if gap_seconds >= GAP_SEPARATOR_SECONDS:
+        gap_hours = max(6, int((gap_seconds / 3600.0) + 0.5))
+        return (f"————— {gap_hours} hours later —————",)
+    return ()
 
 
 def group_messages_for_display(
@@ -1297,7 +1302,10 @@ def message_item_sort_key(
 ) -> tuple[int, int, str]:
     message = item["message"]
     return (
-        int(item.get("ntfy_time", message.get("t", 0)) or 0),
+        int(item.get(
+            "display_sort_time",
+            item.get("ntfy_time", message.get("t", 0)),
+        ) or 0),
         int(message.get("t", 0) or 0),
         # New message IDs begin with a monotonic send-order value. Ntfy's
         # record IDs are unique but not chronological, so using them here can
@@ -1362,12 +1370,17 @@ def message_storage_status(
     now: int | None = None,
 ) -> str:
     current_time = int(time.time()) if now is None else int(now)
+    age_seconds = current_time - int(timestamp)
     if (
         int(timestamp) > 0
-        and current_time - int(timestamp)
-        <= SERVER_HISTORY_RETENTION_SECONDS
+        and age_seconds <= SERVER_HISTORY_RETENTION_SECONDS
     ):
-        return "Stored on server"
+        remaining_seconds = min(
+            SERVER_HISTORY_RETENTION_SECONDS,
+            max(0, SERVER_HISTORY_RETENTION_SECONDS - age_seconds),
+        )
+        remaining_hours = max(1, (remaining_seconds + 3599) // 3600)
+        return f"On server ({remaining_hours}h)"
     return "Expired"
 
 
@@ -3629,6 +3642,10 @@ class MessageLogBrowser(QTextBrowser):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.row_background_blocks: dict[int, QColor] = {}
+        self.row_background_padding_blocks: dict[
+            int,
+            tuple[QColor, int, int],
+        ] = {}
         self.collapsed_fade_blocks: dict[int, QColor] = {}
         self.horizontalScrollBar().rangeChanged.connect(
             self._lock_horizontal_scroll
@@ -3810,9 +3827,55 @@ class MessageLogBrowser(QTextBrowser):
             )
         painter.end()
 
+    def _paint_row_background_padding(self, event: Any) -> None:
+        """Paint block-margin bands after Qt clears the document viewport."""
+        if not self.row_background_padding_blocks:
+            return
+
+        viewport = self.viewport()
+        viewport_width = viewport.width()
+        document_layout = self.document().documentLayout()
+        scroll_y = self.verticalScrollBar().value()
+        painter = QPainter(viewport)
+        painter.setClipRegion(event.region())
+        for block_number, padding in (
+            self.row_background_padding_blocks.items()
+        ):
+            background, top_padding, bottom_padding = padding
+            block = self.document().findBlockByNumber(block_number)
+            if not block.isValid():
+                continue
+            block_rect = document_layout.blockBoundingRect(block)
+            top = round(block_rect.top()) - scroll_y
+            height = max(1, round(block_rect.height()))
+            if (
+                top > event.rect().bottom()
+                or top + height < event.rect().top()
+            ):
+                continue
+            painter.fillRect(
+                0,
+                top - top_padding,
+                viewport_width,
+                top_padding,
+                background,
+            )
+            painter.fillRect(
+                0,
+                top + height,
+                viewport_width,
+                bottom_padding,
+                background,
+            )
+        painter.end()
+
     def paintEvent(self, event: Any) -> None:
         self._paint_row_backgrounds(event)
         super().paintEvent(event)
+        # QTextDocument paints block backgrounds only behind the text line,
+        # not inside block margins. These bands contain no text, so they can
+        # safely be completed after the base document paint.
+        self._paint_row_background_padding(event)
         self._paint_text_shadows(event)
         if not self.collapsed_fade_blocks:
             return
@@ -4920,15 +4983,11 @@ class EncryptedChatClient(QObject):
         old_frame_geometry = self.root.frameGeometry()
         frame_offset_x = old_geometry.x() - old_frame_geometry.x()
         frame_offset_y = old_geometry.y() - old_frame_geometry.y()
-        self.chatrooms_toggle.setText("‹" if expanded else "›")
-        self.chatrooms_panel.setVisible(expanded)
-        self.root.setMinimumWidth(
-            self.root.minimumWidth() + (
-                width_delta if expanded else -width_delta
-            )
+        new_minimum_width = self.root.minimumWidth() + (
+            width_delta if expanded else -width_delta
         )
         new_width = max(
-            self.root.minimumWidth(),
+            new_minimum_width,
             old_geometry.width() + (
                 width_delta if expanded else -width_delta
             ),
@@ -4936,12 +4995,29 @@ class EncryptedChatClient(QObject):
         target_frame_x = old_frame_geometry.x() + (
             -width_delta if expanded else width_delta
         )
-        self.root.setGeometry(
-            target_frame_x + frame_offset_x,
-            old_frame_geometry.y() + frame_offset_y,
-            new_width,
-            old_geometry.height(),
-        )
+        # Apply the sidebar and native-window geometry as one paint update.
+        # Otherwise the chat log is briefly laid out at the intermediate
+        # width and visibly flickers while every line reflows.
+        self.root.setUpdatesEnabled(False)
+        try:
+            self.chatrooms_toggle.setText("‹" if expanded else "›")
+            self.root.setMinimumWidth(new_minimum_width)
+            self.root.setGeometry(
+                target_frame_x + frame_offset_x,
+                old_frame_geometry.y() + frame_offset_y,
+                new_width,
+                old_geometry.height(),
+            )
+            self.chatrooms_panel.setVisible(expanded)
+            central_widget = self.root.centralWidget()
+            if (
+                central_widget is not None
+                and central_widget.layout() is not None
+            ):
+                central_widget.layout().activate()
+        finally:
+            self.root.setUpdatesEnabled(True)
+            self.root.update()
 
     def _chatroom_definitions(self) -> list[dict[str, str]]:
         rooms = [{
@@ -5888,37 +5964,54 @@ class EncryptedChatClient(QObject):
 
     def _on_identity_menu_toggled(self, checked: bool) -> None:
         keep_at_bottom = self._chat_is_scrolled_to_bottom()
-        self.identity_menu.setVisible(checked)
+        self._set_composer_menu_visibility(
+            self.identity_menu if checked else None
+        )
         if checked:
-            self._set_button_checked(self.font_menu_button, False)
-            self.font_menu.hide()
-            self._set_button_checked(self.formatting_menu_button, False)
-            self.formatting_menu.hide()
             self.identity_username_entry.setFocus()
         self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
 
     def _on_font_menu_toggled(self, checked: bool) -> None:
         keep_at_bottom = self._chat_is_scrolled_to_bottom()
-        self.font_menu.setVisible(checked)
+        self._set_composer_menu_visibility(
+            self.font_menu if checked else None
+        )
         if checked:
-            self._set_button_checked(self.identity_menu_button, False)
-            self.identity_menu.hide()
-            self._set_button_checked(self.formatting_menu_button, False)
-            self.formatting_menu.hide()
             self.message_font_combo.setFocus()
         self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
 
     def _on_formatting_menu_toggled(self, checked: bool) -> None:
         keep_at_bottom = self._chat_is_scrolled_to_bottom()
-        self.formatting_menu.setVisible(checked)
+        self._set_composer_menu_visibility(
+            self.formatting_menu if checked else None
+        )
         if checked:
-            self._set_button_checked(self.identity_menu_button, False)
-            self.identity_menu.hide()
-            self._set_button_checked(self.font_menu_button, False)
-            self.font_menu.hide()
             self.message_entry.setFocus()
             self._sync_formatting_buttons()
         self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
+
+    def _set_composer_menu_visibility(
+        self,
+        visible_menu: QWidget | None,
+    ) -> None:
+        # Direct switching used to show the new panel before hiding the old
+        # one, making the log jump through a two-menu intermediate height.
+        self.chat_content.setUpdatesEnabled(False)
+        try:
+            for menu, button in (
+                (self.identity_menu, self.identity_menu_button),
+                (self.font_menu, self.font_menu_button),
+                (self.formatting_menu, self.formatting_menu_button),
+            ):
+                should_show = menu is visible_menu
+                self._set_button_checked(button, should_show)
+                menu.setVisible(should_show)
+            content_layout = self.chat_content.layout()
+            if content_layout is not None:
+                content_layout.activate()
+        finally:
+            self.chat_content.setUpdatesEnabled(True)
+            self.chat_content.update()
 
     def _chat_is_scrolled_to_bottom(self) -> bool:
         scrollbar = self.chat_display.verticalScrollBar()
@@ -8636,13 +8729,26 @@ class EncryptedChatClient(QObject):
         persist: bool = True,
         render: bool = True,
     ) -> None:
-        self.message_log.append({
+        item = {
             "message": message,
             "is_local": is_local,
             "warning": warning,
             "ntfy_id": ntfy_id,
             "ntfy_time": ntfy_time or int(message.get("t", time.time())),
-        })
+        }
+        if is_local and self.message_log:
+            newest_received_time = max(
+                int(existing.get(
+                    "ntfy_time",
+                    existing.get("message", {}).get("t", 0),
+                ) or 0)
+                for existing in self.message_log
+            )
+            item["display_sort_time"] = max(
+                int(item["ntfy_time"]),
+                newest_received_time + 1,
+            )
+        self.message_log.append(item)
 
         self.message_log.sort(key=self._message_sort_key)
         history_limit = self._chatroom_history_limit()
@@ -8703,6 +8809,11 @@ class EncryptedChatClient(QObject):
                 "warning": None,
                 "ntfy_id": ntfy_id,
                 "ntfy_time": stored_ntfy_time,
+                **(
+                    {"display_sort_time": int(item["display_sort_time"])}
+                    if type(item.get("display_sort_time")) is int
+                    else {}
+                ),
             })
 
         self.message_log.sort(key=self._message_sort_key)
@@ -8726,6 +8837,11 @@ class EncryptedChatClient(QObject):
                 "warning": item.get("warning"),
                 "ntfy_id": item.get("ntfy_id"),
                 "ntfy_time": int(item.get("ntfy_time", 0) or 0),
+                **(
+                    {"display_sort_time": int(item["display_sort_time"])}
+                    if type(item.get("display_sort_time")) is int
+                    else {}
+                ),
             })
 
         try:
@@ -9902,16 +10018,16 @@ class EncryptedChatClient(QObject):
             cursor.insertBlock()
         separator_block = QTextBlockFormat()
         separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        separator_font_height = QFontMetrics(
-            self._make_message_font(DEFAULT_MESSAGE_FONT)
-        ).height()
-        separator_block.setLineHeight(
-            float(separator_font_height + 14),
-            QTextBlockFormat.LineHeightTypes.FixedHeight.value,
-        )
+        # Symmetric padding keeps the text vertically centered. The log's
+        # background painter covers the complete block, including margins.
+        separator_block.setTopMargin(7)
+        separator_block.setBottomMargin(7)
         separator_block.setBackground(QColor(background_color))
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
+        self.chat_display.row_background_padding_blocks[
+            cursor.block().blockNumber()
+        ] = (QColor(background_color), 7, 7)
 
         selection = QTextEdit.ExtraSelection()
         selection.cursor = QTextCursor(cursor.block())
@@ -9999,6 +10115,7 @@ class EncryptedChatClient(QObject):
         self.rendered_image_candidates.clear()
         self.chat_display.clear()
         self.chat_display.row_background_blocks.clear()
+        self.chat_display.row_background_padding_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
 
         cursor = self.chat_display.textCursor()
@@ -10426,6 +10543,7 @@ class EncryptedChatClient(QObject):
         self.animated_media_controllers.clear()
         self.last_inline_animation_frame_at.clear()
         self.chat_display.row_background_blocks.clear()
+        self.chat_display.row_background_padding_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
         self.chat_display.setExtraSelections([])
         self._reset_chat_document()

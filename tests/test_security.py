@@ -620,6 +620,35 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
             network_source.index("self._network_send(outbound)"),
         )
 
+    def test_new_local_message_stays_after_received_rows(self) -> None:
+        client = mock.Mock()
+        client.message_log = [{
+            "message": {"i": "remote", "t": 1001},
+            "is_local": False,
+            "warning": None,
+            "ntfy_id": "ntfy-remote",
+            "ntfy_time": 1001,
+        }]
+        client._message_sort_key = SPRITELINK.message_item_sort_key
+        client._chatroom_history_limit.return_value = 100
+
+        SPRITELINK.EncryptedChatClient._add_message_to_log(
+            client,
+            {"i": "local", "t": 1000},
+            is_local=True,
+            persist=False,
+            render=False,
+        )
+
+        self.assertEqual(
+            [item["message"]["i"] for item in client.message_log],
+            ["remote", "local"],
+        )
+        self.assertGreater(
+            client.message_log[-1]["display_sort_time"],
+            client.message_log[0]["ntfy_time"],
+        )
+
     def test_every_rendered_message_enforces_a_new_row_boundary(self) -> None:
         source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_message_item
@@ -630,7 +659,7 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         self.assertLess(boundary, insert_block)
         self.assertLess(insert_block, message_start)
 
-    def test_hour_and_date_separators_are_both_retained(self) -> None:
+    def test_hour_separator_is_omitted_beside_a_date_separator(self) -> None:
         same_day_start = int(
             SPRITELINK.datetime(2026, 7, 20, 8, 0).timestamp()
         )
@@ -655,17 +684,30 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
             previous_day,
             next_day,
         )
-        self.assertEqual(separators[0], "————— 7 hours later —————")
-        self.assertIn("Jul 21, 2026", separators[1])
+        self.assertEqual(len(separators), 1)
+        self.assertIn("Jul 21, 2026", separators[0])
+        self.assertNotIn("hours later", separators[0])
 
         insert_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_log_separator
         )
         self.assertIn("if cursor.block().text():", insert_source)
-        self.assertIn("setLineHeight", insert_source)
+        self.assertIn("setTopMargin(7)", insert_source)
+        self.assertIn("setBottomMargin(7)", insert_source)
         self.assertIn("setBackground", insert_source)
-        self.assertNotIn("setTopMargin", insert_source)
-        self.assertNotIn("setBottomMargin", insert_source)
+        self.assertIn("row_background_padding_blocks", insert_source)
+
+        padding_paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_row_background_padding
+        )
+        self.assertEqual(padding_paint_source.count("painter.fillRect("), 2)
+        paint_event_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser.paintEvent
+        )
+        self.assertGreater(
+            paint_event_source.index("_paint_row_background_padding"),
+            paint_event_source.index("super().paintEvent(event)"),
+        )
 
     def test_composer_menus_keep_a_bottomed_log_at_the_bottom(self) -> None:
         restore_source = inspect.getsource(
@@ -687,6 +729,24 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
                 "_restore_chat_bottom_after_menu_toggle",
                 source,
             )
+
+        visibility_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._set_composer_menu_visibility
+        )
+        self.assertIn("setUpdatesEnabled(False)", visibility_source)
+        self.assertIn("setUpdatesEnabled(True)", visibility_source)
+        self.assertLess(
+            visibility_source.index("menu.setVisible(should_show)"),
+            visibility_source.index("content_layout.activate()"),
+        )
+
+        sidebar_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_chatrooms_toggled
+        )
+        self.assertIn("setUpdatesEnabled(False)", sidebar_source)
+        self.assertIn("setUpdatesEnabled(True)", sidebar_source)
+        self.assertIn("central_widget.layout().activate()", sidebar_source)
 
 
 class TrayBehaviorTests(unittest.TestCase):
@@ -3009,7 +3069,21 @@ class Version120ReleaseTests(unittest.TestCase):
                 1_000_000 - retention,
                 now=1_000_000,
             ),
-            "Stored on server",
+            "On server (1h)",
+        )
+        self.assertEqual(
+            SPRITELINK.message_storage_status(
+                1_000_000,
+                now=1_000_000,
+            ),
+            "On server (12h)",
+        )
+        self.assertEqual(
+            SPRITELINK.message_storage_status(
+                1_000_000 - 3601,
+                now=1_000_000,
+            ),
+            "On server (11h)",
         )
         self.assertEqual(
             SPRITELINK.message_storage_status(
