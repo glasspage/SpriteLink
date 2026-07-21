@@ -5265,84 +5265,8 @@ class EncryptedChatClient(QObject):
         self._refresh_chatroom_list()
 
     def _on_chatrooms_toggled(self, expanded: bool) -> None:
-        width_delta = CHATROOM_SIDEBAR_WIDTH
-        old_geometry = self.root.geometry()
-        new_minimum_width = MINIMUM_WINDOW_WIDTH + (
-            width_delta if expanded else 0
-        )
-        new_width = max(
-            new_minimum_width,
-            old_geometry.width() + (
-                width_delta if expanded else -width_delta
-            ),
-        )
-        target_x = old_geometry.x() + (
-            -width_delta if expanded else width_delta
-        )
-        self._set_window_redraw_enabled(False)
-        self.root.setUpdatesEnabled(False)
-        try:
-            self.chatrooms_toggle.setText("‹" if expanded else "›")
-            # Lower the constraint before shrinking, but do not raise it
-            # before expanding. Raising it first makes Qt resize the window
-            # at its old position before the real move reaches Windows.
-            if not expanded:
-                self.root.setMinimumWidth(new_minimum_width)
-                self.chatrooms_panel.hide()
-            # Keep Qt as the sole owner of the top-level geometry. Calling
-            # SetWindowPos directly leaves QWidget.geometry() stale until a
-            # later native event, so the next toggle can calculate from the
-            # wrong width and snap the window to its minimum size.
-            self.root.setGeometry(
-                target_x,
-                old_geometry.y(),
-                new_width,
-                old_geometry.height(),
-            )
-            if expanded:
-                self.chatrooms_panel.show()
-                self.root.setMinimumWidth(new_minimum_width)
-            central_widget = self.root.centralWidget()
-            if (
-                central_widget is not None
-                and central_widget.layout() is not None
-            ):
-                central_widget.layout().activate()
-        finally:
-            self.root.setUpdatesEnabled(True)
-            self._set_window_redraw_enabled(True)
-
-    def _set_window_redraw_enabled(self, enabled: bool) -> None:
-        if os.name != "nt" or not hasattr(ctypes, "windll"):
-            return
-
-        # setUpdatesEnabled() stops Qt paint events, but it does not stop DWM
-        # from presenting the native client surface while WM_SIZE is laying
-        # out the children. WM_SETREDRAW provides that missing presentation
-        # barrier. Once both the Qt geometry and child layout are final, one
-        # full native redraw exposes only the completed state.
-        user32 = ctypes.windll.user32
-        hwnd = wintypes.HWND(int(self.root.winId()))
-        wm_setredraw = 0x000B
-        user32.SendMessageW(hwnd, wm_setredraw, int(enabled), 0)
-        if not enabled:
-            return
-
-        rdw_invalidate = 0x0001
-        rdw_erase = 0x0004
-        rdw_allchildren = 0x0080
-        rdw_updatenow = 0x0100
-        rdw_frame = 0x0400
-        user32.RedrawWindow(
-            hwnd,
-            None,
-            None,
-            rdw_invalidate
-            | rdw_erase
-            | rdw_allchildren
-            | rdw_updatenow
-            | rdw_frame,
-        )
+        self.chatrooms_toggle.setText("‹" if expanded else "›")
+        self.chatrooms_panel.setVisible(expanded)
 
     def _chatroom_definitions(self) -> list[dict[str, str]]:
         rooms = [{
