@@ -4675,6 +4675,8 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
         self.rendered_message_blocks: dict[int, str] = {}
         self.rendered_image_links: dict[str, str] = {}
+        self.rendered_link_targets: dict[str, tuple[str, str]] = {}
+        self.rendered_link_senders: dict[str, str] = {}
         self.rendered_image_positions: dict[str, list[int]] = {}
         self.rendered_image_candidates: dict[str, list[int]] = {}
         self.viewport_embedded_image_urls: set[str] = set()
@@ -5267,6 +5269,8 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
         self.rendered_image_links.clear()
+        self.rendered_link_targets.clear()
+        self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
         self.viewport_embedded_image_urls.clear()
@@ -9984,13 +9988,41 @@ class EncryptedChatClient(QObject):
         return image_url
 
     def _link_url_from_anchor(self, anchor: str) -> str | None:
-        image_url = self._image_url_from_anchor(anchor)
-        if image_url:
-            return image_url
+        link_target = self._link_target_from_anchor(anchor)
+        if link_target is not None:
+            return link_target[0]
         parsed = QUrl(anchor)
         if parsed.isValid() and parsed.scheme().casefold() == "https":
             return anchor
         return None
+
+    def _link_target_from_anchor(
+        self,
+        anchor: str,
+    ) -> tuple[str, str | None] | None:
+        image_url = self._image_url_from_anchor(anchor)
+        if image_url:
+            return image_url, self.rendered_link_senders.get(anchor)
+
+        prefix = "spritelink-link:"
+        if anchor.startswith(prefix):
+            return self.rendered_link_targets.get(anchor[len(prefix):])
+
+        parsed = QUrl(anchor)
+        if parsed.isValid() and parsed.scheme().casefold() == "https":
+            return anchor, None
+        return None
+
+    def _register_rendered_link(
+        self,
+        url: str,
+        client_id: str,
+    ) -> str:
+        token = hashlib.sha256(
+            f"{client_id}\0{url}".encode("utf-8")
+        ).hexdigest()
+        self.rendered_link_targets[token] = (url, client_id)
+        return f"spritelink-link:{token}"
 
     def _show_link_context_menu(
         self,
@@ -10351,19 +10383,26 @@ class EncryptedChatClient(QObject):
                     image_url = self._image_url_from_anchor(anchor)
                     if image_url:
                         if event.type() == QEvent.Type.MouseButtonRelease:
-                            client_id = self._sender_at_position(
-                                event.position().toPoint()
+                            client_id = (
+                                self.rendered_link_senders.get(anchor)
+                                or self._sender_at_position(
+                                    event.position().toPoint()
+                                )
                             )
                             self._show_image_preview_popup(
                                 image_url,
                                 client_id,
                             )
                         return True
-                    link_url = self._link_url_from_anchor(anchor)
-                    if link_url:
+                    link_target = self._link_target_from_anchor(anchor)
+                    if link_target:
                         if event.type() == QEvent.Type.MouseButtonRelease:
-                            client_id = self._sender_at_position(
-                                event.position().toPoint()
+                            link_url, anchored_client_id = link_target
+                            client_id = (
+                                anchored_client_id
+                                or self._sender_at_position(
+                                    event.position().toPoint()
+                                )
                             )
                             self._open_url_in_browser(
                                 link_url,
@@ -10700,6 +10739,7 @@ class EncryptedChatClient(QObject):
         text: str,
         body_color: str,
         font_name: str,
+        client_id: str,
         *,
         muted: bool,
         ui_font: bool,
@@ -10751,7 +10791,11 @@ class EncryptedChatClient(QObject):
                 overlap_end = min(end, run.end)
                 insert_chunk(position, overlap_start)
                 if url not in embedded_image_urls:
-                    insert_chunk(overlap_start, overlap_end, url)
+                    insert_chunk(
+                        overlap_start,
+                        overlap_end,
+                        self._register_rendered_link(url, client_id),
+                    )
                 position = overlap_end
             insert_chunk(position, run.end)
 
@@ -10806,6 +10850,7 @@ class EncryptedChatClient(QObject):
         self,
         cursor: QTextCursor,
         url: str,
+        client_id: str,
     ) -> bool:
         media = self.image_preview_cache.get(url)
         if not isinstance(media, RemoteMediaPreview):
@@ -10813,9 +10858,16 @@ class EncryptedChatClient(QObject):
         if not is_likely_nsfw_image_url(url):
             self._ensure_animated_media_controller(url, media)
         preview = self._embedded_media_preview(url, media)
-        token = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        self.rendered_image_links[token] = url
-        resource_url = QUrl(f"spritelink-chat-image-resource:{token}")
+        link_token = hashlib.sha256(
+            f"{client_id}\0{url}".encode("utf-8")
+        ).hexdigest()
+        self.rendered_image_links[link_token] = url
+        anchor = f"spritelink-image:{link_token}"
+        self.rendered_link_senders[anchor] = client_id
+        resource_token = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        resource_url = QUrl(
+            f"spritelink-chat-image-resource:{resource_token}"
+        )
         cursor.document().addResource(
             QTextDocument.ResourceType.ImageResource,
             resource_url,
@@ -10829,7 +10881,7 @@ class EncryptedChatClient(QObject):
             QTextCharFormat.VerticalAlignment.AlignTop
         )
         image_format.setAnchor(True)
-        image_format.setAnchorHref(f"spritelink-image:{token}")
+        image_format.setAnchorHref(anchor)
         image_position = cursor.position()
         cursor.insertImage(image_format)
         self.rendered_image_positions.setdefault(url, []).append(
@@ -10998,6 +11050,8 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
         self.rendered_image_links.clear()
+        self.rendered_link_targets.clear()
+        self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
         self.chat_display.clear()
@@ -11329,6 +11383,7 @@ class EncryptedChatClient(QObject):
                 display_text,
                 body_color,
                 font_name,
+                client_id,
                 muted=is_muted,
                 ui_font=is_muted,
                 embedded_image_urls=set(image_urls),
@@ -11339,7 +11394,11 @@ class EncryptedChatClient(QObject):
         if add_image_line_break:
             cursor.insertBlock()
         for image_url in active_image_urls:
-            self._insert_embedded_image_preview(cursor, image_url)
+            self._insert_embedded_image_preview(
+                cursor,
+                image_url,
+                client_id,
+            )
 
         if item.get("warning") and not is_collapsed:
             cursor.insertBlock()
@@ -11422,6 +11481,8 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
         self.rendered_image_links.clear()
+        self.rendered_link_targets.clear()
+        self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
         self.viewport_embedded_image_urls.clear()
