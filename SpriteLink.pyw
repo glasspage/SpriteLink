@@ -11788,8 +11788,8 @@ class EncryptedChatClient(QObject):
             block_format.setBackground(QColor(background_color))
             if block.blockNumber() not in embedded_media_block_numbers:
                 block_format.setLineHeight(
-                    MESSAGE_LINE_HEIGHT_PX,
-                    QTextBlockFormat.LineHeightTypes.FixedHeight,
+                    float(MESSAGE_LINE_HEIGHT_PX),
+                    int(QTextBlockFormat.LineHeightTypes.FixedHeight.value),
                 )
             block_cursor.setBlockFormat(block_format)
 
