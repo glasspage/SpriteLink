@@ -1512,6 +1512,10 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
         )
         self.assertLess(
             user_source.index('menu.addAction("Trust Images from User")'),
+            user_source.index('menu.addAction("Trust Links from User")'),
+        )
+        self.assertLess(
+            user_source.index('menu.addAction("Trust Links from User")'),
             user_source.index('"Unmute User" if is_muted else "Mute User"'),
         )
         self.assertNotIn("Collapse Message", user_source)
@@ -2132,6 +2136,54 @@ class ImageTrustTests(unittest.TestCase):
 
 
 class LinkSafetyTests(unittest.TestCase):
+    def test_user_link_trust_bypasses_only_ordinary_warnings(self) -> None:
+        trusted_user_ids = {"trusted-sender"}
+        ordinary = SPRITELINK.analyze_link_url("https://example.com/")
+        suspicious = SPRITELINK.analyze_link_url(
+            "https://google.com@evilsite.net/"
+        )
+        lookalike = SPRITELINK.analyze_link_url(
+            "https://gооgle.com/"
+        )
+
+        self.assertFalse(SPRITELINK.link_requires_warning(
+            ordinary,
+            "trusted-sender",
+            trusted_user_ids,
+        ))
+        self.assertTrue(SPRITELINK.link_requires_warning(
+            ordinary,
+            "untrusted-sender",
+            trusted_user_ids,
+        ))
+        self.assertTrue(SPRITELINK.link_requires_warning(
+            suspicious,
+            "trusted-sender",
+            trusted_user_ids,
+        ))
+        self.assertTrue(SPRITELINK.link_requires_warning(
+            lookalike,
+            "trusted-sender",
+            trusted_user_ids,
+        ))
+
+    def test_user_link_trust_is_disabled_by_default_and_persisted(self) -> None:
+        config = SPRITELINK.default_config()
+        self.assertEqual(config["trusted_link_users"], {})
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._set_user_link_trusted
+        )
+        self.assertIn('"trusted_link_users"', source)
+        self.assertIn("_write_room_preference_ids", source)
+        menu_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_username_context_menu
+        )
+        self.assertIn("setCheckable(True)", menu_source)
+        self.assertIn(
+            "trust_links_action.setChecked(trusts_links)",
+            menu_source,
+        )
+
     def test_popular_and_sfw_media_domains_open_without_warning(self) -> None:
         trusted_urls = (
             "https://google.com/search?q=spritelink",
