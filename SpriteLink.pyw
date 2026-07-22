@@ -1989,7 +1989,11 @@ def link_requires_warning(
     analysis: LinkSafetyAnalysis,
     client_id: str | None,
     trusted_user_ids: set[str],
+    *,
+    is_local: bool = False,
 ) -> bool:
+    if is_local:
+        return False
     if analysis.suspicious:
         return True
     return not (
@@ -9967,6 +9971,10 @@ class EncryptedChatClient(QObject):
             analysis,
             client_id,
             trusted_user_ids,
+            is_local=(
+                client_id is not None
+                and client_id == self._authenticated_client_id()
+            ),
         ):
             self._launch_url_in_browser(url)
             return
