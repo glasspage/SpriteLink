@@ -2131,6 +2131,109 @@ class ImageTrustTests(unittest.TestCase):
         )
 
 
+class LinkSafetyTests(unittest.TestCase):
+    def test_popular_and_sfw_media_domains_open_without_warning(self) -> None:
+        trusted_urls = (
+            "https://google.com/search?q=spritelink",
+            "https://www.youtube.com/watch?v=example",
+            "https://github.com/glasspage/SpriteLink",
+            "https://discord.com/channels/example",
+            "https://en.wikipedia.org/wiki/Instant_messaging",
+            "https://cdn.discordapp.com/attachments/1/2/example.png",
+            "https://upload.wikimedia.org/example.png",
+            "https://media2.giphy.com/media/example/giphy.gif",
+            "https://cdn.klipy.com/example.gif",
+            "https://images.unsplash.com/example",
+            "https://raw.githubusercontent.com/owner/repo/main/image.png",
+        )
+        for url in trusted_urls:
+            with self.subTest(url=url):
+                self.assertTrue(SPRITELINK.analyze_link_url(url).trusted)
+
+    def test_domain_matching_does_not_trust_suffix_spoofing(self) -> None:
+        for url in (
+            "https://github.com.evil.example/login",
+            "https://notgithub.com/login",
+            "https://discord.com.evil.example/invite",
+            "https://example.com/",
+        ):
+            with self.subTest(url=url):
+                analysis = SPRITELINK.analyze_link_url(url)
+                self.assertFalse(analysis.trusted)
+                self.assertFalse(analysis.suspicious)
+
+    def test_unicode_lookalikes_are_underlined_and_suspicious(self) -> None:
+        url = "https://gооgle.com/account"
+        analysis = SPRITELINK.analyze_link_url(url)
+        self.assertFalse(analysis.trusted)
+        self.assertTrue(analysis.has_lookalike_characters)
+        self.assertFalse(analysis.has_userinfo)
+        html = SPRITELINK.link_warning_url_html(
+            url,
+            analysis.underlined_indices,
+        )
+        self.assertIn("<u>оо</u>", html)
+        self.assertNotIn("<u>gle", html)
+
+    def test_punycode_domains_are_marked_as_lookalikes(self) -> None:
+        url = "https://xn--80ak6aa92e.com/"
+        analysis = SPRITELINK.analyze_link_url(url)
+        self.assertTrue(analysis.has_lookalike_characters)
+        self.assertIn(
+            "<u>xn--80ak6aa92e</u>",
+            SPRITELINK.link_warning_url_html(
+                url,
+                analysis.underlined_indices,
+            ),
+        )
+
+    def test_non_confusable_international_domain_is_not_mislabeled(self) -> None:
+        analysis = SPRITELINK.analyze_link_url("https://münich.example/")
+        self.assertFalse(analysis.trusted)
+        self.assertFalse(analysis.has_lookalike_characters)
+
+    def test_userinfo_spoofing_underlines_the_real_hostname(self) -> None:
+        url = "https://google.com@evilsite.net/private"
+        analysis = SPRITELINK.analyze_link_url(url)
+        self.assertFalse(analysis.trusted)
+        self.assertTrue(analysis.has_userinfo)
+        self.assertFalse(analysis.has_lookalike_characters)
+        self.assertIn(
+            "google.com@<u>evilsite.net</u>/private",
+            SPRITELINK.link_warning_url_html(
+                url,
+                analysis.underlined_indices,
+            ),
+        )
+
+    def test_trusted_real_hostname_still_warns_when_userinfo_exists(self) -> None:
+        analysis = SPRITELINK.analyze_link_url(
+            "https://attacker@github.com/"
+        )
+        self.assertFalse(analysis.trusted)
+        self.assertTrue(analysis.suspicious)
+
+    def test_link_warning_popup_contains_requested_copy_and_actions(self) -> None:
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_link_warning_popup
+        )
+        show_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_link_warning_popup
+        )
+        self.assertIn('self._heading("Link Warning")', build_source)
+        self.assertIn(
+            "Make sure you trust this website before continuing.",
+            build_source,
+        )
+        self.assertIn('QPushButton("Go to URL")', build_source)
+        self.assertIn('QPushButton("Cancel")', build_source)
+        self.assertIn("TextSelectableByMouse", build_source)
+        self.assertIn("look-alike characters", show_source)
+        self.assertIn("username section", show_source)
+        self.assertIn("before the domain name.", show_source)
+        self.assertIn('"color: #c00000;"', show_source)
+
+
 class ImageEmbeddingTests(unittest.TestCase):
     def test_extensionless_provider_pages_are_embeddable(self) -> None:
         urls = (
