@@ -595,7 +595,8 @@ COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
 RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
 RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
 RENDERED_SPOILER_REVEALED_PROPERTY = int(QTextFormat.Property.UserProperty) + 4
-REVEALED_SPOILER_BLOCK_ALPHA = 13
+SPOILER_BLOCK_COLOR = "#1a1a1a"
+REVEALED_SPOILER_BLOCK_ALPHA = 26
 SPOILER_HORIZONTAL_PADDING_PX = 2
 SPOILER_PADDING_CHARACTER = "\u00a0"
 SELECTABLE_MESSAGE_FONTS = (
@@ -3297,7 +3298,7 @@ class ComposeTextEdit(QPlainTextEdit):
             formatting.setFontUnderline(enabled)
         elif style == "spoiler":
             formatting.setProperty(COMPOSER_SPOILER_PROPERTY, enabled)
-            block_color = QColor("#000000")
+            block_color = QColor(SPOILER_BLOCK_COLOR)
             block_color.setAlpha(
                 REVEALED_SPOILER_BLOCK_ALPHA if enabled else 0
             )
@@ -3381,7 +3382,7 @@ class SpoilerFormatButton(QPushButton):
             SPOILER_HORIZONTAL_PADDING_PX,
             0,
         )
-        block_color = QColor("#000000")
+        block_color = QColor(SPOILER_BLOCK_COLOR)
         block_color.setAlpha(REVEALED_SPOILER_BLOCK_ALPHA)
         painter.fillRect(block_rect, block_color)
         self.style().drawItemText(
@@ -4405,6 +4406,89 @@ class MessageLogBrowser(QTextBrowser):
 
         painter.end()
 
+    def _paint_spoilers_over_selection(self, event: Any) -> None:
+        """Keep spoiler formatting visible above Qt's selection colors."""
+        if not self.textCursor().hasSelection():
+            return
+
+        viewport = self.viewport()
+        viewport_width = viewport.width()
+        viewport_height = viewport.height()
+        if viewport_width <= 0 or viewport_height <= 0:
+            return
+
+        paint_rect = event.rect()
+        first_block = self.cursorForPosition(QPoint(
+            0,
+            max(0, paint_rect.top()),
+        )).block().blockNumber()
+        last_block = self.cursorForPosition(QPoint(
+            max(0, viewport_width - 1),
+            min(viewport_height - 1, paint_rect.bottom()),
+        )).block().blockNumber()
+        first_block = max(0, first_block - 1)
+        last_block = min(
+            self.document().blockCount() - 1,
+            last_block + 1,
+        )
+
+        scroll_x = self.horizontalScrollBar().value()
+        scroll_y = self.verticalScrollBar().value()
+        layout_origin = QPointF(-scroll_x, -scroll_y)
+        painter = QPainter(viewport)
+
+        for block_number in range(first_block, last_block + 1):
+            block = self.document().findBlockByNumber(block_number)
+            if not block.isValid() or block.length() <= 1:
+                continue
+            layout = block.layout()
+            if layout is None or layout.lineCount() <= 0:
+                continue
+
+            spoiler_region = QRegion()
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid() and fragment.charFormat().property(
+                    RENDERED_SPOILER_ID_PROPERTY
+                ):
+                    fragment_start = fragment.position() - block.position()
+                    fragment_end = fragment_start + fragment.length()
+                    for line_index in range(layout.lineCount()):
+                        line = layout.lineAt(line_index)
+                        line_start = line.textStart()
+                        line_end = line_start + line.textLength()
+                        start = max(fragment_start, line_start)
+                        end = min(fragment_end, line_end)
+                        if end <= start:
+                            continue
+                        start_x = line.cursorToX(start)[0]
+                        end_x = line.cursorToX(end)[0]
+                        spoiler_rect = QRectF(
+                            layout.position().x() + min(start_x, end_x)
+                            - scroll_x,
+                            layout.position().y() + line.y() - scroll_y,
+                            max(1.0, abs(end_x - start_x)),
+                            line.height(),
+                        ).toAlignedRect()
+                        spoiler_region = spoiler_region.united(
+                            QRegion(spoiler_rect)
+                        )
+                iterator += 1
+
+            spoiler_region = spoiler_region.intersected(event.region())
+            if spoiler_region.isEmpty():
+                continue
+            painter.save()
+            painter.setClipRegion(
+                spoiler_region,
+                Qt.ClipOperation.ReplaceClip,
+            )
+            layout.draw(painter, layout_origin)
+            painter.restore()
+
+        painter.end()
+
     def _paint_row_backgrounds(self, event: Any) -> None:
         if not self.row_background_blocks:
             return
@@ -4504,6 +4588,7 @@ class MessageLogBrowser(QTextBrowser):
         # safely be completed after the base document paint.
         self._paint_row_background_padding(event)
         self._paint_text_shadows(event)
+        self._paint_spoilers_over_selection(event)
         if not self.collapsed_fade_blocks:
             return
 
@@ -10635,9 +10720,11 @@ class EncryptedChatClient(QObject):
                 RENDERED_SPOILER_COLOR_PROPERTY
             )
             formatting.setForeground(
-                QColor(original_color) if reveal else QColor("#000000")
+                QColor(original_color)
+                if reveal
+                else QColor(SPOILER_BLOCK_COLOR)
             )
-            block_color = QColor("#000000")
+            block_color = QColor(SPOILER_BLOCK_COLOR)
             block_color.setAlpha(
                 REVEALED_SPOILER_BLOCK_ALPHA if reveal else 255
             )
@@ -10973,8 +11060,8 @@ class EncryptedChatClient(QObject):
                         RENDERED_SPOILER_REVEALED_PROPERTY,
                         False,
                     )
-                    formatting.setForeground(QColor("#000000"))
-                    formatting.setBackground(QColor("#000000"))
+                    formatting.setForeground(QColor(SPOILER_BLOCK_COLOR))
+                    formatting.setBackground(QColor(SPOILER_BLOCK_COLOR))
                 return formatting
 
             def insert_padding(*, inside: bool) -> None:
