@@ -970,7 +970,7 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn('QPushButton("Bold")', ui_source)
         self.assertIn('QPushButton("Italic")', ui_source)
         self.assertIn('QPushButton("Underline")', ui_source)
-        self.assertIn('QPushButton("Spoiler")', ui_source)
+        self.assertIn('SpoilerFormatButton("Spoiler")', ui_source)
         self.assertIn("bold_button_font.setBold(True)", ui_source)
         self.assertIn("italic_button_font.setItalic(True)", ui_source)
         self.assertIn("underline_button_font.setUnderline(True)", ui_source)
@@ -986,6 +986,8 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn("cursor.mergeCharFormat", toggle_source)
         self.assertIn("mergeCurrentCharFormat", toggle_source)
         self.assertIn("COMPOSER_SPOILER_PROPERTY", toggle_source)
+        self.assertIn("REVEALED_SPOILER_BLOCK_ALPHA", toggle_source)
+        self.assertIn("formatting.setBackground", toggle_source)
         send_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._send_current_message
         )
@@ -1031,6 +1033,21 @@ class RichTextFormattingTests(unittest.TestCase):
         )
         self.assertIn("REVEALED_SPOILER_BLOCK_ALPHA", toggle_source)
         self.assertIn("formatting.setForeground", toggle_source)
+        self.assertIn("insert_padding(inside=False)", insert_source)
+        self.assertIn("insert_padding(inside=True)", insert_source)
+        self.assertIn("SPOILER_HORIZONTAL_PADDING_PX", insert_source)
+
+        shadow_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_text_shadows
+        )
+        self.assertIn("RENDERED_SPOILER_ID_PROPERTY", shadow_source)
+        self.assertIn("shadow_ranges", shadow_source)
+
+        button_source = inspect.getsource(
+            SPRITELINK.SpoilerFormatButton.paintEvent
+        )
+        self.assertIn("REVEALED_SPOILER_BLOCK_ALPHA", button_source)
+        self.assertIn("painter.fillRect", button_source)
 
 
 class RuntimeOptimizationTests(unittest.TestCase):
