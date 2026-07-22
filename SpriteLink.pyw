@@ -590,6 +590,11 @@ DEFAULT_MESSAGE_FONT = "Arial"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
+COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
+RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
+RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
+RENDERED_SPOILER_REVEALED_PROPERTY = int(QTextFormat.Property.UserProperty) + 4
+REVEALED_SPOILER_BLOCK_ALPHA = 13
 SELECTABLE_MESSAGE_FONTS = (
     "Arial",
     "Calibri",
@@ -1208,10 +1213,11 @@ class RichTextRun:
     bold: bool = False
     italic: bool = False
     underline: bool = False
+    spoiler: int | None = None
 
 
-RICH_TEXT_TAG_PATTERN = re.compile(r"</?([biu])>")
-RICH_TEXT_TAG_ORDER = ("b", "i", "u")
+RICH_TEXT_TAG_PATTERN = re.compile(r"</?(b|i|u|sp)>")
+RICH_TEXT_TAG_ORDER = ("sp", "b", "i", "u")
 
 
 @lru_cache(maxsize=4096)
@@ -1221,7 +1227,9 @@ def parse_message_rich_text(
     """Parse SpriteLink's small formatting language without accepting HTML."""
     parts: list[str] = []
     runs: list[RichTextRun] = []
-    active = {tag: 0 for tag in RICH_TEXT_TAG_ORDER}
+    active = {tag: 0 for tag in ("b", "i", "u")}
+    spoiler_stack: list[int] = []
+    next_spoiler_id = 0
     plain_length = 0
     position = 0
 
@@ -1236,6 +1244,7 @@ def parse_message_rich_text(
             active["b"] > 0,
             active["i"] > 0,
             active["u"] > 0,
+            spoiler_stack[-1] if spoiler_stack else None,
         )
         if runs and (
             runs[-1].end == start
@@ -1243,6 +1252,7 @@ def parse_message_rich_text(
                 runs[-1].bold,
                 runs[-1].italic,
                 runs[-1].underline,
+                runs[-1].spoiler,
             ) == style
         ):
             previous = runs[-1]
@@ -1258,7 +1268,15 @@ def parse_message_rich_text(
         append_text(text[position:match.start()])
         tag = match.group(1)
         is_closing = text[match.start() + 1] == "/"
-        if is_closing:
+        if tag == "sp" and is_closing:
+            if spoiler_stack:
+                spoiler_stack.pop()
+            else:
+                append_text(match.group(0))
+        elif tag == "sp":
+            next_spoiler_id += 1
+            spoiler_stack.append(next_spoiler_id)
+        elif is_closing:
             if active[tag] > 0:
                 active[tag] -= 1
             else:
@@ -1674,17 +1692,17 @@ def clear_windows_notification(tag: str) -> bool:
 
 
 def serialize_message_rich_text(
-    segments: list[tuple[str, bool, bool, bool]],
+    segments: list[tuple[str, bool, bool, bool, bool]],
 ) -> str:
     """Serialize visibly formatted composer segments into safe message tags."""
     output: list[str] = []
     active_tags: list[str] = []
-    for text, bold, italic, underline in segments:
+    for text, bold, italic, underline, spoiler in segments:
         desired_tags = [
             tag
             for tag, enabled in zip(
                 RICH_TEXT_TAG_ORDER,
-                (bold, italic, underline),
+                (spoiler, bold, italic, underline),
             )
             if enabled
         ]
@@ -1715,7 +1733,7 @@ def trim_message_text(text: str) -> str:
         return ""
 
     trimmed_length = len(trimmed_plain_text)
-    trimmed_segments: list[tuple[str, bool, bool, bool]] = []
+    trimmed_segments: list[tuple[str, bool, bool, bool, bool]] = []
     for run in runs:
         if run.start >= trimmed_length:
             break
@@ -1725,6 +1743,7 @@ def trim_message_text(text: str) -> str:
             run.bold,
             run.italic,
             run.underline,
+            run.spoiler is not None,
         ))
     return serialize_message_rich_text(trimmed_segments)
 
@@ -3240,12 +3259,12 @@ class ComposeTextEdit(QPlainTextEdit):
     send_requested = Signal()
 
     def to_message_text(self) -> str:
-        segments: list[tuple[str, bool, bool, bool]] = []
+        segments: list[tuple[str, bool, bool, bool, bool]] = []
         block = self.document().begin()
         first_block = True
         while block.isValid():
             if not first_block:
-                segments.append(("\n", False, False, False))
+                segments.append(("\n", False, False, False, False))
             iterator = block.begin()
             while not iterator.atEnd():
                 fragment = iterator.fragment()
@@ -3256,6 +3275,7 @@ class ComposeTextEdit(QPlainTextEdit):
                         formatting.fontWeight() >= QFont.Weight.Bold,
                         formatting.fontItalic(),
                         formatting.fontUnderline(),
+                        bool(formatting.property(COMPOSER_SPOILER_PROPERTY)),
                     ))
                 iterator += 1
             first_block = False
@@ -3272,6 +3292,8 @@ class ComposeTextEdit(QPlainTextEdit):
             formatting.setFontItalic(enabled)
         elif style == "underline":
             formatting.setFontUnderline(enabled)
+        elif style == "spoiler":
+            formatting.setProperty(COMPOSER_SPOILER_PROPERTY, enabled)
         else:
             return
 
@@ -3287,6 +3309,7 @@ class ComposeTextEdit(QPlainTextEdit):
         formatting.setFontWeight(QFont.Weight.Normal)
         formatting.setFontItalic(False)
         formatting.setFontUnderline(False)
+        formatting.setProperty(COMPOSER_SPOILER_PROPERTY, False)
         self.mergeCurrentCharFormat(formatting)
 
     def keyPressEvent(self, event: Any) -> None:
@@ -6520,6 +6543,7 @@ class EncryptedChatClient(QObject):
         self.bold_format_button = QPushButton("Bold")
         self.italic_format_button = QPushButton("Italic")
         self.underline_format_button = QPushButton("Underline")
+        self.spoiler_format_button = QPushButton("Spoiler")
         bold_button_font = QFont(self.bold_format_button.font())
         bold_button_font.setBold(True)
         self.bold_format_button.setFont(bold_button_font)
@@ -6533,6 +6557,7 @@ class EncryptedChatClient(QObject):
             (self.bold_format_button, "bold"),
             (self.italic_format_button, "italic"),
             (self.underline_format_button, "underline"),
+            (self.spoiler_format_button, "spoiler"),
         ):
             button.setCheckable(True)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -6692,6 +6717,10 @@ class EncryptedChatClient(QObject):
             ),
             (self.italic_format_button, formatting.fontItalic()),
             (self.underline_format_button, formatting.fontUnderline()),
+            (
+                self.spoiler_format_button,
+                bool(formatting.property(COMPOSER_SPOILER_PROPERTY)),
+            ),
         )
         for button, checked in states:
             self._set_button_checked(button, checked)
@@ -10353,8 +10382,11 @@ class EncryptedChatClient(QObject):
             elif event.type() == QEvent.Type.MouseMove:
                 anchor = self.chat_display.anchorAt(event.position().toPoint())
                 message_id = self._message_id_from_anchor(anchor)
+                spoiler_id = self._spoiler_id_at_position(
+                    event.position().toPoint()
+                )
 
-                if anchor:
+                if anchor or spoiler_id:
                     self.chat_display.viewport().setCursor(
                         Qt.CursorShape.PointingHandCursor
                     )
@@ -10380,6 +10412,13 @@ class EncryptedChatClient(QObject):
                 QEvent.Type.MouseButtonDblClick,
             ):
                 if event.button() == Qt.MouseButton.LeftButton:
+                    spoiler_id = self._spoiler_id_at_position(
+                        event.position().toPoint()
+                    )
+                    if spoiler_id:
+                        if event.type() == QEvent.Type.MouseButtonRelease:
+                            self._toggle_rendered_spoiler(spoiler_id)
+                        return True
                     anchor = self.chat_display.anchorAt(
                         event.position().toPoint()
                     )
@@ -10466,6 +10505,73 @@ class EncryptedChatClient(QObject):
         return self.rendered_message_blocks.get(
             cursor.block().blockNumber()
         )
+
+    def _spoiler_id_at_position(self, position: QPoint) -> str | None:
+        cursor = self.chat_display.cursorForPosition(position)
+        formatting = cursor.charFormat()
+        spoiler_id = formatting.property(RENDERED_SPOILER_ID_PROPERTY)
+        if spoiler_id:
+            return str(spoiler_id)
+        if cursor.position() > 0:
+            cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter)
+            spoiler_id = cursor.charFormat().property(
+                RENDERED_SPOILER_ID_PROPERTY
+            )
+            if spoiler_id:
+                return str(spoiler_id)
+        return None
+
+    def _toggle_rendered_spoiler(self, spoiler_id: str) -> None:
+        document = self.chat_display.document()
+        block = document.begin()
+        revealed: bool | None = None
+        fragments: list[tuple[int, int, QTextCharFormat]] = []
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    formatting = fragment.charFormat()
+                    if str(formatting.property(
+                        RENDERED_SPOILER_ID_PROPERTY
+                    ) or "") == spoiler_id:
+                        if revealed is None:
+                            revealed = bool(formatting.property(
+                                RENDERED_SPOILER_REVEALED_PROPERTY
+                            ))
+                        fragments.append((
+                            fragment.position(),
+                            fragment.length(),
+                            formatting,
+                        ))
+                iterator += 1
+            block = block.next()
+        if revealed is None:
+            return
+        reveal = not revealed
+        for position, length, formatting in fragments:
+            original_color = formatting.property(
+                RENDERED_SPOILER_COLOR_PROPERTY
+            )
+            formatting.setForeground(
+                QColor(original_color) if reveal else QColor("#000000")
+            )
+            block_color = QColor("#000000")
+            block_color.setAlpha(
+                REVEALED_SPOILER_BLOCK_ALPHA if reveal else 255
+            )
+            formatting.setBackground(block_color)
+            formatting.setProperty(
+                RENDERED_SPOILER_REVEALED_PROPERTY,
+                reveal,
+            )
+            cursor = QTextCursor(document)
+            cursor.setPosition(position)
+            cursor.setPosition(
+                position + length,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            cursor.setCharFormat(formatting)
 
     def _sender_at_position(
         self,
@@ -10732,6 +10838,7 @@ class EncryptedChatClient(QObject):
         body_color: str,
         font_name: str,
         client_id: str,
+        message_id: str,
         *,
         muted: bool,
         ui_font: bool,
@@ -10772,6 +10879,23 @@ class EncryptedChatClient(QObject):
                 )
                 if anchor:
                     formatting.setFontUnderline(True)
+                if run.spoiler is not None:
+                    spoiler_id = f"{message_id}:{run.spoiler}"
+                    original_color = formatting.foreground().color()
+                    formatting.setProperty(
+                        RENDERED_SPOILER_ID_PROPERTY,
+                        spoiler_id,
+                    )
+                    formatting.setProperty(
+                        RENDERED_SPOILER_COLOR_PROPERTY,
+                        original_color.name(QColor.NameFormat.HexArgb),
+                    )
+                    formatting.setProperty(
+                        RENDERED_SPOILER_REVEALED_PROPERTY,
+                        False,
+                    )
+                    formatting.setForeground(QColor("#000000"))
+                    formatting.setBackground(QColor("#000000"))
                 cursor.insertText(plain_text[start:end], formatting)
 
             for start, end, url in url_spans:
@@ -11376,6 +11500,7 @@ class EncryptedChatClient(QObject):
                 body_color,
                 font_name,
                 client_id,
+                message_id,
                 muted=is_muted,
                 ui_font=is_muted,
                 embedded_image_urls=set(image_urls),
