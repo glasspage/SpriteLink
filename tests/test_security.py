@@ -1080,11 +1080,18 @@ class RichTextFormattingTests(unittest.TestCase):
         )
         self.assertEqual(SPRITELINK.SPOILER_BLOCK_COLOR, "#404040")
         self.assertEqual(SPRITELINK.REVEALED_SPOILER_BLOCK_ALPHA, 26)
+        self.assertEqual(SPRITELINK.SPOILER_DISPLAY_HEIGHT_PX, 22)
+        paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_spoilers
+        )
+        self.assertIn("line.height() - spoiler_height", paint_source)
+        self.assertIn("SPOILER_DISPLAY_HEIGHT_PX", paint_source)
         toggle_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._toggle_rendered_spoiler
         )
         self.assertIn("REVEALED_SPOILER_BLOCK_ALPHA", toggle_source)
         self.assertIn("formatting.setForeground", toggle_source)
+        self.assertIn("self.chat_display.viewport().update()", toggle_source)
         self.assertIn("insert_padding(inside=False)", insert_source)
         self.assertIn("insert_padding(inside=True)", insert_source)
         self.assertIn("SPOILER_HORIZONTAL_PADDING_PX", insert_source)
