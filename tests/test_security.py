@@ -1028,7 +1028,7 @@ class RichTextFormattingTests(unittest.TestCase):
             "formatting.setBackground(QColor(SPOILER_BLOCK_COLOR))",
             insert_source,
         )
-        self.assertEqual(SPRITELINK.SPOILER_BLOCK_COLOR, "#1a1a1a")
+        self.assertEqual(SPRITELINK.SPOILER_BLOCK_COLOR, "#404040")
         self.assertEqual(SPRITELINK.REVEALED_SPOILER_BLOCK_ALPHA, 26)
         toggle_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._toggle_rendered_spoiler
@@ -1038,6 +1038,12 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn("insert_padding(inside=False)", insert_source)
         self.assertIn("insert_padding(inside=True)", insert_source)
         self.assertIn("SPOILER_HORIZONTAL_PADDING_PX", insert_source)
+
+    def test_text_shadow_toggle_rerenders_spoiler_backgrounds(self) -> None:
+        toggle_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_text_shadows_toggled
+        )
+        self.assertIn("self._rerender_preserving_scroll()", toggle_source)
 
         shadow_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_text_shadows
