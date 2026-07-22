@@ -2136,7 +2136,9 @@ class ImageTrustTests(unittest.TestCase):
 
 
 class LinkSafetyTests(unittest.TestCase):
-    def test_user_link_trust_bypasses_only_ordinary_warnings(self) -> None:
+    def test_link_trust_policy_distinguishes_local_and_remote_users(
+        self,
+    ) -> None:
         trusted_user_ids = {"trusted-sender"}
         ordinary = SPRITELINK.analyze_link_url("https://example.com/")
         suspicious = SPRITELINK.analyze_link_url(
@@ -2166,6 +2168,24 @@ class LinkSafetyTests(unittest.TestCase):
             "trusted-sender",
             trusted_user_ids,
         ))
+        self.assertFalse(SPRITELINK.link_requires_warning(
+            suspicious,
+            "local-sender",
+            trusted_user_ids,
+            is_local=True,
+        ))
+        self.assertFalse(SPRITELINK.link_requires_warning(
+            lookalike,
+            "local-sender",
+            trusted_user_ids,
+            is_local=True,
+        ))
+
+        open_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._open_url_in_browser
+        )
+        self.assertIn("self._authenticated_client_id()", open_source)
+        self.assertIn("is_local=", open_source)
 
     def test_user_link_trust_is_disabled_by_default_and_persisted(self) -> None:
         config = SPRITELINK.default_config()
