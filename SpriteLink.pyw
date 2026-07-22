@@ -10597,7 +10597,7 @@ class EncryptedChatClient(QObject):
 
         trust_links_action = menu.addAction("Trust Links from User")
         trust_links_action.setCheckable(True)
-        trust_links_action.setChecked(trusts_links)
+        trust_links_action.setChecked(is_local or trusts_links)
         trust_links_action.setEnabled(not is_local)
         if not is_local:
             trust_links_action.toggled.connect(
