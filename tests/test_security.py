@@ -2757,8 +2757,15 @@ class HttpsOnlyMediaAndLinkTests(unittest.TestCase):
         context_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._link_url_from_anchor
         )
+        self.assertIn(
+            'scheme().casefold() != "https"',
+            open_source,
+        )
+        self.assertIn(
+            'scheme().casefold() == "https"',
+            context_source,
+        )
         for source in (open_source, context_source):
-            self.assertIn('scheme().casefold() == "https"', source)
             self.assertNotIn('"http"', source)
 
 
