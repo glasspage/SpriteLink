@@ -1511,13 +1511,13 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._show_username_context_menu
         )
         self.assertLess(
-            user_source.index('menu.addAction("Trust Images from User")'),
-            user_source.index('menu.addAction("Trust Links from User")'),
-        )
-        self.assertLess(
-            user_source.index('menu.addAction("Trust Links from User")'),
+            user_source.index(
+                'menu.addAction("Trust Links & Images from User")'
+            ),
             user_source.index('"Unmute User" if is_muted else "Mute User"'),
         )
+        self.assertNotIn("Trust Images from User", user_source)
+        self.assertNotIn("Trust Links from User", user_source)
         self.assertNotIn("Collapse Message", user_source)
         self.assertNotIn("Expand Message", user_source)
 
@@ -2187,26 +2187,60 @@ class LinkSafetyTests(unittest.TestCase):
         self.assertIn("self._authenticated_client_id()", open_source)
         self.assertIn("is_local=", open_source)
 
-    def test_user_link_trust_is_disabled_by_default_and_persisted(self) -> None:
+    def test_user_trust_is_disabled_by_default_and_persisted(self) -> None:
         config = SPRITELINK.default_config()
-        self.assertEqual(config["trusted_link_users"], {})
+        self.assertEqual(config["trusted_link_and_image_users"], {})
         source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._set_user_link_trusted
+            SPRITELINK.EncryptedChatClient._set_user_links_and_images_trusted
         )
-        self.assertIn('"trusted_link_users"', source)
+        self.assertIn('"trusted_link_and_image_users"', source)
         self.assertIn("_write_room_preference_ids", source)
         menu_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._show_username_context_menu
         )
         self.assertIn("setCheckable(True)", menu_source)
         self.assertIn(
-            "trust_links_action.setChecked(is_local or trusts_links)",
+            "trust_action.setChecked(is_local or trusts_links_and_images)",
             menu_source,
         )
         self.assertIn(
-            "trust_links_action.setEnabled(not is_local)",
+            "trust_action.setEnabled(not is_local)",
             menu_source,
         )
+
+    def test_separate_legacy_trust_settings_are_merged(self) -> None:
+        existing_config = SPRITELINK.default_config()
+        existing_config.pop("trusted_link_and_image_users")
+        existing_config["trusted_image_users"] = {
+            "room-a": ["image-user", "both-user"],
+        }
+        existing_config["trusted_link_users"] = {
+            "room-a": ["link-user", "both-user"],
+            "room-b": ["other-user"],
+        }
+        config_path = mock.Mock()
+        config_path.exists.return_value = True
+        config_path.read_bytes.return_value = b"settings"
+
+        with (
+            mock.patch.object(SPRITELINK, "CONFIG_PATH", config_path),
+            mock.patch.object(
+                SPRITELINK,
+                "_load_dpapi_config",
+                return_value=existing_config,
+            ),
+        ):
+            migrated = SPRITELINK.load_config()
+
+        self.assertEqual(
+            migrated["trusted_link_and_image_users"],
+            {
+                "room-a": ["both-user", "image-user", "link-user"],
+                "room-b": ["other-user"],
+            },
+        )
+        self.assertNotIn("trusted_image_users", migrated)
+        self.assertNotIn("trusted_link_users", migrated)
 
     def test_rendered_links_carry_sender_identity_to_warning_policy(self) -> None:
         insert_source = inspect.getsource(
