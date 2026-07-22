@@ -4406,11 +4406,8 @@ class MessageLogBrowser(QTextBrowser):
 
         painter.end()
 
-    def _paint_spoilers_over_selection(self, event: Any) -> None:
-        """Keep spoiler formatting visible above Qt's selection colors."""
-        if not self.textCursor().hasSelection():
-            return
-
+    def _paint_spoilers(self, event: Any) -> None:
+        """Paint spoiler formatting independently from optional shadows."""
         viewport = self.viewport()
         viewport_width = viewport.width()
         viewport_height = viewport.height()
@@ -4588,7 +4585,13 @@ class MessageLogBrowser(QTextBrowser):
         # safely be completed after the base document paint.
         self._paint_row_background_padding(event)
         self._paint_text_shadows(event)
-        self._paint_spoilers_over_selection(event)
+        # The base QTextBrowser paint can omit character backgrounds after
+        # an application-style replacement.  Text shadows previously hid
+        # that problem because their final layout redraw also happened to
+        # redraw spoilers.  Paint spoiler ranges explicitly in every mode so
+        # they remain visible when shadows start or become disabled, and so
+        # Qt's selection colors cannot replace them.
+        self._paint_spoilers(event)
         if not self.collapsed_fade_blocks:
             return
 
