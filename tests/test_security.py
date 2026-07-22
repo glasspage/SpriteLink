@@ -891,58 +891,69 @@ class TrayBehaviorTests(unittest.TestCase):
 
 
 class RichTextFormattingTests(unittest.TestCase):
-    def test_parser_supports_only_bold_italic_and_underline_tags(self) -> None:
+    def test_parser_supports_safe_formatting_and_spoiler_tags(self) -> None:
         markup = (
             "plain <b>bold <i>both</i></b> "
-            "<u>underlined</u> <script>literal</script>"
+            "<u>underlined</u> <sp>hidden</sp> <script>literal</script>"
         )
         plain, runs = SPRITELINK.parse_message_rich_text(markup)
         self.assertEqual(
             plain,
-            "plain bold both underlined <script>literal</script>",
+            "plain bold both underlined hidden <script>literal</script>",
         )
         styled_text = {
             plain[run.start:run.end]: (
                 run.bold,
                 run.italic,
                 run.underline,
+                run.spoiler is not None,
             )
             for run in runs
         }
-        self.assertEqual(styled_text["bold "], (True, False, False))
-        self.assertEqual(styled_text["both"], (True, True, False))
-        self.assertEqual(styled_text["underlined"], (False, False, True))
+        self.assertEqual(styled_text["bold "], (True, False, False, False))
+        self.assertEqual(styled_text["both"], (True, True, False, False))
+        self.assertEqual(styled_text["underlined"], (False, False, True, False))
+        self.assertEqual(styled_text["hidden"], (False, False, False, True))
 
     def test_unmatched_closing_tags_remain_visible(self) -> None:
         plain, _runs = SPRITELINK.parse_message_rich_text(
-            "text</b></i></u>"
+            "text</b></i></u></sp>"
         )
-        self.assertEqual(plain, "text</b></i></u>")
+        self.assertEqual(plain, "text</b></i></u></sp>")
 
     def test_unclosed_tags_do_not_affect_the_next_message(self) -> None:
         first_plain, first_runs = SPRITELINK.parse_message_rich_text(
-            "<b>unfinished"
+            "<b><sp>unfinished"
         )
         second_plain, second_runs = SPRITELINK.parse_message_rich_text(
             "next message"
         )
         self.assertEqual(first_plain, "unfinished")
         self.assertTrue(all(run.bold for run in first_runs))
+        self.assertTrue(all(run.spoiler is not None for run in first_runs))
         self.assertEqual(second_plain, "next message")
         self.assertTrue(all(not run.bold for run in second_runs))
+        self.assertTrue(all(run.spoiler is None for run in second_runs))
+
+    def test_spoiler_identity_survives_nested_formatting(self) -> None:
+        plain, runs = SPRITELINK.parse_message_rich_text(
+            "<sp>hidden <b>and bold</b> again</sp>"
+        )
+        self.assertEqual(plain, "hidden and bold again")
+        self.assertEqual({run.spoiler for run in runs}, {1})
 
     def test_composer_segments_serialize_to_balanced_tags(self) -> None:
         markup = SPRITELINK.serialize_message_rich_text([
-            ("bold", True, False, False),
-            (" plain ", False, False, False),
-            ("all", True, True, True),
-            (" italic", False, True, False),
+            ("bold", True, False, False, False),
+            (" plain ", False, False, False, False),
+            ("all", True, True, True, True),
+            (" italic", False, True, False, False),
         ])
         self.assertEqual(
             markup,
             (
                 "<b>bold</b> plain "
-                "<b><i><u>all</u></i></b>"
+                "<sp><b><i><u>all</u></i></b></sp>"
                 "<i> italic</i>"
             ),
         )
@@ -959,6 +970,7 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn('QPushButton("Bold")', ui_source)
         self.assertIn('QPushButton("Italic")', ui_source)
         self.assertIn('QPushButton("Underline")', ui_source)
+        self.assertIn('QPushButton("Spoiler")', ui_source)
         self.assertIn("bold_button_font.setBold(True)", ui_source)
         self.assertIn("italic_button_font.setItalic(True)", ui_source)
         self.assertIn("underline_button_font.setUnderline(True)", ui_source)
@@ -973,6 +985,7 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn("cursor.hasSelection()", toggle_source)
         self.assertIn("cursor.mergeCharFormat", toggle_source)
         self.assertIn("mergeCurrentCharFormat", toggle_source)
+        self.assertIn("COMPOSER_SPOILER_PROPERTY", toggle_source)
         send_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._send_current_message
         )
@@ -1003,6 +1016,21 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn("italic=False", username_format)
         self.assertIn("underline=False", username_format)
         self.assertNotIn("bold=True", username_format)
+
+    def test_rendered_spoilers_use_clickable_format_properties(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_text_with_links
+        )
+        self.assertIn("RENDERED_SPOILER_ID_PROPERTY", insert_source)
+        self.assertIn(
+            'formatting.setBackground(QColor("#000000"))',
+            insert_source,
+        )
+        toggle_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._toggle_rendered_spoiler
+        )
+        self.assertIn("REVEALED_SPOILER_BLOCK_ALPHA", toggle_source)
+        self.assertIn("formatting.setForeground", toggle_source)
 
 
 class RuntimeOptimizationTests(unittest.TestCase):
