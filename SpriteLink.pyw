@@ -24,6 +24,7 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 from functools import lru_cache
+from html import escape
 from html.parser import HTMLParser
 from datetime import datetime
 import hashlib
@@ -455,6 +456,70 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "*.xbooru.com",
     "yande.re",
     "*.yande.re",
+)
+TRUSTED_LINK_DOMAINS = (
+    "google.com",
+    "googleusercontent.com",
+    "gstatic.com",
+    "youtube.com",
+    "youtu.be",
+    "ytimg.com",
+    "github.com",
+    "githubassets.com",
+    "githubusercontent.com",
+    "discord.com",
+    "discord.gg",
+    "discordapp.com",
+    "wikipedia.org",
+    "wikimedia.org",
+    "microsoft.com",
+    "live.com",
+    "office.com",
+    "windows.com",
+    "apple.com",
+    "amazon.com",
+    "reddit.com",
+    "redd.it",
+    "twitch.tv",
+    "twitter.com",
+    "x.com",
+    "twimg.com",
+    "bsky.app",
+    "instagram.com",
+    "facebook.com",
+    "fbcdn.net",
+    "tiktok.com",
+    "linkedin.com",
+    "spotify.com",
+    "soundcloud.com",
+    "steamcommunity.com",
+    "steampowered.com",
+    "mozilla.org",
+    "python.org",
+    "pypi.org",
+    "stackoverflow.com",
+    "stackexchange.com",
+    "npmjs.com",
+    "imgur.com",
+    "tenor.com",
+    "giphy.com",
+    "klipy.com",
+    "unsplash.com",
+    "pexels.com",
+    "pixabay.com",
+    "flickr.com",
+    "cloudinary.com",
+    "ctfassets.net",
+    "sanity.io",
+    "wikia.nocookie.net",
+    "wikia.com",
+    "fandom.com",
+    "tmdb.org",
+    "themoviedb.org",
+    "myanimelist.net",
+)
+TRUSTED_LINK_EXACT_HOSTS = (
+    "steamuserimages-a.akamaihd.net",
 )
 IMAGE_LINK_EXTENSIONS = (
     ".png",
@@ -1778,6 +1843,162 @@ def is_trusted_image_url(url: str) -> bool:
             for pattern in TRUSTED_IMAGE_HOST_PATTERNS
         )
     )
+
+
+@dataclass(frozen=True)
+class LinkSafetyAnalysis:
+    trusted: bool
+    has_lookalike_characters: bool
+    has_userinfo: bool
+    underlined_indices: frozenset[int]
+
+    @property
+    def suspicious(self) -> bool:
+        return self.has_lookalike_characters or self.has_userinfo
+
+
+LOOKALIKE_DOMAIN_CHARACTERS = frozenset(
+    "ΑΒΕΖΗΙΚΜΝΟΡΤΥΧϹ"
+    "αβεζηικμνορτυχϲ"
+    "АВСЕНІЈКМОРЅТХҮ"
+    "авсенікморѕтхүј"
+    "ԁԌԍԛԝ"
+    "ՕօՍս"
+    "ᎪᏴᏟᎬᎻᏦᎷᎷᏁᎾᏢᏚᎢ᙭"
+)
+
+
+def _is_lookalike_domain_character(character: str) -> bool:
+    if character in LOOKALIKE_DOMAIN_CHARACTERS:
+        return True
+    normalized = unicodedata.normalize("NFKC", character)
+    return (
+        ord(character) > 127
+        and normalized != character
+        and normalized.isascii()
+        and normalized.isalnum()
+    )
+
+
+def _url_authority_hostname_range(url: str) -> tuple[int, int] | None:
+    scheme_match = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", url)
+    if scheme_match is None:
+        return None
+    authority_start = scheme_match.end()
+    authority_end = len(url)
+    for separator in "/?#":
+        position = url.find(separator, authority_start)
+        if position >= 0:
+            authority_end = min(authority_end, position)
+    authority = url[authority_start:authority_end]
+    host_offset = authority.rfind("@") + 1
+    host_and_port = authority[host_offset:]
+    if host_and_port.startswith("["):
+        closing_bracket = host_and_port.find("]")
+        if closing_bracket < 0:
+            return None
+        hostname_start = authority_start + host_offset + 1
+        return hostname_start, hostname_start + closing_bracket - 1
+
+    hostname_length = len(host_and_port)
+    port_separator = host_and_port.rfind(":")
+    if (
+        port_separator >= 0
+        and host_and_port[port_separator + 1:].isdigit()
+    ):
+        hostname_length = port_separator
+    if hostname_length <= 0:
+        return None
+    hostname_start = authority_start + host_offset
+    return hostname_start, hostname_start + hostname_length
+
+
+def _lookalike_hostname_indices(
+    url: str,
+    hostname_range: tuple[int, int] | None,
+) -> frozenset[int]:
+    if hostname_range is None:
+        return frozenset()
+    start, end = hostname_range
+    hostname = url[start:end]
+    suspicious_indices = {
+        start + offset
+        for offset, character in enumerate(hostname)
+        if _is_lookalike_domain_character(character)
+    }
+    label_start = 0
+    for label in hostname.split("."):
+        if label.casefold().startswith("xn--"):
+            try:
+                decoded_label = label.encode("ascii").decode("idna")
+            except (UnicodeError, UnicodeDecodeError):
+                decoded_label = ""
+            if any(
+                _is_lookalike_domain_character(character)
+                for character in decoded_label
+            ):
+                suspicious_indices.update(range(
+                    start + label_start,
+                    start + label_start + len(label),
+                ))
+        label_start += len(label) + 1
+    return frozenset(suspicious_indices)
+
+
+def _hostname_is_trusted_for_links(hostname: str) -> bool:
+    normalized = hostname.casefold().rstrip(".")
+    if normalized in TRUSTED_LINK_EXACT_HOSTS:
+        return True
+    return any(
+        normalized == domain or normalized.endswith(f".{domain}")
+        for domain in TRUSTED_LINK_DOMAINS
+    )
+
+
+def analyze_link_url(url: str) -> LinkSafetyAnalysis:
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname or ""
+    except ValueError:
+        return LinkSafetyAnalysis(False, False, False, frozenset())
+
+    hostname_range = _url_authority_hostname_range(url)
+    lookalike_indices = _lookalike_hostname_indices(url, hostname_range)
+    has_userinfo = parsed.username is not None
+    underlined_indices = set(lookalike_indices)
+    if has_userinfo and hostname_range is not None:
+        underlined_indices.update(range(*hostname_range))
+    suspicious = bool(lookalike_indices) or has_userinfo
+    trusted = (
+        parsed.scheme.casefold() == "https"
+        and bool(hostname)
+        and not suspicious
+        and hostname.isascii()
+        and _hostname_is_trusted_for_links(hostname)
+    )
+    return LinkSafetyAnalysis(
+        trusted,
+        bool(lookalike_indices),
+        has_userinfo,
+        frozenset(underlined_indices),
+    )
+
+
+def link_warning_url_html(
+    url: str,
+    underlined_indices: frozenset[int],
+) -> str:
+    output: list[str] = []
+    underlining = False
+    for index, character in enumerate(url):
+        should_underline = index in underlined_indices
+        if should_underline != underlining:
+            output.append("<u>" if should_underline else "</u>")
+            underlining = should_underline
+        output.append(escape(character))
+    if underlining:
+        output.append("</u>")
+    return "".join(output)
 
 
 def is_image_url_trusted_for_sender(
@@ -4993,6 +5214,8 @@ class EncryptedChatClient(QObject):
         self.network_wakeup_event.set()
         self.viewport_media_timer.stop()
         self._hide_chat_tooltip()
+        if self.link_warning_overlay.isVisible():
+            self._hide_link_warning_popup()
         if self.image_preview_overlay.isVisible():
             self._hide_image_preview_popup()
         self._pause_animated_media()
@@ -5180,6 +5403,10 @@ class EncryptedChatClient(QObject):
             self.image_preview_panel.setStyleSheet(
                 self._config_panel_stylesheet()
             )
+        if hasattr(self, "link_warning_panel"):
+            self.link_warning_panel.setStyleSheet(
+                self._config_panel_stylesheet()
+            )
         if hasattr(self, "message_size_bar"):
             self._draw_message_size_bar()
         if hasattr(self, "chatrooms_toggle"):
@@ -5227,6 +5454,7 @@ class EncryptedChatClient(QObject):
         self._build_config_popup()
         self._build_message_limit_popup()
         self._build_image_preview_popup()
+        self._build_link_warning_popup()
 
     def _build_chatroom_sidebar(self, root_layout: QHBoxLayout) -> None:
         self.chatrooms_panel = QWidget()
@@ -6860,6 +7088,134 @@ class EncryptedChatClient(QObject):
 
         self.image_preview_overlay.hide()
         QTimer.singleShot(0, self._sync_image_preview_overlay_geometry)
+
+    def _build_link_warning_popup(self) -> None:
+        self.link_warning_overlay = ConfigOverlay(self.chat_content)
+        self.link_warning_overlay.dismissed.connect(
+            self._hide_link_warning_popup
+        )
+
+        overlay_layout = QVBoxLayout(self.link_warning_overlay)
+        overlay_layout.setContentsMargins(36, 24, 36, 24)
+        overlay_layout.addStretch(1)
+
+        panel_row = QHBoxLayout()
+        panel_row.addStretch(1)
+        self.link_warning_panel = QFrame()
+        self.link_warning_panel.setObjectName("configPanel")
+        self.link_warning_panel.setMinimumWidth(360)
+        self.link_warning_panel.setMaximumWidth(620)
+        self.link_warning_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.link_warning_panel.setStyleSheet(
+            self._config_panel_stylesheet()
+        )
+        panel_row.addWidget(self.link_warning_panel, 8)
+        panel_row.addStretch(1)
+        overlay_layout.addLayout(panel_row)
+        overlay_layout.addStretch(1)
+        self.link_warning_overlay.panel = self.link_warning_panel
+
+        panel_layout = QVBoxLayout(self.link_warning_panel)
+        panel_layout.setContentsMargins(16, 14, 16, 14)
+        panel_layout.setSpacing(10)
+        panel_layout.addWidget(self._heading("Link Warning"))
+
+        warning_text = QLabel(
+            "Make sure you trust this website before continuing."
+        )
+        warning_text.setWordWrap(True)
+        panel_layout.addWidget(warning_text)
+
+        self.link_warning_url_label = QLabel()
+        self.link_warning_url_label.setTextFormat(Qt.TextFormat.RichText)
+        self.link_warning_url_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.link_warning_url_label.setWordWrap(True)
+        url_font = QFont("Consolas")
+        url_font.setStyleHint(QFont.StyleHint.Monospace)
+        url_font.setStyleStrategy(self._font_style_strategy())
+        self.link_warning_url_label.setFont(url_font)
+        panel_layout.addWidget(self.link_warning_url_label)
+
+        self.link_warning_suspicious_label = QLabel()
+        self.link_warning_suspicious_label.setWordWrap(True)
+        self.link_warning_suspicious_label.setFont(
+            self._make_ui_font(bold=True)
+        )
+        panel_layout.addWidget(self.link_warning_suspicious_label)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self.link_warning_go_button = QPushButton("Go to URL")
+        self.link_warning_go_button.clicked.connect(
+            self._confirm_link_warning
+        )
+        button_row.addWidget(self.link_warning_go_button)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.setDefault(True)
+        cancel_button.clicked.connect(self._hide_link_warning_popup)
+        button_row.addWidget(cancel_button)
+        panel_layout.addLayout(button_row)
+        self.link_warning_cancel_button = cancel_button
+
+        self.current_link_warning_url: str | None = None
+        self.link_warning_overlay.hide()
+        QTimer.singleShot(0, self._sync_link_warning_overlay_geometry)
+
+    def _sync_link_warning_overlay_geometry(self) -> None:
+        self.link_warning_overlay.setGeometry(self.chat_content.rect())
+
+    def _show_link_warning_popup(
+        self,
+        url: str,
+        analysis: LinkSafetyAnalysis,
+    ) -> None:
+        self._hide_chat_tooltip()
+        self.current_link_warning_url = url
+        self.link_warning_url_label.setText(
+            link_warning_url_html(url, analysis.underlined_indices)
+        )
+        suspicious_messages: list[str] = []
+        if analysis.has_lookalike_characters:
+            suspicious_messages.append(
+                "This URL looks suspicious: it has look-alike characters "
+                "in the domain name."
+            )
+        if analysis.has_userinfo:
+            suspicious_messages.append(
+                "This URL looks suspicious: it has a username section "
+                "before the domain name."
+            )
+        self.link_warning_suspicious_label.setText(
+            "\n".join(suspicious_messages)
+        )
+        self.link_warning_suspicious_label.setVisible(
+            bool(suspicious_messages)
+        )
+        self.link_warning_go_button.setStyleSheet(
+            "color: #c00000;" if analysis.suspicious else ""
+        )
+        self._sync_link_warning_overlay_geometry()
+        self.link_warning_overlay.show()
+        self.link_warning_overlay.raise_()
+        self.link_warning_cancel_button.setFocus()
+
+    def _hide_link_warning_popup(self) -> None:
+        self.link_warning_overlay.hide()
+        self.current_link_warning_url = None
+        self.link_warning_url_label.clear()
+        self.link_warning_suspicious_label.clear()
+        self.message_entry.setFocus()
+
+    def _confirm_link_warning(self) -> None:
+        url = self.current_link_warning_url
+        self._hide_link_warning_popup()
+        if url:
+            self._launch_url_in_browser(url)
 
     def _sync_image_preview_overlay_geometry(self) -> None:
         self.image_preview_overlay.setGeometry(self.chat_content.rect())
@@ -9518,10 +9874,20 @@ class EncryptedChatClient(QObject):
                     widget.hide()
 
     @staticmethod
-    def _open_url_in_browser(url: str) -> None:
+    def _launch_url_in_browser(url: str) -> None:
         parsed = QUrl(url)
         if parsed.isValid() and parsed.scheme().casefold() == "https":
             QDesktopServices.openUrl(parsed)
+
+    def _open_url_in_browser(self, url: str) -> None:
+        parsed = QUrl(url)
+        if not parsed.isValid() or parsed.scheme().casefold() != "https":
+            return
+        analysis = analyze_link_url(url)
+        if analysis.trusted:
+            self._launch_url_in_browser(url)
+            return
+        self._show_link_warning_popup(url, analysis)
 
     def _image_url_from_anchor(self, anchor: str) -> str | None:
         prefix = "spritelink-image:"
@@ -9853,6 +10219,8 @@ class EncryptedChatClient(QObject):
                 self._sync_image_preview_overlay_geometry()
                 if self.image_preview_overlay.isVisible():
                     self._update_image_preview_popup()
+            if hasattr(self, "link_warning_overlay"):
+                self._sync_link_warning_overlay_geometry()
 
         if (
             hasattr(self, "chat_display")
@@ -10927,6 +11295,8 @@ class EncryptedChatClient(QObject):
 
     def _clear_visible_room(self) -> None:
         self._hide_chat_tooltip()
+        if self.link_warning_overlay.isVisible():
+            self._hide_link_warning_popup()
         if self.image_preview_overlay.isVisible():
             self._hide_image_preview_popup()
         self.seen_client_message_ids.clear()
