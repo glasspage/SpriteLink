@@ -1039,7 +1039,7 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn("insert_padding(inside=True)", insert_source)
         self.assertIn("SPOILER_HORIZONTAL_PADDING_PX", insert_source)
 
-    def test_text_shadow_toggle_rerenders_spoiler_backgrounds(self) -> None:
+    def test_spoilers_paint_when_text_shadows_start_disabled(self) -> None:
         toggle_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._on_text_shadows_toggled
         )
@@ -1051,16 +1051,26 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn("RENDERED_SPOILER_ID_PROPERTY", shadow_source)
         self.assertIn("shadow_ranges", shadow_source)
 
-        selection_source = inspect.getsource(
-            SPRITELINK.MessageLogBrowser._paint_spoilers_over_selection
+        spoiler_paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_spoilers
         )
-        self.assertIn("self.textCursor().hasSelection()", selection_source)
-        self.assertIn("RENDERED_SPOILER_ID_PROPERTY", selection_source)
-        self.assertIn("layout.draw(painter, layout_origin)", selection_source)
+        self.assertNotIn(
+            "self.textCursor().hasSelection()",
+            spoiler_paint_source,
+        )
+        self.assertNotIn("spritelinkTextShadows", spoiler_paint_source)
+        self.assertIn(
+            "RENDERED_SPOILER_ID_PROPERTY",
+            spoiler_paint_source,
+        )
+        self.assertIn(
+            "layout.draw(painter, layout_origin)",
+            spoiler_paint_source,
+        )
         paint_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser.paintEvent
         )
-        self.assertIn("_paint_spoilers_over_selection(event)", paint_source)
+        self.assertIn("_paint_spoilers(event)", paint_source)
 
         button_source = inspect.getsource(
             SPRITELINK.SpoilerFormatButton.paintEvent
