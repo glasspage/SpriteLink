@@ -3825,6 +3825,23 @@ class Version120ReleaseTests(unittest.TestCase):
             source,
         )
 
+    def test_user_message_lines_are_fixed_at_24_pixels(self) -> None:
+        self.assertEqual(SPRITELINK.MESSAGE_LINE_HEIGHT_PX, 24)
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertIn("block_format.setLineHeight(", source)
+        self.assertIn(
+            "QTextBlockFormat.LineHeightTypes.FixedHeight",
+            source,
+        )
+        self.assertIn("embedded_media_block_numbers", source)
+
+        separator_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_log_separator
+        )
+        self.assertNotIn("setLineHeight", separator_source)
+
     def test_message_text_trims_after_its_last_visible_character(self) -> None:
         self.assertEqual(
             SPRITELINK.trim_message_text("Hello   \n\n"),
