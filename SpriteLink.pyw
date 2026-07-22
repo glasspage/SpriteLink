@@ -592,6 +592,7 @@ DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
 MESSAGE_LINE_HEIGHT_PX = 24
+SPOILER_DISPLAY_HEIGHT_PX = 22
 COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
 RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
 RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
@@ -4473,12 +4474,21 @@ class MessageLogBrowser(QTextBrowser):
                             continue
                         start_x = line.cursorToX(start)[0]
                         end_x = line.cursorToX(end)[0]
+                        spoiler_height = min(
+                            float(SPOILER_DISPLAY_HEIGHT_PX),
+                            line.height(),
+                        )
                         spoiler_rect = QRectF(
                             layout.position().x() + min(start_x, end_x)
                             - scroll_x,
-                            layout.position().y() + line.y() - scroll_y,
+                            (
+                                layout.position().y()
+                                + line.y()
+                                + ((line.height() - spoiler_height) / 2.0)
+                                - scroll_y
+                            ),
                             max(1.0, abs(end_x - start_x)),
-                            line.height(),
+                            spoiler_height,
                         ).toAlignedRect()
                         spoiler_region = spoiler_region.united(
                             QRegion(spoiler_rect)
@@ -10760,6 +10770,11 @@ class EncryptedChatClient(QObject):
                 QTextCursor.MoveMode.KeepAnchor,
             )
             cursor.setCharFormat(formatting)
+
+        # QTextDocument may invalidate only the text-format bounds after a
+        # reveal toggle. Repaint the complete viewport so the old opaque
+        # spoiler block cannot leave a thin edge outside that dirty region.
+        self.chat_display.viewport().update()
 
     def _sender_at_position(
         self,
