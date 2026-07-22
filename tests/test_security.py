@@ -2180,7 +2180,11 @@ class LinkSafetyTests(unittest.TestCase):
         )
         self.assertIn("setCheckable(True)", menu_source)
         self.assertIn(
-            "trust_links_action.setChecked(trusts_links)",
+            "trust_links_action.setChecked(is_local or trusts_links)",
+            menu_source,
+        )
+        self.assertIn(
+            "trust_links_action.setEnabled(not is_local)",
             menu_source,
         )
 
