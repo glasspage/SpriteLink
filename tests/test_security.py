@@ -582,6 +582,56 @@ class MessageGroupingTests(unittest.TestCase):
             ["message-1", "message-2", "message-3"],
         )
 
+    def test_muted_rows_replace_spoiler_characters_with_blocks(self) -> None:
+        items = [
+            self._item(
+                "muted",
+                "visible <sp>secret text</sp> end",
+                1,
+            ),
+            self._item(
+                "muted",
+                "<sp><b>nested</b></sp>",
+                2,
+            ),
+        ]
+        group = SPRITELINK.group_messages_for_display(
+            items,
+            {"muted"},
+        )[0]
+        display_client = mock.Mock()
+        display_client._repeat_prefixed_message_text = (
+            SPRITELINK.EncryptedChatClient._repeat_prefixed_message_text
+        )
+        display_item = (
+            SPRITELINK.EncryptedChatClient._display_item_for_group(
+                display_client,
+                group,
+                {"muted"},
+            )
+        )
+        self.assertEqual(
+            display_item["message"]["m"],
+            "visible ███████████ end | ██████",
+        )
+        self.assertNotIn("<sp>", display_item["message"]["m"])
+
+    def test_muted_spoiler_redaction_cannot_bleed_between_messages(
+        self,
+    ) -> None:
+        self.assertEqual(
+            SPRITELINK.message_plain_text_with_spoilers_redacted(
+                "<sp>unfinished"
+            ),
+            "██████████",
+        )
+        self.assertEqual(
+            SPRITELINK.message_plain_text_with_spoilers_redacted(
+                "next message"
+            ),
+            "next message",
+        )
+
     def test_duplicate_sound_ordinal_suppresses_only_third_and_later(
         self,
     ) -> None:
