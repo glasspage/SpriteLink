@@ -595,7 +595,7 @@ COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
 RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
 RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
 RENDERED_SPOILER_REVEALED_PROPERTY = int(QTextFormat.Property.UserProperty) + 4
-SPOILER_BLOCK_COLOR = "#1a1a1a"
+SPOILER_BLOCK_COLOR = "#404040"
 REVEALED_SPOILER_BLOCK_ALPHA = 26
 SPOILER_HORIZONTAL_PADDING_PX = 2
 SPOILER_PADDING_CHARACTER = "\u00a0"
@@ -8289,6 +8289,11 @@ class EncryptedChatClient(QObject):
         # widget fonts. Restore the active theme's font family, especially
         # Tahoma for Windows Classic headings and the chatroom title.
         self._apply_application_font_strategy()
+        # Applying a new application style can discard QTextDocument's
+        # rendered background brushes. Rebuild the log so spoiler blocks
+        # remain visible whether text shadows are enabled or disabled.
+        if hasattr(self, "chat_display"):
+            self._rerender_preserving_scroll()
 
     def _validate_current_settings(self) -> str:
         server_url = normalize_server_url(str(self.server_url_var.get()))
