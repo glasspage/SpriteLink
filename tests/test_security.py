@@ -3832,7 +3832,11 @@ class Version120ReleaseTests(unittest.TestCase):
         )
         self.assertIn("block_format.setLineHeight(", source)
         self.assertIn(
-            "QTextBlockFormat.LineHeightTypes.FixedHeight",
+            "float(MESSAGE_LINE_HEIGHT_PX)",
+            source,
+        )
+        self.assertIn(
+            "int(QTextBlockFormat.LineHeightTypes.FixedHeight.value)",
             source,
         )
         self.assertIn("embedded_media_block_numbers", source)
