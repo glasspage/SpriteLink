@@ -1296,6 +1296,17 @@ def message_plain_text(text: str) -> str:
     return parse_message_rich_text(text)[0]
 
 
+def message_plain_text_with_spoilers_redacted(text: str) -> str:
+    """Return plain message text with every spoiler character concealed."""
+    plain_text, runs = parse_message_rich_text(text)
+    redacted = list(plain_text)
+    for run in runs:
+        if run.spoiler is None:
+            continue
+        redacted[run.start:run.end] = "█" * (run.end - run.start)
+    return "".join(redacted)
+
+
 def message_items_are_contiguous(
     previous_item: dict[str, Any],
     current_item: dict[str, Any],
@@ -11362,7 +11373,9 @@ class EncryptedChatClient(QObject):
                 if repeated_count and source_text != repeated_text:
                     combined_parts.append(
                         self._repeat_prefixed_message_text(
-                            repeated_text,
+                            message_plain_text_with_spoilers_redacted(
+                                repeated_text
+                            ),
                             repeated_count,
                         )
                     )
@@ -11372,7 +11385,9 @@ class EncryptedChatClient(QObject):
             if repeated_count:
                 combined_parts.append(
                     self._repeat_prefixed_message_text(
-                        repeated_text,
+                        message_plain_text_with_spoilers_redacted(
+                            repeated_text
+                        ),
                         repeated_count,
                     )
                 )
@@ -11513,7 +11528,6 @@ class EncryptedChatClient(QObject):
         )
         profile_icon = str(message.get("p", ""))
         text = str(message["m"])
-        plain_text = message_plain_text(text)
         message_id = str(message["i"])
         client_id = str(message["c"])
         user_id_preview = visible_user_id(client_id)
@@ -11524,6 +11538,11 @@ class EncryptedChatClient(QObject):
         }
 
         is_muted = client_id in muted_ids and not item["is_local"]
+        plain_text = (
+            message_plain_text_with_spoilers_redacted(text)
+            if is_muted
+            else message_plain_text(text)
+        )
         is_collapsed = is_muted or bool(
             source_message_ids.intersection(collapsed_ids)
         )
