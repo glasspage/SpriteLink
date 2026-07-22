@@ -2188,6 +2188,28 @@ class LinkSafetyTests(unittest.TestCase):
             menu_source,
         )
 
+    def test_rendered_links_carry_sender_identity_to_warning_policy(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_text_with_links
+        )
+        click_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        image_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_embedded_image_preview
+        )
+
+        self.assertIn(
+            "_register_rendered_link(url, client_id)",
+            insert_source,
+        )
+        self.assertIn("anchored_client_id", click_source)
+        self.assertIn("rendered_link_senders.get(anchor)", click_source)
+        self.assertIn(
+            "rendered_link_senders[anchor] = client_id",
+            image_source,
+        )
+
     def test_popular_and_sfw_media_domains_open_without_warning(self) -> None:
         trusted_urls = (
             "https://google.com/search?q=spritelink",
