@@ -2172,7 +2172,10 @@ class LinkSafetyTests(unittest.TestCase):
             url,
             analysis.underlined_indices,
         )
-        self.assertIn("<u>оо</u>", html)
+        self.assertIn(
+            '<span style="color: #c00000;"><u>оо</u></span>',
+            html,
+        )
         self.assertNotIn("<u>gle", html)
 
     def test_punycode_domains_are_marked_as_lookalikes(self) -> None:
@@ -2180,7 +2183,10 @@ class LinkSafetyTests(unittest.TestCase):
         analysis = SPRITELINK.analyze_link_url(url)
         self.assertTrue(analysis.has_lookalike_characters)
         self.assertIn(
-            "<u>xn--80ak6aa92e</u>",
+            (
+                '<span style="color: #c00000;"><u>'
+                "xn--80ak6aa92e</u></span>"
+            ),
             SPRITELINK.link_warning_url_html(
                 url,
                 analysis.underlined_indices,
@@ -2199,7 +2205,10 @@ class LinkSafetyTests(unittest.TestCase):
         self.assertTrue(analysis.has_userinfo)
         self.assertFalse(analysis.has_lookalike_characters)
         self.assertIn(
-            "google.com@<u>evilsite.net</u>/private",
+            (
+                'google.com@<span style="color: #c00000;"><u>'
+                "evilsite.net</u></span>/private"
+            ),
             SPRITELINK.link_warning_url_html(
                 url,
                 analysis.underlined_indices,
@@ -2232,6 +2241,22 @@ class LinkSafetyTests(unittest.TestCase):
         self.assertIn("username section", show_source)
         self.assertIn("before the domain name.", show_source)
         self.assertIn('"color: #c00000;"', show_source)
+
+    def test_link_warning_monospace_font_survives_style_refreshes(self) -> None:
+        font_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._make_link_warning_url_font
+        )
+        refresh_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._apply_application_font_strategy
+        )
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_link_warning_popup
+        )
+        self.assertIn('"lucida console"', font_source)
+        self.assertIn('"consolas"', font_source)
+        self.assertIn("setFixedPitch(True)", font_source)
+        self.assertIn("_refresh_special_widget_fonts()", refresh_source)
+        self.assertIn("_make_link_warning_url_font()", build_source)
 
 
 class ImageEmbeddingTests(unittest.TestCase):
