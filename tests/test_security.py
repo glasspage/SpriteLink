@@ -1512,7 +1512,7 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
         )
         self.assertLess(
             user_source.index(
-                'menu.addAction("Trust Links & Images from User")'
+                'menu.addAction("Trust Links && Images from User")'
             ),
             user_source.index('"Unmute User" if is_muted else "Mute User"'),
         )
