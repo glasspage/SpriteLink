@@ -10626,7 +10626,7 @@ class EncryptedChatClient(QObject):
         trusts_links_and_images = client_id in trusted_ids
 
         menu = QMenu(self.root)
-        trust_action = menu.addAction("Trust Links & Images from User")
+        trust_action = menu.addAction("Trust Links && Images from User")
         trust_action.setCheckable(True)
         trust_action.setChecked(is_local or trusts_links_and_images)
         trust_action.setEnabled(not is_local)
