@@ -1025,9 +1025,11 @@ class RichTextFormattingTests(unittest.TestCase):
         )
         self.assertIn("RENDERED_SPOILER_ID_PROPERTY", insert_source)
         self.assertIn(
-            'formatting.setBackground(QColor("#000000"))',
+            "formatting.setBackground(QColor(SPOILER_BLOCK_COLOR))",
             insert_source,
         )
+        self.assertEqual(SPRITELINK.SPOILER_BLOCK_COLOR, "#1a1a1a")
+        self.assertEqual(SPRITELINK.REVEALED_SPOILER_BLOCK_ALPHA, 26)
         toggle_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._toggle_rendered_spoiler
         )
@@ -1042,6 +1044,17 @@ class RichTextFormattingTests(unittest.TestCase):
         )
         self.assertIn("RENDERED_SPOILER_ID_PROPERTY", shadow_source)
         self.assertIn("shadow_ranges", shadow_source)
+
+        selection_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_spoilers_over_selection
+        )
+        self.assertIn("self.textCursor().hasSelection()", selection_source)
+        self.assertIn("RENDERED_SPOILER_ID_PROPERTY", selection_source)
+        self.assertIn("layout.draw(painter, layout_origin)", selection_source)
+        paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser.paintEvent
+        )
+        self.assertIn("_paint_spoilers_over_selection(event)", paint_source)
 
         button_source = inspect.getsource(
             SPRITELINK.SpoilerFormatButton.paintEvent
