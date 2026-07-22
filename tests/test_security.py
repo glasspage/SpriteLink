@@ -582,6 +582,56 @@ class MessageGroupingTests(unittest.TestCase):
             ["message-1", "message-2", "message-3"],
         )
 
+    def test_muted_rows_replace_spoiler_characters_with_blocks(self) -> None:
+        items = [
+            self._item(
+                "muted",
+                "visible <sp>secret text</sp> end",
+                1,
+            ),
+            self._item(
+                "muted",
+                "<sp><b>nested</b></sp>",
+                2,
+            ),
+        ]
+        group = SPRITELINK.group_messages_for_display(
+            items,
+            {"muted"},
+        )[0]
+        display_client = mock.Mock()
+        display_client._repeat_prefixed_message_text = (
+            SPRITELINK.EncryptedChatClient._repeat_prefixed_message_text
+        )
+        display_item = (
+            SPRITELINK.EncryptedChatClient._display_item_for_group(
+                display_client,
+                group,
+                {"muted"},
+            )
+        )
+        self.assertEqual(
+            display_item["message"]["m"],
+            "visible ███████████ end | ██████",
+        )
+        self.assertNotIn("<sp>", display_item["message"]["m"])
+
+    def test_muted_spoiler_redaction_cannot_bleed_between_messages(
+        self,
+    ) -> None:
+        self.assertEqual(
+            SPRITELINK.message_plain_text_with_spoilers_redacted(
+                "<sp>unfinished"
+            ),
+            "██████████",
+        )
+        self.assertEqual(
+            SPRITELINK.message_plain_text_with_spoilers_redacted(
+                "next message"
+            ),
+            "next message",
+        )
+
     def test_duplicate_sound_ordinal_suppresses_only_third_and_later(
         self,
     ) -> None:
@@ -800,7 +850,7 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
     def test_composer_menus_keep_a_bottomed_log_at_the_bottom(self) -> None:
         restore_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient
-            ._restore_chat_bottom_after_menu_toggle
+            ._restore_chat_bottom_after_layout_change
         )
         self.assertIn("if not keep_at_bottom", restore_source)
         self.assertIn("self._scroll_chat_to_bottom()", restore_source)
@@ -814,7 +864,7 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
             source = inspect.getsource(handler)
             self.assertIn("_chat_is_scrolled_to_bottom()", source)
             self.assertIn(
-                "_restore_chat_bottom_after_menu_toggle",
+                "_restore_chat_bottom_after_layout_change",
                 source,
             )
 
@@ -832,9 +882,20 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         sidebar_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._on_chatrooms_toggled
         )
-        self.assertIn("setUpdatesEnabled(False)", sidebar_source)
-        self.assertIn("setUpdatesEnabled(True)", sidebar_source)
-        self.assertIn("central_widget.layout().activate()", sidebar_source)
+        self.assertIn("chatrooms_panel.setVisible(expanded)", sidebar_source)
+        self.assertIn("chatrooms_toggle.setText", sidebar_source)
+        self.assertIn("_chat_is_scrolled_to_bottom()", sidebar_source)
+        self.assertIn(
+            "_restore_chat_bottom_after_layout_change",
+            sidebar_source,
+        )
+        self.assertNotIn("self.root.setGeometry(", sidebar_source)
+        self.assertNotIn("self.root.setMinimumWidth(", sidebar_source)
+        self.assertNotIn("setUpdatesEnabled", sidebar_source)
+        self.assertFalse(hasattr(
+            SPRITELINK.EncryptedChatClient,
+            "_set_window_redraw_enabled",
+        ))
 
 
 class TrayBehaviorTests(unittest.TestCase):
@@ -880,58 +941,69 @@ class TrayBehaviorTests(unittest.TestCase):
 
 
 class RichTextFormattingTests(unittest.TestCase):
-    def test_parser_supports_only_bold_italic_and_underline_tags(self) -> None:
+    def test_parser_supports_safe_formatting_and_spoiler_tags(self) -> None:
         markup = (
             "plain <b>bold <i>both</i></b> "
-            "<u>underlined</u> <script>literal</script>"
+            "<u>underlined</u> <sp>hidden</sp> <script>literal</script>"
         )
         plain, runs = SPRITELINK.parse_message_rich_text(markup)
         self.assertEqual(
             plain,
-            "plain bold both underlined <script>literal</script>",
+            "plain bold both underlined hidden <script>literal</script>",
         )
         styled_text = {
             plain[run.start:run.end]: (
                 run.bold,
                 run.italic,
                 run.underline,
+                run.spoiler is not None,
             )
             for run in runs
         }
-        self.assertEqual(styled_text["bold "], (True, False, False))
-        self.assertEqual(styled_text["both"], (True, True, False))
-        self.assertEqual(styled_text["underlined"], (False, False, True))
+        self.assertEqual(styled_text["bold "], (True, False, False, False))
+        self.assertEqual(styled_text["both"], (True, True, False, False))
+        self.assertEqual(styled_text["underlined"], (False, False, True, False))
+        self.assertEqual(styled_text["hidden"], (False, False, False, True))
 
     def test_unmatched_closing_tags_remain_visible(self) -> None:
         plain, _runs = SPRITELINK.parse_message_rich_text(
-            "text</b></i></u>"
+            "text</b></i></u></sp>"
         )
-        self.assertEqual(plain, "text</b></i></u>")
+        self.assertEqual(plain, "text</b></i></u></sp>")
 
     def test_unclosed_tags_do_not_affect_the_next_message(self) -> None:
         first_plain, first_runs = SPRITELINK.parse_message_rich_text(
-            "<b>unfinished"
+            "<b><sp>unfinished"
         )
         second_plain, second_runs = SPRITELINK.parse_message_rich_text(
             "next message"
         )
         self.assertEqual(first_plain, "unfinished")
         self.assertTrue(all(run.bold for run in first_runs))
+        self.assertTrue(all(run.spoiler is not None for run in first_runs))
         self.assertEqual(second_plain, "next message")
         self.assertTrue(all(not run.bold for run in second_runs))
+        self.assertTrue(all(run.spoiler is None for run in second_runs))
+
+    def test_spoiler_identity_survives_nested_formatting(self) -> None:
+        plain, runs = SPRITELINK.parse_message_rich_text(
+            "<sp>hidden <b>and bold</b> again</sp>"
+        )
+        self.assertEqual(plain, "hidden and bold again")
+        self.assertEqual({run.spoiler for run in runs}, {1})
 
     def test_composer_segments_serialize_to_balanced_tags(self) -> None:
         markup = SPRITELINK.serialize_message_rich_text([
-            ("bold", True, False, False),
-            (" plain ", False, False, False),
-            ("all", True, True, True),
-            (" italic", False, True, False),
+            ("bold", True, False, False, False),
+            (" plain ", False, False, False, False),
+            ("all", True, True, True, True),
+            (" italic", False, True, False, False),
         ])
         self.assertEqual(
             markup,
             (
                 "<b>bold</b> plain "
-                "<b><i><u>all</u></i></b>"
+                "<sp><b><i><u>all</u></i></b></sp>"
                 "<i> italic</i>"
             ),
         )
@@ -948,6 +1020,7 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn('QPushButton("Bold")', ui_source)
         self.assertIn('QPushButton("Italic")', ui_source)
         self.assertIn('QPushButton("Underline")', ui_source)
+        self.assertIn('SpoilerFormatButton("Spoiler")', ui_source)
         self.assertIn("bold_button_font.setBold(True)", ui_source)
         self.assertIn("italic_button_font.setItalic(True)", ui_source)
         self.assertIn("underline_button_font.setUnderline(True)", ui_source)
@@ -962,6 +1035,9 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn("cursor.hasSelection()", toggle_source)
         self.assertIn("cursor.mergeCharFormat", toggle_source)
         self.assertIn("mergeCurrentCharFormat", toggle_source)
+        self.assertIn("COMPOSER_SPOILER_PROPERTY", toggle_source)
+        self.assertIn("REVEALED_SPOILER_BLOCK_ALPHA", toggle_source)
+        self.assertIn("formatting.setBackground", toggle_source)
         send_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._send_current_message
         )
@@ -992,6 +1068,72 @@ class RichTextFormattingTests(unittest.TestCase):
         self.assertIn("italic=False", username_format)
         self.assertIn("underline=False", username_format)
         self.assertNotIn("bold=True", username_format)
+
+    def test_rendered_spoilers_use_clickable_format_properties(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_text_with_links
+        )
+        self.assertIn("RENDERED_SPOILER_ID_PROPERTY", insert_source)
+        self.assertIn(
+            "formatting.setBackground(QColor(SPOILER_BLOCK_COLOR))",
+            insert_source,
+        )
+        self.assertEqual(SPRITELINK.SPOILER_BLOCK_COLOR, "#404040")
+        self.assertEqual(SPRITELINK.REVEALED_SPOILER_BLOCK_ALPHA, 26)
+        self.assertEqual(SPRITELINK.SPOILER_DISPLAY_HEIGHT_PX, 22)
+        paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_spoilers
+        )
+        self.assertIn("line.height() - spoiler_height", paint_source)
+        self.assertIn("SPOILER_DISPLAY_HEIGHT_PX", paint_source)
+        toggle_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._toggle_rendered_spoiler
+        )
+        self.assertIn("REVEALED_SPOILER_BLOCK_ALPHA", toggle_source)
+        self.assertIn("formatting.setForeground", toggle_source)
+        self.assertIn("self.chat_display.viewport().update()", toggle_source)
+        self.assertIn("insert_padding(inside=False)", insert_source)
+        self.assertIn("insert_padding(inside=True)", insert_source)
+        self.assertIn("SPOILER_HORIZONTAL_PADDING_PX", insert_source)
+
+    def test_spoilers_paint_when_text_shadows_start_disabled(self) -> None:
+        toggle_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_text_shadows_toggled
+        )
+        self.assertIn("self._rerender_preserving_scroll()", toggle_source)
+
+        shadow_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_text_shadows
+        )
+        self.assertIn("RENDERED_SPOILER_ID_PROPERTY", shadow_source)
+        self.assertIn("shadow_ranges", shadow_source)
+
+        spoiler_paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_spoilers
+        )
+        self.assertNotIn(
+            "self.textCursor().hasSelection()",
+            spoiler_paint_source,
+        )
+        self.assertNotIn("spritelinkTextShadows", spoiler_paint_source)
+        self.assertIn(
+            "RENDERED_SPOILER_ID_PROPERTY",
+            spoiler_paint_source,
+        )
+        self.assertIn(
+            "layout.draw(painter, layout_origin)",
+            spoiler_paint_source,
+        )
+        paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser.paintEvent
+        )
+        self.assertIn("_paint_spoilers(event)", paint_source)
+
+        button_source = inspect.getsource(
+            SPRITELINK.SpoilerFormatButton.paintEvent
+        )
+        self.assertIn("REVEALED_SPOILER_BLOCK_ALPHA", button_source)
+        self.assertIn("painter.fillRect", button_source)
 
 
 class RuntimeOptimizationTests(unittest.TestCase):
@@ -1500,9 +1642,13 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._show_username_context_menu
         )
         self.assertLess(
-            user_source.index('menu.addAction("Trust Images from User")'),
+            user_source.index(
+                'menu.addAction("Trust Links && Images from User")'
+            ),
             user_source.index('"Unmute User" if is_muted else "Mute User"'),
         )
+        self.assertNotIn("Trust Images from User", user_source)
+        self.assertNotIn("Trust Links from User", user_source)
         self.assertNotIn("Collapse Message", user_source)
         self.assertNotIn("Expand Message", user_source)
 
@@ -2120,6 +2266,262 @@ class ImageTrustTests(unittest.TestCase):
         )
 
 
+class LinkSafetyTests(unittest.TestCase):
+    def test_link_trust_policy_distinguishes_local_and_remote_users(
+        self,
+    ) -> None:
+        trusted_user_ids = {"trusted-sender"}
+        ordinary = SPRITELINK.analyze_link_url("https://example.com/")
+        suspicious = SPRITELINK.analyze_link_url(
+            "https://google.com@evilsite.net/"
+        )
+        lookalike = SPRITELINK.analyze_link_url(
+            "https://gооgle.com/"
+        )
+
+        self.assertFalse(SPRITELINK.link_requires_warning(
+            ordinary,
+            "trusted-sender",
+            trusted_user_ids,
+        ))
+        self.assertTrue(SPRITELINK.link_requires_warning(
+            ordinary,
+            "untrusted-sender",
+            trusted_user_ids,
+        ))
+        self.assertTrue(SPRITELINK.link_requires_warning(
+            suspicious,
+            "trusted-sender",
+            trusted_user_ids,
+        ))
+        self.assertTrue(SPRITELINK.link_requires_warning(
+            lookalike,
+            "trusted-sender",
+            trusted_user_ids,
+        ))
+        self.assertFalse(SPRITELINK.link_requires_warning(
+            suspicious,
+            "local-sender",
+            trusted_user_ids,
+            is_local=True,
+        ))
+        self.assertFalse(SPRITELINK.link_requires_warning(
+            lookalike,
+            "local-sender",
+            trusted_user_ids,
+            is_local=True,
+        ))
+
+        open_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._open_url_in_browser
+        )
+        self.assertIn("self._authenticated_client_id()", open_source)
+        self.assertIn("is_local=", open_source)
+
+    def test_user_trust_is_disabled_by_default_and_persisted(self) -> None:
+        config = SPRITELINK.default_config()
+        self.assertEqual(config["trusted_link_and_image_users"], {})
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._set_user_links_and_images_trusted
+        )
+        self.assertIn('"trusted_link_and_image_users"', source)
+        self.assertIn("_write_room_preference_ids", source)
+        menu_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_username_context_menu
+        )
+        self.assertIn("setCheckable(True)", menu_source)
+        self.assertIn(
+            "trust_action.setChecked(is_local or trusts_links_and_images)",
+            menu_source,
+        )
+        self.assertIn(
+            "trust_action.setEnabled(not is_local)",
+            menu_source,
+        )
+
+    def test_separate_legacy_trust_settings_are_merged(self) -> None:
+        existing_config = SPRITELINK.default_config()
+        existing_config.pop("trusted_link_and_image_users")
+        existing_config["trusted_image_users"] = {
+            "room-a": ["image-user", "both-user"],
+        }
+        existing_config["trusted_link_users"] = {
+            "room-a": ["link-user", "both-user"],
+            "room-b": ["other-user"],
+        }
+        config_path = mock.Mock()
+        config_path.exists.return_value = True
+        config_path.read_bytes.return_value = b"settings"
+
+        with (
+            mock.patch.object(SPRITELINK, "CONFIG_PATH", config_path),
+            mock.patch.object(
+                SPRITELINK,
+                "_load_dpapi_config",
+                return_value=existing_config,
+            ),
+        ):
+            migrated = SPRITELINK.load_config()
+
+        self.assertEqual(
+            migrated["trusted_link_and_image_users"],
+            {
+                "room-a": ["both-user", "image-user", "link-user"],
+                "room-b": ["other-user"],
+            },
+        )
+        self.assertNotIn("trusted_image_users", migrated)
+        self.assertNotIn("trusted_link_users", migrated)
+
+    def test_rendered_links_carry_sender_identity_to_warning_policy(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_text_with_links
+        )
+        click_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        image_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_embedded_image_preview
+        )
+
+        self.assertIn(
+            "_register_rendered_link(url, client_id)",
+            insert_source,
+        )
+        self.assertIn("anchored_client_id", click_source)
+        self.assertIn("rendered_link_senders.get(anchor)", click_source)
+        self.assertIn(
+            "rendered_link_senders[anchor] = client_id",
+            image_source,
+        )
+
+    def test_popular_and_sfw_media_domains_open_without_warning(self) -> None:
+        trusted_urls = (
+            "https://google.com/search?q=spritelink",
+            "https://www.youtube.com/watch?v=example",
+            "https://github.com/glasspage/SpriteLink",
+            "https://discord.com/channels/example",
+            "https://en.wikipedia.org/wiki/Instant_messaging",
+            "https://cdn.discordapp.com/attachments/1/2/example.png",
+            "https://upload.wikimedia.org/example.png",
+            "https://media2.giphy.com/media/example/giphy.gif",
+            "https://cdn.klipy.com/example.gif",
+            "https://images.unsplash.com/example",
+            "https://raw.githubusercontent.com/owner/repo/main/image.png",
+        )
+        for url in trusted_urls:
+            with self.subTest(url=url):
+                self.assertTrue(SPRITELINK.analyze_link_url(url).trusted)
+
+    def test_domain_matching_does_not_trust_suffix_spoofing(self) -> None:
+        for url in (
+            "https://github.com.evil.example/login",
+            "https://notgithub.com/login",
+            "https://discord.com.evil.example/invite",
+            "https://example.com/",
+        ):
+            with self.subTest(url=url):
+                analysis = SPRITELINK.analyze_link_url(url)
+                self.assertFalse(analysis.trusted)
+                self.assertFalse(analysis.suspicious)
+
+    def test_unicode_lookalikes_are_underlined_and_suspicious(self) -> None:
+        url = "https://gооgle.com/account"
+        analysis = SPRITELINK.analyze_link_url(url)
+        self.assertFalse(analysis.trusted)
+        self.assertTrue(analysis.has_lookalike_characters)
+        self.assertFalse(analysis.has_userinfo)
+        html = SPRITELINK.link_warning_url_html(
+            url,
+            analysis.underlined_indices,
+        )
+        self.assertIn(
+            '<span style="color: #c00000;"><u>оо</u></span>',
+            html,
+        )
+        self.assertNotIn("<u>gle", html)
+
+    def test_punycode_domains_are_marked_as_lookalikes(self) -> None:
+        url = "https://xn--80ak6aa92e.com/"
+        analysis = SPRITELINK.analyze_link_url(url)
+        self.assertTrue(analysis.has_lookalike_characters)
+        self.assertIn(
+            (
+                '<span style="color: #c00000;"><u>'
+                "xn--80ak6aa92e</u></span>"
+            ),
+            SPRITELINK.link_warning_url_html(
+                url,
+                analysis.underlined_indices,
+            ),
+        )
+
+    def test_non_confusable_international_domain_is_not_mislabeled(self) -> None:
+        analysis = SPRITELINK.analyze_link_url("https://münich.example/")
+        self.assertFalse(analysis.trusted)
+        self.assertFalse(analysis.has_lookalike_characters)
+
+    def test_userinfo_spoofing_underlines_the_real_hostname(self) -> None:
+        url = "https://google.com@evilsite.net/private"
+        analysis = SPRITELINK.analyze_link_url(url)
+        self.assertFalse(analysis.trusted)
+        self.assertTrue(analysis.has_userinfo)
+        self.assertFalse(analysis.has_lookalike_characters)
+        self.assertIn(
+            (
+                'google.com@<span style="color: #c00000;"><u>'
+                "evilsite.net</u></span>/private"
+            ),
+            SPRITELINK.link_warning_url_html(
+                url,
+                analysis.underlined_indices,
+            ),
+        )
+
+    def test_trusted_real_hostname_still_warns_when_userinfo_exists(self) -> None:
+        analysis = SPRITELINK.analyze_link_url(
+            "https://attacker@github.com/"
+        )
+        self.assertFalse(analysis.trusted)
+        self.assertTrue(analysis.suspicious)
+
+    def test_link_warning_popup_contains_requested_copy_and_actions(self) -> None:
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_link_warning_popup
+        )
+        show_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._show_link_warning_popup
+        )
+        self.assertIn('self._heading("Link Warning")', build_source)
+        self.assertIn(
+            "Make sure you trust this website before continuing.",
+            build_source,
+        )
+        self.assertIn('QPushButton("Go to URL")', build_source)
+        self.assertIn('QPushButton("Cancel")', build_source)
+        self.assertIn("TextSelectableByMouse", build_source)
+        self.assertIn("look-alike characters", show_source)
+        self.assertIn("username section", show_source)
+        self.assertIn("before the domain name.", show_source)
+        self.assertIn('"color: #c00000;"', show_source)
+
+    def test_link_warning_monospace_font_survives_style_refreshes(self) -> None:
+        font_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._make_link_warning_url_font
+        )
+        refresh_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._apply_application_font_strategy
+        )
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_link_warning_popup
+        )
+        self.assertIn('"lucida console"', font_source)
+        self.assertIn('"consolas"', font_source)
+        self.assertIn("setFixedPitch(True)", font_source)
+        self.assertIn("_refresh_special_widget_fonts()", refresh_source)
+        self.assertIn("_make_link_warning_url_font()", build_source)
+
+
 class ImageEmbeddingTests(unittest.TestCase):
     def test_extensionless_provider_pages_are_embeddable(self) -> None:
         urls = (
@@ -2355,8 +2757,15 @@ class HttpsOnlyMediaAndLinkTests(unittest.TestCase):
         context_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._link_url_from_anchor
         )
+        self.assertIn(
+            'scheme().casefold() != "https"',
+            open_source,
+        )
+        self.assertIn(
+            'scheme().casefold() == "https"',
+            context_source,
+        )
         for source in (open_source, context_source):
-            self.assertIn('scheme().casefold() == "https"', source)
             self.assertNotIn('"http"', source)
 
 
@@ -3429,6 +3838,27 @@ class Version120ReleaseTests(unittest.TestCase):
             "collapsed_block_format = cursor.blockFormat()",
             source,
         )
+
+    def test_user_message_lines_are_fixed_at_24_pixels(self) -> None:
+        self.assertEqual(SPRITELINK.MESSAGE_LINE_HEIGHT_PX, 24)
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        self.assertIn("block_format.setLineHeight(", source)
+        self.assertIn(
+            "float(MESSAGE_LINE_HEIGHT_PX)",
+            source,
+        )
+        self.assertIn(
+            "int(QTextBlockFormat.LineHeightTypes.FixedHeight.value)",
+            source,
+        )
+        self.assertIn("embedded_media_block_numbers", source)
+
+        separator_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_log_separator
+        )
+        self.assertNotIn("setLineHeight", separator_source)
 
     def test_message_text_trims_after_its_last_visible_character(self) -> None:
         self.assertEqual(

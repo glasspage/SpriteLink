@@ -24,6 +24,7 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 from functools import lru_cache
+from html import escape
 from html.parser import HTMLParser
 from datetime import datetime
 import hashlib
@@ -66,6 +67,7 @@ try:
         QDesktopServices,
         QDrag,
         QFont,
+        QFontDatabase,
         QFontMetrics,
         QIcon,
         QImage,
@@ -115,6 +117,7 @@ try:
         QStyle,
         QStyleFactory,
         QStyledItemDelegate,
+        QStyleOptionButton,
         QStyleOptionViewItem,
         QSystemTrayIcon,
         QTextBrowser,
@@ -456,6 +459,70 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "yande.re",
     "*.yande.re",
 )
+TRUSTED_LINK_DOMAINS = (
+    "google.com",
+    "googleusercontent.com",
+    "gstatic.com",
+    "youtube.com",
+    "youtu.be",
+    "ytimg.com",
+    "github.com",
+    "githubassets.com",
+    "githubusercontent.com",
+    "discord.com",
+    "discord.gg",
+    "discordapp.com",
+    "wikipedia.org",
+    "wikimedia.org",
+    "microsoft.com",
+    "live.com",
+    "office.com",
+    "windows.com",
+    "apple.com",
+    "amazon.com",
+    "reddit.com",
+    "redd.it",
+    "twitch.tv",
+    "twitter.com",
+    "x.com",
+    "twimg.com",
+    "bsky.app",
+    "instagram.com",
+    "facebook.com",
+    "fbcdn.net",
+    "tiktok.com",
+    "linkedin.com",
+    "spotify.com",
+    "soundcloud.com",
+    "steamcommunity.com",
+    "steampowered.com",
+    "mozilla.org",
+    "python.org",
+    "pypi.org",
+    "stackoverflow.com",
+    "stackexchange.com",
+    "npmjs.com",
+    "imgur.com",
+    "tenor.com",
+    "giphy.com",
+    "klipy.com",
+    "unsplash.com",
+    "pexels.com",
+    "pixabay.com",
+    "flickr.com",
+    "cloudinary.com",
+    "ctfassets.net",
+    "sanity.io",
+    "wikia.nocookie.net",
+    "wikia.com",
+    "fandom.com",
+    "tmdb.org",
+    "themoviedb.org",
+    "myanimelist.net",
+)
+TRUSTED_LINK_EXACT_HOSTS = (
+    "steamuserimages-a.akamaihd.net",
+)
 IMAGE_LINK_EXTENSIONS = (
     ".png",
     ".jpg",
@@ -524,6 +591,16 @@ DEFAULT_MESSAGE_FONT = "Arial"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
+MESSAGE_LINE_HEIGHT_PX = 24
+SPOILER_DISPLAY_HEIGHT_PX = 22
+COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
+RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
+RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
+RENDERED_SPOILER_REVEALED_PROPERTY = int(QTextFormat.Property.UserProperty) + 4
+SPOILER_BLOCK_COLOR = "#404040"
+REVEALED_SPOILER_BLOCK_ALPHA = 26
+SPOILER_HORIZONTAL_PADDING_PX = 2
+SPOILER_PADDING_CHARACTER = "\u00a0"
 SELECTABLE_MESSAGE_FONTS = (
     "Arial",
     "Calibri",
@@ -1142,10 +1219,11 @@ class RichTextRun:
     bold: bool = False
     italic: bool = False
     underline: bool = False
+    spoiler: int | None = None
 
 
-RICH_TEXT_TAG_PATTERN = re.compile(r"</?([biu])>")
-RICH_TEXT_TAG_ORDER = ("b", "i", "u")
+RICH_TEXT_TAG_PATTERN = re.compile(r"</?(b|i|u|sp)>")
+RICH_TEXT_TAG_ORDER = ("sp", "b", "i", "u")
 
 
 @lru_cache(maxsize=4096)
@@ -1155,7 +1233,9 @@ def parse_message_rich_text(
     """Parse SpriteLink's small formatting language without accepting HTML."""
     parts: list[str] = []
     runs: list[RichTextRun] = []
-    active = {tag: 0 for tag in RICH_TEXT_TAG_ORDER}
+    active = {tag: 0 for tag in ("b", "i", "u")}
+    spoiler_stack: list[int] = []
+    next_spoiler_id = 0
     plain_length = 0
     position = 0
 
@@ -1170,6 +1250,7 @@ def parse_message_rich_text(
             active["b"] > 0,
             active["i"] > 0,
             active["u"] > 0,
+            spoiler_stack[-1] if spoiler_stack else None,
         )
         if runs and (
             runs[-1].end == start
@@ -1177,6 +1258,7 @@ def parse_message_rich_text(
                 runs[-1].bold,
                 runs[-1].italic,
                 runs[-1].underline,
+                runs[-1].spoiler,
             ) == style
         ):
             previous = runs[-1]
@@ -1192,7 +1274,15 @@ def parse_message_rich_text(
         append_text(text[position:match.start()])
         tag = match.group(1)
         is_closing = text[match.start() + 1] == "/"
-        if is_closing:
+        if tag == "sp" and is_closing:
+            if spoiler_stack:
+                spoiler_stack.pop()
+            else:
+                append_text(match.group(0))
+        elif tag == "sp":
+            next_spoiler_id += 1
+            spoiler_stack.append(next_spoiler_id)
+        elif is_closing:
             if active[tag] > 0:
                 active[tag] -= 1
             else:
@@ -1206,6 +1296,17 @@ def parse_message_rich_text(
 
 def message_plain_text(text: str) -> str:
     return parse_message_rich_text(text)[0]
+
+
+def message_plain_text_with_spoilers_redacted(text: str) -> str:
+    """Return plain message text with every spoiler character concealed."""
+    plain_text, runs = parse_message_rich_text(text)
+    redacted = list(plain_text)
+    for run in runs:
+        if run.spoiler is None:
+            continue
+        redacted[run.start:run.end] = "█" * (run.end - run.start)
+    return "".join(redacted)
 
 
 def message_items_are_contiguous(
@@ -1608,17 +1709,17 @@ def clear_windows_notification(tag: str) -> bool:
 
 
 def serialize_message_rich_text(
-    segments: list[tuple[str, bool, bool, bool]],
+    segments: list[tuple[str, bool, bool, bool, bool]],
 ) -> str:
     """Serialize visibly formatted composer segments into safe message tags."""
     output: list[str] = []
     active_tags: list[str] = []
-    for text, bold, italic, underline in segments:
+    for text, bold, italic, underline, spoiler in segments:
         desired_tags = [
             tag
             for tag, enabled in zip(
                 RICH_TEXT_TAG_ORDER,
-                (bold, italic, underline),
+                (spoiler, bold, italic, underline),
             )
             if enabled
         ]
@@ -1649,7 +1750,7 @@ def trim_message_text(text: str) -> str:
         return ""
 
     trimmed_length = len(trimmed_plain_text)
-    trimmed_segments: list[tuple[str, bool, bool, bool]] = []
+    trimmed_segments: list[tuple[str, bool, bool, bool, bool]] = []
     for run in runs:
         if run.start >= trimmed_length:
             break
@@ -1659,6 +1760,7 @@ def trim_message_text(text: str) -> str:
             run.bold,
             run.italic,
             run.underline,
+            run.spoiler is not None,
         ))
     return serialize_message_rich_text(trimmed_segments)
 
@@ -1778,6 +1880,183 @@ def is_trusted_image_url(url: str) -> bool:
             for pattern in TRUSTED_IMAGE_HOST_PATTERNS
         )
     )
+
+
+@dataclass(frozen=True)
+class LinkSafetyAnalysis:
+    trusted: bool
+    has_lookalike_characters: bool
+    has_userinfo: bool
+    underlined_indices: frozenset[int]
+
+    @property
+    def suspicious(self) -> bool:
+        return self.has_lookalike_characters or self.has_userinfo
+
+
+LOOKALIKE_DOMAIN_CHARACTERS = frozenset(
+    "ΑΒΕΖΗΙΚΜΝΟΡΤΥΧϹ"
+    "αβεζηικμνορτυχϲ"
+    "АВСЕНІЈКМОРЅТХҮ"
+    "авсенікморѕтхүј"
+    "ԁԌԍԛԝ"
+    "ՕօՍս"
+    "ᎪᏴᏟᎬᎻᏦᎷᎷᏁᎾᏢᏚᎢ᙭"
+)
+
+
+def _is_lookalike_domain_character(character: str) -> bool:
+    if character in LOOKALIKE_DOMAIN_CHARACTERS:
+        return True
+    normalized = unicodedata.normalize("NFKC", character)
+    return (
+        ord(character) > 127
+        and normalized != character
+        and normalized.isascii()
+        and normalized.isalnum()
+    )
+
+
+def _url_authority_hostname_range(url: str) -> tuple[int, int] | None:
+    scheme_match = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", url)
+    if scheme_match is None:
+        return None
+    authority_start = scheme_match.end()
+    authority_end = len(url)
+    for separator in "/?#":
+        position = url.find(separator, authority_start)
+        if position >= 0:
+            authority_end = min(authority_end, position)
+    authority = url[authority_start:authority_end]
+    host_offset = authority.rfind("@") + 1
+    host_and_port = authority[host_offset:]
+    if host_and_port.startswith("["):
+        closing_bracket = host_and_port.find("]")
+        if closing_bracket < 0:
+            return None
+        hostname_start = authority_start + host_offset + 1
+        return hostname_start, hostname_start + closing_bracket - 1
+
+    hostname_length = len(host_and_port)
+    port_separator = host_and_port.rfind(":")
+    if (
+        port_separator >= 0
+        and host_and_port[port_separator + 1:].isdigit()
+    ):
+        hostname_length = port_separator
+    if hostname_length <= 0:
+        return None
+    hostname_start = authority_start + host_offset
+    return hostname_start, hostname_start + hostname_length
+
+
+def _lookalike_hostname_indices(
+    url: str,
+    hostname_range: tuple[int, int] | None,
+) -> frozenset[int]:
+    if hostname_range is None:
+        return frozenset()
+    start, end = hostname_range
+    hostname = url[start:end]
+    suspicious_indices = {
+        start + offset
+        for offset, character in enumerate(hostname)
+        if _is_lookalike_domain_character(character)
+    }
+    label_start = 0
+    for label in hostname.split("."):
+        if label.casefold().startswith("xn--"):
+            try:
+                decoded_label = label.encode("ascii").decode("idna")
+            except (UnicodeError, UnicodeDecodeError):
+                decoded_label = ""
+            if any(
+                _is_lookalike_domain_character(character)
+                for character in decoded_label
+            ):
+                suspicious_indices.update(range(
+                    start + label_start,
+                    start + label_start + len(label),
+                ))
+        label_start += len(label) + 1
+    return frozenset(suspicious_indices)
+
+
+def _hostname_is_trusted_for_links(hostname: str) -> bool:
+    normalized = hostname.casefold().rstrip(".")
+    if normalized in TRUSTED_LINK_EXACT_HOSTS:
+        return True
+    return any(
+        normalized == domain or normalized.endswith(f".{domain}")
+        for domain in TRUSTED_LINK_DOMAINS
+    )
+
+
+def analyze_link_url(url: str) -> LinkSafetyAnalysis:
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname or ""
+    except ValueError:
+        return LinkSafetyAnalysis(False, False, False, frozenset())
+
+    hostname_range = _url_authority_hostname_range(url)
+    lookalike_indices = _lookalike_hostname_indices(url, hostname_range)
+    has_userinfo = parsed.username is not None
+    underlined_indices = set(lookalike_indices)
+    if has_userinfo and hostname_range is not None:
+        underlined_indices.update(range(*hostname_range))
+    suspicious = bool(lookalike_indices) or has_userinfo
+    trusted = (
+        parsed.scheme.casefold() == "https"
+        and bool(hostname)
+        and not suspicious
+        and hostname.isascii()
+        and _hostname_is_trusted_for_links(hostname)
+    )
+    return LinkSafetyAnalysis(
+        trusted,
+        bool(lookalike_indices),
+        has_userinfo,
+        frozenset(underlined_indices),
+    )
+
+
+def link_requires_warning(
+    analysis: LinkSafetyAnalysis,
+    client_id: str | None,
+    trusted_user_ids: set[str],
+    *,
+    is_local: bool = False,
+) -> bool:
+    if is_local:
+        return False
+    if analysis.suspicious:
+        return True
+    return not (
+        analysis.trusted
+        or (client_id is not None and client_id in trusted_user_ids)
+    )
+
+
+def link_warning_url_html(
+    url: str,
+    underlined_indices: frozenset[int],
+) -> str:
+    output: list[str] = []
+    underlining = False
+    for index, character in enumerate(url):
+        should_underline = index in underlined_indices
+        if should_underline != underlining:
+            output.append(
+                '<span style="color: #c00000;"><u>'
+                if should_underline
+                else "</u></span>"
+            )
+            underlining = should_underline
+        output.append(escape(character))
+    if underlining:
+        output.append("</u></span>")
+    return "".join(output)
 
 
 def is_image_url_trusted_for_sender(
@@ -2320,7 +2599,7 @@ def default_config() -> dict[str, Any]:
         "unread_counts": {},
         "room_state": {},
         "muted_users": {},
-        "trusted_image_users": {},
+        "trusted_link_and_image_users": {},
         "collapsed_messages": {},
         "sent_message_utc_day": current_utc_day_number(),
         "sent_messages_today": 0,
@@ -2406,11 +2685,28 @@ def load_config() -> dict[str, Any]:
     for dictionary_key in (
         "room_state",
         "muted_users",
+        "trusted_link_and_image_users",
         "trusted_image_users",
+        "trusted_link_users",
         "collapsed_messages",
     ):
         if not isinstance(config.get(dictionary_key), dict):
             config[dictionary_key] = {}
+
+    combined_trusted_users = config["trusted_link_and_image_users"]
+    for legacy_key in ("trusted_image_users", "trusted_link_users"):
+        for scope_id, raw_values in config[legacy_key].items():
+            existing_values = combined_trusted_users.get(scope_id, [])
+            if not isinstance(existing_values, list):
+                existing_values = []
+            if not isinstance(raw_values, list):
+                raw_values = []
+            combined_trusted_users[scope_id] = sorted({
+                value
+                for value in (*existing_values, *raw_values)
+                if isinstance(value, str) and value
+            })
+        config.pop(legacy_key, None)
 
     today_utc = current_utc_day_number()
     try:
@@ -2980,12 +3276,12 @@ class ComposeTextEdit(QPlainTextEdit):
     send_requested = Signal()
 
     def to_message_text(self) -> str:
-        segments: list[tuple[str, bool, bool, bool]] = []
+        segments: list[tuple[str, bool, bool, bool, bool]] = []
         block = self.document().begin()
         first_block = True
         while block.isValid():
             if not first_block:
-                segments.append(("\n", False, False, False))
+                segments.append(("\n", False, False, False, False))
             iterator = block.begin()
             while not iterator.atEnd():
                 fragment = iterator.fragment()
@@ -2996,6 +3292,7 @@ class ComposeTextEdit(QPlainTextEdit):
                         formatting.fontWeight() >= QFont.Weight.Bold,
                         formatting.fontItalic(),
                         formatting.fontUnderline(),
+                        bool(formatting.property(COMPOSER_SPOILER_PROPERTY)),
                     ))
                 iterator += 1
             first_block = False
@@ -3012,6 +3309,13 @@ class ComposeTextEdit(QPlainTextEdit):
             formatting.setFontItalic(enabled)
         elif style == "underline":
             formatting.setFontUnderline(enabled)
+        elif style == "spoiler":
+            formatting.setProperty(COMPOSER_SPOILER_PROPERTY, enabled)
+            block_color = QColor(SPOILER_BLOCK_COLOR)
+            block_color.setAlpha(
+                REVEALED_SPOILER_BLOCK_ALPHA if enabled else 0
+            )
+            formatting.setBackground(block_color)
         else:
             return
 
@@ -3027,6 +3331,8 @@ class ComposeTextEdit(QPlainTextEdit):
         formatting.setFontWeight(QFont.Weight.Normal)
         formatting.setFontItalic(False)
         formatting.setFontUnderline(False)
+        formatting.setProperty(COMPOSER_SPOILER_PROPERTY, False)
+        formatting.setBackground(QColor(0, 0, 0, 0))
         self.mergeCurrentCharFormat(formatting)
 
     def keyPressEvent(self, event: Any) -> None:
@@ -3052,6 +3358,56 @@ class ClickableProgressBar(QProgressBar):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+
+class SpoilerFormatButton(QPushButton):
+    """Show the revealed spoiler block treatment behind the button text."""
+
+    def paintEvent(self, _event: Any) -> None:
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        text = option.text
+        option.text = ""
+
+        painter = QPainter(self)
+        self.style().drawControl(
+            QStyle.ControlElement.CE_PushButton,
+            option,
+            painter,
+            self,
+        )
+        text_rect = self.style().subElementRect(
+            QStyle.SubElement.SE_PushButtonContents,
+            option,
+            self,
+        )
+        alignment = (
+            int(Qt.AlignmentFlag.AlignCenter)
+            | int(Qt.TextFlag.TextShowMnemonic)
+        )
+        block_rect = QFontMetrics(self.font()).boundingRect(
+            text_rect,
+            alignment,
+            text,
+        ).adjusted(
+            -SPOILER_HORIZONTAL_PADDING_PX,
+            0,
+            SPOILER_HORIZONTAL_PADDING_PX,
+            0,
+        )
+        block_color = QColor(SPOILER_BLOCK_COLOR)
+        block_color.setAlpha(REVEALED_SPOILER_BLOCK_ALPHA)
+        painter.fillRect(block_rect, block_color)
+        self.style().drawItemText(
+            painter,
+            text_rect,
+            alignment,
+            self.palette(),
+            self.isEnabled(),
+            text,
+            QPalette.ColorRole.ButtonText,
+        )
+        painter.end()
 
 
 class ConfigOverlay(QWidget):
@@ -4005,6 +4361,9 @@ class MessageLogBrowser(QTextBrowser):
         shadow_color.setAlphaF(0.15)
         shadow_format = QTextCharFormat()
         shadow_format.setForeground(shadow_color)
+        transparent_spoiler_format = QTextCharFormat()
+        transparent_spoiler_format.setForeground(QColor(0, 0, 0, 0))
+        transparent_spoiler_format.setBackground(QColor(0, 0, 0, 0))
         painter = QPainter(viewport)
         painter.setClipRegion(event.region())
         # QTextLayout already retains its absolute document position.  The
@@ -4024,10 +4383,29 @@ class MessageLogBrowser(QTextBrowser):
             if layout is None or layout.lineCount() <= 0:
                 continue
 
-            shadow_range = QTextLayout.FormatRange()
-            shadow_range.start = 0
-            shadow_range.length = block.length() - 1
-            shadow_range.format = shadow_format
+            shadow_ranges: list[QTextLayout.FormatRange] = []
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    formatting = fragment.charFormat()
+                    shadow_range = QTextLayout.FormatRange()
+                    shadow_range.start = (
+                        fragment.position() - block.position()
+                    )
+                    shadow_range.length = fragment.length()
+                    shadow_range.format = (
+                        transparent_spoiler_format
+                        if formatting.property(
+                            RENDERED_SPOILER_ID_PROPERTY
+                        )
+                        else shadow_format
+                    )
+                    shadow_ranges.append(shadow_range)
+                iterator += 1
+
+            if not shadow_ranges:
+                continue
 
             painter.save()
             painter.setClipRegion(
@@ -4035,9 +4413,98 @@ class MessageLogBrowser(QTextBrowser):
                 Qt.ClipOperation.ReplaceClip,
             )
             painter.translate(1, 1)
-            layout.draw(painter, layout_origin, [shadow_range])
+            layout.draw(painter, layout_origin, shadow_ranges)
             painter.restore()
             layout.draw(painter, layout_origin)
+
+        painter.end()
+
+    def _paint_spoilers(self, event: Any) -> None:
+        """Paint spoiler formatting independently from optional shadows."""
+        viewport = self.viewport()
+        viewport_width = viewport.width()
+        viewport_height = viewport.height()
+        if viewport_width <= 0 or viewport_height <= 0:
+            return
+
+        paint_rect = event.rect()
+        first_block = self.cursorForPosition(QPoint(
+            0,
+            max(0, paint_rect.top()),
+        )).block().blockNumber()
+        last_block = self.cursorForPosition(QPoint(
+            max(0, viewport_width - 1),
+            min(viewport_height - 1, paint_rect.bottom()),
+        )).block().blockNumber()
+        first_block = max(0, first_block - 1)
+        last_block = min(
+            self.document().blockCount() - 1,
+            last_block + 1,
+        )
+
+        scroll_x = self.horizontalScrollBar().value()
+        scroll_y = self.verticalScrollBar().value()
+        layout_origin = QPointF(-scroll_x, -scroll_y)
+        painter = QPainter(viewport)
+
+        for block_number in range(first_block, last_block + 1):
+            block = self.document().findBlockByNumber(block_number)
+            if not block.isValid() or block.length() <= 1:
+                continue
+            layout = block.layout()
+            if layout is None or layout.lineCount() <= 0:
+                continue
+
+            spoiler_region = QRegion()
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid() and fragment.charFormat().property(
+                    RENDERED_SPOILER_ID_PROPERTY
+                ):
+                    fragment_start = fragment.position() - block.position()
+                    fragment_end = fragment_start + fragment.length()
+                    for line_index in range(layout.lineCount()):
+                        line = layout.lineAt(line_index)
+                        line_start = line.textStart()
+                        line_end = line_start + line.textLength()
+                        start = max(fragment_start, line_start)
+                        end = min(fragment_end, line_end)
+                        if end <= start:
+                            continue
+                        start_x = line.cursorToX(start)[0]
+                        end_x = line.cursorToX(end)[0]
+                        spoiler_height = min(
+                            float(SPOILER_DISPLAY_HEIGHT_PX),
+                            line.height(),
+                        )
+                        spoiler_rect = QRectF(
+                            layout.position().x() + min(start_x, end_x)
+                            - scroll_x,
+                            (
+                                layout.position().y()
+                                + line.y()
+                                + ((line.height() - spoiler_height) / 2.0)
+                                - scroll_y
+                            ),
+                            max(1.0, abs(end_x - start_x)),
+                            spoiler_height,
+                        ).toAlignedRect()
+                        spoiler_region = spoiler_region.united(
+                            QRegion(spoiler_rect)
+                        )
+                iterator += 1
+
+            spoiler_region = spoiler_region.intersected(event.region())
+            if spoiler_region.isEmpty():
+                continue
+            painter.save()
+            painter.setClipRegion(
+                spoiler_region,
+                Qt.ClipOperation.ReplaceClip,
+            )
+            layout.draw(painter, layout_origin)
+            painter.restore()
 
         painter.end()
 
@@ -4140,6 +4607,13 @@ class MessageLogBrowser(QTextBrowser):
         # safely be completed after the base document paint.
         self._paint_row_background_padding(event)
         self._paint_text_shadows(event)
+        # The base QTextBrowser paint can omit character backgrounds after
+        # an application-style replacement.  Text shadows previously hid
+        # that problem because their final layout redraw also happened to
+        # redraw spoilers.  Paint spoiler ranges explicitly in every mode so
+        # they remain visible when shadows start or become disabled, and so
+        # Qt's selection colors cannot replace them.
+        self._paint_spoilers(event)
         if not self.collapsed_fade_blocks:
             return
 
@@ -4434,6 +4908,8 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
         self.rendered_message_blocks: dict[int, str] = {}
         self.rendered_image_links: dict[str, str] = {}
+        self.rendered_link_targets: dict[str, tuple[str, str]] = {}
+        self.rendered_link_senders: dict[str, str] = {}
         self.rendered_image_positions: dict[str, list[int]] = {}
         self.rendered_image_candidates: dict[str, list[int]] = {}
         self.viewport_embedded_image_urls: set[str] = set()
@@ -4445,6 +4921,7 @@ class EncryptedChatClient(QObject):
         ] = {}
         self.last_inline_animation_frame_at: dict[str, float] = {}
         self.current_image_preview_url: str | None = None
+        self.current_image_preview_client_id: str | None = None
         self.recent_chatroom_switch_times: list[float] = []
         self.image_fetch_executor = DaemonTaskPool(
             max_workers=3,
@@ -4699,6 +5176,27 @@ class EncryptedChatClient(QObject):
         font.setStyleStrategy(self._font_style_strategy())
         return font
 
+    def _make_link_warning_url_font(self) -> QFont:
+        available_families = {
+            family.casefold(): family
+            for family in QFontDatabase.families()
+        }
+        family = available_families.get(
+            "lucida console",
+            available_families.get("consolas", "Monospace"),
+        )
+        font = QFont(family)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFixedPitch(True)
+        font.setStyleStrategy(self._font_style_strategy())
+        return font
+
+    def _refresh_special_widget_fonts(self) -> None:
+        if hasattr(self, "link_warning_url_label"):
+            self.link_warning_url_label.setFont(
+                self._make_link_warning_url_font()
+            )
+
     def _apply_application_font_strategy(self) -> None:
         self._message_font_cache.clear()
         app = QApplication.instance()
@@ -4715,6 +5213,7 @@ class EncryptedChatClient(QObject):
             widget_font.setFamily(self._ui_font_family())
             widget_font.setStyleStrategy(strategy)
             widget.setFont(widget_font)
+        self._refresh_special_widget_fonts()
         self._refresh_message_font_combo_fonts()
 
     def _ui_font_family(self) -> str:
@@ -4993,6 +5492,8 @@ class EncryptedChatClient(QObject):
         self.network_wakeup_event.set()
         self.viewport_media_timer.stop()
         self._hide_chat_tooltip()
+        if self.link_warning_overlay.isVisible():
+            self._hide_link_warning_popup()
         if self.image_preview_overlay.isVisible():
             self._hide_image_preview_popup()
         self._pause_animated_media()
@@ -5001,6 +5502,8 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
         self.rendered_image_links.clear()
+        self.rendered_link_targets.clear()
+        self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
         self.viewport_embedded_image_urls.clear()
@@ -5180,6 +5683,10 @@ class EncryptedChatClient(QObject):
             self.image_preview_panel.setStyleSheet(
                 self._config_panel_stylesheet()
             )
+        if hasattr(self, "link_warning_panel"):
+            self.link_warning_panel.setStyleSheet(
+                self._config_panel_stylesheet()
+            )
         if hasattr(self, "message_size_bar"):
             self._draw_message_size_bar()
         if hasattr(self, "chatrooms_toggle"):
@@ -5227,6 +5734,7 @@ class EncryptedChatClient(QObject):
         self._build_config_popup()
         self._build_message_limit_popup()
         self._build_image_preview_popup()
+        self._build_link_warning_popup()
 
     def _build_chatroom_sidebar(self, root_layout: QHBoxLayout) -> None:
         self.chatrooms_panel = QWidget()
@@ -5265,46 +5773,10 @@ class EncryptedChatClient(QObject):
         self._refresh_chatroom_list()
 
     def _on_chatrooms_toggled(self, expanded: bool) -> None:
-        width_delta = CHATROOM_SIDEBAR_WIDTH
-        old_geometry = self.root.geometry()
-        old_frame_geometry = self.root.frameGeometry()
-        frame_offset_x = old_geometry.x() - old_frame_geometry.x()
-        frame_offset_y = old_geometry.y() - old_frame_geometry.y()
-        new_minimum_width = self.root.minimumWidth() + (
-            width_delta if expanded else -width_delta
-        )
-        new_width = max(
-            new_minimum_width,
-            old_geometry.width() + (
-                width_delta if expanded else -width_delta
-            ),
-        )
-        target_frame_x = old_frame_geometry.x() + (
-            -width_delta if expanded else width_delta
-        )
-        # Apply the sidebar and native-window geometry as one paint update.
-        # Otherwise the chat log is briefly laid out at the intermediate
-        # width and visibly flickers while every line reflows.
-        self.root.setUpdatesEnabled(False)
-        try:
-            self.chatrooms_toggle.setText("‹" if expanded else "›")
-            self.root.setMinimumWidth(new_minimum_width)
-            self.root.setGeometry(
-                target_frame_x + frame_offset_x,
-                old_frame_geometry.y() + frame_offset_y,
-                new_width,
-                old_geometry.height(),
-            )
-            self.chatrooms_panel.setVisible(expanded)
-            central_widget = self.root.centralWidget()
-            if (
-                central_widget is not None
-                and central_widget.layout() is not None
-            ):
-                central_widget.layout().activate()
-        finally:
-            self.root.setUpdatesEnabled(True)
-            self.root.update()
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
+        self.chatrooms_toggle.setText("‹" if expanded else "›")
+        self.chatrooms_panel.setVisible(expanded)
+        self._restore_chat_bottom_after_layout_change(keep_at_bottom)
 
     def _chatroom_definitions(self) -> list[dict[str, str]]:
         rooms = [{
@@ -6262,6 +6734,7 @@ class EncryptedChatClient(QObject):
         self.bold_format_button = QPushButton("Bold")
         self.italic_format_button = QPushButton("Italic")
         self.underline_format_button = QPushButton("Underline")
+        self.spoiler_format_button = SpoilerFormatButton("Spoiler")
         bold_button_font = QFont(self.bold_format_button.font())
         bold_button_font.setBold(True)
         self.bold_format_button.setFont(bold_button_font)
@@ -6275,6 +6748,7 @@ class EncryptedChatClient(QObject):
             (self.bold_format_button, "bold"),
             (self.italic_format_button, "italic"),
             (self.underline_format_button, "underline"),
+            (self.spoiler_format_button, "spoiler"),
         ):
             button.setCheckable(True)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -6353,7 +6827,7 @@ class EncryptedChatClient(QObject):
         )
         if checked:
             self.identity_username_entry.setFocus()
-        self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
+        self._restore_chat_bottom_after_layout_change(keep_at_bottom)
 
     def _on_font_menu_toggled(self, checked: bool) -> None:
         keep_at_bottom = self._chat_is_scrolled_to_bottom()
@@ -6362,7 +6836,7 @@ class EncryptedChatClient(QObject):
         )
         if checked:
             self.message_font_combo.setFocus()
-        self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
+        self._restore_chat_bottom_after_layout_change(keep_at_bottom)
 
     def _on_formatting_menu_toggled(self, checked: bool) -> None:
         keep_at_bottom = self._chat_is_scrolled_to_bottom()
@@ -6372,7 +6846,7 @@ class EncryptedChatClient(QObject):
         if checked:
             self.message_entry.setFocus()
             self._sync_formatting_buttons()
-        self._restore_chat_bottom_after_menu_toggle(keep_at_bottom)
+        self._restore_chat_bottom_after_layout_change(keep_at_bottom)
 
     def _set_composer_menu_visibility(
         self,
@@ -6405,7 +6879,7 @@ class EncryptedChatClient(QObject):
         scrollbar = self.chat_display.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def _restore_chat_bottom_after_menu_toggle(
+    def _restore_chat_bottom_after_layout_change(
         self,
         keep_at_bottom: bool,
     ) -> None:
@@ -6434,6 +6908,10 @@ class EncryptedChatClient(QObject):
             ),
             (self.italic_format_button, formatting.fontItalic()),
             (self.underline_format_button, formatting.fontUnderline()),
+            (
+                self.spoiler_format_button,
+                bool(formatting.property(COMPOSER_SPOILER_PROPERTY)),
+            ),
         )
         for button, checked in states:
             self._set_button_checked(button, checked)
@@ -6897,6 +7375,133 @@ class EncryptedChatClient(QObject):
         self.image_preview_overlay.hide()
         QTimer.singleShot(0, self._sync_image_preview_overlay_geometry)
 
+    def _build_link_warning_popup(self) -> None:
+        self.link_warning_overlay = ConfigOverlay(self.chat_content)
+        self.link_warning_overlay.dismissed.connect(
+            self._hide_link_warning_popup
+        )
+
+        overlay_layout = QVBoxLayout(self.link_warning_overlay)
+        overlay_layout.setContentsMargins(36, 24, 36, 24)
+        overlay_layout.addStretch(1)
+
+        panel_row = QHBoxLayout()
+        panel_row.addStretch(1)
+        self.link_warning_panel = QFrame()
+        self.link_warning_panel.setObjectName("configPanel")
+        self.link_warning_panel.setMinimumWidth(360)
+        self.link_warning_panel.setMaximumWidth(620)
+        self.link_warning_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.link_warning_panel.setStyleSheet(
+            self._config_panel_stylesheet()
+        )
+        panel_row.addWidget(self.link_warning_panel, 8)
+        panel_row.addStretch(1)
+        overlay_layout.addLayout(panel_row)
+        overlay_layout.addStretch(1)
+        self.link_warning_overlay.panel = self.link_warning_panel
+
+        panel_layout = QVBoxLayout(self.link_warning_panel)
+        panel_layout.setContentsMargins(16, 14, 16, 14)
+        panel_layout.setSpacing(10)
+        panel_layout.addWidget(self._heading("Link Warning"))
+
+        warning_text = QLabel(
+            "Make sure you trust this website before continuing."
+        )
+        warning_text.setWordWrap(True)
+        panel_layout.addWidget(warning_text)
+
+        self.link_warning_url_label = QLabel()
+        self.link_warning_url_label.setTextFormat(Qt.TextFormat.RichText)
+        self.link_warning_url_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.link_warning_url_label.setWordWrap(True)
+        self.link_warning_url_label.setFont(
+            self._make_link_warning_url_font()
+        )
+        panel_layout.addWidget(self.link_warning_url_label)
+
+        self.link_warning_suspicious_label = QLabel()
+        self.link_warning_suspicious_label.setWordWrap(True)
+        self.link_warning_suspicious_label.setFont(
+            self._make_ui_font(bold=True)
+        )
+        panel_layout.addWidget(self.link_warning_suspicious_label)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self.link_warning_go_button = QPushButton("Go to URL")
+        self.link_warning_go_button.clicked.connect(
+            self._confirm_link_warning
+        )
+        button_row.addWidget(self.link_warning_go_button)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.setDefault(True)
+        cancel_button.clicked.connect(self._hide_link_warning_popup)
+        button_row.addWidget(cancel_button)
+        panel_layout.addLayout(button_row)
+        self.link_warning_cancel_button = cancel_button
+
+        self.current_link_warning_url: str | None = None
+        self.link_warning_overlay.hide()
+        QTimer.singleShot(0, self._sync_link_warning_overlay_geometry)
+
+    def _sync_link_warning_overlay_geometry(self) -> None:
+        self.link_warning_overlay.setGeometry(self.chat_content.rect())
+
+    def _show_link_warning_popup(
+        self,
+        url: str,
+        analysis: LinkSafetyAnalysis,
+    ) -> None:
+        self._hide_chat_tooltip()
+        self.current_link_warning_url = url
+        self.link_warning_url_label.setText(
+            link_warning_url_html(url, analysis.underlined_indices)
+        )
+        suspicious_messages: list[str] = []
+        if analysis.has_lookalike_characters:
+            suspicious_messages.append(
+                "This URL looks suspicious: it has look-alike characters "
+                "in the domain name."
+            )
+        if analysis.has_userinfo:
+            suspicious_messages.append(
+                "This URL looks suspicious: it has a username section "
+                "before the domain name."
+            )
+        self.link_warning_suspicious_label.setText(
+            "\n".join(suspicious_messages)
+        )
+        self.link_warning_suspicious_label.setVisible(
+            bool(suspicious_messages)
+        )
+        self.link_warning_go_button.setStyleSheet(
+            "color: #c00000;" if analysis.suspicious else ""
+        )
+        self._sync_link_warning_overlay_geometry()
+        self.link_warning_overlay.show()
+        self.link_warning_overlay.raise_()
+        self.link_warning_cancel_button.setFocus()
+
+    def _hide_link_warning_popup(self) -> None:
+        self.link_warning_overlay.hide()
+        self.current_link_warning_url = None
+        self.link_warning_url_label.clear()
+        self.link_warning_suspicious_label.clear()
+        self.message_entry.setFocus()
+
+    def _confirm_link_warning(self) -> None:
+        url = self.current_link_warning_url
+        self._hide_link_warning_popup()
+        if url:
+            self._launch_url_in_browser(url)
+
     def _sync_image_preview_overlay_geometry(self) -> None:
         self.image_preview_overlay.setGeometry(self.chat_content.rect())
 
@@ -7003,12 +7608,17 @@ class EncryptedChatClient(QObject):
         self.image_preview_label.clear()
         self.image_preview_label.setPixmap(QPixmap.fromImage(preview))
 
-    def _show_image_preview_popup(self, url: str) -> None:
+    def _show_image_preview_popup(
+        self,
+        url: str,
+        client_id: str | None = None,
+    ) -> None:
         media = self.image_preview_cache.get(url)
         if not isinstance(media, RemoteMediaPreview):
             return
         self._hide_chat_tooltip()
         self.current_image_preview_url = url
+        self.current_image_preview_client_id = client_id
         self._ensure_animated_media_controller(url, media)
         self._sync_image_preview_overlay_geometry()
         self.image_preview_overlay.show()
@@ -7043,6 +7653,7 @@ class EncryptedChatClient(QObject):
         url = self.current_image_preview_url
         self.image_preview_overlay.hide()
         self.current_image_preview_url = None
+        self.current_image_preview_client_id = None
         self.image_preview_label.clear()
         self.image_preview_url_label.clear()
         self.image_preview_url_label.setToolTip("")
@@ -7056,7 +7667,10 @@ class EncryptedChatClient(QObject):
 
     def _open_current_image_in_browser(self) -> None:
         if self.current_image_preview_url:
-            self._open_url_in_browser(self.current_image_preview_url)
+            self._open_url_in_browser(
+                self.current_image_preview_url,
+                self.current_image_preview_client_id,
+            )
 
     def _build_config_tab(self) -> None:
         layout = QGridLayout(self.config_tab)
@@ -7700,6 +8314,11 @@ class EncryptedChatClient(QObject):
         # widget fonts. Restore the active theme's font family, especially
         # Tahoma for Windows Classic headings and the chatroom title.
         self._apply_application_font_strategy()
+        # Applying a new application style can discard QTextDocument's
+        # rendered background brushes. Rebuild the log so spoiler blocks
+        # remain visible whether text shadows are enabled or disabled.
+        if hasattr(self, "chat_display"):
+            self._rerender_preserving_scroll()
 
     def _validate_current_settings(self) -> str:
         server_url = normalize_server_url(str(self.server_url_var.get()))
@@ -9422,12 +10041,14 @@ class EncryptedChatClient(QObject):
         self._write_room_preference_ids("muted_users", muted_ids)
         self._rerender_preserving_scroll()
 
-    def _set_user_image_trusted(
+    def _set_user_links_and_images_trusted(
         self,
         client_id: str,
         trusted: bool,
     ) -> None:
-        trusted_ids = self._room_preference_ids("trusted_image_users")
+        trusted_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
+        )
 
         if trusted:
             trusted_ids.add(client_id)
@@ -9435,7 +10056,7 @@ class EncryptedChatClient(QObject):
             trusted_ids.discard(client_id)
 
         self._write_room_preference_ids(
-            "trusted_image_users",
+            "trusted_link_and_image_users",
             trusted_ids,
         )
         self._rerender_preserving_scroll()
@@ -9554,10 +10175,35 @@ class EncryptedChatClient(QObject):
                     widget.hide()
 
     @staticmethod
-    def _open_url_in_browser(url: str) -> None:
+    def _launch_url_in_browser(url: str) -> None:
         parsed = QUrl(url)
         if parsed.isValid() and parsed.scheme().casefold() == "https":
             QDesktopServices.openUrl(parsed)
+
+    def _open_url_in_browser(
+        self,
+        url: str,
+        client_id: str | None = None,
+    ) -> None:
+        parsed = QUrl(url)
+        if not parsed.isValid() or parsed.scheme().casefold() != "https":
+            return
+        analysis = analyze_link_url(url)
+        trusted_user_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
+        )
+        if not link_requires_warning(
+            analysis,
+            client_id,
+            trusted_user_ids,
+            is_local=(
+                client_id is not None
+                and client_id == self._authenticated_client_id()
+            ),
+        ):
+            self._launch_url_in_browser(url)
+            return
+        self._show_link_warning_popup(url, analysis)
 
     def _image_url_from_anchor(self, anchor: str) -> str | None:
         prefix = "spritelink-image:"
@@ -9575,13 +10221,41 @@ class EncryptedChatClient(QObject):
         return image_url
 
     def _link_url_from_anchor(self, anchor: str) -> str | None:
-        image_url = self._image_url_from_anchor(anchor)
-        if image_url:
-            return image_url
+        link_target = self._link_target_from_anchor(anchor)
+        if link_target is not None:
+            return link_target[0]
         parsed = QUrl(anchor)
         if parsed.isValid() and parsed.scheme().casefold() == "https":
             return anchor
         return None
+
+    def _link_target_from_anchor(
+        self,
+        anchor: str,
+    ) -> tuple[str, str | None] | None:
+        image_url = self._image_url_from_anchor(anchor)
+        if image_url:
+            return image_url, self.rendered_link_senders.get(anchor)
+
+        prefix = "spritelink-link:"
+        if anchor.startswith(prefix):
+            return self.rendered_link_targets.get(anchor[len(prefix):])
+
+        parsed = QUrl(anchor)
+        if parsed.isValid() and parsed.scheme().casefold() == "https":
+            return anchor, None
+        return None
+
+    def _register_rendered_link(
+        self,
+        url: str,
+        client_id: str,
+    ) -> str:
+        token = hashlib.sha256(
+            f"{client_id}\0{url}".encode("utf-8")
+        ).hexdigest()
+        self.rendered_link_targets[token] = (url, client_id)
+        return f"spritelink-link:{token}"
 
     def _show_link_context_menu(
         self,
@@ -9889,6 +10563,8 @@ class EncryptedChatClient(QObject):
                 self._sync_image_preview_overlay_geometry()
                 if self.image_preview_overlay.isVisible():
                     self._update_image_preview_popup()
+            if hasattr(self, "link_warning_overlay"):
+                self._sync_link_warning_overlay_geometry()
 
         if (
             hasattr(self, "chat_display")
@@ -9902,8 +10578,11 @@ class EncryptedChatClient(QObject):
             elif event.type() == QEvent.Type.MouseMove:
                 anchor = self.chat_display.anchorAt(event.position().toPoint())
                 message_id = self._message_id_from_anchor(anchor)
+                spoiler_id = self._spoiler_id_at_position(
+                    event.position().toPoint()
+                )
 
-                if anchor:
+                if anchor or spoiler_id:
                     self.chat_display.viewport().setCursor(
                         Qt.CursorShape.PointingHandCursor
                     )
@@ -9929,6 +10608,13 @@ class EncryptedChatClient(QObject):
                 QEvent.Type.MouseButtonDblClick,
             ):
                 if event.button() == Qt.MouseButton.LeftButton:
+                    spoiler_id = self._spoiler_id_at_position(
+                        event.position().toPoint()
+                    )
+                    if spoiler_id:
+                        if event.type() == QEvent.Type.MouseButtonRelease:
+                            self._toggle_rendered_spoiler(spoiler_id)
+                        return True
                     anchor = self.chat_display.anchorAt(
                         event.position().toPoint()
                     )
@@ -9940,12 +10626,31 @@ class EncryptedChatClient(QObject):
                     image_url = self._image_url_from_anchor(anchor)
                     if image_url:
                         if event.type() == QEvent.Type.MouseButtonRelease:
-                            self._show_image_preview_popup(image_url)
+                            client_id = (
+                                self.rendered_link_senders.get(anchor)
+                                or self._sender_at_position(
+                                    event.position().toPoint()
+                                )
+                            )
+                            self._show_image_preview_popup(
+                                image_url,
+                                client_id,
+                            )
                         return True
-                    link_url = self._link_url_from_anchor(anchor)
-                    if link_url:
+                    link_target = self._link_target_from_anchor(anchor)
+                    if link_target:
                         if event.type() == QEvent.Type.MouseButtonRelease:
-                            self._open_url_in_browser(link_url)
+                            link_url, anchored_client_id = link_target
+                            client_id = (
+                                anchored_client_id
+                                or self._sender_at_position(
+                                    event.position().toPoint()
+                                )
+                            )
+                            self._open_url_in_browser(
+                                link_url,
+                                client_id,
+                            )
                         return True
 
             elif event.type() == QEvent.Type.ContextMenu:
@@ -9996,6 +10701,90 @@ class EncryptedChatClient(QObject):
         return self.rendered_message_blocks.get(
             cursor.block().blockNumber()
         )
+
+    def _spoiler_id_at_position(self, position: QPoint) -> str | None:
+        cursor = self.chat_display.cursorForPosition(position)
+        formatting = cursor.charFormat()
+        spoiler_id = formatting.property(RENDERED_SPOILER_ID_PROPERTY)
+        if spoiler_id:
+            return str(spoiler_id)
+        if cursor.position() > 0:
+            cursor.movePosition(QTextCursor.MoveOperation.PreviousCharacter)
+            spoiler_id = cursor.charFormat().property(
+                RENDERED_SPOILER_ID_PROPERTY
+            )
+            if spoiler_id:
+                return str(spoiler_id)
+        return None
+
+    def _toggle_rendered_spoiler(self, spoiler_id: str) -> None:
+        document = self.chat_display.document()
+        block = document.begin()
+        revealed: bool | None = None
+        fragments: list[tuple[int, int, QTextCharFormat]] = []
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    formatting = fragment.charFormat()
+                    if str(formatting.property(
+                        RENDERED_SPOILER_ID_PROPERTY
+                    ) or "") == spoiler_id:
+                        if revealed is None:
+                            revealed = bool(formatting.property(
+                                RENDERED_SPOILER_REVEALED_PROPERTY
+                            ))
+                        fragments.append((
+                            fragment.position(),
+                            fragment.length(),
+                            formatting,
+                        ))
+                iterator += 1
+            block = block.next()
+        if revealed is None:
+            return
+        reveal = not revealed
+        for position, length, formatting in fragments:
+            original_color = formatting.property(
+                RENDERED_SPOILER_COLOR_PROPERTY
+            )
+            formatting.setForeground(
+                QColor(original_color)
+                if reveal
+                else QColor(SPOILER_BLOCK_COLOR)
+            )
+            block_color = QColor(SPOILER_BLOCK_COLOR)
+            block_color.setAlpha(
+                REVEALED_SPOILER_BLOCK_ALPHA if reveal else 255
+            )
+            formatting.setBackground(block_color)
+            formatting.setProperty(
+                RENDERED_SPOILER_REVEALED_PROPERTY,
+                reveal,
+            )
+            cursor = QTextCursor(document)
+            cursor.setPosition(position)
+            cursor.setPosition(
+                position + length,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            cursor.setCharFormat(formatting)
+
+        # QTextDocument may invalidate only the text-format bounds after a
+        # reveal toggle. Repaint the complete viewport so the old opaque
+        # spoiler block cannot leave a thin edge outside that dirty region.
+        self.chat_display.viewport().update()
+
+    def _sender_at_position(
+        self,
+        position: QPoint,
+    ) -> str | None:
+        message_id = self._message_id_at_position(position)
+        item = self.rendered_message_items.get(message_id or "")
+        if item is None:
+            return None
+        return str(item["message"]["c"])
 
     def _blend_toward_chat_background(
         self,
@@ -10139,20 +10928,20 @@ class EncryptedChatClient(QObject):
         is_local = bool(item.get("is_local", False))
 
         muted_ids = self._room_preference_ids("muted_users")
-        trusted_image_ids = self._room_preference_ids(
-            "trusted_image_users"
+        trusted_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
         )
         is_muted = client_id in muted_ids
-        trusts_images = client_id in trusted_image_ids
+        trusts_links_and_images = client_id in trusted_ids
 
         menu = QMenu(self.root)
-        trust_images_action = menu.addAction("Trust Images from User")
-        trust_images_action.setCheckable(True)
-        trust_images_action.setChecked(is_local or trusts_images)
-        trust_images_action.setEnabled(not is_local)
+        trust_action = menu.addAction("Trust Links && Images from User")
+        trust_action.setCheckable(True)
+        trust_action.setChecked(is_local or trusts_links_and_images)
+        trust_action.setEnabled(not is_local)
         if not is_local:
-            trust_images_action.toggled.connect(
-                lambda checked: self._set_user_image_trusted(
+            trust_action.toggled.connect(
+                lambda checked: self._set_user_links_and_images_trusted(
                     client_id,
                     checked,
                 )
@@ -10251,6 +11040,8 @@ class EncryptedChatClient(QObject):
         text: str,
         body_color: str,
         font_name: str,
+        client_id: str,
+        message_id: str,
         *,
         muted: bool,
         ui_font: bool,
@@ -10268,16 +11059,14 @@ class EncryptedChatClient(QObject):
         if muted:
             link_color = self._blend_toward_chat_background(link_color)
 
-        for run in rich_runs:
+        for run_index, run in enumerate(rich_runs):
             position = run.start
 
-            def insert_chunk(
-                start: int,
-                end: int,
+            def make_formatting(
                 anchor: str | None = None,
-            ) -> None:
-                if end <= start:
-                    return
+                *,
+                spoiler: bool = run.spoiler is not None,
+            ) -> QTextCharFormat:
                 formatting = self._text_format(
                     link_color if anchor else body_color,
                     bold=run.bold,
@@ -10291,7 +11080,65 @@ class EncryptedChatClient(QObject):
                 )
                 if anchor:
                     formatting.setFontUnderline(True)
+                if spoiler:
+                    spoiler_id = f"{message_id}:{run.spoiler}"
+                    original_color = formatting.foreground().color()
+                    formatting.setProperty(
+                        RENDERED_SPOILER_ID_PROPERTY,
+                        spoiler_id,
+                    )
+                    formatting.setProperty(
+                        RENDERED_SPOILER_COLOR_PROPERTY,
+                        original_color.name(QColor.NameFormat.HexArgb),
+                    )
+                    formatting.setProperty(
+                        RENDERED_SPOILER_REVEALED_PROPERTY,
+                        False,
+                    )
+                    formatting.setForeground(QColor(SPOILER_BLOCK_COLOR))
+                    formatting.setBackground(QColor(SPOILER_BLOCK_COLOR))
+                return formatting
+
+            def insert_padding(*, inside: bool) -> None:
+                formatting = make_formatting(spoiler=inside)
+                spacer_font = formatting.font()
+                natural_width = max(
+                    1,
+                    QFontMetrics(spacer_font).horizontalAdvance(
+                        SPOILER_PADDING_CHARACTER
+                    ),
+                )
+                spacer_font.setStretch(max(
+                    1,
+                    round(
+                        SPOILER_HORIZONTAL_PADDING_PX
+                        * 100
+                        / natural_width
+                    ),
+                ))
+                formatting.setFont(spacer_font)
+                cursor.insertText(SPOILER_PADDING_CHARACTER, formatting)
+
+            def insert_chunk(
+                start: int,
+                end: int,
+                anchor: str | None = None,
+            ) -> None:
+                if end <= start:
+                    return
+                formatting = make_formatting(anchor)
                 cursor.insertText(plain_text[start:end], formatting)
+
+            first_spoiler_run = (
+                run.spoiler is not None
+                and (
+                    run_index == 0
+                    or rich_runs[run_index - 1].spoiler != run.spoiler
+                )
+            )
+            if first_spoiler_run:
+                insert_padding(inside=False)
+                insert_padding(inside=True)
 
             for start, end, url in url_spans:
                 if end <= run.start:
@@ -10302,9 +11149,23 @@ class EncryptedChatClient(QObject):
                 overlap_end = min(end, run.end)
                 insert_chunk(position, overlap_start)
                 if url not in embedded_image_urls:
-                    insert_chunk(overlap_start, overlap_end, url)
+                    insert_chunk(
+                        overlap_start,
+                        overlap_end,
+                        self._register_rendered_link(url, client_id),
+                    )
                 position = overlap_end
             insert_chunk(position, run.end)
+            last_spoiler_run = (
+                run.spoiler is not None
+                and (
+                    run_index == len(rich_runs) - 1
+                    or rich_runs[run_index + 1].spoiler != run.spoiler
+                )
+            )
+            if last_spoiler_run:
+                insert_padding(inside=True)
+                insert_padding(inside=False)
 
     @staticmethod
     def _scaled_inline_media_frame(
@@ -10357,6 +11218,7 @@ class EncryptedChatClient(QObject):
         self,
         cursor: QTextCursor,
         url: str,
+        client_id: str,
     ) -> bool:
         media = self.image_preview_cache.get(url)
         if not isinstance(media, RemoteMediaPreview):
@@ -10364,9 +11226,16 @@ class EncryptedChatClient(QObject):
         if not is_likely_nsfw_image_url(url):
             self._ensure_animated_media_controller(url, media)
         preview = self._embedded_media_preview(url, media)
-        token = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        self.rendered_image_links[token] = url
-        resource_url = QUrl(f"spritelink-chat-image-resource:{token}")
+        link_token = hashlib.sha256(
+            f"{client_id}\0{url}".encode("utf-8")
+        ).hexdigest()
+        self.rendered_image_links[link_token] = url
+        anchor = f"spritelink-image:{link_token}"
+        self.rendered_link_senders[anchor] = client_id
+        resource_token = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        resource_url = QUrl(
+            f"spritelink-chat-image-resource:{resource_token}"
+        )
         cursor.document().addResource(
             QTextDocument.ResourceType.ImageResource,
             resource_url,
@@ -10380,7 +11249,7 @@ class EncryptedChatClient(QObject):
             QTextCharFormat.VerticalAlignment.AlignTop
         )
         image_format.setAnchor(True)
-        image_format.setAnchorHref(f"spritelink-image:{token}")
+        image_format.setAnchorHref(anchor)
         image_position = cursor.position()
         cursor.insertImage(image_format)
         self.rendered_image_positions.setdefault(url, []).append(
@@ -10520,7 +11389,9 @@ class EncryptedChatClient(QObject):
                 if repeated_count and source_text != repeated_text:
                     combined_parts.append(
                         self._repeat_prefixed_message_text(
-                            repeated_text,
+                            message_plain_text_with_spoilers_redacted(
+                                repeated_text
+                            ),
                             repeated_count,
                         )
                     )
@@ -10530,7 +11401,9 @@ class EncryptedChatClient(QObject):
             if repeated_count:
                 combined_parts.append(
                     self._repeat_prefixed_message_text(
-                        repeated_text,
+                        message_plain_text_with_spoilers_redacted(
+                            repeated_text
+                        ),
                         repeated_count,
                     )
                 )
@@ -10549,6 +11422,8 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
         self.rendered_image_links.clear()
+        self.rendered_link_targets.clear()
+        self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
         self.chat_display.clear()
@@ -10560,8 +11435,8 @@ class EncryptedChatClient(QObject):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
-        trusted_image_user_ids = self._room_preference_ids(
-            "trusted_image_users"
+        trusted_user_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
         )
         row_selections: list[QTextEdit.ExtraSelection] = []
         previous_timestamp: int | None = None
@@ -10601,7 +11476,7 @@ class EncryptedChatClient(QObject):
                 item,
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
-                trusted_image_user_ids=trusted_image_user_ids,
+                trusted_user_ids=trusted_user_ids,
                 background_color=MESSAGE_ROW_BACKGROUNDS[
                     stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
                 ],
@@ -10646,7 +11521,7 @@ class EncryptedChatClient(QObject):
         *,
         muted_ids: set[str],
         collapsed_ids: set[str],
-        trusted_image_user_ids: set[str],
+        trusted_user_ids: set[str],
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
@@ -10669,7 +11544,6 @@ class EncryptedChatClient(QObject):
         )
         profile_icon = str(message.get("p", ""))
         text = str(message["m"])
-        plain_text = message_plain_text(text)
         message_id = str(message["i"])
         client_id = str(message["c"])
         user_id_preview = visible_user_id(client_id)
@@ -10680,12 +11554,18 @@ class EncryptedChatClient(QObject):
         }
 
         is_muted = client_id in muted_ids and not item["is_local"]
+        plain_text = (
+            message_plain_text_with_spoilers_redacted(text)
+            if is_muted
+            else message_plain_text(text)
+        )
         is_collapsed = is_muted or bool(
             source_message_ids.intersection(collapsed_ids)
         )
         message_block_format = QTextBlockFormat()
         message_block_format.setNonBreakableLines(is_collapsed)
         cursor.setBlockFormat(message_block_format)
+        embedded_media_block_numbers: set[int] = set()
 
         candidate_image_urls = direct_image_urls_in_message(plain_text)
         embedded_image_url_set = {
@@ -10695,7 +11575,7 @@ class EncryptedChatClient(QObject):
                 url,
                 client_id,
                 bool(item["is_local"]),
-                trusted_image_user_ids,
+                trusted_user_ids,
             )
         }
         untrusted_image_urls = {
@@ -10880,6 +11760,8 @@ class EncryptedChatClient(QObject):
                 display_text,
                 body_color,
                 font_name,
+                client_id,
+                message_id,
                 muted=is_muted,
                 ui_font=is_muted,
                 embedded_image_urls=set(image_urls),
@@ -10890,7 +11772,14 @@ class EncryptedChatClient(QObject):
         if add_image_line_break:
             cursor.insertBlock()
         for image_url in active_image_urls:
-            self._insert_embedded_image_preview(cursor, image_url)
+            if self._insert_embedded_image_preview(
+                cursor,
+                image_url,
+                client_id,
+            ):
+                embedded_media_block_numbers.add(
+                    cursor.block().blockNumber()
+                )
 
         if item.get("warning") and not is_collapsed:
             cursor.insertBlock()
@@ -10912,6 +11801,11 @@ class EncryptedChatClient(QObject):
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
             block_format.setBackground(QColor(background_color))
+            if block.blockNumber() not in embedded_media_block_numbers:
+                block_format.setLineHeight(
+                    float(MESSAGE_LINE_HEIGHT_PX),
+                    int(QTextBlockFormat.LineHeightTypes.FixedHeight.value),
+                )
             block_cursor.setBlockFormat(block_format)
 
             selection = QTextEdit.ExtraSelection()
@@ -10963,6 +11857,8 @@ class EncryptedChatClient(QObject):
 
     def _clear_visible_room(self) -> None:
         self._hide_chat_tooltip()
+        if self.link_warning_overlay.isVisible():
+            self._hide_link_warning_popup()
         if self.image_preview_overlay.isVisible():
             self._hide_image_preview_popup()
         self.seen_client_message_ids.clear()
@@ -10971,6 +11867,8 @@ class EncryptedChatClient(QObject):
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
         self.rendered_image_links.clear()
+        self.rendered_link_targets.clear()
+        self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
         self.viewport_embedded_image_urls.clear()
