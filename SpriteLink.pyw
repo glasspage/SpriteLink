@@ -67,6 +67,7 @@ try:
         QDesktopServices,
         QDrag,
         QFont,
+        QFontDatabase,
         QFontMetrics,
         QIcon,
         QImage,
@@ -1993,11 +1994,15 @@ def link_warning_url_html(
     for index, character in enumerate(url):
         should_underline = index in underlined_indices
         if should_underline != underlining:
-            output.append("<u>" if should_underline else "</u>")
+            output.append(
+                '<span style="color: #c00000;"><u>'
+                if should_underline
+                else "</u></span>"
+            )
             underlining = should_underline
         output.append(escape(character))
     if underlining:
-        output.append("</u>")
+        output.append("</u></span>")
     return "".join(output)
 
 
@@ -4920,6 +4925,27 @@ class EncryptedChatClient(QObject):
         font.setStyleStrategy(self._font_style_strategy())
         return font
 
+    def _make_link_warning_url_font(self) -> QFont:
+        available_families = {
+            family.casefold(): family
+            for family in QFontDatabase.families()
+        }
+        family = available_families.get(
+            "lucida console",
+            available_families.get("consolas", "Monospace"),
+        )
+        font = QFont(family)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFixedPitch(True)
+        font.setStyleStrategy(self._font_style_strategy())
+        return font
+
+    def _refresh_special_widget_fonts(self) -> None:
+        if hasattr(self, "link_warning_url_label"):
+            self.link_warning_url_label.setFont(
+                self._make_link_warning_url_font()
+            )
+
     def _apply_application_font_strategy(self) -> None:
         self._message_font_cache.clear()
         app = QApplication.instance()
@@ -4936,6 +4962,7 @@ class EncryptedChatClient(QObject):
             widget_font.setFamily(self._ui_font_family())
             widget_font.setStyleStrategy(strategy)
             widget.setFont(widget_font)
+        self._refresh_special_widget_fonts()
         self._refresh_message_font_combo_fonts()
 
     def _ui_font_family(self) -> str:
@@ -7135,10 +7162,9 @@ class EncryptedChatClient(QObject):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         self.link_warning_url_label.setWordWrap(True)
-        url_font = QFont("Consolas")
-        url_font.setStyleHint(QFont.StyleHint.Monospace)
-        url_font.setStyleStrategy(self._font_style_strategy())
-        self.link_warning_url_label.setFont(url_font)
+        self.link_warning_url_label.setFont(
+            self._make_link_warning_url_font()
+        )
         panel_layout.addWidget(self.link_warning_url_label)
 
         self.link_warning_suspicious_label = QLabel()
