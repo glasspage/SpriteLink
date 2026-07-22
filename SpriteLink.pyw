@@ -591,6 +591,7 @@ DEFAULT_MESSAGE_FONT = "Arial"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
+MESSAGE_LINE_HEIGHT_PX = 24
 COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
 RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
 RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
@@ -11549,6 +11550,7 @@ class EncryptedChatClient(QObject):
         message_block_format = QTextBlockFormat()
         message_block_format.setNonBreakableLines(is_collapsed)
         cursor.setBlockFormat(message_block_format)
+        embedded_media_block_numbers: set[int] = set()
 
         candidate_image_urls = direct_image_urls_in_message(plain_text)
         embedded_image_url_set = {
@@ -11755,11 +11757,14 @@ class EncryptedChatClient(QObject):
         if add_image_line_break:
             cursor.insertBlock()
         for image_url in active_image_urls:
-            self._insert_embedded_image_preview(
+            if self._insert_embedded_image_preview(
                 cursor,
                 image_url,
                 client_id,
-            )
+            ):
+                embedded_media_block_numbers.add(
+                    cursor.block().blockNumber()
+                )
 
         if item.get("warning") and not is_collapsed:
             cursor.insertBlock()
@@ -11781,6 +11786,11 @@ class EncryptedChatClient(QObject):
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
             block_format.setBackground(QColor(background_color))
+            if block.blockNumber() not in embedded_media_block_numbers:
+                block_format.setLineHeight(
+                    MESSAGE_LINE_HEIGHT_PX,
+                    QTextBlockFormat.LineHeightTypes.FixedHeight,
+                )
             block_cursor.setBlockFormat(block_format)
 
             selection = QTextEdit.ExtraSelection()
