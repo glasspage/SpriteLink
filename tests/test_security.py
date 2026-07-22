@@ -3353,12 +3353,12 @@ class UpdateConfigTests(unittest.TestCase):
             notes="Release notes",
         )
 
-    def test_update_checks_are_forced_at_startup_and_every_30_minutes(
+    def test_update_checks_are_forced_at_startup_and_every_5_minutes(
         self,
     ) -> None:
         self.assertEqual(
             SPRITELINK.UPDATE_CHECK_INTERVAL_MS,
-            30 * 60 * 1000,
+            5 * 60 * 1000,
         )
         self.assertNotIn(
             "automatic_update_checks",
