@@ -1985,6 +1985,19 @@ def analyze_link_url(url: str) -> LinkSafetyAnalysis:
     )
 
 
+def link_requires_warning(
+    analysis: LinkSafetyAnalysis,
+    client_id: str | None,
+    trusted_user_ids: set[str],
+) -> bool:
+    if analysis.suspicious:
+        return True
+    return not (
+        analysis.trusted
+        or (client_id is not None and client_id in trusted_user_ids)
+    )
+
+
 def link_warning_url_html(
     url: str,
     underlined_indices: frozenset[int],
@@ -2547,6 +2560,7 @@ def default_config() -> dict[str, Any]:
         "room_state": {},
         "muted_users": {},
         "trusted_image_users": {},
+        "trusted_link_users": {},
         "collapsed_messages": {},
         "sent_message_utc_day": current_utc_day_number(),
         "sent_messages_today": 0,
@@ -2633,6 +2647,7 @@ def load_config() -> dict[str, Any]:
         "room_state",
         "muted_users",
         "trusted_image_users",
+        "trusted_link_users",
         "collapsed_messages",
     ):
         if not isinstance(config.get(dictionary_key), dict):
@@ -4671,6 +4686,7 @@ class EncryptedChatClient(QObject):
         ] = {}
         self.last_inline_animation_frame_at: dict[str, float] = {}
         self.current_image_preview_url: str | None = None
+        self.current_image_preview_client_id: str | None = None
         self.recent_chatroom_switch_times: list[float] = []
         self.image_fetch_executor = DaemonTaskPool(
             max_workers=3,
@@ -7349,12 +7365,17 @@ class EncryptedChatClient(QObject):
         self.image_preview_label.clear()
         self.image_preview_label.setPixmap(QPixmap.fromImage(preview))
 
-    def _show_image_preview_popup(self, url: str) -> None:
+    def _show_image_preview_popup(
+        self,
+        url: str,
+        client_id: str | None = None,
+    ) -> None:
         media = self.image_preview_cache.get(url)
         if not isinstance(media, RemoteMediaPreview):
             return
         self._hide_chat_tooltip()
         self.current_image_preview_url = url
+        self.current_image_preview_client_id = client_id
         self._ensure_animated_media_controller(url, media)
         self._sync_image_preview_overlay_geometry()
         self.image_preview_overlay.show()
@@ -7389,6 +7410,7 @@ class EncryptedChatClient(QObject):
         url = self.current_image_preview_url
         self.image_preview_overlay.hide()
         self.current_image_preview_url = None
+        self.current_image_preview_client_id = None
         self.image_preview_label.clear()
         self.image_preview_url_label.clear()
         self.image_preview_url_label.setToolTip("")
@@ -7402,7 +7424,10 @@ class EncryptedChatClient(QObject):
 
     def _open_current_image_in_browser(self) -> None:
         if self.current_image_preview_url:
-            self._open_url_in_browser(self.current_image_preview_url)
+            self._open_url_in_browser(
+                self.current_image_preview_url,
+                self.current_image_preview_client_id,
+            )
 
     def _build_config_tab(self) -> None:
         layout = QGridLayout(self.config_tab)
@@ -9786,6 +9811,23 @@ class EncryptedChatClient(QObject):
         )
         self._rerender_preserving_scroll()
 
+    def _set_user_link_trusted(
+        self,
+        client_id: str,
+        trusted: bool,
+    ) -> None:
+        trusted_ids = self._room_preference_ids("trusted_link_users")
+
+        if trusted:
+            trusted_ids.add(client_id)
+        else:
+            trusted_ids.discard(client_id)
+
+        self._write_room_preference_ids(
+            "trusted_link_users",
+            trusted_ids,
+        )
+
     def _set_message_collapsed(
         self,
         message_id: str,
@@ -9905,12 +9947,23 @@ class EncryptedChatClient(QObject):
         if parsed.isValid() and parsed.scheme().casefold() == "https":
             QDesktopServices.openUrl(parsed)
 
-    def _open_url_in_browser(self, url: str) -> None:
+    def _open_url_in_browser(
+        self,
+        url: str,
+        client_id: str | None = None,
+    ) -> None:
         parsed = QUrl(url)
         if not parsed.isValid() or parsed.scheme().casefold() != "https":
             return
         analysis = analyze_link_url(url)
-        if analysis.trusted:
+        trusted_user_ids = self._room_preference_ids(
+            "trusted_link_users"
+        )
+        if not link_requires_warning(
+            analysis,
+            client_id,
+            trusted_user_ids,
+        ):
             self._launch_url_in_browser(url)
             return
         self._show_link_warning_popup(url, analysis)
@@ -10298,12 +10351,24 @@ class EncryptedChatClient(QObject):
                     image_url = self._image_url_from_anchor(anchor)
                     if image_url:
                         if event.type() == QEvent.Type.MouseButtonRelease:
-                            self._show_image_preview_popup(image_url)
+                            client_id = self._sender_at_position(
+                                event.position().toPoint()
+                            )
+                            self._show_image_preview_popup(
+                                image_url,
+                                client_id,
+                            )
                         return True
                     link_url = self._link_url_from_anchor(anchor)
                     if link_url:
                         if event.type() == QEvent.Type.MouseButtonRelease:
-                            self._open_url_in_browser(link_url)
+                            client_id = self._sender_at_position(
+                                event.position().toPoint()
+                            )
+                            self._open_url_in_browser(
+                                link_url,
+                                client_id,
+                            )
                         return True
 
             elif event.type() == QEvent.Type.ContextMenu:
@@ -10354,6 +10419,16 @@ class EncryptedChatClient(QObject):
         return self.rendered_message_blocks.get(
             cursor.block().blockNumber()
         )
+
+    def _sender_at_position(
+        self,
+        position: QPoint,
+    ) -> str | None:
+        message_id = self._message_id_at_position(position)
+        item = self.rendered_message_items.get(message_id or "")
+        if item is None:
+            return None
+        return str(item["message"]["c"])
 
     def _blend_toward_chat_background(
         self,
@@ -10500,8 +10575,12 @@ class EncryptedChatClient(QObject):
         trusted_image_ids = self._room_preference_ids(
             "trusted_image_users"
         )
+        trusted_link_ids = self._room_preference_ids(
+            "trusted_link_users"
+        )
         is_muted = client_id in muted_ids
         trusts_images = client_id in trusted_image_ids
+        trusts_links = client_id in trusted_link_ids
 
         menu = QMenu(self.root)
         trust_images_action = menu.addAction("Trust Images from User")
@@ -10511,6 +10590,18 @@ class EncryptedChatClient(QObject):
         if not is_local:
             trust_images_action.toggled.connect(
                 lambda checked: self._set_user_image_trusted(
+                    client_id,
+                    checked,
+                )
+            )
+
+        trust_links_action = menu.addAction("Trust Links from User")
+        trust_links_action.setCheckable(True)
+        trust_links_action.setChecked(trusts_links)
+        trust_links_action.setEnabled(not is_local)
+        if not is_local:
+            trust_links_action.toggled.connect(
+                lambda checked: self._set_user_link_trusted(
                     client_id,
                     checked,
                 )
