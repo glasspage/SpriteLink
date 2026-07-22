@@ -2563,8 +2563,7 @@ def default_config() -> dict[str, Any]:
         "unread_counts": {},
         "room_state": {},
         "muted_users": {},
-        "trusted_image_users": {},
-        "trusted_link_users": {},
+        "trusted_link_and_image_users": {},
         "collapsed_messages": {},
         "sent_message_utc_day": current_utc_day_number(),
         "sent_messages_today": 0,
@@ -2650,12 +2649,28 @@ def load_config() -> dict[str, Any]:
     for dictionary_key in (
         "room_state",
         "muted_users",
+        "trusted_link_and_image_users",
         "trusted_image_users",
         "trusted_link_users",
         "collapsed_messages",
     ):
         if not isinstance(config.get(dictionary_key), dict):
             config[dictionary_key] = {}
+
+    combined_trusted_users = config["trusted_link_and_image_users"]
+    for legacy_key in ("trusted_image_users", "trusted_link_users"):
+        for scope_id, raw_values in config[legacy_key].items():
+            existing_values = combined_trusted_users.get(scope_id, [])
+            if not isinstance(existing_values, list):
+                existing_values = []
+            if not isinstance(raw_values, list):
+                raw_values = []
+            combined_trusted_users[scope_id] = sorted({
+                value
+                for value in (*existing_values, *raw_values)
+                if isinstance(value, str) and value
+            })
+        config.pop(legacy_key, None)
 
     today_utc = current_utc_day_number()
     try:
@@ -9801,12 +9816,14 @@ class EncryptedChatClient(QObject):
         self._write_room_preference_ids("muted_users", muted_ids)
         self._rerender_preserving_scroll()
 
-    def _set_user_image_trusted(
+    def _set_user_links_and_images_trusted(
         self,
         client_id: str,
         trusted: bool,
     ) -> None:
-        trusted_ids = self._room_preference_ids("trusted_image_users")
+        trusted_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
+        )
 
         if trusted:
             trusted_ids.add(client_id)
@@ -9814,27 +9831,10 @@ class EncryptedChatClient(QObject):
             trusted_ids.discard(client_id)
 
         self._write_room_preference_ids(
-            "trusted_image_users",
+            "trusted_link_and_image_users",
             trusted_ids,
         )
         self._rerender_preserving_scroll()
-
-    def _set_user_link_trusted(
-        self,
-        client_id: str,
-        trusted: bool,
-    ) -> None:
-        trusted_ids = self._room_preference_ids("trusted_link_users")
-
-        if trusted:
-            trusted_ids.add(client_id)
-        else:
-            trusted_ids.discard(client_id)
-
-        self._write_room_preference_ids(
-            "trusted_link_users",
-            trusted_ids,
-        )
 
     def _set_message_collapsed(
         self,
@@ -9965,7 +9965,7 @@ class EncryptedChatClient(QObject):
             return
         analysis = analyze_link_url(url)
         trusted_user_ids = self._room_preference_ids(
-            "trusted_link_users"
+            "trusted_link_and_image_users"
         )
         if not link_requires_warning(
             analysis,
@@ -10619,36 +10619,20 @@ class EncryptedChatClient(QObject):
         is_local = bool(item.get("is_local", False))
 
         muted_ids = self._room_preference_ids("muted_users")
-        trusted_image_ids = self._room_preference_ids(
-            "trusted_image_users"
-        )
-        trusted_link_ids = self._room_preference_ids(
-            "trusted_link_users"
+        trusted_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
         )
         is_muted = client_id in muted_ids
-        trusts_images = client_id in trusted_image_ids
-        trusts_links = client_id in trusted_link_ids
+        trusts_links_and_images = client_id in trusted_ids
 
         menu = QMenu(self.root)
-        trust_images_action = menu.addAction("Trust Images from User")
-        trust_images_action.setCheckable(True)
-        trust_images_action.setChecked(is_local or trusts_images)
-        trust_images_action.setEnabled(not is_local)
+        trust_action = menu.addAction("Trust Links & Images from User")
+        trust_action.setCheckable(True)
+        trust_action.setChecked(is_local or trusts_links_and_images)
+        trust_action.setEnabled(not is_local)
         if not is_local:
-            trust_images_action.toggled.connect(
-                lambda checked: self._set_user_image_trusted(
-                    client_id,
-                    checked,
-                )
-            )
-
-        trust_links_action = menu.addAction("Trust Links from User")
-        trust_links_action.setCheckable(True)
-        trust_links_action.setChecked(is_local or trusts_links)
-        trust_links_action.setEnabled(not is_local)
-        if not is_local:
-            trust_links_action.toggled.connect(
-                lambda checked: self._set_user_link_trusted(
+            trust_action.toggled.connect(
+                lambda checked: self._set_user_links_and_images_trusted(
                     client_id,
                     checked,
                 )
@@ -11071,8 +11055,8 @@ class EncryptedChatClient(QObject):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
-        trusted_image_user_ids = self._room_preference_ids(
-            "trusted_image_users"
+        trusted_user_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
         )
         row_selections: list[QTextEdit.ExtraSelection] = []
         previous_timestamp: int | None = None
@@ -11112,7 +11096,7 @@ class EncryptedChatClient(QObject):
                 item,
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
-                trusted_image_user_ids=trusted_image_user_ids,
+                trusted_user_ids=trusted_user_ids,
                 background_color=MESSAGE_ROW_BACKGROUNDS[
                     stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
                 ],
@@ -11157,7 +11141,7 @@ class EncryptedChatClient(QObject):
         *,
         muted_ids: set[str],
         collapsed_ids: set[str],
-        trusted_image_user_ids: set[str],
+        trusted_user_ids: set[str],
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
@@ -11206,7 +11190,7 @@ class EncryptedChatClient(QObject):
                 url,
                 client_id,
                 bool(item["is_local"]),
-                trusted_image_user_ids,
+                trusted_user_ids,
             )
         }
         untrusted_image_urls = {
