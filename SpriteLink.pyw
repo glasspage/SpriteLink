@@ -117,6 +117,7 @@ try:
         QStyle,
         QStyleFactory,
         QStyledItemDelegate,
+        QStyleOptionButton,
         QStyleOptionViewItem,
         QSystemTrayIcon,
         QTextBrowser,
@@ -595,6 +596,8 @@ RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
 RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
 RENDERED_SPOILER_REVEALED_PROPERTY = int(QTextFormat.Property.UserProperty) + 4
 REVEALED_SPOILER_BLOCK_ALPHA = 13
+SPOILER_HORIZONTAL_PADDING_PX = 2
+SPOILER_PADDING_CHARACTER = "\u00a0"
 SELECTABLE_MESSAGE_FONTS = (
     "Arial",
     "Calibri",
@@ -3294,6 +3297,11 @@ class ComposeTextEdit(QPlainTextEdit):
             formatting.setFontUnderline(enabled)
         elif style == "spoiler":
             formatting.setProperty(COMPOSER_SPOILER_PROPERTY, enabled)
+            block_color = QColor("#000000")
+            block_color.setAlpha(
+                REVEALED_SPOILER_BLOCK_ALPHA if enabled else 0
+            )
+            formatting.setBackground(block_color)
         else:
             return
 
@@ -3310,6 +3318,7 @@ class ComposeTextEdit(QPlainTextEdit):
         formatting.setFontItalic(False)
         formatting.setFontUnderline(False)
         formatting.setProperty(COMPOSER_SPOILER_PROPERTY, False)
+        formatting.setBackground(QColor(0, 0, 0, 0))
         self.mergeCurrentCharFormat(formatting)
 
     def keyPressEvent(self, event: Any) -> None:
@@ -3335,6 +3344,56 @@ class ClickableProgressBar(QProgressBar):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+
+class SpoilerFormatButton(QPushButton):
+    """Show the revealed spoiler block treatment behind the button text."""
+
+    def paintEvent(self, _event: Any) -> None:
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        text = option.text
+        option.text = ""
+
+        painter = QPainter(self)
+        self.style().drawControl(
+            QStyle.ControlElement.CE_PushButton,
+            option,
+            painter,
+            self,
+        )
+        text_rect = self.style().subElementRect(
+            QStyle.SubElement.SE_PushButtonContents,
+            option,
+            self,
+        )
+        alignment = (
+            int(Qt.AlignmentFlag.AlignCenter)
+            | int(Qt.TextFlag.TextShowMnemonic)
+        )
+        block_rect = QFontMetrics(self.font()).boundingRect(
+            text_rect,
+            alignment,
+            text,
+        ).adjusted(
+            -SPOILER_HORIZONTAL_PADDING_PX,
+            0,
+            SPOILER_HORIZONTAL_PADDING_PX,
+            0,
+        )
+        block_color = QColor("#000000")
+        block_color.setAlpha(REVEALED_SPOILER_BLOCK_ALPHA)
+        painter.fillRect(block_rect, block_color)
+        self.style().drawItemText(
+            painter,
+            text_rect,
+            alignment,
+            self.palette(),
+            self.isEnabled(),
+            text,
+            QPalette.ColorRole.ButtonText,
+        )
+        painter.end()
 
 
 class ConfigOverlay(QWidget):
@@ -4288,6 +4347,9 @@ class MessageLogBrowser(QTextBrowser):
         shadow_color.setAlphaF(0.15)
         shadow_format = QTextCharFormat()
         shadow_format.setForeground(shadow_color)
+        transparent_spoiler_format = QTextCharFormat()
+        transparent_spoiler_format.setForeground(QColor(0, 0, 0, 0))
+        transparent_spoiler_format.setBackground(QColor(0, 0, 0, 0))
         painter = QPainter(viewport)
         painter.setClipRegion(event.region())
         # QTextLayout already retains its absolute document position.  The
@@ -4307,10 +4369,29 @@ class MessageLogBrowser(QTextBrowser):
             if layout is None or layout.lineCount() <= 0:
                 continue
 
-            shadow_range = QTextLayout.FormatRange()
-            shadow_range.start = 0
-            shadow_range.length = block.length() - 1
-            shadow_range.format = shadow_format
+            shadow_ranges: list[QTextLayout.FormatRange] = []
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    formatting = fragment.charFormat()
+                    shadow_range = QTextLayout.FormatRange()
+                    shadow_range.start = (
+                        fragment.position() - block.position()
+                    )
+                    shadow_range.length = fragment.length()
+                    shadow_range.format = (
+                        transparent_spoiler_format
+                        if formatting.property(
+                            RENDERED_SPOILER_ID_PROPERTY
+                        )
+                        else shadow_format
+                    )
+                    shadow_ranges.append(shadow_range)
+                iterator += 1
+
+            if not shadow_ranges:
+                continue
 
             painter.save()
             painter.setClipRegion(
@@ -4318,7 +4399,7 @@ class MessageLogBrowser(QTextBrowser):
                 Qt.ClipOperation.ReplaceClip,
             )
             painter.translate(1, 1)
-            layout.draw(painter, layout_origin, [shadow_range])
+            layout.draw(painter, layout_origin, shadow_ranges)
             painter.restore()
             layout.draw(painter, layout_origin)
 
@@ -6543,7 +6624,7 @@ class EncryptedChatClient(QObject):
         self.bold_format_button = QPushButton("Bold")
         self.italic_format_button = QPushButton("Italic")
         self.underline_format_button = QPushButton("Underline")
-        self.spoiler_format_button = QPushButton("Spoiler")
+        self.spoiler_format_button = SpoilerFormatButton("Spoiler")
         bold_button_font = QFont(self.bold_format_button.font())
         bold_button_font.setBold(True)
         self.bold_format_button.setFont(bold_button_font)
@@ -10856,16 +10937,14 @@ class EncryptedChatClient(QObject):
         if muted:
             link_color = self._blend_toward_chat_background(link_color)
 
-        for run in rich_runs:
+        for run_index, run in enumerate(rich_runs):
             position = run.start
 
-            def insert_chunk(
-                start: int,
-                end: int,
+            def make_formatting(
                 anchor: str | None = None,
-            ) -> None:
-                if end <= start:
-                    return
+                *,
+                spoiler: bool = run.spoiler is not None,
+            ) -> QTextCharFormat:
                 formatting = self._text_format(
                     link_color if anchor else body_color,
                     bold=run.bold,
@@ -10879,7 +10958,7 @@ class EncryptedChatClient(QObject):
                 )
                 if anchor:
                     formatting.setFontUnderline(True)
-                if run.spoiler is not None:
+                if spoiler:
                     spoiler_id = f"{message_id}:{run.spoiler}"
                     original_color = formatting.foreground().color()
                     formatting.setProperty(
@@ -10896,7 +10975,48 @@ class EncryptedChatClient(QObject):
                     )
                     formatting.setForeground(QColor("#000000"))
                     formatting.setBackground(QColor("#000000"))
+                return formatting
+
+            def insert_padding(*, inside: bool) -> None:
+                formatting = make_formatting(spoiler=inside)
+                spacer_font = formatting.font()
+                natural_width = max(
+                    1,
+                    QFontMetrics(spacer_font).horizontalAdvance(
+                        SPOILER_PADDING_CHARACTER
+                    ),
+                )
+                spacer_font.setStretch(max(
+                    1,
+                    round(
+                        SPOILER_HORIZONTAL_PADDING_PX
+                        * 100
+                        / natural_width
+                    ),
+                ))
+                formatting.setFont(spacer_font)
+                cursor.insertText(SPOILER_PADDING_CHARACTER, formatting)
+
+            def insert_chunk(
+                start: int,
+                end: int,
+                anchor: str | None = None,
+            ) -> None:
+                if end <= start:
+                    return
+                formatting = make_formatting(anchor)
                 cursor.insertText(plain_text[start:end], formatting)
+
+            first_spoiler_run = (
+                run.spoiler is not None
+                and (
+                    run_index == 0
+                    or rich_runs[run_index - 1].spoiler != run.spoiler
+                )
+            )
+            if first_spoiler_run:
+                insert_padding(inside=False)
+                insert_padding(inside=True)
 
             for start, end, url in url_spans:
                 if end <= run.start:
@@ -10914,6 +11034,16 @@ class EncryptedChatClient(QObject):
                     )
                 position = overlap_end
             insert_chunk(position, run.end)
+            last_spoiler_run = (
+                run.spoiler is not None
+                and (
+                    run_index == len(rich_runs) - 1
+                    or rich_runs[run_index + 1].spoiler != run.spoiler
+                )
+            )
+            if last_spoiler_run:
+                insert_padding(inside=True)
+                insert_padding(inside=False)
 
     @staticmethod
     def _scaled_inline_media_frame(
