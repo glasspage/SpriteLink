@@ -11870,7 +11870,7 @@ class EncryptedChatClient(QObject):
         text: str,
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
-    ) -> bool:
+    ) -> int:
         if cursor.block().text():
             cursor.insertBlock()
         separator_block = QTextBlockFormat()
@@ -11882,8 +11882,9 @@ class EncryptedChatClient(QObject):
         separator_block.setBackground(QColor(background_color))
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
+        separator_block_number = cursor.block().blockNumber()
         self.chat_display.row_background_padding_blocks[
-            cursor.block().blockNumber()
+            separator_block_number
         ] = (QColor(background_color), 7, 7)
 
         selection = QTextEdit.ExtraSelection()
@@ -11898,7 +11899,7 @@ class EncryptedChatClient(QObject):
 
         cursor.insertBlock()
         cursor.setBlockFormat(QTextBlockFormat())
-        return True
+        return separator_block_number
 
     def _reset_chat_document(self) -> None:
         document = QTextDocument(self.chat_display)
@@ -11992,6 +11993,7 @@ class EncryptedChatClient(QObject):
         )
         row_selections: list[QTextEdit.ExtraSelection] = []
         previous_timestamp: int | None = None
+        previous_message_id: str | None = None
         first_item = True
         stripe_index = 0
 
@@ -12031,16 +12033,28 @@ class EncryptedChatClient(QObject):
                 if previous_timestamp is not None
                 else ()
             )
+            last_separator_block_number: int | None = None
             for separator_text in separator_texts:
-                if self._insert_log_separator(
+                last_separator_block_number = self._insert_log_separator(
                     cursor,
                     separator_text,
                     MESSAGE_ROW_BACKGROUNDS[
                         stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
                     ],
                     row_selections,
-                ):
-                    stripe_index += 1
+                )
+                stripe_index += 1
+            if (
+                last_separator_block_number is not None
+                and unread_boundary_id
+                and previous_message_id == unread_boundary_id
+            ):
+                # A separator belongs visually between the read and unread
+                # rows. Anchor the divider to its last painted block so the
+                # orange line appears at the separator's bottom edge.
+                self.rendered_message_last_blocks[unread_boundary_id] = (
+                    last_separator_block_number
+                )
             if not first_item and not separator_texts:
                 cursor.insertBlock()
 
@@ -12058,6 +12072,7 @@ class EncryptedChatClient(QObject):
             stripe_index += 1
             first_item = False
             previous_timestamp = self._display_timestamp_for_item(group[-1])
+            previous_message_id = self._message_id_from_log_item(group[-1])
 
         self.chat_display.row_background_blocks = {
             selection.cursor.block().blockNumber(): QColor(
