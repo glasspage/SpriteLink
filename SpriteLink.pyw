@@ -30,6 +30,7 @@ from datetime import datetime
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -279,6 +280,7 @@ def chatroom_connection_label(
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
 GLOBAL_CHATROOM_ID = "global"
+UNREAD_FROM_START_MARKER = "__start__"
 GLOBAL_CHATROOM_NICKNAME = "Global"
 GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
 CHATROOM_SIDEBAR_WIDTH = 180
@@ -2597,7 +2599,9 @@ def default_config() -> dict[str, Any]:
         },
         "identity_presets": [default_preset],
         "muted_chatrooms": [],
+        "muted_chatroom_deadlines": {},
         "unread_counts": {},
+        "unread_after_message_ids": {},
         "room_state": {},
         "muted_users": {},
         "trusted_link_and_image_users": {},
@@ -2828,11 +2832,33 @@ def load_config() -> dict[str, Any]:
     muted_chatrooms = config.get("muted_chatrooms")
     if not isinstance(muted_chatrooms, list):
         muted_chatrooms = []
-    config["muted_chatrooms"] = sorted({
+    cleaned_muted_chatrooms = {
         str(room_id)
         for room_id in muted_chatrooms
         if str(room_id) in valid_room_ids
-    })
+    }
+    raw_mute_deadlines = config.get("muted_chatroom_deadlines")
+    if not isinstance(raw_mute_deadlines, dict):
+        raw_mute_deadlines = {}
+    cleaned_mute_deadlines: dict[str, float] = {}
+    expired_timed_mutes: set[str] = set()
+    now = time.time()
+    for room_id, raw_deadline in raw_mute_deadlines.items():
+        normalized_room_id = str(room_id)
+        if normalized_room_id not in valid_room_ids:
+            continue
+        try:
+            deadline = float(raw_deadline)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(deadline) or deadline <= now:
+            expired_timed_mutes.add(normalized_room_id)
+            continue
+        cleaned_mute_deadlines[normalized_room_id] = deadline
+        cleaned_muted_chatrooms.add(normalized_room_id)
+    cleaned_muted_chatrooms.difference_update(expired_timed_mutes)
+    config["muted_chatrooms"] = sorted(cleaned_muted_chatrooms)
+    config["muted_chatroom_deadlines"] = cleaned_mute_deadlines
 
     unread_counts = config.get("unread_counts")
     if not isinstance(unread_counts, dict):
@@ -2849,6 +2875,18 @@ def load_config() -> dict[str, Any]:
         if unread_count:
             cleaned_unread_counts[room_id] = unread_count
     config["unread_counts"] = cleaned_unread_counts
+    unread_after_message_ids = config.get("unread_after_message_ids")
+    if not isinstance(unread_after_message_ids, dict):
+        unread_after_message_ids = {}
+    config["unread_after_message_ids"] = {
+        str(room_id): str(message_id)
+        for room_id, message_id in unread_after_message_ids.items()
+        if (
+            str(room_id) in valid_room_ids
+            and str(message_id).strip()
+            and cleaned_unread_counts.get(str(room_id), 0) > 0
+        )
+    }
     config["config_version"] = CONFIG_FORMAT_VERSION
     return config
 
@@ -3275,6 +3313,7 @@ messagebox = MessageBoxes()
 
 class ComposeTextEdit(QPlainTextEdit):
     send_requested = Signal()
+    formatting_shortcut_requested = Signal(str)
 
     def to_message_text(self) -> str:
         segments: list[tuple[str, bool, bool, bool, bool]] = []
@@ -3381,6 +3420,20 @@ class ComposeTextEdit(QPlainTextEdit):
         self.mergeCurrentCharFormat(formatting)
 
     def keyPressEvent(self, event: Any) -> None:
+        shortcut_styles = {
+            Qt.Key.Key_B: "bold",
+            Qt.Key.Key_I: "italic",
+            Qt.Key.Key_U: "underline",
+        }
+        if (
+            event.modifiers() == Qt.KeyboardModifier.ControlModifier
+            and event.key() in shortcut_styles
+        ):
+            self.formatting_shortcut_requested.emit(
+                shortcut_styles[event.key()]
+            )
+            event.accept()
+            return
         if (
             event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
             and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
@@ -3400,6 +3453,23 @@ class ClickableProgressBar(QProgressBar):
             and self.rect().contains(event.position().toPoint())
         ):
             self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class ClickableSubmenuMenu(QMenu):
+    """Let a submenu-bearing row retain its own direct click action."""
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        action = self.actionAt(event.position().toPoint())
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and action is not None
+            and action.menu() is not None
+        ):
+            action.trigger()
+            self.close()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -4311,6 +4381,8 @@ class MessageLogBrowser(QTextBrowser):
             tuple[QColor, int, int],
         ] = {}
         self.collapsed_fade_blocks: dict[int, QColor] = {}
+        self.unread_divider_block_number: int | None = None
+        self.unread_divider_alpha = 255
         self.horizontalScrollBar().rangeChanged.connect(
             self._lock_horizontal_scroll
         )
@@ -4644,6 +4716,24 @@ class MessageLogBrowser(QTextBrowser):
             )
         painter.end()
 
+    def _paint_unread_divider(self, event: Any) -> None:
+        block_number = self.unread_divider_block_number
+        if block_number is None or self.unread_divider_alpha <= 0:
+            return
+        block = self.document().findBlockByNumber(block_number)
+        if not block.isValid():
+            return
+        block_rect = self.document().documentLayout().blockBoundingRect(block)
+        y = round(block_rect.bottom()) - self.verticalScrollBar().value() - 1
+        if y < event.rect().top() or y > event.rect().bottom():
+            return
+        color = QColor("#ff8a00")
+        color.setAlpha(max(0, min(255, self.unread_divider_alpha)))
+        painter = QPainter(self.viewport())
+        painter.setClipRegion(event.region())
+        painter.fillRect(0, y, self.viewport().width(), 1, color)
+        painter.end()
+
     def paintEvent(self, event: Any) -> None:
         self._paint_row_backgrounds(event)
         super().paintEvent(event)
@@ -4660,6 +4750,7 @@ class MessageLogBrowser(QTextBrowser):
         # Qt's selection colors cannot replace them.
         self._paint_spoilers(event)
         if not self.collapsed_fade_blocks:
+            self._paint_unread_divider(event)
             return
 
         viewport = self.viewport()
@@ -4733,6 +4824,7 @@ class MessageLogBrowser(QTextBrowser):
                 fade_brush,
             )
         painter.end()
+        self._paint_unread_divider(event)
 
 
 class MainWindow(QMainWindow):
@@ -4948,11 +5040,15 @@ class EncryptedChatClient(QObject):
         self.message_log: list[dict[str, Any]] = []
         self.draft_message_id = uuid.uuid4().hex
         self.chatroom_drafts: dict[str, str] = {}
+        self.read_divider_message_ids: dict[str, str] = {}
+        self.read_divider_visible_seconds: dict[str, float] = {}
+        self._read_divider_last_tick = time.monotonic()
         self._last_outbound_message_order = 0
         self.current_estimated_packet_size = 0
         self.message_size_check_pending = False
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
         self.rendered_message_blocks: dict[int, str] = {}
+        self.rendered_message_last_blocks: dict[str, int] = {}
         self.rendered_image_links: dict[str, str] = {}
         self.rendered_link_targets: dict[str, tuple[str, str]] = {}
         self.rendered_link_senders: dict[str, str] = {}
@@ -4984,6 +5080,18 @@ class EncryptedChatClient(QObject):
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
         )
         self._update_window_title()
+        startup_unread_boundary = self.config_data.setdefault(
+            "unread_after_message_ids",
+            {},
+        ).pop(self.active_chatroom_id, None)
+        if (
+            isinstance(startup_unread_boundary, str)
+            and startup_unread_boundary
+            and startup_unread_boundary != UNREAD_FROM_START_MARKER
+        ):
+            self.read_divider_message_ids[self.active_chatroom_id] = (
+                startup_unread_boundary
+            )
         cleared_stale_unread = (
             self.config_data.setdefault("unread_counts", {}).pop(
                 self.active_chatroom_id,
@@ -4995,7 +5103,7 @@ class EncryptedChatClient(QObject):
             room["id"] for room in self._chatroom_definitions()
         }
         self.notification_started_at = int(time.time())
-        if cleared_stale_unread:
+        if cleared_stale_unread or startup_unread_boundary is not None:
             try:
                 save_config(self.config_data)
             except Exception:
@@ -5143,6 +5251,18 @@ class EncryptedChatClient(QObject):
             self._show_pending_chat_tooltip
         )
 
+        self.timed_mute_timer = QTimer(self)
+        self.timed_mute_timer.setInterval(15_000)
+        self.timed_mute_timer.timeout.connect(
+            self._refresh_timed_chatroom_mutes
+        )
+
+        self.unread_divider_timer = QTimer(self)
+        self.unread_divider_timer.setInterval(100)
+        self.unread_divider_timer.timeout.connect(
+            self._update_unread_divider_fade
+        )
+
         self.ui_event_available.connect(self._process_ui_queue)
 
         self._apply_theme()
@@ -5158,6 +5278,8 @@ class EncryptedChatClient(QObject):
         QTimer.singleShot(0, self._check_for_updates)
         self.update_check_timer.start()
         self.background_history_prune_timer.start()
+        self.timed_mute_timer.start()
+        self.unread_divider_timer.start()
         self._start_network_thread()
 
     def _font_style_strategy(self) -> QFont.StyleStrategy:
@@ -5547,6 +5669,7 @@ class EncryptedChatClient(QObject):
         self.image_preview_cache.clear()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
+        self.rendered_message_last_blocks.clear()
         self.rendered_image_links.clear()
         self.rendered_link_targets.clear()
         self.rendered_link_senders.clear()
@@ -5555,6 +5678,7 @@ class EncryptedChatClient(QObject):
         self.viewport_embedded_image_urls.clear()
         self.chat_display.row_background_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
+        self.chat_display.unread_divider_block_number = None
         self.chat_display.setExtraSelections([])
         self._reset_chat_document()
         self._message_font_cache.clear()
@@ -6011,10 +6135,91 @@ class EncryptedChatClient(QObject):
         self._run_message_size_check()
 
     def _muted_chatroom_ids(self) -> set[str]:
-        return {
+        muted_ids = {
             str(room_id)
             for room_id in self.config_data.get("muted_chatrooms", [])
         }
+        now = time.time()
+        for room_id, raw_deadline in self.config_data.get(
+            "muted_chatroom_deadlines",
+            {},
+        ).items():
+            try:
+                if float(raw_deadline) <= now:
+                    muted_ids.discard(str(room_id))
+            except (TypeError, ValueError):
+                muted_ids.discard(str(room_id))
+        return muted_ids
+
+    def _chatroom_mute_deadline(self, room_id: str) -> float | None:
+        raw_deadline = self.config_data.get(
+            "muted_chatroom_deadlines",
+            {},
+        ).get(room_id)
+        if raw_deadline is None:
+            return None
+        try:
+            deadline = float(raw_deadline)
+        except (TypeError, ValueError):
+            return None
+        return deadline if math.isfinite(deadline) else None
+
+    def _chatroom_unmute_label(self, room_id: str) -> str:
+        deadline = self._chatroom_mute_deadline(room_id)
+        if deadline is None:
+            return "Unmute"
+        remaining_seconds = max(0.0, deadline - time.time())
+        if remaining_seconds > 60 * 60:
+            hours = max(1, math.ceil(remaining_seconds / (60 * 60)))
+            return f"Unmute ({hours} {'hr' if hours == 1 else 'hrs'})"
+        minutes = max(1, math.ceil(remaining_seconds / 60))
+        return f"Unmute ({minutes} min)"
+
+    def _refresh_timed_chatroom_mutes(self) -> None:
+        raw_deadlines = self.config_data.get(
+            "muted_chatroom_deadlines",
+            {},
+        )
+        if not isinstance(raw_deadlines, dict):
+            raw_deadlines = {}
+            self.config_data["muted_chatroom_deadlines"] = raw_deadlines
+        now = time.time()
+        expired_ids: set[str] = set()
+        for room_id, raw_deadline in list(raw_deadlines.items()):
+            try:
+                expired = float(raw_deadline) <= now
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                expired_ids.add(str(room_id))
+                raw_deadlines.pop(room_id, None)
+
+        open_context = getattr(self, "_open_chatroom_mute_context", None)
+        if open_context is not None:
+            context_room_id, context_menu, context_action = open_context
+            if context_room_id in expired_ids:
+                context_menu.close()
+            elif context_room_id in self._muted_chatroom_ids():
+                context_action.setText(
+                    self._chatroom_unmute_label(context_room_id)
+                )
+
+        if not expired_ids:
+            return
+        muted_ids = {
+            str(room_id)
+            for room_id in self.config_data.get("muted_chatrooms", [])
+        }
+        muted_ids.difference_update(expired_ids)
+        self.config_data["muted_chatrooms"] = sorted(muted_ids)
+        try:
+            save_config(self.config_data)
+        except Exception:
+            pass
+        self._request_subscription_refresh()
+        self.network_wakeup_event.set()
+        if hasattr(self, "chatrooms_list"):
+            self._refresh_chatroom_list()
 
     def _is_chatroom_muted(self, room_id: str) -> bool:
         return room_id in self._muted_chatroom_ids()
@@ -6137,6 +6342,119 @@ class EncryptedChatClient(QObject):
             self.config_data["unread_counts"] = unread_counts
         return unread_counts
 
+    def _unread_after_message_ids(self) -> dict[str, str]:
+        boundaries = self.config_data.setdefault(
+            "unread_after_message_ids",
+            {},
+        )
+        if not isinstance(boundaries, dict):
+            boundaries = {}
+            self.config_data["unread_after_message_ids"] = boundaries
+        return boundaries
+
+    def _set_unread_boundary_if_missing(
+        self,
+        room_id: str,
+        message_id: str | None,
+    ) -> None:
+        boundaries = self._unread_after_message_ids()
+        if room_id not in boundaries:
+            boundaries[room_id] = message_id or UNREAD_FROM_START_MARKER
+
+    def _consume_unread_boundary(self, room_id: str) -> bool:
+        message_id = self._unread_after_message_ids().pop(room_id, None)
+        if not isinstance(message_id, str) or not message_id:
+            return False
+        if message_id == UNREAD_FROM_START_MARKER:
+            return True
+        self.read_divider_message_ids[room_id] = message_id
+        self.read_divider_visible_seconds[room_id] = 0.0
+        return True
+
+    @staticmethod
+    def _message_id_from_log_item(item: dict[str, Any] | None) -> str | None:
+        if not isinstance(item, dict):
+            return None
+        message = item.get("message")
+        if not isinstance(message, dict):
+            return None
+        message_id = message.get("i")
+        return (
+            str(message_id)
+            if isinstance(message_id, str) and message_id
+            else None
+        )
+
+    def _apply_active_unread_divider_block(self) -> None:
+        if not hasattr(self, "chat_display"):
+            return
+        message_id = self._unread_after_message_ids().get(
+            self.active_chatroom_id
+        ) or self.read_divider_message_ids.get(self.active_chatroom_id)
+        block_number = (
+            self.rendered_message_last_blocks.get(message_id)
+            if message_id
+            else None
+        )
+        self.chat_display.unread_divider_block_number = block_number
+        elapsed = self.read_divider_visible_seconds.get(
+            self.active_chatroom_id,
+            0.0,
+        )
+        self.chat_display.unread_divider_alpha = (
+            255
+            if elapsed <= 3.0
+            else max(0, round(255 * (1.0 - ((elapsed - 3.0) / 3.0))))
+        )
+        self.chat_display.viewport().update()
+
+    def _update_unread_divider_fade(self) -> None:
+        now = time.monotonic()
+        elapsed_since_tick = max(0.0, now - self._read_divider_last_tick)
+        self._read_divider_last_tick = now
+        room_id = self.active_chatroom_id
+        message_id = self.read_divider_message_ids.get(room_id)
+        if not message_id or not hasattr(self, "chat_display"):
+            return
+        block_number = self.rendered_message_last_blocks.get(message_id)
+        if block_number is None:
+            return
+        block = self.chat_display.document().findBlockByNumber(block_number)
+        if not block.isValid():
+            return
+        block_rect = (
+            self.chat_display.document()
+            .documentLayout()
+            .blockBoundingRect(block)
+        )
+        divider_y = (
+            round(block_rect.bottom())
+            - self.chat_display.verticalScrollBar().value()
+            - 1
+        )
+        is_visible = 0 <= divider_y < self.chat_display.viewport().height()
+        is_focused = (
+            self.window_focused_event.is_set()
+            and self.root.isActiveWindow()
+            and self.root.isVisible()
+            and not self.root.isMinimized()
+            and not self._tray_ui_suspended
+        )
+        if is_visible and is_focused:
+            visible_seconds = self.read_divider_visible_seconds.get(
+                room_id,
+                0.0,
+            ) + elapsed_since_tick
+            self.read_divider_visible_seconds[room_id] = visible_seconds
+            if visible_seconds >= 6.0:
+                self.read_divider_message_ids.pop(room_id, None)
+                self.read_divider_visible_seconds.pop(room_id, None)
+                self.chat_display.unread_divider_block_number = None
+                self.chat_display.unread_divider_alpha = 0
+                self.chat_display.viewport().update()
+                return
+        self._apply_active_unread_divider_block()
+
     def _clear_desktop_notification(
         self,
         room_id: str,
@@ -6171,16 +6489,22 @@ class EncryptedChatClient(QObject):
 
     def _mark_chatroom_read(self, room_id: str) -> None:
         self._clear_desktop_notification(room_id)
+        had_boundary = self._consume_unread_boundary(room_id)
         unread_counts = self._unread_counts()
-        if room_id not in unread_counts:
+        had_unread = room_id in unread_counts
+        if room_id not in unread_counts and not had_boundary:
             self._clear_tray_notification_if_no_unread()
             return
         unread_counts.pop(room_id, None)
         self._clear_tray_notification_if_no_unread()
+        if room_id == self.active_chatroom_id:
+            self._apply_active_unread_divider_block()
         try:
             save_config(self.config_data)
         except Exception:
             pass
+        if (had_unread or had_boundary) and hasattr(self, "chatrooms_list"):
+            self._refresh_chatroom_list()
 
     def _add_chatroom(self) -> None:
         dialog = AddChatroomChoiceDialog(self.root)
@@ -6437,7 +6761,7 @@ class EncryptedChatClient(QObject):
 
         room_id = str(item.data(Qt.ItemDataRole.UserRole))
         is_muted = self._is_chatroom_muted(room_id)
-        menu = QMenu(self.root)
+        menu = ClickableSubmenuMenu(self.root)
 
         edit_action = menu.addAction("Edit")
         edit_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
@@ -6451,10 +6775,47 @@ class EncryptedChatClient(QObject):
             lambda: self._copy_chatroom_invite_code(room_id)
         )
 
-        mute_action = menu.addAction("Unmute" if is_muted else "Mute")
-        mute_action.triggered.connect(
-            lambda: self._set_chatroom_muted(room_id, not is_muted)
-        )
+        mute_action = None
+        if is_muted:
+            mute_action = menu.addAction(
+                self._chatroom_unmute_label(room_id)
+            )
+            mute_action.triggered.connect(
+                lambda: self._set_chatroom_muted(room_id, False)
+            )
+        else:
+            mute_menu = menu.addMenu("Mute")
+            forever_action = mute_menu.addAction("Forever")
+            one_hour_action = mute_menu.addAction("For 1 hour")
+            eight_hour_action = mute_menu.addAction("For 8 hours")
+            twenty_four_hour_action = mute_menu.addAction("For 24 hours")
+            forever_action.triggered.connect(
+                lambda: self._set_chatroom_muted(room_id, True)
+            )
+            one_hour_action.triggered.connect(
+                lambda: self._set_chatroom_muted(
+                    room_id,
+                    True,
+                    duration_seconds=60 * 60,
+                )
+            )
+            eight_hour_action.triggered.connect(
+                lambda: self._set_chatroom_muted(
+                    room_id,
+                    True,
+                    duration_seconds=8 * 60 * 60,
+                )
+            )
+            twenty_four_hour_action.triggered.connect(
+                lambda: self._set_chatroom_muted(
+                    room_id,
+                    True,
+                    duration_seconds=24 * 60 * 60,
+                )
+            )
+            mute_menu.menuAction().triggered.connect(
+                lambda: self._set_chatroom_muted(room_id, True)
+            )
 
         remove_action = menu.addAction("Remove")
         remove_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
@@ -6462,14 +6823,38 @@ class EncryptedChatClient(QObject):
             remove_action.triggered.connect(
                 lambda: self._remove_chatroom(room_id)
             )
+        self._open_chatroom_mute_context = (
+            (room_id, menu, mute_action)
+            if mute_action is not None
+            else None
+        )
         menu.exec(self.chatrooms_list.mapToGlobal(position))
+        self._open_chatroom_mute_context = None
 
-    def _set_chatroom_muted(self, room_id: str, muted: bool) -> None:
+    def _set_chatroom_muted(
+        self,
+        room_id: str,
+        muted: bool,
+        *,
+        duration_seconds: int | None = None,
+    ) -> None:
         muted_ids = self._muted_chatroom_ids()
+        deadlines = self.config_data.setdefault(
+            "muted_chatroom_deadlines",
+            {},
+        )
         if muted:
             muted_ids.add(room_id)
+            if duration_seconds is None:
+                deadlines.pop(room_id, None)
+            else:
+                deadlines[room_id] = time.time() + max(
+                    1,
+                    int(duration_seconds),
+                )
         else:
             muted_ids.discard(room_id)
+            deadlines.pop(room_id, None)
         self.config_data["muted_chatrooms"] = sorted(muted_ids)
         try:
             save_config(self.config_data)
@@ -6508,8 +6893,18 @@ class EncryptedChatClient(QObject):
         muted_ids = self._muted_chatroom_ids()
         muted_ids.discard(room_id)
         self.config_data["muted_chatrooms"] = sorted(muted_ids)
+        self.config_data.get("muted_chatroom_deadlines", {}).pop(
+            room_id,
+            None,
+        )
         self._clear_desktop_notification(room_id)
         self._unread_counts().pop(room_id, None)
+        self.config_data.get("unread_after_message_ids", {}).pop(
+            room_id,
+            None,
+        )
+        self.read_divider_message_ids.pop(room_id, None)
+        self.read_divider_visible_seconds.pop(room_id, None)
         self._clear_tray_notification_if_no_unread()
         self.config_data.get("room_profiles", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
@@ -6832,6 +7227,9 @@ class EncryptedChatClient(QObject):
             self._sync_formatting_buttons
         )
         self.message_entry.send_requested.connect(self._send_current_message)
+        self.message_entry.formatting_shortcut_requested.connect(
+            self._toggle_composer_formatting_shortcut
+        )
         compose_layout.addWidget(self.message_entry, 0, 0)
 
         self.send_button = QPushButton("Send")
@@ -6940,6 +7338,16 @@ class EncryptedChatClient(QObject):
         self.message_entry.apply_formatting(style, enabled)
         self.message_entry.setFocus()
         self._sync_formatting_buttons()
+
+    def _toggle_composer_formatting_shortcut(self, style: str) -> None:
+        buttons = {
+            "bold": self.bold_format_button,
+            "italic": self.italic_format_button,
+            "underline": self.underline_format_button,
+        }
+        button = buttons.get(style)
+        if button is not None:
+            button.click()
 
     def _sync_formatting_buttons(self) -> None:
         if not hasattr(self, "bold_format_button"):
@@ -9658,6 +10066,9 @@ class EncryptedChatClient(QObject):
             "muted_users",
             encryption_key,
         )
+        previous_message_id = self._message_id_from_log_item(
+            history[-1] if history else None
+        )
         added = 0
         unread_added = 0
 
@@ -9703,6 +10114,10 @@ class EncryptedChatClient(QObject):
                 notification_started_at=self.notification_started_at,
             )
             if should_notify and not is_local:
+                self._set_unread_boundary_if_missing(
+                    room_id,
+                    previous_message_id,
+                )
                 unread_added += 1
                 sender_id = str(message.get("c", ""))
                 is_muted_notification = (
@@ -9729,6 +10144,7 @@ class EncryptedChatClient(QObject):
                     and duplicate_ordinal <= 2
                 ):
                     self._play_notification_sound()
+            previous_message_id = client_message_id
 
         if not added:
             return
@@ -9753,6 +10169,7 @@ class EncryptedChatClient(QObject):
                 save_config(self.config_data)
             except Exception:
                 pass
+            self._apply_active_unread_divider_block()
             self._refresh_chatroom_list()
 
     def _accept_network_message(
@@ -9778,6 +10195,9 @@ class EncryptedChatClient(QObject):
         self.seen_client_message_ids.add(client_message_id)
 
         is_local = message["c"] == self._authenticated_client_id()
+        previous_message_id = self._message_id_from_log_item(
+            self.message_log[-1] if self.message_log else None
+        )
         duplicate_ordinal = consecutive_duplicate_message_ordinal(
             self.message_log,
             message,
@@ -9794,6 +10214,26 @@ class EncryptedChatClient(QObject):
             persist=persist,
             render=render,
         )
+
+        if (
+            play_chime
+            and not is_local
+            and not self.window_focused_event.is_set()
+        ):
+            self._set_unread_boundary_if_missing(
+                self.active_chatroom_id,
+                previous_message_id,
+            )
+            unread_counts = self._unread_counts()
+            unread_counts[self.active_chatroom_id] = (
+                int(unread_counts.get(self.active_chatroom_id, 0) or 0) + 1
+            )
+            try:
+                save_config(self.config_data)
+            except Exception:
+                pass
+            self._apply_active_unread_divider_block()
+            self._refresh_chatroom_list()
 
         is_muted_notification = (
             self._is_chatroom_muted(self.active_chatroom_id)
@@ -11481,6 +11921,7 @@ class EncryptedChatClient(QObject):
         self._hide_chat_tooltip()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
+        self.rendered_message_last_blocks.clear()
         self.rendered_image_links.clear()
         self.rendered_link_targets.clear()
         self.rendered_link_senders.clear()
@@ -11490,6 +11931,7 @@ class EncryptedChatClient(QObject):
         self.chat_display.row_background_blocks.clear()
         self.chat_display.row_background_padding_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
+        self.chat_display.unread_divider_block_number = None
 
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -11507,6 +11949,27 @@ class EncryptedChatClient(QObject):
             self.message_log,
             muted_ids,
         )
+        unread_boundary_id = self._unread_after_message_ids().get(
+            self.active_chatroom_id
+        ) or self.read_divider_message_ids.get(self.active_chatroom_id)
+        if unread_boundary_id:
+            boundary_split_groups: list[list[dict[str, Any]]] = []
+            for group in display_groups:
+                boundary_index = next(
+                    (
+                        index
+                        for index, source in enumerate(group)
+                        if self._message_id_from_log_item(source)
+                        == unread_boundary_id
+                    ),
+                    -1,
+                )
+                if 0 <= boundary_index < len(group) - 1:
+                    boundary_split_groups.append(group[:boundary_index + 1])
+                    boundary_split_groups.append(group[boundary_index + 1:])
+                else:
+                    boundary_split_groups.append(group)
+            display_groups = boundary_split_groups
         for group in display_groups:
             item = self._display_item_for_group(group, muted_ids)
             current_timestamp = self._display_timestamp_for_item(group[0])
@@ -11554,6 +12017,7 @@ class EncryptedChatClient(QObject):
             if selection.cursor.block().isValid()
         }
         self.chat_display.setExtraSelections(row_selections)
+        self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
 
         active_animated_urls = set(self.rendered_image_positions)
@@ -11881,6 +12345,10 @@ class EncryptedChatClient(QObject):
                 block.blockNumber()
             ] = message_id
             block = block.next()
+        for source_message_id in source_message_ids:
+            self.rendered_message_last_blocks[source_message_id] = (
+                final_block_number
+            )
 
         if is_collapsed:
             collapsed_block = document.findBlock(message_start_position)
@@ -11926,6 +12394,7 @@ class EncryptedChatClient(QObject):
         self.message_log.clear()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
+        self.rendered_message_last_blocks.clear()
         self.rendered_image_links.clear()
         self.rendered_link_targets.clear()
         self.rendered_link_senders.clear()
@@ -11941,6 +12410,7 @@ class EncryptedChatClient(QObject):
         self.chat_display.row_background_blocks.clear()
         self.chat_display.row_background_padding_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
+        self.chat_display.unread_divider_block_number = None
         self.chat_display.setExtraSelections([])
         self._reset_chat_document()
 
