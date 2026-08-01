@@ -1628,14 +1628,25 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
         )
         edit_at = source.index('menu.addAction("Edit")')
         copy_at = source.index('menu.addAction("Copy Invite Code")')
-        mute_at = source.index(
-            'menu.addAction("Unmute" if is_muted else "Mute")'
-        )
+        mute_at = source.index('mute_menu = menu.addMenu("Mute")')
         remove_at = source.index('menu.addAction("Remove")')
+        forever_at = source.index('mute_menu.addAction("Forever")')
+        one_hour_at = source.index('mute_menu.addAction("For 1 hour")')
+        eight_hours_at = source.index('mute_menu.addAction("For 8 hours")')
+        twenty_four_hours_at = source.index(
+            'mute_menu.addAction("For 24 hours")'
+        )
         self.assertLess(edit_at, copy_at)
         self.assertLess(copy_at, mute_at)
         self.assertLess(mute_at, remove_at)
+        self.assertLess(forever_at, one_hour_at)
+        self.assertLess(one_hour_at, eight_hours_at)
+        self.assertLess(eight_hours_at, twenty_four_hours_at)
         self.assertIn("_copy_chatroom_invite_code(room_id)", source)
+        self.assertIn("mute_menu.menuAction().triggered.connect", source)
+        self.assertIn("duration_seconds=60 * 60", source)
+        self.assertIn("duration_seconds=8 * 60 * 60", source)
+        self.assertIn("duration_seconds=24 * 60 * 60", source)
 
     def test_user_and_message_context_menus_are_separated(self) -> None:
         user_source = inspect.getsource(
