@@ -1638,6 +1638,40 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("_unread_divider_y(block)", paint_source)
         self.assertIn("_unread_divider_y(block)", fade_source)
 
+    def test_unread_divider_moves_below_a_separator_before_unread(
+        self,
+    ) -> None:
+        separator_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_log_separator
+        )
+        self.assertIn(") -> int:", separator_source)
+        self.assertIn("return separator_block_number", separator_source)
+
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._render_message_log
+        )
+        self.assertIn(
+            "previous_message_id == unread_boundary_id",
+            render_source,
+        )
+        self.assertIn(
+            "self.rendered_message_last_blocks[unread_boundary_id] =",
+            render_source,
+        )
+        self.assertIn(
+            "last_separator_block_number",
+            render_source,
+        )
+        self.assertLess(
+            render_source.index(
+                "last_separator_block_number = "
+                "self._insert_log_separator"
+            ),
+            render_source.index(
+                "self.rendered_message_last_blocks[unread_boundary_id] ="
+            ),
+        )
+
 
 class QualityOfLifeUpdateTests(unittest.TestCase):
     def test_single_instance_mutex_rejects_a_second_process(self) -> None:
