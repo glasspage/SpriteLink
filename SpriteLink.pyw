@@ -524,6 +524,7 @@ TRUSTED_LINK_DOMAINS = (
     "myanimelist.net",
 )
 TRUSTED_LINK_EXACT_HOSTS = (
+    "adriansblinkiecollection.neocities.org",
     "steamuserimages-a.akamaihd.net",
 )
 IMAGE_LINK_EXTENSIONS = (
@@ -4398,20 +4399,58 @@ class MessageLogBrowser(QTextBrowser):
         scrollbar.setValue(0)
         scrollbar.blockSignals(signals_were_blocked)
 
-    def _unread_divider_y(self, block: Any) -> int:
-        document_layout = self.document().documentLayout()
+    def _block_content_vertical_bounds(
+        self,
+        block: Any,
+    ) -> tuple[int, int]:
+        """Return the exact pixel rows occupied by a block's painted lines."""
+        layout = block.layout()
         scroll_y = self.verticalScrollBar().value()
+        if layout is not None and layout.lineCount() > 0:
+            first_line = layout.lineAt(0)
+            last_line = layout.lineAt(layout.lineCount() - 1)
+            top = layout.position().y() + first_line.y()
+            bottom = (
+                layout.position().y()
+                + last_line.y()
+                + last_line.height()
+            )
+        else:
+            block_rect = (
+                self.document().documentLayout().blockBoundingRect(block)
+            )
+            top = block_rect.top()
+            bottom = block_rect.top() + block_rect.height()
+
+        painted_top = round(top) - scroll_y
+        painted_bottom = round(bottom) - scroll_y
+        return painted_top, max(painted_top + 1, painted_bottom)
+
+    def _block_row_vertical_bounds(
+        self,
+        block: Any,
+    ) -> tuple[int, int]:
+        """Include any explicitly painted padding around a block's lines."""
+        top, bottom = self._block_content_vertical_bounds(block)
+        padding = self.row_background_padding_blocks.get(
+            block.blockNumber()
+        )
+        if padding is not None:
+            _background, top_padding, bottom_padding = padding
+            top -= top_padding
+            bottom += bottom_padding
+        return top, bottom
+
+    def _unread_divider_y(self, block: Any) -> int:
         next_block = block.next()
         if next_block.isValid():
-            next_top = document_layout.blockBoundingRect(next_block).top()
-            return round(next_top) - scroll_y - 1
+            next_top, _next_bottom = self._block_row_vertical_bounds(
+                next_block
+            )
+            return next_top - 1
 
-        block_rect = document_layout.blockBoundingRect(block)
-        block_bottom = (
-            round(block_rect.top())
-            + max(1, round(block_rect.height()))
-        )
-        return block_bottom - scroll_y - 1
+        _block_top, block_bottom = self._block_row_vertical_bounds(block)
+        return block_bottom - 1
 
     def _text_shadow_clip_region(
         self,
@@ -4664,8 +4703,6 @@ class MessageLogBrowser(QTextBrowser):
             self.document().blockCount() - 1,
             last_block + 1,
         )
-        document_layout = self.document().documentLayout()
-        scroll_y = self.verticalScrollBar().value()
         painter = QPainter(viewport)
         painter.setClipRegion(event.region())
         for block_number in range(first_block, last_block + 1):
@@ -4675,16 +4712,14 @@ class MessageLogBrowser(QTextBrowser):
             block = self.document().findBlockByNumber(block_number)
             if not block.isValid():
                 continue
-            block_rect = document_layout.blockBoundingRect(block)
-            top = round(block_rect.top()) - scroll_y
-            height = max(1, round(block_rect.height()))
-            if top > paint_rect.bottom() or top + height < paint_rect.top():
+            top, bottom = self._block_row_vertical_bounds(block)
+            if top > paint_rect.bottom() or bottom <= paint_rect.top():
                 continue
             painter.fillRect(
                 0,
                 top,
                 viewport_width,
-                height + 1,
+                bottom - top,
                 background,
             )
         painter.end()
@@ -4696,8 +4731,6 @@ class MessageLogBrowser(QTextBrowser):
 
         viewport = self.viewport()
         viewport_width = viewport.width()
-        document_layout = self.document().documentLayout()
-        scroll_y = self.verticalScrollBar().value()
         painter = QPainter(viewport)
         painter.setClipRegion(event.region())
         for block_number, padding in (
@@ -4707,12 +4740,10 @@ class MessageLogBrowser(QTextBrowser):
             block = self.document().findBlockByNumber(block_number)
             if not block.isValid():
                 continue
-            block_rect = document_layout.blockBoundingRect(block)
-            top = round(block_rect.top()) - scroll_y
-            height = max(1, round(block_rect.height()))
+            top, bottom = self._block_content_vertical_bounds(block)
             if (
-                top > event.rect().bottom()
-                or top + height < event.rect().top()
+                top - top_padding > event.rect().bottom()
+                or bottom + bottom_padding <= event.rect().top()
             ):
                 continue
             painter.fillRect(
@@ -4724,7 +4755,7 @@ class MessageLogBrowser(QTextBrowser):
             )
             painter.fillRect(
                 0,
-                top + height,
+                bottom,
                 viewport_width,
                 bottom_padding,
                 background,
