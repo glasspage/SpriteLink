@@ -369,7 +369,8 @@ TOOLTIP_SPACER_DATA_URI = (
     "AA7EAAAOxAGVKw4bAAAAC0lEQVQImWNgAAIAAAUAAWJVMogAAAAASUV"
     "ORK5CYII="
 )
-EMBEDDED_IMAGE_MAX_EDGE = 96
+EMBEDDED_IMAGE_MAX_WIDTH = 256
+EMBEDDED_IMAGE_MAX_HEIGHT = 96
 NSFW_IMAGE_PLACEHOLDER_SIZE = 64
 TOP_ALIGNED_PROFILE_ICON_PADDING = 3
 IMAGE_PREVIEW_MAX_WIDTH = CONFIG_POPUP_MAX_WIDTH - 32
@@ -382,7 +383,6 @@ MAX_ANIMATED_IMAGE_FRAMES = 500
 IMAGE_PREVIEW_CACHE_LIMIT = 128
 MAX_REMOTE_MEDIA_CACHE_BYTES = 64 * 1024 * 1024
 MAX_ACTIVE_ANIMATED_MEDIA = 12
-INLINE_MEDIA_NO_UPSCALE_EDGE = 64
 VIEWPORT_MEDIA_PRELOAD_SCREENS = 1
 VIEWPORT_MEDIA_UPDATE_DELAY_MS = 100
 MAX_UNCOMPRESSED_MESSAGE_BYTES = 32 * 1024
@@ -430,6 +430,7 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "www.imgur.com",
     "klipy.com",
     "*.klipy.com",
+    "adriansblinkiecollection.neocities.org",
     "res.cloudinary.com",
     "images.ctfassets.net",
     "cdn.sanity.io",
@@ -3299,6 +3300,50 @@ class ComposeTextEdit(QPlainTextEdit):
             block = block.next()
         return serialize_message_rich_text(segments)
 
+    def set_message_text(self, text: str) -> None:
+        plain_text, runs = parse_message_rich_text(text)
+        self.setPlainText(plain_text)
+
+        document = self.document()
+        for run in runs:
+            if not (
+                run.bold
+                or run.italic
+                or run.underline
+                or run.spoiler is not None
+            ):
+                continue
+            cursor = QTextCursor(document)
+            cursor.setPosition(run.start)
+            cursor.setPosition(
+                run.end,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            formatting = QTextCharFormat()
+            formatting.setFontWeight(
+                QFont.Weight.Bold
+                if run.bold
+                else QFont.Weight.Normal
+            )
+            formatting.setFontItalic(run.italic)
+            formatting.setFontUnderline(run.underline)
+            is_spoiler = run.spoiler is not None
+            formatting.setProperty(
+                COMPOSER_SPOILER_PROPERTY,
+                is_spoiler,
+            )
+            block_color = QColor(SPOILER_BLOCK_COLOR)
+            block_color.setAlpha(
+                REVEALED_SPOILER_BLOCK_ALPHA if is_spoiler else 0
+            )
+            formatting.setBackground(block_color)
+            cursor.mergeCharFormat(formatting)
+
+        cursor = QTextCursor(document)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.setTextCursor(cursor)
+        self.clear_formatting_state()
+
     def apply_formatting(self, style: str, enabled: bool) -> None:
         formatting = QTextCharFormat()
         if style == "bold":
@@ -4902,6 +4947,7 @@ class EncryptedChatClient(QObject):
         self.seen_ntfy_message_ids: set[str] = set()
         self.message_log: list[dict[str, Any]] = []
         self.draft_message_id = uuid.uuid4().hex
+        self.chatroom_drafts: dict[str, str] = {}
         self._last_outbound_message_order = 0
         self.current_estimated_packet_size = 0
         self.message_size_check_pending = False
@@ -6467,6 +6513,7 @@ class EncryptedChatClient(QObject):
         self._clear_tray_notification_if_no_unread()
         self.config_data.get("room_profiles", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
+        self.chatroom_drafts.pop(room_id, None)
         self._request_subscription_refresh()
 
         if self.active_chatroom_id == room_id:
@@ -6546,10 +6593,7 @@ class EncryptedChatClient(QObject):
         )
         if refresh_subscription:
             self._request_subscription_refresh()
-        self.message_entry.clear()
-        self.message_entry.clear_formatting_state()
-        self._sync_formatting_buttons()
-        self._run_message_size_check()
+        self._restore_active_chatroom_draft()
         self._refresh_chatroom_list()
 
     def _build_chat_tab(self) -> None:
@@ -8435,7 +8479,23 @@ class EncryptedChatClient(QObject):
             self._identity_private_key(),
         )
 
+    def _restore_active_chatroom_draft(self) -> None:
+        self._cancel_pending_message_size_check()
+        signals_were_blocked = self.message_entry.blockSignals(True)
+        try:
+            self.message_entry.set_message_text(
+                self.chatroom_drafts.get(self.active_chatroom_id, "")
+            )
+        finally:
+            self.message_entry.blockSignals(signals_were_blocked)
+        self._sync_formatting_buttons()
+        self._resize_message_entry()
+        self._run_message_size_check()
+
     def _schedule_composer_update(self) -> None:
+        self.chatroom_drafts[self.active_chatroom_id] = (
+            self.message_entry.to_message_text()
+        )
         self.message_resize_timer.start(0)
         self.message_size_check_pending = True
         self.message_size_timer.start(MESSAGE_SIZE_DEBOUNCE_MS)
@@ -11173,15 +11233,15 @@ class EncryptedChatClient(QObject):
         frame: QImage,
     ) -> QImage:
         preserve_native_size = (
-            frame.width() <= INLINE_MEDIA_NO_UPSCALE_EDGE
-            and frame.height() <= INLINE_MEDIA_NO_UPSCALE_EDGE
+            frame.width() <= EMBEDDED_IMAGE_MAX_WIDTH
+            and frame.height() <= EMBEDDED_IMAGE_MAX_HEIGHT
         )
         if preserve_native_size:
             preview = frame.copy()
         else:
             preview = frame.scaled(
-                EMBEDDED_IMAGE_MAX_EDGE,
-                EMBEDDED_IMAGE_MAX_EDGE,
+                EMBEDDED_IMAGE_MAX_WIDTH,
+                EMBEDDED_IMAGE_MAX_HEIGHT,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
@@ -11189,8 +11249,8 @@ class EncryptedChatClient(QObject):
             return preview
 
         canvas = QImage(
-            EMBEDDED_IMAGE_MAX_EDGE,
-            EMBEDDED_IMAGE_MAX_EDGE,
+            EMBEDDED_IMAGE_MAX_WIDTH,
+            EMBEDDED_IMAGE_MAX_HEIGHT,
             QImage.Format.Format_ARGB32_Premultiplied,
         )
         canvas.fill(Qt.GlobalColor.transparent)
@@ -11259,8 +11319,8 @@ class EncryptedChatClient(QObject):
 
     def _animated_media_loading_placeholder(self) -> QImage:
         placeholder = QImage(
-            EMBEDDED_IMAGE_MAX_EDGE,
-            EMBEDDED_IMAGE_MAX_EDGE,
+            EMBEDDED_IMAGE_MAX_WIDTH,
+            EMBEDDED_IMAGE_MAX_HEIGHT,
             QImage.Format.Format_ARGB32_Premultiplied,
         )
         placeholder.fill(QColor("#ececec"))
