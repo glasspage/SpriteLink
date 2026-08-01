@@ -4398,6 +4398,21 @@ class MessageLogBrowser(QTextBrowser):
         scrollbar.setValue(0)
         scrollbar.blockSignals(signals_were_blocked)
 
+    def _unread_divider_y(self, block: Any) -> int:
+        document_layout = self.document().documentLayout()
+        scroll_y = self.verticalScrollBar().value()
+        next_block = block.next()
+        if next_block.isValid():
+            next_top = document_layout.blockBoundingRect(next_block).top()
+            return round(next_top) - scroll_y - 1
+
+        block_rect = document_layout.blockBoundingRect(block)
+        block_bottom = (
+            round(block_rect.top())
+            + max(1, round(block_rect.height()))
+        )
+        return block_bottom - scroll_y - 1
+
     def _text_shadow_clip_region(
         self,
         event: Any,
@@ -4723,8 +4738,7 @@ class MessageLogBrowser(QTextBrowser):
         block = self.document().findBlockByNumber(block_number)
         if not block.isValid():
             return
-        block_rect = self.document().documentLayout().blockBoundingRect(block)
-        y = round(block_rect.bottom()) - self.verticalScrollBar().value() - 1
+        y = self._unread_divider_y(block)
         if y < event.rect().top() or y > event.rect().bottom():
             return
         color = QColor("#ff8a00")
@@ -6422,16 +6436,7 @@ class EncryptedChatClient(QObject):
         block = self.chat_display.document().findBlockByNumber(block_number)
         if not block.isValid():
             return
-        block_rect = (
-            self.chat_display.document()
-            .documentLayout()
-            .blockBoundingRect(block)
-        )
-        divider_y = (
-            round(block_rect.bottom())
-            - self.chat_display.verticalScrollBar().value()
-            - 1
-        )
+        divider_y = self.chat_display._unread_divider_y(block)
         is_visible = 0 <= divider_y < self.chat_display.viewport().height()
         is_focused = (
             self.window_focused_event.is_set()
@@ -6958,10 +6963,12 @@ class EncryptedChatClient(QObject):
         self,
         *,
         poll_immediately: bool,
+        bypass_rate_limits: bool = False,
     ) -> None:
         self.network_control_queue.put({
             "room_id": self.active_chatroom_id,
             "poll_immediately": poll_immediately,
+            "bypass_rate_limits": bypass_rate_limits,
         })
         self.network_wakeup_event.set()
 
@@ -9114,14 +9121,6 @@ class EncryptedChatClient(QObject):
 
         encryption_key = self._active_chatroom()["key"]
 
-        if not self.connected:
-            messagebox.showwarning(
-                "Not connected",
-                "The client is not currently connected to the selected server.",
-                parent=self.root,
-            )
-            return
-
         message = self._build_draft_message(text)
         (
             message["i"],
@@ -9171,6 +9170,14 @@ class EncryptedChatClient(QObject):
                 parent=self.root,
             )
             return
+
+        if not self.connected:
+            self.status_var.set("Connecting")
+            self._restart_connection_error_delay()
+            self._request_network_refresh(
+                poll_immediately=True,
+                bypass_rate_limits=True,
+            )
 
         # The network worker consumes this FIFO queue synchronously. A newer
         # message never starts its POST until every earlier one has finished.
@@ -9368,9 +9375,17 @@ class EncryptedChatClient(QObject):
             latest_control: dict[str, Any] | None = None
             while True:
                 try:
-                    latest_control = self.network_control_queue.get_nowait()
+                    pending_control = (
+                        self.network_control_queue.get_nowait()
+                    )
                 except queue.Empty:
                     break
+                if (
+                    latest_control is None
+                    or bool(pending_control.get("bypass_rate_limits"))
+                    or not bool(latest_control.get("bypass_rate_limits"))
+                ):
+                    latest_control = pending_control
 
             while True:
                 try:
@@ -9439,17 +9454,21 @@ class EncryptedChatClient(QObject):
                     if poll_immediately:
                         urgent_room_ids.add(active_room_id)
                         forced_active_poll_room_id = active_room_id
-                        background_delay_debt += (
-                            immediate_poll_borrowed_seconds(
-                                now=now,
-                                last_global_poll_at=last_global_poll_at,
-                                poll_interval=poll_interval,
+                        bypass_rate_limits = bool(
+                            latest_control.get("bypass_rate_limits", False)
+                        )
+                        if not bypass_rate_limits:
+                            background_delay_debt += (
+                                immediate_poll_borrowed_seconds(
+                                    now=now,
+                                    last_global_poll_at=last_global_poll_at,
+                                    poll_interval=poll_interval,
+                                )
                             )
-                        )
-                        background_repayment_checks = max(
-                            background_repayment_checks,
-                            CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS,
-                        )
+                            background_repayment_checks = max(
+                                background_repayment_checks,
+                                CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS,
+                            )
                         background_delay_until = None
                         background_delay_slice = 0.0
                     else:
