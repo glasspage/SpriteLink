@@ -1522,6 +1522,33 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("network_wakeup_event.set()", send_source)
         self.assertIn("network_wakeup_event.set()", event_source)
 
+    def test_send_reconnect_bypasses_poll_rate_limits(self) -> None:
+        client = mock.Mock()
+        client.active_chatroom_id = "room-a"
+        SPRITELINK.EncryptedChatClient._request_network_refresh(
+            client,
+            poll_immediately=True,
+            bypass_rate_limits=True,
+        )
+        client.network_control_queue.put.assert_called_once_with({
+            "room_id": "room-a",
+            "poll_immediately": True,
+            "bypass_rate_limits": True,
+        })
+        client.network_wakeup_event.set.assert_called_once_with()
+
+        send_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._send_current_message
+        )
+        loop_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._network_loop
+        )
+        self.assertNotIn('"Not connected"', send_source)
+        self.assertIn("if not self.connected:", send_source)
+        self.assertIn("bypass_rate_limits=True", send_source)
+        self.assertIn("pending_control.get(\"bypass_rate_limits\")", loop_source)
+        self.assertIn("if not bypass_rate_limits:", loop_source)
+
     def test_ui_queue_is_signal_driven_instead_of_polled(self) -> None:
         init_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient.__init__
@@ -1576,6 +1603,39 @@ class RuntimeOptimizationTests(unittest.TestCase):
         )
         self.assertNotIn("profile_icon_tooltip_data_uri", insert_source)
         self.assertIn("_tooltip_for_message_item", show_source)
+
+
+    def test_unread_divider_tracks_the_next_row_background_edge(
+        self,
+    ) -> None:
+        browser = mock.Mock()
+        block = mock.Mock()
+        next_block = mock.Mock()
+        block.next.return_value = next_block
+        next_block.isValid.return_value = True
+        next_rect = mock.Mock()
+        next_rect.top.return_value = 72.6
+        document_layout = (
+            browser.document.return_value.documentLayout.return_value
+        )
+        document_layout.blockBoundingRect.return_value = next_rect
+        browser.verticalScrollBar.return_value.value.return_value = 8
+
+        divider_y = SPRITELINK.MessageLogBrowser._unread_divider_y(
+            browser,
+            block,
+        )
+
+        self.assertEqual(divider_y, 64)
+        document_layout.blockBoundingRect.assert_called_once_with(next_block)
+        paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_unread_divider
+        )
+        fade_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._update_unread_divider_fade
+        )
+        self.assertIn("_unread_divider_y(block)", paint_source)
+        self.assertIn("_unread_divider_y(block)", fade_source)
 
 
 class QualityOfLifeUpdateTests(unittest.TestCase):
