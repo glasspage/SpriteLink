@@ -1147,11 +1147,18 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("setTextIndent(0)", source)
         self.assertIn("setBackground(QColor(background_color))", source)
 
+        bounds_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._block_content_vertical_bounds
+        )
+        self.assertIn("layout.lineAt(0)", bounds_source)
+        self.assertIn("last_line.height()", bounds_source)
+
         background_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_row_backgrounds
         )
-        self.assertIn("blockBoundingRect(block)", background_source)
-        self.assertIn("viewport_width", background_source)
+        self.assertIn("_block_row_vertical_bounds(block)", background_source)
+        self.assertIn("bottom - top", background_source)
+        self.assertNotIn("height + 1", background_source)
         paint_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser.paintEvent
         )
@@ -1613,13 +1620,7 @@ class RuntimeOptimizationTests(unittest.TestCase):
         next_block = mock.Mock()
         block.next.return_value = next_block
         next_block.isValid.return_value = True
-        next_rect = mock.Mock()
-        next_rect.top.return_value = 72.6
-        document_layout = (
-            browser.document.return_value.documentLayout.return_value
-        )
-        document_layout.blockBoundingRect.return_value = next_rect
-        browser.verticalScrollBar.return_value.value.return_value = 8
+        browser._block_row_vertical_bounds.return_value = (65, 87)
 
         divider_y = SPRITELINK.MessageLogBrowser._unread_divider_y(
             browser,
@@ -1627,7 +1628,7 @@ class RuntimeOptimizationTests(unittest.TestCase):
         )
 
         self.assertEqual(divider_y, 64)
-        document_layout.blockBoundingRect.assert_called_once_with(next_block)
+        browser._block_row_vertical_bounds.assert_called_once_with(next_block)
         paint_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_unread_divider
         )
@@ -2479,6 +2480,7 @@ class LinkSafetyTests(unittest.TestCase):
             "https://cdn.klipy.com/example.gif",
             "https://images.unsplash.com/example",
             "https://raw.githubusercontent.com/owner/repo/main/image.png",
+            "https://adriansblinkiecollection.neocities.org/blinkies.html",
         )
         for url in trusted_urls:
             with self.subTest(url=url):
@@ -2489,6 +2491,8 @@ class LinkSafetyTests(unittest.TestCase):
             "https://github.com.evil.example/login",
             "https://notgithub.com/login",
             "https://discord.com.evil.example/invite",
+            "https://adriansblinkiecollection.neocities.org.evil.example/",
+            "https://sub.adriansblinkiecollection.neocities.org/",
             "https://example.com/",
         ):
             with self.subTest(url=url):
