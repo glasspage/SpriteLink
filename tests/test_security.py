@@ -371,6 +371,50 @@ class BehaviorSettingsTests(unittest.TestCase):
         self.assertIn("_chatroom_history_limit()", persist_source)
         self.assertIn("_chatroom_history_limit()", add_source)
 
+    def test_long_chatroom_history_rendering_is_paged(self) -> None:
+        self.assertEqual(SPRITELINK.INITIAL_HISTORY_RENDER_MESSAGES, 40)
+        self.assertEqual(SPRITELINK.HISTORY_RENDER_PAGE_MESSAGES, 40)
+
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._render_message_log
+        )
+        self.assertIn(
+            "visible_message_items = "
+            "self.message_log[-visible_message_limit:]",
+            render_source,
+        )
+        self.assertIn(
+            "group_messages_for_display(\n            "
+            "visible_message_items,",
+            render_source,
+        )
+
+        scroll_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_chat_history_scrolled
+        )
+        self.assertIn("_schedule_older_history_page()", scroll_source)
+        page_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._load_older_history_page
+        )
+        self.assertIn("HISTORY_RENDER_PAGE_MESSAGES", page_source)
+        self.assertIn(
+            "new_maximum - previous_maximum",
+            page_source,
+        )
+        self.assertIn(
+            "previous_value\n                + max(",
+            page_source,
+        )
+
+        load_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._load_saved_history_for_current_room
+        )
+        self.assertIn("_schedule_older_history_page()", load_source)
+        switch_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._activate_chatroom
+        )
+        self.assertNotIn("_persist_local_history()", switch_source)
+
     def test_settings_never_embed_chatroom_history(self) -> None:
         config = SPRITELINK.default_config()
         config["history"] = {"scope": [{"message": {"m": "secret"}}]}
