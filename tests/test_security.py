@@ -538,6 +538,17 @@ class BehaviorSettingsTests(unittest.TestCase):
             "self._older_history_user_request = request",
             scroll_action_source,
         )
+        event_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        self.assertIn(
+            "self._on_chat_history_scroll_action(0)",
+            event_source,
+        )
+        self.assertNotIn(
+            "self._request_older_history_page_from_user_scroll,",
+            event_source,
+        )
         self.assertIn(
             "if self._older_history_user_request != request",
             action_source,
