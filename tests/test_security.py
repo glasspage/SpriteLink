@@ -1511,19 +1511,23 @@ class RuntimeOptimizationTests(unittest.TestCase):
         )
         self.assertIn("poll_message_should_notify", background_source)
 
-    def test_network_wakes_immediately_for_send_config_and_focus(self) -> None:
+    def test_network_wakes_for_work_and_window_visibility_changes(self) -> None:
         refresh_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._request_network_refresh
         )
         send_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._send_current_message
         )
+        activity_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._sync_window_activity
+        )
         event_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient.eventFilter
         )
         self.assertIn("network_wakeup_event.set()", refresh_source)
         self.assertIn("network_wakeup_event.set()", send_source)
-        self.assertIn("network_wakeup_event.set()", event_source)
+        self.assertIn("network_wakeup_event.set()", activity_source)
+        self.assertNotIn("network_wakeup_event.set()", event_source)
 
     def test_send_reconnect_bypasses_poll_rate_limits(self) -> None:
         client = mock.Mock()
@@ -2003,19 +2007,25 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
         self.assertIn('"SpriteLinkSubscriptionRefreshClose"', refresh_source)
         self.assertIn("daemon=True", refresh_source)
 
-    def test_tray_state_selects_the_tray_poll_interval(self) -> None:
+    def test_minimized_and_tray_windows_share_off_screen_polling(self) -> None:
         suspend_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._suspend_for_tray
         )
         resume_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._resume_from_tray
         )
+        event_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
         loop_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._network_loop
         )
-        self.assertIn("tray_mode_event.set()", suspend_source)
-        self.assertIn("tray_mode_event.clear()", resume_source)
-        self.assertIn("tray_mode_event.is_set()", loop_source)
+        self.assertIn("_sync_window_activity()", suspend_source)
+        self.assertIn("_sync_window_activity()", resume_source)
+        self.assertIn("WindowStateChange", event_source)
+        self.assertIn("_sync_window_activity", event_source)
+        self.assertIn("window_on_screen_event.is_set()", loop_source)
+        self.assertNotIn("tray_mode_event", loop_source)
 
 
 
