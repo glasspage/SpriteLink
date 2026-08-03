@@ -4029,6 +4029,20 @@ class Version120ReleaseTests(unittest.TestCase):
         )
         self.assertIn("embedded_media_block_numbers", source)
 
+        icon_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_profile_icon
+        )
+        self.assertEqual(SPRITELINK.PROFILE_ICON_VERTICAL_OFFSET_PX, 2)
+        self.assertIn(
+            "PROFILE_ICON_VERTICAL_OFFSET_PX * 2",
+            icon_source,
+        )
+        self.assertIn(
+            "TOP_ALIGNED_PROFILE_ICON_PADDING"
+            " - PROFILE_ICON_VERTICAL_OFFSET_PX",
+            icon_source,
+        )
+
         separator_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_log_separator
         )
