@@ -357,6 +357,7 @@ NTFY_DAILY_MESSAGE_LIMIT = 250
 MESSAGE_LIMIT_BAR_THRESHOLD = 50
 PACKET_PADDING_BLOCK = 128
 PROFILE_ICON_SIZE = 16
+PROFILE_ICON_VERTICAL_OFFSET_PX = 2
 PROFILE_ICON_MAX_COLORS = 16
 MAX_PROFILE_ICON_GIF_BYTES = 2048
 MAX_IDENTITY_PRESETS = 64
@@ -11406,23 +11407,35 @@ class EncryptedChatClient(QObject):
 
         displayed_image = image
         resource_suffix = ""
-        if align_top:
+        top_padding = (
+            max(
+                0,
+                TOP_ALIGNED_PROFILE_ICON_PADDING
+                - PROFILE_ICON_VERTICAL_OFFSET_PX,
+            )
+            if align_top
+            else 0
+        )
+        bottom_padding = (
+            0
+            if align_top
+            else PROFILE_ICON_VERTICAL_OFFSET_PX * 2
+        )
+        if top_padding or bottom_padding:
             padded_image = QImage(
                 image.width(),
-                image.height() + TOP_ALIGNED_PROFILE_ICON_PADDING,
+                image.height() + top_padding + bottom_padding,
                 QImage.Format.Format_ARGB32,
             )
             padded_image.fill(Qt.GlobalColor.transparent)
             painter = QPainter(padded_image)
-            painter.drawImage(
-                0,
-                TOP_ALIGNED_PROFILE_ICON_PADDING,
-                image,
-            )
+            painter.drawImage(0, top_padding, image)
             painter.end()
             padded_image.setDevicePixelRatio(1.0)
             displayed_image = padded_image
-            resource_suffix = "-top-padded"
+            resource_suffix = (
+                f"-vertical-offset-{PROFILE_ICON_VERTICAL_OFFSET_PX}"
+            )
 
         opacity = max(0.0, min(1.0, opacity))
         if opacity < 1.0:
