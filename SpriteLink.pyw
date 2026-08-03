@@ -12081,10 +12081,9 @@ class EncryptedChatClient(QObject):
             for selection in row_selections
             if selection.cursor.block().isValid()
         }
-        # Block backgrounds and the shared full-width painter already cover
-        # every row. A full-width ExtraSelection uses QTextLine content
-        # geometry instead, so it can repaint a shorter or taller stripe
-        # according to the font and profile-icon metrics.
+        # The shared full-width painter owns normal row backgrounds. Keep
+        # ExtraSelections empty so neither QTextBlock nor QTextLine content
+        # geometry can repaint only the middle of a stripe.
         self.chat_display.setExtraSelections([])
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
@@ -12397,7 +12396,12 @@ class EncryptedChatClient(QObject):
             # Ordinary message blocks always occupy fixed 24-pixel lines.
             block_format.setTopMargin(0.0)
             block_format.setBottomMargin(0.0)
-            block_format.setBackground(QColor(background_color))
+            # The custom full-width painter owns the entire normal stripe.
+            # Clear any inherited QTextBlock background so Qt cannot repaint
+            # the middle with independently rasterized vertical bounds.
+            block_format.clearProperty(
+                QTextFormat.Property.BackgroundBrush
+            )
             if block.blockNumber() not in embedded_media_block_numbers:
                 block_format.setLineHeight(
                     float(MESSAGE_LINE_HEIGHT_PX),
