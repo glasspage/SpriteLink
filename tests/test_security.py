@@ -445,19 +445,48 @@ class BehaviorSettingsTests(unittest.TestCase):
         scroll_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._on_chat_history_scrolled
         )
-        self.assertIn("_schedule_older_history_page()", scroll_source)
+        self.assertNotIn("_schedule_older_history_page()", scroll_source)
+        scroll_request = (
+            SPRITELINK.EncryptedChatClient
+            ._request_older_history_page_from_user_scroll
+        )
+        action_source = inspect.getsource(scroll_request)
+        self.assertIn("_schedule_older_history_page()", action_source)
         page_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._load_older_history_page
         )
         finish_page_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._finish_older_history_page
         )
+        restore_page_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._restore_older_history_page_view
+        )
         self.assertIn("HISTORY_RENDER_PAGE_MESSAGES", page_source)
         self.assertIn("on_finished=", page_source)
         self.assertIn(
-            "new_maximum - previous_maximum",
+            "QTimer.singleShot(",
             finish_page_source,
         )
+        self.assertIn(
+            "new_maximum - max(0, previous_distance_from_bottom)",
+            restore_page_source,
+        )
+        self.assertNotIn(
+            "_schedule_older_history_page()",
+            finish_page_source,
+        )
+        self.assertNotIn(
+            "_schedule_older_history_page()",
+            restore_page_source,
+        )
+        self.assertIn(
+            "_set_history_render_updates_suppressed(True)",
+            page_source,
+        )
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        self.assertIn("actionTriggered.connect", build_source)
         switch_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._activate_chatroom
         )
