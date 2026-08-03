@@ -4416,31 +4416,35 @@ class MessageLogBrowser(QTextBrowser):
         painted_bottom = aligned_rect.bottom() + 1 - scroll_y
         return painted_top, max(painted_top + 1, painted_bottom)
 
+    @staticmethod
+    def _nearest_pixel_edge(value: float) -> int:
+        """Resolve one document edge without creating overlapping rows."""
+        return int(math.floor(float(value) + 0.5))
+
     def _block_row_vertical_bounds(
         self,
         block: Any,
     ) -> tuple[int, int]:
-        """Return Qt's finalized full row box in viewport coordinates."""
-        block_rect = (
-            self.document().documentLayout().blockBoundingRect(block)
-        )
-        # The document block rect includes fixed line height, wrapping,
-        # inline objects, and block margins. QTextLayout.boundingRect() only
-        # describes the content and is often shorter for iconless messages.
-        aligned_rect = block_rect.toAlignedRect()
+        """Return a row whose bottom is the next row's exact top edge."""
+        document_layout = self.document().documentLayout()
+        block_rect = document_layout.blockBoundingRect(block)
+        next_block = block.next()
+        if next_block.isValid():
+            bottom_edge = document_layout.blockBoundingRect(
+                next_block
+            ).top()
+        else:
+            bottom_edge = block_rect.top() + block_rect.height()
+
+        # Round each shared edge once. Aligning every QRect independently
+        # makes neighboring rows overlap whenever their coordinates are
+        # fractional, so the later alternating color steals an edge pixel.
         scroll_y = self.verticalScrollBar().value()
-        painted_top = aligned_rect.top() - scroll_y
-        painted_bottom = aligned_rect.bottom() + 1 - scroll_y
+        painted_top = self._nearest_pixel_edge(block_rect.top()) - scroll_y
+        painted_bottom = self._nearest_pixel_edge(bottom_edge) - scroll_y
         return painted_top, max(painted_top + 1, painted_bottom)
 
     def _unread_divider_y(self, block: Any) -> int:
-        next_block = block.next()
-        if next_block.isValid():
-            next_top, _next_bottom = self._block_row_vertical_bounds(
-                next_block
-            )
-            return next_top - 1
-
         _block_top, block_bottom = self._block_row_vertical_bounds(block)
         return block_bottom - 1
 
@@ -12077,7 +12081,11 @@ class EncryptedChatClient(QObject):
             for selection in row_selections
             if selection.cursor.block().isValid()
         }
-        self.chat_display.setExtraSelections(row_selections)
+        # Block backgrounds and the shared full-width painter already cover
+        # every row. A full-width ExtraSelection uses QTextLine content
+        # geometry instead, so it can repaint a shorter or taller stripe
+        # according to the font and profile-icon metrics.
+        self.chat_display.setExtraSelections([])
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
 
@@ -12385,6 +12393,10 @@ class EncryptedChatClient(QObject):
             block_format.setLeftMargin(10)
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
+            # Only date/hour separators may contribute vertical margins.
+            # Ordinary message blocks always occupy fixed 24-pixel lines.
+            block_format.setTopMargin(0.0)
+            block_format.setBottomMargin(0.0)
             block_format.setBackground(QColor(background_color))
             if block.blockNumber() not in embedded_media_block_numbers:
                 block_format.setLineHeight(
