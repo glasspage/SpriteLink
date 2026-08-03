@@ -1146,6 +1146,18 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("setLeftMargin(10)", source)
         self.assertIn("setTextIndent(0)", source)
         self.assertIn("setBackground(QColor(background_color))", source)
+        self.assertIn("setTopMargin(0.0)", source)
+        self.assertIn("setBottomMargin(0.0)", source)
+        self.assertIn("LineHeightTypes.FixedHeight", source)
+
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._render_message_log
+        )
+        self.assertIn("setExtraSelections([])", render_source)
+        self.assertNotIn(
+            "setExtraSelections(row_selections)",
+            render_source,
+        )
 
         content_bounds_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._block_content_vertical_bounds
@@ -1161,29 +1173,37 @@ class RuntimeOptimizationTests(unittest.TestCase):
             SPRITELINK.MessageLogBrowser._block_row_vertical_bounds
         )
         self.assertIn("blockBoundingRect(block)", row_bounds_source)
-        self.assertIn("block_rect.toAlignedRect()", row_bounds_source)
+        self.assertIn("next_block = block.next()", row_bounds_source)
+        self.assertIn("blockBoundingRect(", row_bounds_source)
+        self.assertIn("_nearest_pixel_edge", row_bounds_source)
         self.assertNotIn(
             "row_background_padding_blocks",
             row_bounds_source,
         )
         self.assertNotIn("layout.boundingRect()", row_bounds_source)
+        self.assertNotIn("toAlignedRect()", row_bounds_source)
         self.assertNotIn("round(", row_bounds_source)
 
         browser = mock.Mock()
+        block = mock.Mock()
+        next_block = mock.Mock()
+        block.next.return_value = next_block
+        next_block.isValid.return_value = True
         document_layout = (
             browser.document.return_value.documentLayout.return_value
         )
-        document_layout.blockBoundingRect.return_value = SPRITELINK.QRectF(
-            0.0,
-            10.25,
-            100.0,
-            22.5,
+        document_layout.blockBoundingRect.side_effect = (
+            SPRITELINK.QRectF(0.0, 10.25, 100.0, 22.5),
+            SPRITELINK.QRectF(0.0, 32.75, 100.0, 22.5),
         )
         browser.verticalScrollBar.return_value.value.return_value = 3
+        browser._nearest_pixel_edge = (
+            SPRITELINK.MessageLogBrowser._nearest_pixel_edge
+        )
         top, bottom = (
             SPRITELINK.MessageLogBrowser._block_row_vertical_bounds(
                 browser,
-                mock.Mock(),
+                block,
             )
         )
         self.assertEqual((top, bottom), (7, 30))
@@ -1651,10 +1671,7 @@ class RuntimeOptimizationTests(unittest.TestCase):
     ) -> None:
         browser = mock.Mock()
         block = mock.Mock()
-        next_block = mock.Mock()
-        block.next.return_value = next_block
-        next_block.isValid.return_value = True
-        browser._block_row_vertical_bounds.return_value = (65, 87)
+        browser._block_row_vertical_bounds.return_value = (42, 65)
 
         divider_y = SPRITELINK.MessageLogBrowser._unread_divider_y(
             browser,
@@ -1662,7 +1679,7 @@ class RuntimeOptimizationTests(unittest.TestCase):
         )
 
         self.assertEqual(divider_y, 64)
-        browser._block_row_vertical_bounds.assert_called_once_with(next_block)
+        browser._block_row_vertical_bounds.assert_called_once_with(block)
         paint_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_unread_divider
         )
