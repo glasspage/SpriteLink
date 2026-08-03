@@ -4403,27 +4403,25 @@ class MessageLogBrowser(QTextBrowser):
         self,
         block: Any,
     ) -> tuple[int, int]:
-        """Return the exact pixel rows occupied by a block's painted lines."""
+        """Match the exact pixel rows used by Qt's block background painter."""
         layout = block.layout()
-        scroll_y = self.verticalScrollBar().value()
-        if layout is not None and layout.lineCount() > 0:
-            first_line = layout.lineAt(0)
-            last_line = layout.lineAt(layout.lineCount() - 1)
-            top = layout.position().y() + first_line.y()
-            bottom = (
-                layout.position().y()
-                + last_line.y()
-                + last_line.height()
+        if layout is not None:
+            content_rect = layout.boundingRect().translated(
+                layout.position()
             )
         else:
-            block_rect = (
+            content_rect = (
                 self.document().documentLayout().blockBoundingRect(block)
             )
-            top = block_rect.top()
-            bottom = block_rect.top() + block_rect.height()
 
-        painted_top = round(top) - scroll_y
-        painted_bottom = round(bottom) - scroll_y
+        # Qt paints a block's background from QTextLayout.boundingRect().
+        # Preserve its outward pixel alignment instead of independently
+        # rounding line coordinates, which can shift fractional metrics by
+        # one pixel relative to the actual alternating background edge.
+        aligned_rect = content_rect.toAlignedRect()
+        scroll_y = self.verticalScrollBar().value()
+        painted_top = aligned_rect.top() - scroll_y
+        painted_bottom = aligned_rect.bottom() + 1 - scroll_y
         return painted_top, max(painted_top + 1, painted_bottom)
 
     def _block_row_vertical_bounds(
