@@ -97,6 +97,57 @@ class LazyViewportMediaTests(unittest.TestCase):
         self.assertIn("max(1, int(width))", placeholder_source)
         self.assertIn("max(1, int(height))", placeholder_source)
 
+    def test_image_rerenders_preserve_a_message_anchor_transactionally(
+        self,
+    ) -> None:
+        rerender_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._rerender_preserving_scroll
+        )
+        capture_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._capture_chat_view_anchor
+        )
+        finish_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._finish_preserving_scroll_rerender
+        )
+        restore_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._restore_preserving_scroll_rerender
+        )
+        action_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._on_chat_history_scroll_action
+        )
+
+        self.assertIn("_capture_chat_view_anchor()", rerender_source)
+        self.assertIn(
+            "_set_history_render_updates_suppressed(True)",
+            rerender_source,
+        )
+        self.assertNotIn("fraction", rerender_source)
+        self.assertIn("cursorForPosition(QPoint(0, 0))", capture_source)
+        self.assertIn("rendered_message_blocks", capture_source)
+        self.assertIn("blockBoundingRect(block)", capture_source)
+        self.assertIn("QTimer.singleShot(", finish_source)
+        self.assertIn('if bool(anchor.get("at_bottom"))', restore_source)
+        self.assertIn("block_top - float(anchor.get", restore_source)
+        self.assertIn(
+            "self._media_rerender_in_progress = False",
+            restore_source,
+        )
+        self.assertIn(
+            "or self._history_render_updates_suppressed",
+            action_source,
+        )
+        self.assertIn(
+            "or self._media_rerender_in_progress",
+            action_source,
+        )
+        self.assertIn(
+            "or scrollbar.value() > scrollbar.minimum()",
+            action_source,
+        )
+
     def test_far_animations_are_stopped_and_removed(self) -> None:
         viewport_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._update_viewport_media
