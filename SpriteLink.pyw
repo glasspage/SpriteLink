@@ -5128,6 +5128,7 @@ class EncryptedChatClient(QObject):
         self._message_render_generation = 0
         self._message_render_job: dict[str, Any] | None = None
         self._rendering_message_log = False
+        self._media_rerender_in_progress = False
         self.embedded_image_preview_sizes: dict[str, tuple[int, int]] = {}
         self.history_load_executor = DaemonTaskPool(
             max_workers=2,
@@ -7073,6 +7074,7 @@ class EncryptedChatClient(QObject):
         self._message_render_generation += 1
         self._message_render_job = None
         self._rendering_message_log = False
+        self._media_rerender_in_progress = False
         self.rendered_history_message_limit = (
             INITIAL_HISTORY_RENDER_MESSAGES
         )
@@ -7085,6 +7087,10 @@ class EncryptedChatClient(QObject):
         if self._history_render_updates_suppressed == suppressed:
             return
         self._history_render_updates_suppressed = suppressed
+        if suppressed:
+            # A scroll action queued before a document transaction must not
+            # observe the temporary zero-position created by clear/rebuild.
+            self._older_history_user_request = None
         self.chat_display.setUpdatesEnabled(not suppressed)
         if not suppressed:
             self.chat_display.viewport().update()
@@ -7098,7 +7104,15 @@ class EncryptedChatClient(QObject):
         # Queue at most one request for the action that actually reached the
         # top. Repeated actionTriggered signals from the same wheel/slider
         # gesture must not survive a page transaction and request another one.
-        if self._older_history_user_request is not None:
+        scrollbar = self.chat_display.verticalScrollBar()
+        if (
+            self._older_history_user_request is not None
+            or self._history_render_updates_suppressed
+            or self._rendering_message_log
+            or self._loading_older_history_page
+            or self._media_rerender_in_progress
+            or scrollbar.value() > scrollbar.minimum()
+        ):
             return
         request = (
             self._history_render_generation,
@@ -10982,23 +10996,122 @@ class EncryptedChatClient(QObject):
         self._rerender_preserving_scroll()
 
     def _rerender_preserving_scroll(self) -> None:
-        if self._rendering_message_log or self._loading_older_history_page:
+        if (
+            self._rendering_message_log
+            or self._loading_older_history_page
+            or self._media_rerender_in_progress
+        ):
             self.viewport_media_timer.start(
                 VIEWPORT_MEDIA_UPDATE_DELAY_MS
             )
             return
-        scrollbar = self.chat_display.verticalScrollBar()
-        maximum = max(1, scrollbar.maximum())
-        fraction = scrollbar.value() / maximum
+        anchor = self._capture_chat_view_anchor()
+        generation = self._history_render_generation
+        room_id = self.active_chatroom_id
+        self._media_rerender_in_progress = True
+        self._set_history_render_updates_suppressed(True)
         self._render_message_log(
             scroll_to_bottom=False,
-            on_finished=lambda: self.chat_display.verticalScrollBar().setValue(
-                round(
-                    fraction
-                    * self.chat_display.verticalScrollBar().maximum()
-                )
+            on_finished=lambda: self._finish_preserving_scroll_rerender(
+                generation,
+                room_id,
+                anchor,
             ),
         )
+
+    def _capture_chat_view_anchor(self) -> dict[str, Any]:
+        scrollbar = self.chat_display.verticalScrollBar()
+        value = scrollbar.value()
+        maximum = scrollbar.maximum()
+        anchor: dict[str, Any] = {
+            "at_bottom": value >= maximum - 1,
+            "distance_from_bottom": max(0, maximum - value),
+            "message_id": None,
+            "viewport_offset": 0.0,
+        }
+        document = self.chat_display.document()
+        cursor = self.chat_display.cursorForPosition(QPoint(0, 0))
+        block = cursor.block()
+        while block.isValid():
+            message_id = self.rendered_message_blocks.get(
+                block.blockNumber()
+            )
+            if message_id:
+                block_top = (
+                    document.documentLayout()
+                    .blockBoundingRect(block)
+                    .top()
+                )
+                anchor["message_id"] = message_id
+                anchor["viewport_offset"] = block_top - value
+                break
+            block = block.next()
+        return anchor
+
+    def _finish_preserving_scroll_rerender(
+        self,
+        generation: int,
+        room_id: str,
+        anchor: dict[str, Any],
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+        ):
+            return
+        self.chat_display.document().documentLayout().documentSize()
+        QTimer.singleShot(
+            0,
+            lambda: self._restore_preserving_scroll_rerender(
+                generation,
+                room_id,
+                anchor,
+            ),
+        )
+
+    def _restore_preserving_scroll_rerender(
+        self,
+        generation: int,
+        room_id: str,
+        anchor: dict[str, Any],
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+        ):
+            return
+
+        scrollbar = self.chat_display.verticalScrollBar()
+        if bool(anchor.get("at_bottom")):
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            message_id = str(anchor.get("message_id") or "")
+            anchor_blocks = [
+                block_number
+                for block_number, rendered_message_id
+                in self.rendered_message_blocks.items()
+                if rendered_message_id == message_id
+            ]
+            if anchor_blocks:
+                block = self.chat_display.document().findBlockByNumber(
+                    min(anchor_blocks)
+                )
+                block_top = (
+                    self.chat_display.document().documentLayout()
+                    .blockBoundingRect(block)
+                    .top()
+                )
+                scrollbar.setValue(round(
+                    block_top - float(anchor.get("viewport_offset", 0.0))
+                ))
+            else:
+                scrollbar.setValue(max(
+                    scrollbar.minimum(),
+                    scrollbar.maximum()
+                    - max(0, int(anchor.get("distance_from_bottom", 0))),
+                ))
+        self._media_rerender_in_progress = False
+        self._set_history_render_updates_suppressed(False)
 
     def _schedule_chat_tooltip(
         self,
