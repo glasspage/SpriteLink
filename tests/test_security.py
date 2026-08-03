@@ -404,7 +404,7 @@ class BehaviorSettingsTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(SPRITELINK.INITIAL_HISTORY_RENDER_MESSAGES, 40)
         self.assertEqual(SPRITELINK.HISTORY_RENDER_PAGE_MESSAGES, 40)
-        self.assertEqual(SPRITELINK.MESSAGE_RENDER_BATCH_GROUPS, 5)
+        self.assertEqual(SPRITELINK.MESSAGE_RENDER_STEP_DELAY_MS, 1)
         self.assertEqual(SPRITELINK.UI_EVENT_BATCH_LIMIT, 8)
 
         load_source = inspect.getsource(
@@ -439,8 +439,18 @@ class BehaviorSettingsTests(unittest.TestCase):
             "self.message_log[-visible_message_limit:]",
             render_source,
         )
-        self.assertIn("MESSAGE_RENDER_BATCH_GROUPS", continue_source)
-        self.assertIn("QTimer.singleShot(", continue_source)
+        self.assertNotIn("while index <", continue_source)
+        self.assertIn("group = display_groups[index]", continue_source)
+        self.assertIn("index += 1", continue_source)
+        self.assertIn(
+            "QTimer.singleShot(\n"
+            "                MESSAGE_RENDER_STEP_DELAY_MS,",
+            continue_source,
+        )
+        self.assertIn(
+            "scrollbar.setValue(scrollbar.maximum())",
+            continue_source,
+        )
 
         scroll_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._on_chat_history_scrolled
@@ -452,6 +462,26 @@ class BehaviorSettingsTests(unittest.TestCase):
         )
         action_source = inspect.getsource(scroll_request)
         self.assertIn("_schedule_older_history_page()", action_source)
+        scroll_action_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._on_chat_history_scroll_action
+        )
+        self.assertIn(
+            "if self._older_history_user_request is not None",
+            scroll_action_source,
+        )
+        self.assertIn(
+            "self._older_history_user_request = request",
+            scroll_action_source,
+        )
+        self.assertIn(
+            "if self._older_history_user_request != request",
+            action_source,
+        )
+        self.assertIn(
+            "self._older_history_user_request = None",
+            action_source,
+        )
         page_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._load_older_history_page
         )
@@ -482,6 +512,29 @@ class BehaviorSettingsTests(unittest.TestCase):
         self.assertIn(
             "_set_history_render_updates_suppressed(True)",
             page_source,
+        )
+        queue_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._process_ui_queue
+        )
+        finish_initial_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._finalize_initial_history_render
+        )
+        self.assertNotIn(
+            "_maybe_prefetch_initial_history_page",
+            queue_source,
+        )
+        self.assertNotIn(
+            "_schedule_older_history_page()",
+            finish_initial_source,
+        )
+        reset_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._reset_history_render_window
+        )
+        self.assertIn(
+            "self._older_history_user_request = None",
+            reset_source,
         )
         build_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._build_chat_tab
