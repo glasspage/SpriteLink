@@ -4396,7 +4396,7 @@ class MessageLogBrowser(QTextBrowser):
         self,
         block: Any,
     ) -> tuple[int, int]:
-        """Match the exact pixel rows used by Qt's block background painter."""
+        """Return text-layout bounds without the block's outer margins."""
         layout = block.layout()
         if layout is not None:
             content_rect = layout.boundingRect().translated(
@@ -4407,10 +4407,9 @@ class MessageLogBrowser(QTextBrowser):
                 self.document().documentLayout().blockBoundingRect(block)
             )
 
-        # Qt paints a block's background from QTextLayout.boundingRect().
-        # Preserve its outward pixel alignment instead of independently
-        # rounding line coordinates, which can shift fractional metrics by
-        # one pixel relative to the actual alternating background edge.
+        # Separator margin bands are painted separately after Qt draws the
+        # document, so this helper deliberately keeps the content-only layout
+        # rectangle for that path.
         aligned_rect = content_rect.toAlignedRect()
         scroll_y = self.verticalScrollBar().value()
         painted_top = aligned_rect.top() - scroll_y
@@ -4421,16 +4420,18 @@ class MessageLogBrowser(QTextBrowser):
         self,
         block: Any,
     ) -> tuple[int, int]:
-        """Include any explicitly painted padding around a block's lines."""
-        top, bottom = self._block_content_vertical_bounds(block)
-        padding = self.row_background_padding_blocks.get(
-            block.blockNumber()
+        """Return Qt's finalized full row box in viewport coordinates."""
+        block_rect = (
+            self.document().documentLayout().blockBoundingRect(block)
         )
-        if padding is not None:
-            _background, top_padding, bottom_padding = padding
-            top -= top_padding
-            bottom += bottom_padding
-        return top, bottom
+        # The document block rect includes fixed line height, wrapping,
+        # inline objects, and block margins. QTextLayout.boundingRect() only
+        # describes the content and is often shorter for iconless messages.
+        aligned_rect = block_rect.toAlignedRect()
+        scroll_y = self.verticalScrollBar().value()
+        painted_top = aligned_rect.top() - scroll_y
+        painted_bottom = aligned_rect.bottom() + 1 - scroll_y
+        return painted_top, max(painted_top + 1, painted_bottom)
 
     def _unread_divider_y(self, block: Any) -> int:
         next_block = block.next()
