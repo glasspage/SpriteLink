@@ -5122,6 +5122,7 @@ class EncryptedChatClient(QObject):
         self._history_render_generation = 0
         self._older_history_page_scheduled = False
         self._loading_older_history_page = False
+        self._history_render_updates_suppressed = False
         self._history_initial_render_complete = False
         self._history_prefetch_requested = False
         self._message_render_generation = 0
@@ -7063,6 +7064,7 @@ class EncryptedChatClient(QObject):
         self._refresh_chatroom_list()
 
     def _reset_history_render_window(self) -> None:
+        self._set_history_render_updates_suppressed(False)
         self._history_render_generation += 1
         self._older_history_page_scheduled = False
         self._loading_older_history_page = False
@@ -7075,12 +7077,37 @@ class EncryptedChatClient(QObject):
             INITIAL_HISTORY_RENDER_MESSAGES
         )
 
-    def _on_chat_history_scrolled(self, value: int) -> None:
+    def _set_history_render_updates_suppressed(
+        self,
+        suppressed: bool,
+    ) -> None:
+        suppressed = bool(suppressed)
+        if self._history_render_updates_suppressed == suppressed:
+            return
+        self._history_render_updates_suppressed = suppressed
+        self.chat_display.setUpdatesEnabled(not suppressed)
+        if not suppressed:
+            self.chat_display.viewport().update()
+
+    def _on_chat_history_scrolled(self, _value: int) -> None:
         self.viewport_media_timer.start(
             VIEWPORT_MEDIA_UPDATE_DELAY_MS
         )
+
+    def _on_chat_history_scroll_action(self, _action: int) -> None:
+        # QScrollBar.valueChanged also fires for document rebuilds and our
+        # own viewport restoration. Defer this user-action check until Qt has
+        # applied the wheel/slider operation so programmatic zero values can
+        # never recursively request more history pages.
+        QTimer.singleShot(
+            0,
+            self._request_older_history_page_from_user_scroll,
+        )
+
+    def _request_older_history_page_from_user_scroll(self) -> None:
+        scrollbar = self.chat_display.verticalScrollBar()
         if (
-            value > 0
+            scrollbar.value() > scrollbar.minimum()
             or self._tray_ui_suspended
             or self._rendering_message_log
             or self._loading_older_history_page
@@ -7128,19 +7155,23 @@ class EncryptedChatClient(QObject):
         scrollbar = self.chat_display.verticalScrollBar()
         previous_value = scrollbar.value()
         previous_maximum = scrollbar.maximum()
+        previous_distance_from_bottom = max(
+            0,
+            previous_maximum - previous_value,
+        )
         self.rendered_history_message_limit = min(
             len(self.message_log),
             self.rendered_history_message_limit
             + HISTORY_RENDER_PAGE_MESSAGES,
         )
         self._loading_older_history_page = True
+        self._set_history_render_updates_suppressed(True)
         self._render_message_log(
             scroll_to_bottom=False,
             on_finished=lambda: self._finish_older_history_page(
                 generation,
                 room_id,
-                previous_value,
-                previous_maximum,
+                previous_distance_from_bottom,
             ),
         )
 
@@ -7148,31 +7179,54 @@ class EncryptedChatClient(QObject):
         self,
         generation: int,
         room_id: str,
-        previous_value: int,
-        previous_maximum: int,
+        previous_distance_from_bottom: int,
     ) -> None:
-        self._loading_older_history_page = False
         if (
             generation != self._history_render_generation
             or room_id != self.active_chatroom_id
             or self._tray_ui_suspended
         ):
+            self._loading_older_history_page = False
+            self._set_history_render_updates_suppressed(False)
             return
+
+        # QTextDocument can defer its final height until the event loop gets
+        # control again. Force layout once, then restore on the next turn
+        # while updates remain disabled so no intermediate scroll position is
+        # ever painted.
+        self.chat_display.document().documentLayout().documentSize()
+        QTimer.singleShot(
+            0,
+            lambda: self._restore_older_history_page_view(
+                generation,
+                room_id,
+                previous_distance_from_bottom,
+            ),
+        )
+
+    def _restore_older_history_page_view(
+        self,
+        generation: int,
+        room_id: str,
+        previous_distance_from_bottom: int,
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            self._loading_older_history_page = False
+            self._set_history_render_updates_suppressed(False)
+            return
+
         scrollbar = self.chat_display.verticalScrollBar()
         new_maximum = scrollbar.maximum()
-        scrollbar.setValue(min(
-            new_maximum,
-            previous_value + max(0, new_maximum - previous_maximum),
+        scrollbar.setValue(max(
+            scrollbar.minimum(),
+            new_maximum - max(0, previous_distance_from_bottom),
         ))
-
-        # Very tall windows may fit more than one page. Continue only until
-        # the document can actually scroll; after that, older pages load when
-        # the user reaches the top.
-        if (
-            scrollbar.maximum() == 0
-            and self.rendered_history_message_limit < len(self.message_log)
-        ):
-            self._schedule_older_history_page()
+        self._loading_older_history_page = False
+        self._set_history_render_updates_suppressed(False)
 
     def _build_chat_tab(self) -> None:
         layout = QVBoxLayout(self.chat_tab)
@@ -7233,6 +7287,9 @@ class EncryptedChatClient(QObject):
         self.chat_display.viewport().installEventFilter(self)
         self.chat_display.verticalScrollBar().valueChanged.connect(
             self._on_chat_history_scrolled
+        )
+        self.chat_display.verticalScrollBar().actionTriggered.connect(
+            self._on_chat_history_scroll_action
         )
         content_layout.addWidget(self.chat_display, 1)
 
@@ -10183,6 +10240,7 @@ class EncryptedChatClient(QObject):
                         self.message_log[0:0] = accepted_items
                     if initial_chunk:
                         if self.message_log and not self._tray_ui_suspended:
+                            self._set_history_render_updates_suppressed(True)
                             self._render_message_log(
                                 scroll_to_bottom=True,
                                 on_finished=lambda: (
@@ -10677,7 +10735,31 @@ class EncryptedChatClient(QObject):
             generation != self._history_render_generation
             or room_id != self.active_chatroom_id
         ):
+            self._set_history_render_updates_suppressed(False)
             return
+        self.chat_display.document().documentLayout().documentSize()
+        QTimer.singleShot(
+            0,
+            lambda: self._finalize_initial_history_render(
+                generation,
+                room_id,
+            ),
+        )
+
+    def _finalize_initial_history_render(
+        self,
+        generation: int,
+        room_id: str,
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+        ):
+            self._set_history_render_updates_suppressed(False)
+            return
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self._set_history_render_updates_suppressed(False)
         self._history_initial_render_complete = True
         self._maybe_prefetch_initial_history_page()
 
@@ -10894,6 +10976,11 @@ class EncryptedChatClient(QObject):
         self._rerender_preserving_scroll()
 
     def _rerender_preserving_scroll(self) -> None:
+        if self._rendering_message_log or self._loading_older_history_page:
+            self.viewport_media_timer.start(
+                VIEWPORT_MEDIA_UPDATE_DELAY_MS
+            )
+            return
         scrollbar = self.chat_display.verticalScrollBar()
         maximum = max(1, scrollbar.maximum())
         fraction = scrollbar.value() / maximum
@@ -11391,6 +11478,20 @@ class EncryptedChatClient(QObject):
             if event.type() == QEvent.Type.Resize:
                 self.viewport_media_timer.start(
                     VIEWPORT_MEDIA_UPDATE_DELAY_MS
+                )
+
+            elif (
+                event.type() == QEvent.Type.Wheel
+                and event.angleDelta().y() > 0
+                and self.chat_display.verticalScrollBar().value()
+                <= self.chat_display.verticalScrollBar().minimum()
+            ):
+                # A wheel-up at the top is still meaningful when the first
+                # pages do not fill a tall viewport and the scrollbar cannot
+                # emit a changed value.
+                QTimer.singleShot(
+                    0,
+                    self._request_older_history_page_from_user_scroll,
                 )
 
             elif event.type() == QEvent.Type.MouseMove:
