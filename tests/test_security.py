@@ -440,10 +440,10 @@ class BehaviorSettingsTests(unittest.TestCase):
             render_source,
         )
         self.assertNotIn("while index <", continue_source)
-        self.assertIn(
-            '"index": len(render_steps) - 1',
-            render_source,
-        )
+        self.assertIn('"index": (', render_source)
+        self.assertIn("len(render_steps) - 1", render_source)
+        self.assertIn("if scroll_to_bottom", render_source)
+        self.assertIn("else 0", render_source)
         self.assertIn('step = render_steps[index]', continue_source)
         self.assertIn("index -= 1", continue_source)
         self.assertIn(
