@@ -309,6 +309,8 @@ CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
 INITIAL_HISTORY_RENDER_MESSAGES = 40
 HISTORY_RENDER_PAGE_MESSAGES = 40
+MESSAGE_RENDER_BATCH_GROUPS = 5
+UI_EVENT_BATCH_LIMIT = 8
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 TRAY_NOTIFICATION_OUTLINE_COLOR = "#ff7a00"
 MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY = (
@@ -5120,7 +5122,16 @@ class EncryptedChatClient(QObject):
         self._history_render_generation = 0
         self._older_history_page_scheduled = False
         self._loading_older_history_page = False
+        self._history_initial_render_complete = False
+        self._history_prefetch_requested = False
+        self._message_render_generation = 0
+        self._message_render_job: dict[str, Any] | None = None
         self._rendering_message_log = False
+        self.embedded_image_preview_sizes: dict[str, tuple[int, int]] = {}
+        self.history_load_executor = DaemonTaskPool(
+            max_workers=2,
+            thread_name_prefix="SpriteLinkHistory",
+        )
         self.image_fetch_executor = DaemonTaskPool(
             max_workers=3,
             thread_name_prefix="SpriteLinkImage",
@@ -7055,6 +7066,11 @@ class EncryptedChatClient(QObject):
         self._history_render_generation += 1
         self._older_history_page_scheduled = False
         self._loading_older_history_page = False
+        self._history_initial_render_complete = False
+        self._history_prefetch_requested = False
+        self._message_render_generation += 1
+        self._message_render_job = None
+        self._rendering_message_log = False
         self.rendered_history_message_limit = (
             INITIAL_HISTORY_RENDER_MESSAGES
         )
@@ -7118,23 +7134,42 @@ class EncryptedChatClient(QObject):
             + HISTORY_RENDER_PAGE_MESSAGES,
         )
         self._loading_older_history_page = True
-        try:
-            self._render_message_log(scroll_to_bottom=False)
-            scrollbar = self.chat_display.verticalScrollBar()
-            new_maximum = scrollbar.maximum()
-            scrollbar.setValue(min(
-                new_maximum,
-                previous_value
-                + max(0, new_maximum - previous_maximum),
-            ))
-        finally:
-            self._loading_older_history_page = False
+        self._render_message_log(
+            scroll_to_bottom=False,
+            on_finished=lambda: self._finish_older_history_page(
+                generation,
+                room_id,
+                previous_value,
+                previous_maximum,
+            ),
+        )
+
+    def _finish_older_history_page(
+        self,
+        generation: int,
+        room_id: str,
+        previous_value: int,
+        previous_maximum: int,
+    ) -> None:
+        self._loading_older_history_page = False
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            return
+        scrollbar = self.chat_display.verticalScrollBar()
+        new_maximum = scrollbar.maximum()
+        scrollbar.setValue(min(
+            new_maximum,
+            previous_value + max(0, new_maximum - previous_maximum),
+        ))
 
         # Very tall windows may fit more than one page. Continue only until
         # the document can actually scroll; after that, older pages load when
         # the user reaches the top.
         if (
-            self.chat_display.verticalScrollBar().maximum() == 0
+            scrollbar.maximum() == 0
             and self.rendered_history_message_limit < len(self.message_log)
         ):
             self._schedule_older_history_page()
@@ -10051,7 +10086,7 @@ class EncryptedChatClient(QObject):
 
     def _process_ui_queue(self) -> None:
         try:
-            while True:
+            for _event_index in range(UI_EVENT_BATCH_LIMIT):
                 event_type, payload = self.ui_queue.get_nowait()
 
                 if event_type == "status":
@@ -10109,6 +10144,61 @@ class EncryptedChatClient(QObject):
                         f"{message_plain_text(str(message['m']))}",
                         warning=True,
                     )
+
+                elif event_type == "history_chunk_loaded":
+                    generation = int(payload.get("generation", -1))
+                    room_id = str(payload.get("room_id", ""))
+                    if (
+                        generation != self._history_render_generation
+                        or room_id != self.active_chatroom_id
+                    ):
+                        continue
+
+                    initial_chunk = bool(payload.get("initial", False))
+                    accepted_items: list[dict[str, Any]] = []
+                    for item in payload.get("items", []):
+                        message = item.get("message")
+                        if not isinstance(message, dict):
+                            continue
+                        message_id = str(message.get("i", ""))
+                        if (
+                            not message_id
+                            or message_id in self.seen_client_message_ids
+                        ):
+                            continue
+                        self.seen_client_message_ids.add(message_id)
+                        ntfy_id = item.get("ntfy_id")
+                        if isinstance(ntfy_id, str) and ntfy_id:
+                            self.seen_ntfy_message_ids.add(ntfy_id)
+                        accepted_items.append(item)
+
+                    if initial_chunk:
+                        self.message_log.extend(accepted_items)
+                        self.message_log.sort(key=self._message_sort_key)
+                    elif accepted_items:
+                        # The worker emits saved-history chunks newest-first.
+                        # Every later chunk is older than the current prefix,
+                        # so prepend it without repeatedly sorting the growing
+                        # retained history on the GUI thread.
+                        self.message_log[0:0] = accepted_items
+                    if initial_chunk:
+                        if self.message_log and not self._tray_ui_suspended:
+                            self._render_message_log(
+                                scroll_to_bottom=True,
+                                on_finished=lambda: (
+                                    self._finish_initial_history_render(
+                                        generation,
+                                        room_id,
+                                    )
+                                ),
+                            )
+                        else:
+                            self._finish_initial_history_render(
+                                generation,
+                                room_id,
+                            )
+                    else:
+                        self._maybe_prefetch_initial_history_page()
 
                 elif event_type == "image_preview_loaded":
                     url = str(payload.get("url", ""))
@@ -10185,6 +10275,8 @@ class EncryptedChatClient(QObject):
 
         except queue.Empty:
             pass
+        if not self.ui_queue.empty():
+            QTimer.singleShot(0, self._process_ui_queue)
 
     def _accept_background_messages(
         self,
@@ -10470,61 +10562,124 @@ class EncryptedChatClient(QObject):
         if not server_url or not encryption_key:
             return
 
-        entries = load_chatroom_history(server_url, encryption_key)
-        for item in entries[-self._chatroom_history_limit():]:
-            message = item.get("message")
-            if not isinstance(message, dict):
-                continue
-
-            stored_ntfy_time = int(
-                item.get("ntfy_time", message.get("t", 0)) or 0
+        generation = self._history_render_generation
+        room_id = self.active_chatroom_id
+        history_limit = self._chatroom_history_limit()
+        try:
+            self.history_load_executor.submit(
+                self._load_saved_history_worker,
+                generation,
+                room_id,
+                server_url,
+                encryption_key,
+                history_limit,
             )
-            try:
-                self._validate_decrypted_message(
-                    message,
-                    encryption_key,
-                    ntfy_time=(
-                        stored_ntfy_time
-                        if stored_ntfy_time > 0
-                        else None
-                    ),
+        except RuntimeError:
+            pass
+
+    def _load_saved_history_worker(
+        self,
+        generation: int,
+        room_id: str,
+        server_url: str,
+        encryption_key: str,
+        history_limit: int,
+    ) -> None:
+        entries = load_chatroom_history(server_url, encryption_key)[
+            -history_limit:
+        ]
+        first_chunk = True
+        chunk_end = len(entries)
+        while chunk_end > 0 and not self._closing:
+            chunk_start = max(
+                0,
+                chunk_end - INITIAL_HISTORY_RENDER_MESSAGES,
+            )
+            prepared_items: list[dict[str, Any]] = []
+            for item in entries[chunk_start:chunk_end]:
+                message = item.get("message")
+                if not isinstance(message, dict):
+                    continue
+
+                stored_ntfy_time = int(
+                    item.get("ntfy_time", message.get("t", 0)) or 0
                 )
-            except Exception:
-                continue
+                try:
+                    self._validate_decrypted_message(
+                        message,
+                        encryption_key,
+                        ntfy_time=(
+                            stored_ntfy_time
+                            if stored_ntfy_time > 0
+                            else None
+                        ),
+                    )
+                except Exception:
+                    continue
 
-            client_message_id = message["i"]
-            if client_message_id in self.seen_client_message_ids:
-                continue
+                ntfy_id = item.get("ntfy_id")
+                if not isinstance(ntfy_id, str) or not ntfy_id:
+                    ntfy_id = None
+                prepared_items.append({
+                    "message": message,
+                    "is_local": (
+                        message["c"] == self._authenticated_client_id()
+                    ),
+                    "warning": None,
+                    "ntfy_id": ntfy_id,
+                    "ntfy_time": stored_ntfy_time,
+                    **(
+                        {"display_sort_time": int(item["display_sort_time"])}
+                        if type(item.get("display_sort_time")) is int
+                        else {}
+                    ),
+                })
 
-            ntfy_id = item.get("ntfy_id")
-            if isinstance(ntfy_id, str) and ntfy_id:
-                self.seen_ntfy_message_ids.add(ntfy_id)
-            else:
-                ntfy_id = None
+            self._queue_ui_event((
+                "history_chunk_loaded",
+                {
+                    "generation": generation,
+                    "room_id": room_id,
+                    "items": prepared_items,
+                    "initial": first_chunk,
+                },
+            ))
+            first_chunk = False
+            chunk_end = chunk_start
 
-            self.seen_client_message_ids.add(client_message_id)
-            self.message_log.append({
-                "message": message,
-                "is_local": (
-                    message["c"] == self._authenticated_client_id()
-                ),
-                "warning": None,
-                "ntfy_id": ntfy_id,
-                "ntfy_time": stored_ntfy_time,
-                **(
-                    {"display_sort_time": int(item["display_sort_time"])}
-                    if type(item.get("display_sort_time")) is int
-                    else {}
-                ),
-            })
+        if first_chunk and not self._closing:
+            self._queue_ui_event((
+                "history_chunk_loaded",
+                {
+                    "generation": generation,
+                    "room_id": room_id,
+                    "items": [],
+                    "initial": True,
+                },
+            ))
 
-        self.message_log.sort(key=self._message_sort_key)
-        if self.message_log:
-            self._render_message_log(scroll_to_bottom=True)
-            # Prepare one older page after the newest messages are already
-            # visible. Further pages remain lazy so a 10,000-message room
-            # cannot recreate the original switch-time freeze later.
-            self._schedule_older_history_page()
+    def _maybe_prefetch_initial_history_page(self) -> None:
+        if (
+            not self._history_initial_render_complete
+            or self._history_prefetch_requested
+            or self.rendered_history_message_limit >= len(self.message_log)
+        ):
+            return
+        self._history_prefetch_requested = True
+        self._schedule_older_history_page()
+
+    def _finish_initial_history_render(
+        self,
+        generation: int,
+        room_id: str,
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+        ):
+            return
+        self._history_initial_render_complete = True
+        self._maybe_prefetch_initial_history_page()
 
     def _persist_local_history(self) -> None:
         server_url = normalize_server_url(
@@ -10742,9 +10897,15 @@ class EncryptedChatClient(QObject):
         scrollbar = self.chat_display.verticalScrollBar()
         maximum = max(1, scrollbar.maximum())
         fraction = scrollbar.value() / maximum
-        self._render_message_log(scroll_to_bottom=False)
-        scrollbar = self.chat_display.verticalScrollBar()
-        scrollbar.setValue(round(fraction * scrollbar.maximum()))
+        self._render_message_log(
+            scroll_to_bottom=False,
+            on_finished=lambda: self.chat_display.verticalScrollBar().setValue(
+                round(
+                    fraction
+                    * self.chat_display.verticalScrollBar().maximum()
+                )
+            ),
+        )
 
     def _schedule_chat_tooltip(
         self,
@@ -11885,6 +12046,23 @@ class EncryptedChatClient(QObject):
             return self._scaled_inline_media_frame(media, media.frame)
         return self._animated_media_loading_placeholder()
 
+    def _unloaded_image_placeholder(
+        self,
+        width: int,
+        height: int,
+    ) -> QImage:
+        placeholder = QImage(
+            max(1, int(width)),
+            max(1, int(height)),
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        placeholder.fill(QColor("#d0d0d0"))
+        painter = QPainter(placeholder)
+        painter.setPen(QColor("#aaaaaa"))
+        painter.drawRect(placeholder.rect().adjusted(0, 0, -1, -1))
+        painter.end()
+        return placeholder
+
     def _insert_embedded_image_preview(
         self,
         cursor: QTextCursor,
@@ -11892,11 +12070,25 @@ class EncryptedChatClient(QObject):
         client_id: str,
     ) -> bool:
         media = self.image_preview_cache.get(url)
-        if not isinstance(media, RemoteMediaPreview):
-            return False
-        if not is_likely_nsfw_image_url(url):
-            self._ensure_animated_media_controller(url, media)
-        preview = self._embedded_media_preview(url, media)
+        show_loaded_preview = (
+            url in self.viewport_embedded_image_urls
+            and isinstance(media, RemoteMediaPreview)
+        )
+        if show_loaded_preview:
+            assert isinstance(media, RemoteMediaPreview)
+            if not is_likely_nsfw_image_url(url):
+                self._ensure_animated_media_controller(url, media)
+            preview = self._embedded_media_preview(url, media)
+            self.embedded_image_preview_sizes[url] = (
+                preview.width(),
+                preview.height(),
+            )
+        else:
+            preview_size = self.embedded_image_preview_sizes.get(url)
+            if preview_size is None:
+                return False
+            preview = self._unloaded_image_placeholder(*preview_size)
+
         link_token = hashlib.sha256(
             f"{client_id}\0{url}".encode("utf-8")
         ).hexdigest()
@@ -11923,9 +12115,10 @@ class EncryptedChatClient(QObject):
         image_format.setAnchorHref(anchor)
         image_position = cursor.position()
         cursor.insertImage(image_format)
-        self.rendered_image_positions.setdefault(url, []).append(
-            image_position
-        )
+        if show_loaded_preview:
+            self.rendered_image_positions.setdefault(url, []).append(
+                image_position
+            )
         return True
 
     def _animated_media_loading_placeholder(self) -> QImage:
@@ -12087,9 +12280,25 @@ class EncryptedChatClient(QObject):
             )
         return item
 
-    def _render_message_log(self, *, scroll_to_bottom: bool) -> None:
+    def _render_message_log(
+        self,
+        *,
+        scroll_to_bottom: bool,
+        on_finished: Any | None = None,
+    ) -> None:
         if self._tray_ui_suspended:
             return
+
+        previous_job = self._message_render_job
+        if (
+            on_finished is None
+            and isinstance(previous_job, dict)
+            and callable(previous_job.get("on_finished"))
+        ):
+            on_finished = previous_job["on_finished"]
+
+        self._message_render_generation += 1
+        generation = self._message_render_generation
         self._rendering_message_log = True
         self._hide_chat_tooltip()
         self.rendered_message_items.clear()
@@ -12114,10 +12323,6 @@ class EncryptedChatClient(QObject):
             "trusted_link_and_image_users"
         )
         row_selections: list[QTextEdit.ExtraSelection] = []
-        previous_timestamp: int | None = None
-        previous_message_id: str | None = None
-        first_item = True
-        stripe_index = 0
 
         visible_message_limit = max(
             INITIAL_HISTORY_RENDER_MESSAGES,
@@ -12149,7 +12354,57 @@ class EncryptedChatClient(QObject):
                 else:
                     boundary_split_groups.append(group)
             display_groups = boundary_split_groups
-        for group in display_groups:
+
+        self._message_render_job = {
+            "generation": generation,
+            "room_id": self.active_chatroom_id,
+            "scroll_to_bottom": scroll_to_bottom,
+            "on_finished": on_finished,
+            "cursor": cursor,
+            "muted_ids": muted_ids,
+            "collapsed_ids": collapsed_ids,
+            "trusted_user_ids": trusted_user_ids,
+            "row_selections": row_selections,
+            "display_groups": display_groups,
+            "unread_boundary_id": unread_boundary_id,
+            "index": 0,
+            "previous_timestamp": None,
+            "previous_message_id": None,
+            "first_item": True,
+            "stripe_index": 0,
+        }
+        self._continue_message_log_render(generation)
+
+    def _continue_message_log_render(self, generation: int) -> None:
+        job = self._message_render_job
+        if (
+            not isinstance(job, dict)
+            or generation != self._message_render_generation
+            or generation != job.get("generation")
+            or job.get("room_id") != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            return
+
+        cursor = job["cursor"]
+        muted_ids = job["muted_ids"]
+        collapsed_ids = job["collapsed_ids"]
+        trusted_user_ids = job["trusted_user_ids"]
+        row_selections = job["row_selections"]
+        display_groups = job["display_groups"]
+        unread_boundary_id = job["unread_boundary_id"]
+        index = int(job["index"])
+        previous_timestamp = job["previous_timestamp"]
+        previous_message_id = job["previous_message_id"]
+        first_item = bool(job["first_item"])
+        stripe_index = int(job["stripe_index"])
+        batch_end = min(
+            len(display_groups),
+            index + MESSAGE_RENDER_BATCH_GROUPS,
+        )
+
+        while index < batch_end:
+            group = display_groups[index]
             item = self._display_item_for_group(group, muted_ids)
             current_timestamp = self._display_timestamp_for_item(group[0])
             separator_texts = (
@@ -12176,9 +12431,6 @@ class EncryptedChatClient(QObject):
                 and unread_boundary_id
                 and previous_message_id == unread_boundary_id
             ):
-                # A separator belongs visually between the read and unread
-                # rows. Anchor the divider to its last painted block so the
-                # orange line appears at the separator's bottom edge.
                 self.rendered_message_last_blocks[unread_boundary_id] = (
                     last_separator_block_number
                 )
@@ -12200,6 +12452,21 @@ class EncryptedChatClient(QObject):
             first_item = False
             previous_timestamp = self._display_timestamp_for_item(group[-1])
             previous_message_id = self._message_id_from_log_item(group[-1])
+            index += 1
+
+        job["index"] = index
+        job["previous_timestamp"] = previous_timestamp
+        job["previous_message_id"] = previous_message_id
+        job["first_item"] = first_item
+        job["stripe_index"] = stripe_index
+
+        if index < len(display_groups):
+            self.chat_display.viewport().update()
+            QTimer.singleShot(
+                0,
+                lambda: self._continue_message_log_render(generation),
+            )
+            return
 
         self.chat_display.row_background_blocks = {
             selection.cursor.block().blockNumber(): QColor(
@@ -12208,9 +12475,6 @@ class EncryptedChatClient(QObject):
             for selection in row_selections
             if selection.cursor.block().isValid()
         }
-        # The shared full-width painter owns normal row backgrounds. Keep
-        # ExtraSelections empty so neither QTextBlock nor QTextLine content
-        # geometry can repaint only the middle of a stripe.
         self.chat_display.setExtraSelections([])
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
@@ -12226,13 +12490,17 @@ class EncryptedChatClient(QObject):
             controller.deleteLater()
             self.last_inline_animation_frame_at.pop(url, None)
 
-        if scroll_to_bottom:
+        if bool(job["scroll_to_bottom"]):
             scrollbar = self.chat_display.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
         self.viewport_media_timer.start(
             VIEWPORT_MEDIA_UPDATE_DELAY_MS
         )
+        on_finished = job.get("on_finished")
+        self._message_render_job = None
         self._rendering_message_log = False
+        if callable(on_finished):
+            on_finished()
 
     def _insert_message_item(
         self,
@@ -12333,15 +12601,18 @@ class EncryptedChatClient(QObject):
                 image_url,
                 [],
             ).append(message_start_position)
-        active_image_urls = [
+        displayed_image_urls = [
             image_url
             for image_url in image_urls
             if (
-                image_url in self.viewport_embedded_image_urls
-                and isinstance(
-                    self.image_preview_cache.get(image_url),
-                    RemoteMediaPreview,
+                (
+                    image_url in self.viewport_embedded_image_urls
+                    and isinstance(
+                        self.image_preview_cache.get(image_url),
+                        RemoteMediaPreview,
+                    )
                 )
+                or image_url in self.embedded_image_preview_sizes
             )
         ]
 
@@ -12380,23 +12651,30 @@ class EncryptedChatClient(QObject):
         top_align_height = 0
         if (
             not is_collapsed
-            and bool(active_image_urls)
+            and bool(displayed_image_urls)
             and not message_text_without_image_links(
                 plain_display_text,
                 set(image_urls),
             ).strip()
         ):
-            for url in active_image_urls:
+            for url in displayed_image_urls:
                 cached_media = self.image_preview_cache.get(url)
-                if isinstance(cached_media, RemoteMediaPreview):
+                if (
+                    url in self.viewport_embedded_image_urls
+                    and isinstance(cached_media, RemoteMediaPreview)
+                ):
                     preview_height = self._embedded_media_preview(
                         url,
                         cached_media,
                     ).height()
-                    top_align_height = max(
-                        top_align_height,
-                        preview_height,
-                    )
+                else:
+                    preview_height = self.embedded_image_preview_sizes[
+                        url
+                    ][1]
+                top_align_height = max(
+                    top_align_height,
+                    preview_height,
+                )
         align_message_top = top_align_height > 0
 
         has_profile_icon = self._insert_profile_icon(
@@ -12457,7 +12735,7 @@ class EncryptedChatClient(QObject):
             set(image_urls),
         )
         add_image_line_break = (
-            bool(active_image_urls)
+            bool(displayed_image_urls)
             and bool(visible_text_without_images.strip())
             and not visible_text_without_images.rstrip(" \t").endswith(
                 ("\n", "\r")
@@ -12491,7 +12769,7 @@ class EncryptedChatClient(QObject):
         cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
         if add_image_line_break:
             cursor.insertBlock()
-        for image_url in active_image_urls:
+        for image_url in displayed_image_urls:
             if self._insert_embedded_image_preview(
                 cursor,
                 image_url,
@@ -13030,6 +13308,10 @@ class EncryptedChatClient(QObject):
             controller.stop()
         self.animated_media_controllers.clear()
         self.last_inline_animation_frame_at.clear()
+        self.history_load_executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
         self.image_fetch_executor.shutdown(
             wait=False,
             cancel_futures=True,
