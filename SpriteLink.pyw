@@ -12503,11 +12503,149 @@ class EncryptedChatClient(QObject):
             "collapsed_ids": collapsed_ids,
             "trusted_user_ids": trusted_user_ids,
             "row_selections": row_selections,
+            "display_groups": display_groups,
             "render_steps": render_steps,
             "unread_boundary_id": unread_boundary_id,
-            "index": len(render_steps) - 1,
+            "newest_first": bool(scroll_to_bottom),
+            "cursor": self.chat_display.textCursor(),
+            "previous_timestamp": None,
+            "previous_message_id": None,
+            "first_item": True,
+            "stripe_index": 0,
+            "index": (
+                len(render_steps) - 1
+                if scroll_to_bottom
+                else 0
+            ),
         }
-        self._continue_message_log_render(generation)
+        if scroll_to_bottom:
+            self._continue_message_log_render(generation)
+        else:
+            self._continue_message_log_render_forward(generation)
+
+    def _continue_message_log_render_forward(
+        self,
+        generation: int,
+    ) -> None:
+        job = self._message_render_job
+        if (
+            not isinstance(job, dict)
+            or generation != self._message_render_generation
+            or generation != job.get("generation")
+            or job.get("room_id") != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            return
+
+        cursor = job["cursor"]
+        muted_ids = job["muted_ids"]
+        collapsed_ids = job["collapsed_ids"]
+        trusted_user_ids = job["trusted_user_ids"]
+        row_selections = job["row_selections"]
+        display_groups = job["display_groups"]
+        unread_boundary_id = job["unread_boundary_id"]
+        index = int(job["index"])
+        previous_timestamp = job["previous_timestamp"]
+        previous_message_id = job["previous_message_id"]
+        first_item = bool(job["first_item"])
+        stripe_index = int(job["stripe_index"])
+
+        if index < len(display_groups):
+            group = display_groups[index]
+            item = self._display_item_for_group(group, muted_ids)
+            current_timestamp = self._display_timestamp_for_item(group[0])
+            separator_texts = (
+                message_log_separator_texts(
+                    previous_timestamp,
+                    current_timestamp,
+                )
+                if previous_timestamp is not None
+                else ()
+            )
+            last_separator_block_number: int | None = None
+            for separator_text in separator_texts:
+                last_separator_block_number = self._insert_log_separator(
+                    cursor,
+                    separator_text,
+                    MESSAGE_ROW_BACKGROUNDS[
+                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                    ],
+                    row_selections,
+                )
+                stripe_index += 1
+            if (
+                last_separator_block_number is not None
+                and unread_boundary_id
+                and previous_message_id == unread_boundary_id
+            ):
+                self.rendered_message_last_blocks[unread_boundary_id] = (
+                    last_separator_block_number
+                )
+            if not first_item and not separator_texts:
+                cursor.insertBlock()
+
+            self._insert_message_item(
+                cursor,
+                item,
+                muted_ids=muted_ids,
+                collapsed_ids=collapsed_ids,
+                trusted_user_ids=trusted_user_ids,
+                background_color=MESSAGE_ROW_BACKGROUNDS[
+                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                ],
+                row_selections=row_selections,
+            )
+            stripe_index += 1
+            first_item = False
+            previous_timestamp = self._display_timestamp_for_item(group[-1])
+            previous_message_id = self._message_id_from_log_item(group[-1])
+            index += 1
+
+        job["index"] = index
+        job["previous_timestamp"] = previous_timestamp
+        job["previous_message_id"] = previous_message_id
+        job["first_item"] = first_item
+        job["stripe_index"] = stripe_index
+
+        if index < len(display_groups):
+            QTimer.singleShot(
+                MESSAGE_RENDER_STEP_DELAY_MS,
+                lambda: self._continue_message_log_render_forward(
+                    generation
+                ),
+            )
+            return
+
+        self.chat_display.row_background_blocks = {
+            selection.cursor.block().blockNumber(): QColor(
+                selection.format.background().color()
+            )
+            for selection in row_selections
+            if selection.cursor.block().isValid()
+        }
+        self.chat_display.setExtraSelections([])
+        self._apply_active_unread_divider_block()
+        self.chat_display.horizontalScrollBar().setValue(0)
+
+        active_animated_urls = set(self.rendered_image_positions)
+        if self.current_image_preview_url:
+            active_animated_urls.add(self.current_image_preview_url)
+        for url in list(self.animated_media_controllers):
+            if url in active_animated_urls:
+                continue
+            controller = self.animated_media_controllers.pop(url)
+            controller.stop()
+            controller.deleteLater()
+            self.last_inline_animation_frame_at.pop(url, None)
+
+        self.viewport_media_timer.start(
+            VIEWPORT_MEDIA_UPDATE_DELAY_MS
+        )
+        on_finished = job.get("on_finished")
+        self._message_render_job = None
+        self._rendering_message_log = False
+        if callable(on_finished):
+            on_finished()
 
     def _insert_log_separator_before_newer_content(
         self,
