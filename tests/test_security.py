@@ -3734,8 +3734,15 @@ class Version120ReleaseTests(unittest.TestCase):
         chat_shadow_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_text_shadows
         )
-        self.assertIn("setAlphaF(0.15)", chat_shadow_source)
+        self.assertNotIn("setAlphaF(0.15)", chat_shadow_source)
         self.assertIn("painter.translate(1, 1)", chat_shadow_source)
+        self.assertIn("painter.setOpacity(0.15)", chat_shadow_source)
+        self.assertLess(
+            chat_shadow_source.index("painter.setOpacity(0.15)"),
+            chat_shadow_source.index(
+                "layout.draw(painter, layout_origin, shadow_ranges)"
+            ),
+        )
         self.assertIn("layout.draw", chat_shadow_source)
         self.assertIn(
             "-self.verticalScrollBar().value()",
@@ -4034,7 +4041,15 @@ class Version120ReleaseTests(unittest.TestCase):
         )
         self.assertEqual(SPRITELINK.PROFILE_ICON_VERTICAL_OFFSET_PX, 2)
         self.assertIn(
-            "PROFILE_ICON_VERTICAL_OFFSET_PX * 2",
+            "else PROFILE_ICON_VERTICAL_OFFSET_PX",
+            icon_source,
+        )
+        self.assertNotIn(
+            "VerticalAlignment.AlignMiddle",
+            icon_source,
+        )
+        self.assertIn(
+            "VerticalAlignment.AlignTop",
             icon_source,
         )
         self.assertIn(
