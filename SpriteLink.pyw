@@ -12422,8 +12422,6 @@ class EncryptedChatClient(QObject):
         self.chat_display.collapsed_fade_blocks.clear()
         self.chat_display.unread_divider_block_number = None
 
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
         trusted_user_ids = self._room_preference_ids(
@@ -12462,25 +12460,88 @@ class EncryptedChatClient(QObject):
                     boundary_split_groups.append(group)
             display_groups = boundary_split_groups
 
+        # Calculate the final chronological stripe/separator plan once, then
+        # execute it backwards.  The newest row becomes visible immediately;
+        # each later GUI turn prepends one older row while preserving the
+        # completed document's normal oldest-to-newest order.
+        render_steps: list[dict[str, Any]] = []
+        previous_timestamp: int | None = None
+        stripe_index = 0
+        for group in display_groups:
+            separator_specs: list[tuple[str, str]] = []
+            current_timestamp = self._display_timestamp_for_item(group[0])
+            if previous_timestamp is not None:
+                for separator_text in message_log_separator_texts(
+                    previous_timestamp,
+                    current_timestamp,
+                ):
+                    separator_specs.append((
+                        separator_text,
+                        MESSAGE_ROW_BACKGROUNDS[
+                            stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                        ],
+                    ))
+                    stripe_index += 1
+            if render_steps:
+                render_steps[-1]["separators_after"] = separator_specs
+            render_steps.append({
+                "group": group,
+                "background_color": MESSAGE_ROW_BACKGROUNDS[
+                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                ],
+                "separators_after": [],
+            })
+            stripe_index += 1
+            previous_timestamp = self._display_timestamp_for_item(group[-1])
+
         self._message_render_job = {
             "generation": generation,
             "room_id": self.active_chatroom_id,
             "scroll_to_bottom": scroll_to_bottom,
             "on_finished": on_finished,
-            "cursor": cursor,
             "muted_ids": muted_ids,
             "collapsed_ids": collapsed_ids,
             "trusted_user_ids": trusted_user_ids,
             "row_selections": row_selections,
-            "display_groups": display_groups,
+            "render_steps": render_steps,
             "unread_boundary_id": unread_boundary_id,
-            "index": 0,
-            "previous_timestamp": None,
-            "previous_message_id": None,
-            "first_item": True,
-            "stripe_index": 0,
+            "index": len(render_steps) - 1,
         }
         self._continue_message_log_render(generation)
+
+    def _insert_log_separator_before_newer_content(
+        self,
+        cursor: QTextCursor,
+        text: str,
+        background_color: str,
+        row_selections: list[QTextEdit.ExtraSelection],
+    ) -> int:
+        # Unlike the append-oriented separator helper, this leaves no trailing
+        # empty block: the already-rendered newer content is immediately next.
+        if cursor.block().text():
+            cursor.insertBlock()
+        separator_block = QTextBlockFormat()
+        separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        separator_block.setTopMargin(7)
+        separator_block.setBottomMargin(7)
+        separator_block.setBackground(QColor(background_color))
+        cursor.setBlockFormat(separator_block)
+        cursor.insertText(text, self._text_format("#777777"))
+        separator_block_number = cursor.block().blockNumber()
+        self.chat_display.row_background_padding_blocks[
+            separator_block_number
+        ] = (QColor(background_color), 7, 7)
+
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = QTextCursor(cursor.block())
+        selection.cursor.clearSelection()
+        selection.format.setBackground(QColor(background_color))
+        selection.format.setProperty(
+            QTextFormat.Property.FullWidthSelection,
+            True,
+        )
+        row_selections.append(selection)
+        return separator_block_number
 
     def _continue_message_log_render(self, generation: int) -> None:
         job = self._message_render_job
@@ -12493,76 +12554,146 @@ class EncryptedChatClient(QObject):
         ):
             return
 
-        cursor = job["cursor"]
         muted_ids = job["muted_ids"]
         collapsed_ids = job["collapsed_ids"]
         trusted_user_ids = job["trusted_user_ids"]
         row_selections = job["row_selections"]
-        display_groups = job["display_groups"]
+        render_steps = job["render_steps"]
         unread_boundary_id = job["unread_boundary_id"]
         index = int(job["index"])
-        previous_timestamp = job["previous_timestamp"]
-        previous_message_id = job["previous_message_id"]
-        first_item = bool(job["first_item"])
-        stripe_index = int(job["stripe_index"])
-        if index < len(display_groups):
-            group = display_groups[index]
+        if index >= 0:
+            step = render_steps[index]
+            group = step["group"]
             item = self._display_item_for_group(group, muted_ids)
-            current_timestamp = self._display_timestamp_for_item(group[0])
-            separator_texts = (
-                message_log_separator_texts(
-                    previous_timestamp,
-                    current_timestamp,
-                )
-                if previous_timestamp is not None
-                else ()
-            )
-            last_separator_block_number: int | None = None
-            for separator_text in separator_texts:
-                last_separator_block_number = self._insert_log_separator(
-                    cursor,
-                    separator_text,
-                    MESSAGE_ROW_BACKGROUNDS[
-                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
-                    ],
-                    row_selections,
-                )
-                stripe_index += 1
-            if (
-                last_separator_block_number is not None
-                and unread_boundary_id
-                and previous_message_id == unread_boundary_id
-            ):
-                self.rendered_message_last_blocks[unread_boundary_id] = (
-                    last_separator_block_number
-                )
-            if not first_item and not separator_texts:
-                cursor.insertBlock()
+            document = self.chat_display.document()
+            old_block_count = document.blockCount()
+            old_character_count = document.characterCount()
 
+            # Integer block/character positions do not follow QTextDocument
+            # edits automatically. Preserve the existing newer rows, clear the
+            # live maps to avoid low-number collisions, then shift them by the
+            # exact amount inserted at the front.
+            old_message_blocks = dict(self.rendered_message_blocks)
+            old_message_last_blocks = dict(
+                self.rendered_message_last_blocks
+            )
+            old_image_positions = {
+                url: list(positions)
+                for url, positions in self.rendered_image_positions.items()
+            }
+            old_image_candidates = {
+                url: list(positions)
+                for url, positions in self.rendered_image_candidates.items()
+            }
+            old_padding_blocks = dict(
+                self.chat_display.row_background_padding_blocks
+            )
+            old_collapsed_blocks = dict(
+                self.chat_display.collapsed_fade_blocks
+            )
+            old_row_selections = [
+                (
+                    selection.cursor.position(),
+                    QTextCharFormat(selection.format),
+                )
+                for selection in row_selections
+            ]
+
+            self.rendered_message_blocks.clear()
+            self.rendered_message_last_blocks.clear()
+            self.rendered_image_positions.clear()
+            self.rendered_image_candidates.clear()
+            self.chat_display.row_background_padding_blocks.clear()
+            self.chat_display.collapsed_fade_blocks.clear()
+            row_selections.clear()
+
+            cursor = QTextCursor(document)
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
             self._insert_message_item(
                 cursor,
                 item,
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
                 trusted_user_ids=trusted_user_ids,
-                background_color=MESSAGE_ROW_BACKGROUNDS[
-                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
-                ],
+                background_color=str(step["background_color"]),
                 row_selections=row_selections,
             )
-            stripe_index += 1
-            first_item = False
-            previous_timestamp = self._display_timestamp_for_item(group[-1])
-            previous_message_id = self._message_id_from_log_item(group[-1])
-            index += 1
+
+            last_separator_block_number: int | None = None
+            for separator_text, background_color in step[
+                "separators_after"
+            ]:
+                last_separator_block_number = (
+                    self._insert_log_separator_before_newer_content(
+                        cursor,
+                        str(separator_text),
+                        str(background_color),
+                        row_selections,
+                    )
+                )
+
+            block_delta = document.blockCount() - old_block_count
+            character_delta = (
+                document.characterCount() - old_character_count
+            )
+            self.rendered_message_blocks.update({
+                block_number + block_delta: message_id
+                for block_number, message_id in old_message_blocks.items()
+            })
+            self.rendered_message_last_blocks.update({
+                message_id: block_number + block_delta
+                for message_id, block_number
+                in old_message_last_blocks.items()
+            })
+            for url, positions in old_image_positions.items():
+                self.rendered_image_positions.setdefault(url, []).extend(
+                    position + character_delta
+                    for position in positions
+                )
+            for url, positions in old_image_candidates.items():
+                self.rendered_image_candidates.setdefault(url, []).extend(
+                    position + character_delta
+                    for position in positions
+                )
+            self.chat_display.row_background_padding_blocks.update({
+                block_number + block_delta: value
+                for block_number, value in old_padding_blocks.items()
+            })
+            self.chat_display.collapsed_fade_blocks.update({
+                block_number + block_delta: value
+                for block_number, value in old_collapsed_blocks.items()
+            })
+            for position, formatting in old_row_selections:
+                selection = QTextEdit.ExtraSelection()
+                selection.cursor = QTextCursor(document)
+                selection.cursor.setPosition(
+                    position + character_delta
+                )
+                selection.cursor.clearSelection()
+                selection.format = QTextCharFormat(formatting)
+                row_selections.append(selection)
+
+            if (
+                last_separator_block_number is not None
+                and unread_boundary_id
+                and self._message_id_from_log_item(group[-1])
+                == unread_boundary_id
+            ):
+                self.rendered_message_last_blocks[unread_boundary_id] = (
+                    last_separator_block_number
+                )
+            index -= 1
 
         job["index"] = index
-        job["previous_timestamp"] = previous_timestamp
-        job["previous_message_id"] = previous_message_id
-        job["first_item"] = first_item
-        job["stripe_index"] = stripe_index
 
-        if index < len(display_groups):
+        self.chat_display.row_background_blocks = {
+            selection.cursor.block().blockNumber(): QColor(
+                selection.format.background().color()
+            )
+            for selection in row_selections
+            if selection.cursor.block().isValid()
+        }
+        if index >= 0:
             if bool(job["scroll_to_bottom"]):
                 scrollbar = self.chat_display.verticalScrollBar()
                 scrollbar.setValue(scrollbar.maximum())
@@ -12573,13 +12704,6 @@ class EncryptedChatClient(QObject):
             )
             return
 
-        self.chat_display.row_background_blocks = {
-            selection.cursor.block().blockNumber(): QColor(
-                selection.format.background().color()
-            )
-            for selection in row_selections
-            if selection.cursor.block().isValid()
-        }
         self.chat_display.setExtraSelections([])
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
