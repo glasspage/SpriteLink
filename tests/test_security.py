@@ -450,6 +450,27 @@ class BehaviorSettingsTests(unittest.TestCase):
             "cursor.movePosition(QTextCursor.MoveOperation.Start)",
             continue_source,
         )
+        self.assertIn("if old_message_blocks:", continue_source)
+        self.assertIn("cursor.insertBlock()", continue_source)
+        self.assertIn(
+            "QTextCursor.MoveOperation.PreviousBlock",
+            continue_source,
+        )
+        self.assertLess(
+            continue_source.index("cursor.insertBlock()"),
+            continue_source.index("self._insert_message_item("),
+        )
+        bottom_align_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._bottom_align_short_message_log
+        )
+        self.assertIn("frame_format.setTopMargin(0.0)", bottom_align_source)
+        self.assertIn("viewport().height()", bottom_align_source)
+        self.assertIn("frame_format.setTopMargin(top_margin)", bottom_align_source)
+        self.assertIn(
+            "self._bottom_align_short_message_log()",
+            continue_source,
+        )
         self.assertIn(
             "_insert_log_separator_before_newer_content",
             continue_source,
