@@ -440,8 +440,26 @@ class BehaviorSettingsTests(unittest.TestCase):
             render_source,
         )
         self.assertNotIn("while index <", continue_source)
-        self.assertIn("group = display_groups[index]", continue_source)
-        self.assertIn("index += 1", continue_source)
+        self.assertIn(
+            '"index": len(render_steps) - 1',
+            render_source,
+        )
+        self.assertIn('step = render_steps[index]', continue_source)
+        self.assertIn("index -= 1", continue_source)
+        self.assertIn(
+            "cursor.movePosition(QTextCursor.MoveOperation.Start)",
+            continue_source,
+        )
+        self.assertIn(
+            "_insert_log_separator_before_newer_content",
+            continue_source,
+        )
+        self.assertIn("block_number + block_delta", continue_source)
+        self.assertIn("position + character_delta", continue_source)
+        self.assertLess(
+            continue_source.index('step = render_steps[index]'),
+            continue_source.index("index -= 1"),
+        )
         self.assertIn(
             "QTimer.singleShot(\n"
             "                MESSAGE_RENDER_STEP_DELAY_MS,",
