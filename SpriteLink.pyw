@@ -11495,10 +11495,11 @@ class EncryptedChatClient(QObject):
                 # A wheel-up at the top is still meaningful when the first
                 # pages do not fill a tall viewport and the scrollbar cannot
                 # emit a changed value.
-                QTimer.singleShot(
-                    0,
-                    self._request_older_history_page_from_user_scroll,
-                )
+                # Use the same tokenized/coalesced entrypoint as the
+                # scrollbar. Calling the request callback directly would omit
+                # its required generation/room token and crash when the user
+                # overscrolls an already-exhausted history.
+                self._on_chat_history_scroll_action(0)
 
             elif event.type() == QEvent.Type.MouseMove:
                 anchor = self.chat_display.anchorAt(event.position().toPoint())
