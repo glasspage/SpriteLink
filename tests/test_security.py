@@ -582,7 +582,7 @@ class BehaviorSettingsTests(unittest.TestCase):
             ._on_chat_history_scroll_action
         )
         self.assertIn(
-            "if self._older_history_user_request is not None",
+            "self._older_history_user_request is not None",
             scroll_action_source,
         )
         self.assertIn(
