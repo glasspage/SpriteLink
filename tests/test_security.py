@@ -1147,12 +1147,44 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("setTextIndent(0)", source)
         self.assertIn("setBackground(QColor(background_color))", source)
 
-        bounds_source = inspect.getsource(
+        content_bounds_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._block_content_vertical_bounds
         )
-        self.assertIn("layout.boundingRect()", bounds_source)
-        self.assertIn("content_rect.toAlignedRect()", bounds_source)
-        self.assertNotIn("round(", bounds_source)
+        self.assertIn("layout.boundingRect()", content_bounds_source)
+        self.assertIn(
+            "content_rect.toAlignedRect()",
+            content_bounds_source,
+        )
+        self.assertNotIn("round(", content_bounds_source)
+
+        row_bounds_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._block_row_vertical_bounds
+        )
+        self.assertIn("blockBoundingRect(block)", row_bounds_source)
+        self.assertIn("block_rect.toAlignedRect()", row_bounds_source)
+        self.assertNotIn(
+            "row_background_padding_blocks",
+            row_bounds_source,
+        )
+        self.assertNotIn("layout.boundingRect()", row_bounds_source)
+        self.assertNotIn("round(", row_bounds_source)
+
+        browser = mock.Mock()
+        browser.document.return_value.documentLayout.return_value.\
+blockBoundingRect.return_value = SPRITELINK.QRectF(
+            0.0,
+            10.25,
+            100.0,
+            22.5,
+        )
+        browser.verticalScrollBar.return_value.value.return_value = 3
+        top, bottom = (
+            SPRITELINK.MessageLogBrowser._block_row_vertical_bounds(
+                browser,
+                mock.Mock(),
+            )
+        )
+        self.assertEqual((top, bottom), (7, 30))
 
         background_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_row_backgrounds
