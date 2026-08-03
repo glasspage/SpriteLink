@@ -1145,7 +1145,15 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertNotIn("horizontalAdvance(username)", source)
         self.assertIn("setLeftMargin(10)", source)
         self.assertIn("setTextIndent(0)", source)
-        self.assertIn("setBackground(QColor(background_color))", source)
+        self.assertNotIn("block_format.setBackground(", source)
+        self.assertIn(
+            "block_format.clearProperty(",
+            source,
+        )
+        self.assertIn(
+            "QTextFormat.Property.BackgroundBrush",
+            source,
+        )
         self.assertIn("setTopMargin(0.0)", source)
         self.assertIn("setBottomMargin(0.0)", source)
         self.assertIn("LineHeightTypes.FixedHeight", source)
