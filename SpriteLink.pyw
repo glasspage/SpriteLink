@@ -309,7 +309,7 @@ CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
 INITIAL_HISTORY_RENDER_MESSAGES = 40
 HISTORY_RENDER_PAGE_MESSAGES = 40
-MESSAGE_RENDER_BATCH_GROUPS = 5
+MESSAGE_RENDER_STEP_DELAY_MS = 1
 UI_EVENT_BATCH_LIMIT = 8
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 TRAY_NOTIFICATION_OUTLINE_COLOR = "#ff7a00"
@@ -5124,7 +5124,7 @@ class EncryptedChatClient(QObject):
         self._loading_older_history_page = False
         self._history_render_updates_suppressed = False
         self._history_initial_render_complete = False
-        self._history_prefetch_requested = False
+        self._older_history_user_request: tuple[int, str] | None = None
         self._message_render_generation = 0
         self._message_render_job: dict[str, Any] | None = None
         self._rendering_message_log = False
@@ -7069,7 +7069,7 @@ class EncryptedChatClient(QObject):
         self._older_history_page_scheduled = False
         self._loading_older_history_page = False
         self._history_initial_render_complete = False
-        self._history_prefetch_requested = False
+        self._older_history_user_request = None
         self._message_render_generation += 1
         self._message_render_job = None
         self._rendering_message_log = False
@@ -7095,16 +7095,37 @@ class EncryptedChatClient(QObject):
         )
 
     def _on_chat_history_scroll_action(self, _action: int) -> None:
-        # QScrollBar.valueChanged also fires for document rebuilds and our
-        # own viewport restoration. Defer this user-action check until Qt has
-        # applied the wheel/slider operation so programmatic zero values can
-        # never recursively request more history pages.
+        # Queue at most one request for the action that actually reached the
+        # top. Repeated actionTriggered signals from the same wheel/slider
+        # gesture must not survive a page transaction and request another one.
+        if self._older_history_user_request is not None:
+            return
+        request = (
+            self._history_render_generation,
+            self.active_chatroom_id,
+        )
+        self._older_history_user_request = request
         QTimer.singleShot(
             0,
-            self._request_older_history_page_from_user_scroll,
+            lambda: self._request_older_history_page_from_user_scroll(
+                request
+            ),
         )
 
-    def _request_older_history_page_from_user_scroll(self) -> None:
+    def _request_older_history_page_from_user_scroll(
+        self,
+        request: tuple[int, str],
+    ) -> None:
+        if self._older_history_user_request != request:
+            return
+        self._older_history_user_request = None
+        generation, room_id = request
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+        ):
+            return
+
         scrollbar = self.chat_display.verticalScrollBar()
         if (
             scrollbar.value() > scrollbar.minimum()
@@ -10240,7 +10261,6 @@ class EncryptedChatClient(QObject):
                         self.message_log[0:0] = accepted_items
                     if initial_chunk:
                         if self.message_log and not self._tray_ui_suspended:
-                            self._set_history_render_updates_suppressed(True)
                             self._render_message_log(
                                 scroll_to_bottom=True,
                                 on_finished=lambda: (
@@ -10255,9 +10275,6 @@ class EncryptedChatClient(QObject):
                                 generation,
                                 room_id,
                             )
-                    else:
-                        self._maybe_prefetch_initial_history_page()
-
                 elif event_type == "image_preview_loaded":
                     url = str(payload.get("url", ""))
                     data = payload.get("data")
@@ -10716,16 +10733,6 @@ class EncryptedChatClient(QObject):
                 },
             ))
 
-    def _maybe_prefetch_initial_history_page(self) -> None:
-        if (
-            not self._history_initial_render_complete
-            or self._history_prefetch_requested
-            or self.rendered_history_message_limit >= len(self.message_log)
-        ):
-            return
-        self._history_prefetch_requested = True
-        self._schedule_older_history_page()
-
     def _finish_initial_history_render(
         self,
         generation: int,
@@ -10761,7 +10768,6 @@ class EncryptedChatClient(QObject):
         scrollbar.setValue(scrollbar.maximum())
         self._set_history_render_updates_suppressed(False)
         self._history_initial_render_complete = True
-        self._maybe_prefetch_initial_history_page()
 
     def _persist_local_history(self) -> None:
         server_url = normalize_server_url(
@@ -12499,12 +12505,7 @@ class EncryptedChatClient(QObject):
         previous_message_id = job["previous_message_id"]
         first_item = bool(job["first_item"])
         stripe_index = int(job["stripe_index"])
-        batch_end = min(
-            len(display_groups),
-            index + MESSAGE_RENDER_BATCH_GROUPS,
-        )
-
-        while index < batch_end:
+        if index < len(display_groups):
             group = display_groups[index]
             item = self._display_item_for_group(group, muted_ids)
             current_timestamp = self._display_timestamp_for_item(group[0])
@@ -12562,9 +12563,12 @@ class EncryptedChatClient(QObject):
         job["stripe_index"] = stripe_index
 
         if index < len(display_groups):
+            if bool(job["scroll_to_bottom"]):
+                scrollbar = self.chat_display.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
             self.chat_display.viewport().update()
             QTimer.singleShot(
-                0,
+                MESSAGE_RENDER_STEP_DELAY_MS,
                 lambda: self._continue_message_log_render(generation),
             )
             return
