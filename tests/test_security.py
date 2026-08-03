@@ -475,6 +475,31 @@ class BehaviorSettingsTests(unittest.TestCase):
             "_insert_log_separator_before_newer_content",
             continue_source,
         )
+        forward_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._continue_message_log_render_forward
+        )
+        self.assertIn(
+            "group = display_groups[index]",
+            forward_source,
+        )
+        self.assertIn("index += 1", forward_source)
+        self.assertIn(
+            "self._insert_log_separator(",
+            forward_source,
+        )
+        self.assertNotIn(
+            "_insert_log_separator_before_newer_content",
+            forward_source,
+        )
+        self.assertIn(
+            "if scroll_to_bottom:",
+            render_source,
+        )
+        self.assertIn(
+            "self._continue_message_log_render_forward(generation)",
+            render_source,
+        )
         self.assertIn("block_number + block_delta", continue_source)
         self.assertIn("position + character_delta", continue_source)
         self.assertLess(
