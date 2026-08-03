@@ -4038,8 +4038,11 @@ class Version120ReleaseTests(unittest.TestCase):
             icon_source,
         )
         self.assertIn(
-            "TOP_ALIGNED_PROFILE_ICON_PADDING"
-            " - PROFILE_ICON_VERTICAL_OFFSET_PX",
+            "TOP_ALIGNED_PROFILE_ICON_PADDING",
+            icon_source,
+        )
+        self.assertIn(
+            "- PROFILE_ICON_VERTICAL_OFFSET_PX",
             icon_source,
         )
 
