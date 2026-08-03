@@ -12543,6 +12543,27 @@ class EncryptedChatClient(QObject):
         row_selections.append(selection)
         return separator_block_number
 
+    def _bottom_align_short_message_log(self) -> None:
+        document = self.chat_display.document()
+        root_frame = document.rootFrame()
+        frame_format = root_frame.frameFormat()
+        if frame_format.topMargin() != 0.0:
+            frame_format.setTopMargin(0.0)
+            root_frame.setFrameFormat(frame_format)
+
+        content_height = (
+            document.documentLayout().documentSize().height()
+        )
+        top_margin = max(
+            0.0,
+            float(self.chat_display.viewport().height()) - content_height,
+        )
+        if top_margin <= 0.0:
+            return
+        frame_format = root_frame.frameFormat()
+        frame_format.setTopMargin(top_margin)
+        root_frame.setFrameFormat(frame_format)
+
     def _continue_message_log_render(self, generation: int) -> None:
         job = self._message_render_job
         if (
@@ -12609,6 +12630,15 @@ class EncryptedChatClient(QObject):
 
             cursor = QTextCursor(document)
             cursor.movePosition(QTextCursor.MoveOperation.Start)
+            if old_message_blocks:
+                # insertBlock() leaves the cursor in the existing block when
+                # splitting at position zero. Move back into the new blank
+                # block so the prepended sender cannot share or reformat the
+                # first already-rendered message.
+                cursor.insertBlock()
+                cursor.movePosition(
+                    QTextCursor.MoveOperation.PreviousBlock
+                )
             self._insert_message_item(
                 cursor,
                 item,
@@ -12693,6 +12723,7 @@ class EncryptedChatClient(QObject):
             for selection in row_selections
             if selection.cursor.block().isValid()
         }
+        self._bottom_align_short_message_log()
         if index >= 0:
             if bool(job["scroll_to_bottom"]):
                 scrollbar = self.chat_display.verticalScrollBar()
