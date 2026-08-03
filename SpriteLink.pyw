@@ -307,6 +307,8 @@ COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
 DESKTOP_NOTIFICATION_DEBOUNCE_MS = 250
 CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
+INITIAL_HISTORY_RENDER_MESSAGES = 40
+HISTORY_RENDER_PAGE_MESSAGES = 40
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 TRAY_NOTIFICATION_OUTLINE_COLOR = "#ff7a00"
 MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY = (
@@ -5112,6 +5114,13 @@ class EncryptedChatClient(QObject):
         self.current_image_preview_url: str | None = None
         self.current_image_preview_client_id: str | None = None
         self.recent_chatroom_switch_times: list[float] = []
+        self.rendered_history_message_limit = (
+            INITIAL_HISTORY_RENDER_MESSAGES
+        )
+        self._history_render_generation = 0
+        self._older_history_page_scheduled = False
+        self._loading_older_history_page = False
+        self._rendering_message_log = False
         self.image_fetch_executor = DaemonTaskPool(
             max_workers=3,
             thread_name_prefix="SpriteLinkImage",
@@ -5714,6 +5723,7 @@ class EncryptedChatClient(QObject):
         if self._tray_ui_suspended:
             return
         self._tray_ui_suspended = True
+        self._reset_history_render_window()
         self._sync_window_activity()
         self.viewport_media_timer.stop()
         self._hide_chat_tooltip()
@@ -6992,7 +7002,9 @@ class EncryptedChatClient(QObject):
             self.active_chatroom_id in muted_room_ids
             or room_id in muted_room_ids
         )
-        self._persist_local_history()
+        # Every message mutation is persisted when it occurs. Rewriting the
+        # complete history again here made leaving a long room needlessly
+        # proportional to its retained message count.
         self.active_chatroom_id = room_id
         self.config_data["active_chatroom_id"] = room_id
         self._switch_active_chatroom(
@@ -7038,6 +7050,94 @@ class EncryptedChatClient(QObject):
             self._request_subscription_refresh()
         self._restore_active_chatroom_draft()
         self._refresh_chatroom_list()
+
+    def _reset_history_render_window(self) -> None:
+        self._history_render_generation += 1
+        self._older_history_page_scheduled = False
+        self._loading_older_history_page = False
+        self.rendered_history_message_limit = (
+            INITIAL_HISTORY_RENDER_MESSAGES
+        )
+
+    def _on_chat_history_scrolled(self, value: int) -> None:
+        self.viewport_media_timer.start(
+            VIEWPORT_MEDIA_UPDATE_DELAY_MS
+        )
+        if (
+            value > 0
+            or self._tray_ui_suspended
+            or self._rendering_message_log
+            or self._loading_older_history_page
+        ):
+            return
+        self._schedule_older_history_page()
+
+    def _schedule_older_history_page(self) -> None:
+        if (
+            self._older_history_page_scheduled
+            or self._loading_older_history_page
+            or self._tray_ui_suspended
+            or self.rendered_history_message_limit >= len(self.message_log)
+        ):
+            return
+        self._older_history_page_scheduled = True
+        generation = self._history_render_generation
+        room_id = self.active_chatroom_id
+        QTimer.singleShot(
+            0,
+            lambda: self._load_older_history_page(
+                generation,
+                room_id,
+            ),
+        )
+
+    def _load_older_history_page(
+        self,
+        generation: int,
+        room_id: str,
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            return
+        self._older_history_page_scheduled = False
+        if (
+            self._loading_older_history_page
+            or self.rendered_history_message_limit >= len(self.message_log)
+        ):
+            return
+
+        scrollbar = self.chat_display.verticalScrollBar()
+        previous_value = scrollbar.value()
+        previous_maximum = scrollbar.maximum()
+        self.rendered_history_message_limit = min(
+            len(self.message_log),
+            self.rendered_history_message_limit
+            + HISTORY_RENDER_PAGE_MESSAGES,
+        )
+        self._loading_older_history_page = True
+        try:
+            self._render_message_log(scroll_to_bottom=False)
+            scrollbar = self.chat_display.verticalScrollBar()
+            new_maximum = scrollbar.maximum()
+            scrollbar.setValue(min(
+                new_maximum,
+                previous_value
+                + max(0, new_maximum - previous_maximum),
+            ))
+        finally:
+            self._loading_older_history_page = False
+
+        # Very tall windows may fit more than one page. Continue only until
+        # the document can actually scroll; after that, older pages load when
+        # the user reaches the top.
+        if (
+            self.chat_display.verticalScrollBar().maximum() == 0
+            and self.rendered_history_message_limit < len(self.message_log)
+        ):
+            self._schedule_older_history_page()
 
     def _build_chat_tab(self) -> None:
         layout = QVBoxLayout(self.chat_tab)
@@ -7097,9 +7197,7 @@ class EncryptedChatClient(QObject):
         self.chat_display.viewport().setMouseTracking(True)
         self.chat_display.viewport().installEventFilter(self)
         self.chat_display.verticalScrollBar().valueChanged.connect(
-            lambda _value: self.viewport_media_timer.start(
-                VIEWPORT_MEDIA_UPDATE_DELAY_MS
-            )
+            self._on_chat_history_scrolled
         )
         content_layout.addWidget(self.chat_display, 1)
 
@@ -10423,6 +10521,10 @@ class EncryptedChatClient(QObject):
         self.message_log.sort(key=self._message_sort_key)
         if self.message_log:
             self._render_message_log(scroll_to_bottom=True)
+            # Prepare one older page after the newest messages are already
+            # visible. Further pages remain lazy so a 10,000-message room
+            # cannot recreate the original switch-time freeze later.
+            self._schedule_older_history_page()
 
     def _persist_local_history(self) -> None:
         server_url = normalize_server_url(
@@ -11988,6 +12090,7 @@ class EncryptedChatClient(QObject):
     def _render_message_log(self, *, scroll_to_bottom: bool) -> None:
         if self._tray_ui_suspended:
             return
+        self._rendering_message_log = True
         self._hide_chat_tooltip()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
@@ -12016,8 +12119,13 @@ class EncryptedChatClient(QObject):
         first_item = True
         stripe_index = 0
 
+        visible_message_limit = max(
+            INITIAL_HISTORY_RENDER_MESSAGES,
+            int(self.rendered_history_message_limit),
+        )
+        visible_message_items = self.message_log[-visible_message_limit:]
         display_groups = group_messages_for_display(
-            self.message_log,
+            visible_message_items,
             muted_ids,
         )
         unread_boundary_id = self._unread_after_message_ids().get(
@@ -12124,6 +12232,7 @@ class EncryptedChatClient(QObject):
         self.viewport_media_timer.start(
             VIEWPORT_MEDIA_UPDATE_DELAY_MS
         )
+        self._rendering_message_log = False
 
     def _insert_message_item(
         self,
@@ -12480,6 +12589,7 @@ class EncryptedChatClient(QObject):
         scrollbar.setValue(scrollbar.maximum())
 
     def _clear_visible_room(self) -> None:
+        self._reset_history_render_window()
         self._hide_chat_tooltip()
         if self.link_warning_overlay.isVisible():
             self._hide_link_warning_popup()
