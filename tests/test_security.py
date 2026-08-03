@@ -1238,46 +1238,41 @@ class RuntimeOptimizationTests(unittest.TestCase):
     def test_network_worker_waits_until_real_work_is_due(self) -> None:
         self.assertEqual(
             SPRITELINK.polling_interval_seconds(
-                window_focused=True,
-                tray_suspended=False,
+                window_on_screen=True,
             ),
             6.0,
         )
         self.assertEqual(
             SPRITELINK.polling_interval_seconds(
-                window_focused=False,
-                tray_suspended=False,
+                window_on_screen=False,
             ),
             9.0,
         )
         self.assertEqual(
-            SPRITELINK.polling_interval_seconds(
-                window_focused=False,
-                tray_suspended=True,
-            ),
-            12.0,
-        )
-        self.assertEqual(
             SPRITELINK.muted_inactive_polling_interval_seconds(
-                window_focused=True,
-                tray_suspended=False,
+                window_on_screen=True,
             ),
             5 * 60.0,
         )
         self.assertEqual(
             SPRITELINK.muted_inactive_polling_interval_seconds(
-                window_focused=False,
-                tray_suspended=False,
+                window_on_screen=False,
             ),
             7.5 * 60.0,
         )
-        self.assertEqual(
-            SPRITELINK.muted_inactive_polling_interval_seconds(
-                window_focused=False,
-                tray_suspended=True,
-            ),
-            10 * 60.0,
+
+        activity_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._sync_window_activity
         )
+        network_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._network_loop
+        )
+        self.assertIn("not self._tray_ui_suspended", activity_source)
+        self.assertIn("self.root.isVisible()", activity_source)
+        self.assertIn("not self.root.isMinimized()", activity_source)
+        self.assertIn("self.window_on_screen_event", activity_source)
+        self.assertNotIn("window_focused_event", network_source)
+        self.assertNotIn("tray_mode_event", network_source)
         self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
                 now=100.0,
