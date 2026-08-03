@@ -1150,8 +1150,9 @@ class RuntimeOptimizationTests(unittest.TestCase):
         bounds_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._block_content_vertical_bounds
         )
-        self.assertIn("layout.lineAt(0)", bounds_source)
-        self.assertIn("last_line.height()", bounds_source)
+        self.assertIn("layout.boundingRect()", bounds_source)
+        self.assertIn("content_rect.toAlignedRect()", bounds_source)
+        self.assertNotIn("round(", bounds_source)
 
         background_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_row_backgrounds
