@@ -1170,8 +1170,10 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertNotIn("round(", row_bounds_source)
 
         browser = mock.Mock()
-        browser.document.return_value.documentLayout.return_value.\
-blockBoundingRect.return_value = SPRITELINK.QRectF(
+        document_layout = (
+            browser.document.return_value.documentLayout.return_value
+        )
+        document_layout.blockBoundingRect.return_value = SPRITELINK.QRectF(
             0.0,
             10.25,
             100.0,
