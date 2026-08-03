@@ -4525,8 +4525,11 @@ class MessageLogBrowser(QTextBrowser):
             last_block + 1,
         )
 
+        # Enforce opacity on the painter as well as the format. QTextLayout
+        # can use its default foreground for characters outside an explicit
+        # format range on wrapped lines; painter opacity guarantees those
+        # fallback glyphs can never become opaque black.
         shadow_color = QColor(0, 0, 0)
-        shadow_color.setAlphaF(0.15)
         shadow_format = QTextCharFormat()
         shadow_format.setForeground(shadow_color)
         transparent_spoiler_format = QTextCharFormat()
@@ -4581,6 +4584,7 @@ class MessageLogBrowser(QTextBrowser):
                 Qt.ClipOperation.ReplaceClip,
             )
             painter.translate(1, 1)
+            painter.setOpacity(0.15)
             layout.draw(painter, layout_origin, shadow_ranges)
             painter.restore()
             layout.draw(painter, layout_origin)
@@ -11414,12 +11418,12 @@ class EncryptedChatClient(QObject):
                 - PROFILE_ICON_VERTICAL_OFFSET_PX,
             )
             if align_top
-            else 0
+            else PROFILE_ICON_VERTICAL_OFFSET_PX
         )
         bottom_padding = (
             0
             if align_top
-            else PROFILE_ICON_VERTICAL_OFFSET_PX * 2
+            else PROFILE_ICON_VERTICAL_OFFSET_PX
         )
         if top_padding or bottom_padding:
             padded_image = QImage(
@@ -11472,10 +11476,12 @@ class EncryptedChatClient(QObject):
         image_format.setAnchorHref(f"spritelink:{message_id}")
         # Inline images participate in Qt's automatic line-height calculation,
         # so a short text line expands to the icon's native 16-pixel height.
+        # A normal 16 px icon belongs at y=2 in the fixed 24 px row:
+        # centered at y=4, then shifted upward by exactly 2 px. Aligning the
+        # padded 20 px canvas to the row top avoids AlignMiddle's half-pixel
+        # rounding, which previously reduced the visible shift to one pixel.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
-            if align_top
-            else QTextCharFormat.VerticalAlignment.AlignMiddle
         )
         cursor.insertImage(image_format)
         return True
