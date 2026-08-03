@@ -1893,16 +1893,22 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self,
     ) -> None:
         separator_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._insert_log_separator
+            SPRITELINK.EncryptedChatClient
+            ._insert_log_separator_before_newer_content
         )
         self.assertIn(") -> int:", separator_source)
         self.assertIn("return separator_block_number", separator_source)
+        self.assertNotIn("cursor.insertBlock()\n        return", separator_source)
 
         render_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._continue_message_log_render
         )
         self.assertIn(
-            "previous_message_id == unread_boundary_id",
+            "self._message_id_from_log_item(group[-1])",
+            render_source,
+        )
+        self.assertIn(
+            "== unread_boundary_id",
             render_source,
         )
         self.assertIn(
@@ -1915,8 +1921,7 @@ class RuntimeOptimizationTests(unittest.TestCase):
         )
         self.assertLess(
             render_source.index(
-                "last_separator_block_number = "
-                "self._insert_log_separator"
+                "_insert_log_separator_before_newer_content"
             ),
             render_source.index(
                 "self.rendered_message_last_blocks[unread_boundary_id] ="
