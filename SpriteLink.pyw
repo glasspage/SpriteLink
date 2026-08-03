@@ -335,12 +335,10 @@ DEFAULT_WINDOW_HEIGHT = 650
 MINIMUM_WINDOW_WIDTH = 670
 MINIMUM_WINDOW_HEIGHT = 500
 
-FOCUSED_POLL_INTERVAL_SECONDS = 6.0
-UNFOCUSED_POLL_INTERVAL_SECONDS = 9.0
-TRAY_POLL_INTERVAL_SECONDS = 12.0
-MUTED_INACTIVE_FOCUSED_POLL_INTERVAL_SECONDS = 5 * 60.0
-MUTED_INACTIVE_UNFOCUSED_POLL_INTERVAL_SECONDS = 7.5 * 60.0
-MUTED_INACTIVE_TRAY_POLL_INTERVAL_SECONDS = 10 * 60.0
+ON_SCREEN_POLL_INTERVAL_SECONDS = 6.0
+OFF_SCREEN_POLL_INTERVAL_SECONDS = 9.0
+MUTED_INACTIVE_ON_SCREEN_POLL_INTERVAL_SECONDS = 5 * 60.0
+MUTED_INACTIVE_OFF_SCREEN_POLL_INTERVAL_SECONDS = 7.5 * 60.0
 # Focused catch-up polls use most of ntfy's sustained request allowance.
 # Leave the remaining budget for reconnecting the long-lived stream.
 SUBSCRIPTION_RECONNECT_DELAY_SECONDS = 30.0
@@ -3910,16 +3908,12 @@ def vertical_range_is_near_viewport(
     )
 
 
-def polling_interval_seconds(
-    *,
-    window_focused: bool,
-    tray_suspended: bool,
-) -> float:
-    if tray_suspended:
-        return TRAY_POLL_INTERVAL_SECONDS
-    if window_focused:
-        return FOCUSED_POLL_INTERVAL_SECONDS
-    return UNFOCUSED_POLL_INTERVAL_SECONDS
+def polling_interval_seconds(*, window_on_screen: bool) -> float:
+    return (
+        ON_SCREEN_POLL_INTERVAL_SECONDS
+        if window_on_screen
+        else OFF_SCREEN_POLL_INTERVAL_SECONDS
+    )
 
 
 def notification_outline_required(
@@ -3933,14 +3927,13 @@ def notification_outline_required(
 
 def muted_inactive_polling_interval_seconds(
     *,
-    window_focused: bool,
-    tray_suspended: bool,
+    window_on_screen: bool,
 ) -> float:
-    if tray_suspended:
-        return MUTED_INACTIVE_TRAY_POLL_INTERVAL_SECONDS
-    if window_focused:
-        return MUTED_INACTIVE_FOCUSED_POLL_INTERVAL_SECONDS
-    return MUTED_INACTIVE_UNFOCUSED_POLL_INTERVAL_SECONDS
+    return (
+        MUTED_INACTIVE_ON_SCREEN_POLL_INTERVAL_SECONDS
+        if window_on_screen
+        else MUTED_INACTIVE_OFF_SCREEN_POLL_INTERVAL_SECONDS
+    )
 
 
 def network_idle_wait_seconds(
@@ -5059,7 +5052,8 @@ class EncryptedChatClient(QObject):
         self.network_wakeup_event = threading.Event()
         self.window_focused_event = threading.Event()
         self.window_focused_event.set()
-        self.tray_mode_event = threading.Event()
+        self.window_on_screen_event = threading.Event()
+        self.window_on_screen_event.set()
         self.subscription_refresh_event = threading.Event()
         self.subscription_response_lock = threading.Lock()
         self.subscription_response: requests.Response | None = None
@@ -5683,11 +5677,22 @@ class EncryptedChatClient(QObject):
         self.last_inline_animation_frame_at.clear()
 
     def _sync_window_activity(self) -> None:
-        if (
-            self._tray_ui_suspended
-            or not self.root.isVisible()
-            or self.root.isMinimized()
-        ):
+        window_on_screen = (
+            not self._tray_ui_suspended
+            and self.root.isVisible()
+            and not self.root.isMinimized()
+        )
+        state_changed = (
+            self.window_on_screen_event.is_set() != window_on_screen
+        )
+        if window_on_screen:
+            self.window_on_screen_event.set()
+        else:
+            self.window_on_screen_event.clear()
+        if state_changed:
+            self.network_wakeup_event.set()
+
+        if not window_on_screen:
             self._pause_animated_media()
             return
         for url in self.rendered_image_positions:
@@ -5699,8 +5704,7 @@ class EncryptedChatClient(QObject):
         if self._tray_ui_suspended:
             return
         self._tray_ui_suspended = True
-        self.tray_mode_event.set()
-        self.network_wakeup_event.set()
+        self._sync_window_activity()
         self.viewport_media_timer.stop()
         self._hide_chat_tooltip()
         if self.link_warning_overlay.isVisible():
@@ -5737,8 +5741,6 @@ class EncryptedChatClient(QObject):
         if not self._tray_ui_suspended:
             return
         self._tray_ui_suspended = False
-        self.tray_mode_event.clear()
-        self.network_wakeup_event.set()
         self.root.setUpdatesEnabled(True)
         self._render_message_log(scroll_to_bottom=True)
         self._sync_window_activity()
@@ -9441,16 +9443,13 @@ class EncryptedChatClient(QObject):
                 rooms[0],
             )
             active_room_id = active_room["id"]
-            window_focused = self.window_focused_event.is_set()
-            tray_suspended = self.tray_mode_event.is_set()
+            window_on_screen = self.window_on_screen_event.is_set()
             poll_interval = polling_interval_seconds(
-                window_focused=window_focused,
-                tray_suspended=tray_suspended,
+                window_on_screen=window_on_screen,
             )
             muted_poll_interval = (
                 muted_inactive_polling_interval_seconds(
-                    window_focused=window_focused,
-                    tray_suspended=tray_suspended,
+                    window_on_screen=window_on_screen,
                 )
             )
             valid_room_ids = {room["id"] for room in rooms}
@@ -11088,13 +11087,11 @@ class EncryptedChatClient(QObject):
         ):
             if event.type() == QEvent.Type.WindowActivate:
                 self.window_focused_event.set()
-                self.network_wakeup_event.set()
                 self._sync_connection_error_timer()
                 if hasattr(self, "tray_icon"):
                     self._mark_chatroom_read(self.active_chatroom_id)
             elif event.type() == QEvent.Type.WindowDeactivate:
                 self.window_focused_event.clear()
-                self.network_wakeup_event.set()
                 self._sync_connection_error_timer()
             elif event.type() == QEvent.Type.WindowStateChange:
                 QTimer.singleShot(0, self._sync_window_activity)
