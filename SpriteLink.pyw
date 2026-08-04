@@ -13381,9 +13381,14 @@ class EncryptedChatClient(QObject):
                         cached_media,
                     ).height()
                 else:
-                    preview_height = self.embedded_image_preview_sizes[
-                        url
-                    ][1]
+                    preview_size = self.embedded_image_preview_sizes.get(url)
+                    if preview_size is None:
+                        preview_size = (
+                            EMBEDDED_IMAGE_MAX_WIDTH,
+                            EMBEDDED_IMAGE_MAX_HEIGHT,
+                        )
+                        self.embedded_image_preview_sizes[url] = preview_size
+                    preview_height = preview_size[1]
                 top_align_height = max(
                     top_align_height,
                     preview_height,
