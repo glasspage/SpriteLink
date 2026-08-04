@@ -307,8 +307,8 @@ COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
 DESKTOP_NOTIFICATION_DEBOUNCE_MS = 250
 CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
-INITIAL_HISTORY_RENDER_MESSAGES = 40
-HISTORY_RENDER_PAGE_MESSAGES = 40
+INITIAL_HISTORY_RENDER_MESSAGES = 100
+HISTORY_RENDER_PAGE_MESSAGES = 50
 MESSAGE_RENDER_STEP_DELAY_MS = 1
 UI_EVENT_BATCH_LIMIT = 8
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
@@ -4768,6 +4768,37 @@ class MessageLogBrowser(QTextBrowser):
             )
         painter.end()
 
+    def _paint_final_row_background_tail(self, event: Any) -> None:
+        """Extend a final gray message stripe through the viewport bottom."""
+        if not self.row_background_blocks:
+            return
+
+        last_block_number = max(self.row_background_blocks)
+        background = self.row_background_blocks[last_block_number]
+        if background != QColor(MESSAGE_ROW_BACKGROUNDS[1]):
+            return
+
+        block = self.document().findBlockByNumber(last_block_number)
+        if not block.isValid():
+            return
+        _top, bottom = self._block_row_vertical_bounds(block)
+
+        viewport = self.viewport()
+        viewport_height = viewport.height()
+        if bottom <= 0 or bottom >= viewport_height:
+            return
+
+        painter = QPainter(viewport)
+        painter.setClipRegion(event.region())
+        painter.fillRect(
+            0,
+            bottom,
+            viewport.width(),
+            viewport_height - bottom,
+            background,
+        )
+        painter.end()
+
     def _paint_unread_divider(self, event: Any) -> None:
         block_number = self.unread_divider_block_number
         if block_number is None or self.unread_divider_alpha <= 0:
@@ -4788,6 +4819,10 @@ class MessageLogBrowser(QTextBrowser):
     def paintEvent(self, event: Any) -> None:
         self._paint_row_backgrounds(event)
         super().paintEvent(event)
+        # QTextBrowser clears the document's trailing margin with its base
+        # color. If the newest row is gray, continue that stripe through the
+        # otherwise-white pixels at the bottom edge of the viewport.
+        self._paint_final_row_background_tail(event)
         # QTextDocument paints block backgrounds only behind the text line,
         # not inside block margins. These bands contain no text, so they can
         # safely be completed after the base document paint.

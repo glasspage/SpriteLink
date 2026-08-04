@@ -540,8 +540,8 @@ class BehaviorSettingsTests(unittest.TestCase):
     def test_long_chatroom_history_loading_is_threaded_and_staggered(
         self,
     ) -> None:
-        self.assertEqual(SPRITELINK.INITIAL_HISTORY_RENDER_MESSAGES, 40)
-        self.assertEqual(SPRITELINK.HISTORY_RENDER_PAGE_MESSAGES, 40)
+        self.assertEqual(SPRITELINK.INITIAL_HISTORY_RENDER_MESSAGES, 100)
+        self.assertEqual(SPRITELINK.HISTORY_RENDER_PAGE_MESSAGES, 50)
         self.assertEqual(SPRITELINK.MESSAGE_RENDER_STEP_DELAY_MS, 1)
         self.assertEqual(SPRITELINK.UI_EVENT_BATCH_LIMIT, 8)
 
@@ -1633,6 +1633,19 @@ class RuntimeOptimizationTests(unittest.TestCase):
             paint_source.index("_paint_row_backgrounds(event)"),
             paint_source.index("super().paintEvent(event)"),
         )
+        self.assertGreater(
+            paint_source.index("_paint_final_row_background_tail(event)"),
+            paint_source.index("super().paintEvent(event)"),
+        )
+
+        tail_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser
+            ._paint_final_row_background_tail
+        )
+        self.assertIn("max(self.row_background_blocks)", tail_source)
+        self.assertIn("MESSAGE_ROW_BACKGROUNDS[1]", tail_source)
+        self.assertIn("_block_row_vertical_bounds(block)", tail_source)
+        self.assertIn("viewport_height - bottom", tail_source)
 
     def test_status_line_uses_chatroom_name_and_delayed_error(self) -> None:
         self.assertEqual(
