@@ -647,7 +647,7 @@ class BehaviorSettingsTests(unittest.TestCase):
             ._on_chat_history_scroll_action
         )
         self.assertIn(
-            "if self._older_history_user_request is not None",
+            "self._older_history_user_request is not None",
             scroll_action_source,
         )
         self.assertIn(
@@ -1141,6 +1141,7 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
             "ntfy_id": "ntfy-remote",
             "ntfy_time": 1001,
         }]
+        client.rendered_history_message_limit = 1
         client._message_sort_key = SPRITELINK.message_item_sort_key
         client._chatroom_history_limit.return_value = 100
 
@@ -1156,6 +1157,7 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
             [item["message"]["i"] for item in client.message_log],
             ["remote", "local"],
         )
+        self.assertEqual(client.rendered_history_message_limit, 2)
         self.assertGreater(
             client.message_log[-1]["display_sort_time"],
             client.message_log[0]["ntfy_time"],
