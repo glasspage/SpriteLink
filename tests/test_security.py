@@ -583,6 +583,11 @@ class BehaviorSettingsTests(unittest.TestCase):
         self.assertIn('"history_chunk_loaded"', queue_source)
         self.assertIn("range(UI_EVENT_BATCH_LIMIT)", queue_source)
         self.assertIn("self.message_log[0:0] = accepted_items", queue_source)
+        self.assertIn("_queue_live_message_render(", queue_source)
+        self.assertNotIn(
+            "_render_message_log(scroll_to_bottom=True)",
+            queue_source,
+        )
 
         render_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._render_message_log
@@ -848,6 +853,23 @@ class BehaviorSettingsTests(unittest.TestCase):
             add_source,
         )
         self.assertIn("min(\n            len(self.message_log)", add_source)
+        self.assertIn("_queue_live_message_render(", add_source)
+        self.assertNotIn("_render_message_log(", add_source)
+
+        live_append_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._append_live_message_items
+        )
+        self.assertIn("self._insert_message_item(", live_append_source)
+        self.assertIn(
+            "cursor.movePosition(QTextCursor.MoveOperation.End)",
+            live_append_source,
+        )
+        self.assertIn(
+            "self.chat_display.row_background_blocks.update({",
+            live_append_source,
+        )
+        self.assertNotIn("self.chat_display.clear()", live_append_source)
+        self.assertNotIn("QTimer.singleShot(", live_append_source)
 
     def test_settings_never_embed_chatroom_history(self) -> None:
         config = SPRITELINK.default_config()
