@@ -1742,9 +1742,18 @@ class RuntimeOptimizationTests(unittest.TestCase):
             ._paint_final_row_background_tail
         )
         self.assertIn("max(self.row_background_blocks)", tail_source)
-        self.assertIn("MESSAGE_ROW_BACKGROUNDS[1]", tail_source)
+        self.assertNotIn("MESSAGE_ROW_BACKGROUNDS[1]", tail_source)
         self.assertIn("_block_row_vertical_bounds(block)", tail_source)
         self.assertIn("viewport_height - bottom", tail_source)
+
+        forward_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._continue_message_log_render_forward
+        )
+        self.assertIn(
+            "self._bottom_align_short_message_log()",
+            forward_source,
+        )
 
     def test_status_line_uses_chatroom_name_and_delayed_error(self) -> None:
         self.assertEqual(
@@ -4022,9 +4031,13 @@ class _FakeUpdateClient:
         self.config_overlay = _FakeConfigOverlay()
         self.config_style_updates = 0
         self.windows_classic = False
+        self.glassy = False
 
     def _is_windows_classic_theme(self) -> bool:
         return self.windows_classic
+
+    def _is_glassy_theme(self) -> bool:
+        return self.glassy
 
     def _update_config_toggle_update_style(self) -> None:
         self.config_style_updates += 1
@@ -4040,6 +4053,7 @@ class NotificationButtonThemeTests(unittest.TestCase):
     def test_classic_attention_style_preserves_beveled_buttons(self) -> None:
         classic = SPRITELINK.notification_button_stylesheet(True)
         modern = SPRITELINK.notification_button_stylesheet(False)
+        glassy = SPRITELINK.notification_button_stylesheet(False, True)
 
         self.assertEqual(
             classic,
@@ -4049,6 +4063,12 @@ class NotificationButtonThemeTests(unittest.TestCase):
             modern,
             SPRITELINK.NOTIFICATION_BUTTON_STYLESHEET,
         )
+        self.assertEqual(
+            glassy,
+            SPRITELINK.GLASSY_NOTIFICATION_BUTTON_STYLESHEET,
+        )
+        self.assertIn("qlineargradient", glassy)
+        self.assertIn("rgba", glassy)
         self.assertIn("background-color: #f8d8ad", classic)
         self.assertIn("border-top: 2px solid #ffffff", classic)
         self.assertIn("border-left: 2px solid #ffffff", classic)
@@ -4073,6 +4093,7 @@ class NotificationButtonThemeTests(unittest.TestCase):
             source = inspect.getsource(method)
             self.assertIn("notification_button_stylesheet(", source)
             self.assertIn("_is_windows_classic_theme()", source)
+            self.assertIn("_is_glassy_theme()", source)
 
 
 class UpdateConfigTests(unittest.TestCase):
@@ -4173,6 +4194,24 @@ class UpdateConfigTests(unittest.TestCase):
             SPRITELINK.WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET,
         )
 
+    def test_available_update_uses_glassy_attention_style(self) -> None:
+        client = _FakeUpdateClient()
+        client.glassy = True
+        release = self._release("2.0.0")
+        with mock.patch.object(
+            SPRITELINK,
+            "release_is_newer",
+            return_value=True,
+        ):
+            SPRITELINK.EncryptedChatClient._handle_update_check_result(
+                client,
+                {"release": release},
+            )
+        self.assertEqual(
+            client.update_button.stylesheet,
+            SPRITELINK.GLASSY_NOTIFICATION_BUTTON_STYLESHEET,
+        )
+
     def test_current_release_disables_up_to_date_button(self) -> None:
         client = _FakeUpdateClient()
         release = self._release("1.0.0")
@@ -4199,13 +4238,16 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertTrue(config["text_shadows"])
         self.assertFalse(config["desktop_notifications"])
         self.assertEqual(SPRITELINK.DEFAULT_THEME, "Classic")
-        self.assertEqual(SPRITELINK.THEMES, ("Classic", "Modern"))
+        self.assertEqual(
+            SPRITELINK.THEMES,
+            ("Classic", "Glassy", "Modern"),
+        )
 
         source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._build_config_tab
         )
         self.assertLess(
-            source.index('QLabel("Themes")'),
+            source.index('QLabel("Theme")'),
             source.index('QCheckBox("Text Shadows")'),
         )
         self.assertLess(
@@ -4215,6 +4257,79 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertLess(
             source.index('"Desktop Notifications"'),
             source.index('QLabel("Chatroom History")'),
+        )
+
+    def test_glassy_theme_uses_aero_visuals_and_windows_backdrop(self) -> None:
+        self.assertIn("qlineargradient", SPRITELINK.GLASSY_STYLESHEET)
+        self.assertIn("rgba", SPRITELINK.GLASSY_STYLESHEET)
+        self.assertIn("QPushButton:hover", SPRITELINK.GLASSY_STYLESHEET)
+        self.assertIn("QWidget#chatroomsPanel", SPRITELINK.GLASSY_STYLESHEET)
+
+        theme_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._apply_theme
+        )
+        self.assertIn("self._glassy_palette()", theme_source)
+        self.assertIn("GLASSY_STYLESHEET", theme_source)
+        self.assertIn('available_styles.get("fusion", "Fusion")', theme_source)
+
+        titlebar_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._apply_window_titlebar_theme
+        )
+        self.assertIn("DWMWA_SYSTEMBACKDROP_TYPE", titlebar_source)
+        self.assertIn("DwmExtendFrameIntoClientArea", titlebar_source)
+        self.assertIn("DWMSBT_TRANSIENTWINDOW", titlebar_source)
+
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_ui
+        )
+        sidebar_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chatroom_sidebar
+        )
+        self.assertIn('setObjectName("glassRoot")', build_source)
+        self.assertIn('setObjectName("chatTab")', build_source)
+        self.assertIn('setObjectName("chatroomsPanel")', sidebar_source)
+
+    def test_glassy_controls_keep_edges_arrows_and_modal_blur(self) -> None:
+        stylesheet = SPRITELINK.GLASSY_STYLESHEET
+        self.assertIn("border: 1px solid #496f87", stylesheet)
+        self.assertNotIn("border-top-color: #ffffff", stylesheet)
+        self.assertIn("QTextBrowser#chatViewport", stylesheet)
+        self.assertIn("QPushButton#identityMenuButton", stylesheet)
+        self.assertIn("QPushButton#fontMenuButton", stylesheet)
+        self.assertIn("QPushButton#formattingMenuButton", stylesheet)
+
+        combo_paint_source = inspect.getsource(
+            SPRITELINK.ThemeComboBox.paintEvent
+        )
+        self.assertIn('property("spritelinkGlassy")', combo_paint_source)
+        self.assertIn("drawPolygon", combo_paint_source)
+
+        overlay_source = inspect.getsource(SPRITELINK.ConfigOverlay)
+        self.assertIn("QGraphicsBlurEffect", overlay_source)
+        self.assertIn("QualityHint", overlay_source)
+        self.assertIn("parent.grab()", overlay_source)
+        self.assertIn("blur_radius * 2.0", overlay_source)
+        self.assertIn("source_width - 1.0", overlay_source)
+        self.assertIn("source_height - 1.0", overlay_source)
+        self.assertIn("painter.drawPixmap", overlay_source)
+
+        chat_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        self.assertIn('setObjectName("chatViewport")', chat_source)
+        self.assertIn('setObjectName("identityMenuButton")', chat_source)
+        self.assertIn('setObjectName("fontMenuButton")', chat_source)
+        self.assertIn(
+            'setObjectName("formattingMenuButton")',
+            chat_source,
+        )
+
+        panel_style_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._config_panel_stylesheet
+        )
+        self.assertIn(
+            "border: 1px solid rgba(49, 91, 118, 245)",
+            panel_style_source,
         )
 
     def test_legacy_theme_names_keep_their_equivalent_theme(self) -> None:
