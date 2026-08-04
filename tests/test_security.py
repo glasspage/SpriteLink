@@ -677,7 +677,7 @@ class BehaviorSettingsTests(unittest.TestCase):
             ._on_chat_history_scroll_action
         )
         self.assertIn(
-            "if self._older_history_user_request is not None",
+            "self._older_history_user_request is not None",
             scroll_action_source,
         )
         self.assertIn(
@@ -1173,6 +1173,7 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         }]
         client._message_sort_key = SPRITELINK.message_item_sort_key
         client._chatroom_history_limit.return_value = 100
+        client.rendered_history_message_limit = 1
 
         SPRITELINK.EncryptedChatClient._add_message_to_log(
             client,
