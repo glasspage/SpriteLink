@@ -30,6 +30,7 @@ from datetime import datetime
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -279,6 +280,7 @@ def chatroom_connection_label(
 DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
 GLOBAL_CHATROOM_ID = "global"
+UNREAD_FROM_START_MARKER = "__start__"
 GLOBAL_CHATROOM_NICKNAME = "Global"
 GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
 CHATROOM_SIDEBAR_WIDTH = 180
@@ -305,8 +307,16 @@ COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
 DESKTOP_NOTIFICATION_DEBOUNCE_MS = 250
 CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
+INITIAL_HISTORY_RENDER_MESSAGES = 50
+HISTORY_RENDER_PAGE_MESSAGES = 50
+HISTORY_PREFETCH_SCROLL_FRACTION = 0.20
+MESSAGE_RENDER_STEP_DELAY_MS = 1
+UI_EVENT_BATCH_LIMIT = 8
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 TRAY_NOTIFICATION_OUTLINE_COLOR = "#ff7a00"
+FLASHW_STOP = 0x00000000
+FLASHW_TRAY = 0x00000002
+FLASHW_TIMERNOFG = 0x0000000C
 MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY = (
     "minimize_to_tray_1_2_default_applied"
 )
@@ -333,12 +343,10 @@ DEFAULT_WINDOW_HEIGHT = 650
 MINIMUM_WINDOW_WIDTH = 670
 MINIMUM_WINDOW_HEIGHT = 500
 
-FOCUSED_POLL_INTERVAL_SECONDS = 6.0
-UNFOCUSED_POLL_INTERVAL_SECONDS = 9.0
-TRAY_POLL_INTERVAL_SECONDS = 12.0
-MUTED_INACTIVE_FOCUSED_POLL_INTERVAL_SECONDS = 5 * 60.0
-MUTED_INACTIVE_UNFOCUSED_POLL_INTERVAL_SECONDS = 7.5 * 60.0
-MUTED_INACTIVE_TRAY_POLL_INTERVAL_SECONDS = 10 * 60.0
+ON_SCREEN_POLL_INTERVAL_SECONDS = 6.0
+OFF_SCREEN_POLL_INTERVAL_SECONDS = 9.0
+MUTED_INACTIVE_ON_SCREEN_POLL_INTERVAL_SECONDS = 5 * 60.0
+MUTED_INACTIVE_OFF_SCREEN_POLL_INTERVAL_SECONDS = 7.5 * 60.0
 # Focused catch-up polls use most of ntfy's sustained request allowance.
 # Leave the remaining budget for reconnecting the long-lived stream.
 SUBSCRIPTION_RECONNECT_DELAY_SECONDS = 30.0
@@ -357,6 +365,7 @@ NTFY_DAILY_MESSAGE_LIMIT = 250
 MESSAGE_LIMIT_BAR_THRESHOLD = 50
 PACKET_PADDING_BLOCK = 128
 PROFILE_ICON_SIZE = 16
+PROFILE_ICON_VERTICAL_OFFSET_PX = 2
 PROFILE_ICON_MAX_COLORS = 16
 MAX_PROFILE_ICON_GIF_BYTES = 2048
 MAX_IDENTITY_PRESETS = 64
@@ -369,7 +378,9 @@ TOOLTIP_SPACER_DATA_URI = (
     "AA7EAAAOxAGVKw4bAAAAC0lEQVQImWNgAAIAAAUAAWJVMogAAAAASUV"
     "ORK5CYII="
 )
-EMBEDDED_IMAGE_MAX_EDGE = 96
+EMBEDDED_IMAGE_MAX_WIDTH = 256
+EMBEDDED_IMAGE_MAX_HEIGHT = 96
+EMBEDDED_IMAGE_PLACEHOLDER_SIZE = 48
 NSFW_IMAGE_PLACEHOLDER_SIZE = 64
 TOP_ALIGNED_PROFILE_ICON_PADDING = 3
 IMAGE_PREVIEW_MAX_WIDTH = CONFIG_POPUP_MAX_WIDTH - 32
@@ -382,7 +393,6 @@ MAX_ANIMATED_IMAGE_FRAMES = 500
 IMAGE_PREVIEW_CACHE_LIMIT = 128
 MAX_REMOTE_MEDIA_CACHE_BYTES = 64 * 1024 * 1024
 MAX_ACTIVE_ANIMATED_MEDIA = 12
-INLINE_MEDIA_NO_UPSCALE_EDGE = 64
 VIEWPORT_MEDIA_PRELOAD_SCREENS = 1
 VIEWPORT_MEDIA_UPDATE_DELAY_MS = 100
 MAX_UNCOMPRESSED_MESSAGE_BYTES = 32 * 1024
@@ -430,6 +440,7 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "www.imgur.com",
     "klipy.com",
     "*.klipy.com",
+    "adriansblinkiecollection.neocities.org",
     "res.cloudinary.com",
     "images.ctfassets.net",
     "cdn.sanity.io",
@@ -521,6 +532,7 @@ TRUSTED_LINK_DOMAINS = (
     "myanimelist.net",
 )
 TRUSTED_LINK_EXACT_HOSTS = (
+    "adriansblinkiecollection.neocities.org",
     "steamuserimages-a.akamaihd.net",
 )
 IMAGE_LINK_EXTENSIONS = (
@@ -1075,6 +1087,50 @@ class DATA_BLOB(ctypes.Structure):
         ("cbData", wintypes.DWORD),
         ("pbData", ctypes.POINTER(ctypes.c_byte)),
     ]
+
+
+class FLASHWINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("hwnd", wintypes.HWND),
+        ("dwFlags", wintypes.DWORD),
+        ("uCount", wintypes.UINT),
+        ("dwTimeout", wintypes.DWORD),
+    ]
+
+
+def set_windows_taskbar_attention(
+    window_handle: int,
+    enabled: bool,
+) -> bool:
+    """Start or stop native Windows taskbar-button flashing."""
+    if (
+        os.name != "nt"
+        or not hasattr(ctypes, "windll")
+        or int(window_handle) == 0
+    ):
+        return False
+
+    flags = (
+        FLASHW_TRAY | FLASHW_TIMERNOFG
+        if enabled
+        else FLASHW_STOP
+    )
+    info = FLASHWINFO(
+        ctypes.sizeof(FLASHWINFO),
+        wintypes.HWND(int(window_handle)),
+        flags,
+        0,
+        0,
+    )
+    try:
+        flash_window_ex = ctypes.windll.user32.FlashWindowEx
+        flash_window_ex.argtypes = [ctypes.POINTER(FLASHWINFO)]
+        flash_window_ex.restype = wintypes.BOOL
+        flash_window_ex(ctypes.byref(info))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _bytes_to_blob(data: bytes) -> tuple[DATA_BLOB, Any]:
@@ -2596,7 +2652,9 @@ def default_config() -> dict[str, Any]:
         },
         "identity_presets": [default_preset],
         "muted_chatrooms": [],
+        "muted_chatroom_deadlines": {},
         "unread_counts": {},
+        "unread_after_message_ids": {},
         "room_state": {},
         "muted_users": {},
         "trusted_link_and_image_users": {},
@@ -2827,11 +2885,33 @@ def load_config() -> dict[str, Any]:
     muted_chatrooms = config.get("muted_chatrooms")
     if not isinstance(muted_chatrooms, list):
         muted_chatrooms = []
-    config["muted_chatrooms"] = sorted({
+    cleaned_muted_chatrooms = {
         str(room_id)
         for room_id in muted_chatrooms
         if str(room_id) in valid_room_ids
-    })
+    }
+    raw_mute_deadlines = config.get("muted_chatroom_deadlines")
+    if not isinstance(raw_mute_deadlines, dict):
+        raw_mute_deadlines = {}
+    cleaned_mute_deadlines: dict[str, float] = {}
+    expired_timed_mutes: set[str] = set()
+    now = time.time()
+    for room_id, raw_deadline in raw_mute_deadlines.items():
+        normalized_room_id = str(room_id)
+        if normalized_room_id not in valid_room_ids:
+            continue
+        try:
+            deadline = float(raw_deadline)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(deadline) or deadline <= now:
+            expired_timed_mutes.add(normalized_room_id)
+            continue
+        cleaned_mute_deadlines[normalized_room_id] = deadline
+        cleaned_muted_chatrooms.add(normalized_room_id)
+    cleaned_muted_chatrooms.difference_update(expired_timed_mutes)
+    config["muted_chatrooms"] = sorted(cleaned_muted_chatrooms)
+    config["muted_chatroom_deadlines"] = cleaned_mute_deadlines
 
     unread_counts = config.get("unread_counts")
     if not isinstance(unread_counts, dict):
@@ -2848,6 +2928,18 @@ def load_config() -> dict[str, Any]:
         if unread_count:
             cleaned_unread_counts[room_id] = unread_count
     config["unread_counts"] = cleaned_unread_counts
+    unread_after_message_ids = config.get("unread_after_message_ids")
+    if not isinstance(unread_after_message_ids, dict):
+        unread_after_message_ids = {}
+    config["unread_after_message_ids"] = {
+        str(room_id): str(message_id)
+        for room_id, message_id in unread_after_message_ids.items()
+        if (
+            str(room_id) in valid_room_ids
+            and str(message_id).strip()
+            and cleaned_unread_counts.get(str(room_id), 0) > 0
+        )
+    }
     config["config_version"] = CONFIG_FORMAT_VERSION
     return config
 
@@ -3274,6 +3366,7 @@ messagebox = MessageBoxes()
 
 class ComposeTextEdit(QPlainTextEdit):
     send_requested = Signal()
+    formatting_shortcut_requested = Signal(str)
 
     def to_message_text(self) -> str:
         segments: list[tuple[str, bool, bool, bool, bool]] = []
@@ -3298,6 +3391,50 @@ class ComposeTextEdit(QPlainTextEdit):
             first_block = False
             block = block.next()
         return serialize_message_rich_text(segments)
+
+    def set_message_text(self, text: str) -> None:
+        plain_text, runs = parse_message_rich_text(text)
+        self.setPlainText(plain_text)
+
+        document = self.document()
+        for run in runs:
+            if not (
+                run.bold
+                or run.italic
+                or run.underline
+                or run.spoiler is not None
+            ):
+                continue
+            cursor = QTextCursor(document)
+            cursor.setPosition(run.start)
+            cursor.setPosition(
+                run.end,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            formatting = QTextCharFormat()
+            formatting.setFontWeight(
+                QFont.Weight.Bold
+                if run.bold
+                else QFont.Weight.Normal
+            )
+            formatting.setFontItalic(run.italic)
+            formatting.setFontUnderline(run.underline)
+            is_spoiler = run.spoiler is not None
+            formatting.setProperty(
+                COMPOSER_SPOILER_PROPERTY,
+                is_spoiler,
+            )
+            block_color = QColor(SPOILER_BLOCK_COLOR)
+            block_color.setAlpha(
+                REVEALED_SPOILER_BLOCK_ALPHA if is_spoiler else 0
+            )
+            formatting.setBackground(block_color)
+            cursor.mergeCharFormat(formatting)
+
+        cursor = QTextCursor(document)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.setTextCursor(cursor)
+        self.clear_formatting_state()
 
     def apply_formatting(self, style: str, enabled: bool) -> None:
         formatting = QTextCharFormat()
@@ -3336,6 +3473,20 @@ class ComposeTextEdit(QPlainTextEdit):
         self.mergeCurrentCharFormat(formatting)
 
     def keyPressEvent(self, event: Any) -> None:
+        shortcut_styles = {
+            Qt.Key.Key_B: "bold",
+            Qt.Key.Key_I: "italic",
+            Qt.Key.Key_U: "underline",
+        }
+        if (
+            event.modifiers() == Qt.KeyboardModifier.ControlModifier
+            and event.key() in shortcut_styles
+        ):
+            self.formatting_shortcut_requested.emit(
+                shortcut_styles[event.key()]
+            )
+            event.accept()
+            return
         if (
             event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
             and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
@@ -3355,6 +3506,23 @@ class ClickableProgressBar(QProgressBar):
             and self.rect().contains(event.position().toPoint())
         ):
             self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class ClickableSubmenuMenu(QMenu):
+    """Let a submenu-bearing row retain its own direct click action."""
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        action = self.actionAt(event.position().toPoint())
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and action is not None
+            and action.menu() is not None
+        ):
+            action.trigger()
+            self.close()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -3794,16 +3962,25 @@ def vertical_range_is_near_viewport(
     )
 
 
-def polling_interval_seconds(
-    *,
-    window_focused: bool,
-    tray_suspended: bool,
-) -> float:
-    if tray_suspended:
-        return TRAY_POLL_INTERVAL_SECONDS
-    if window_focused:
-        return FOCUSED_POLL_INTERVAL_SECONDS
-    return UNFOCUSED_POLL_INTERVAL_SECONDS
+def scroll_position_is_near_history_start(
+    position: int,
+    minimum: int,
+    maximum: int,
+) -> bool:
+    scroll_span = max(0, int(maximum) - int(minimum))
+    trigger_position = (
+        int(minimum)
+        + scroll_span * HISTORY_PREFETCH_SCROLL_FRACTION
+    )
+    return int(position) <= trigger_position
+
+
+def polling_interval_seconds(*, window_on_screen: bool) -> float:
+    return (
+        ON_SCREEN_POLL_INTERVAL_SECONDS
+        if window_on_screen
+        else OFF_SCREEN_POLL_INTERVAL_SECONDS
+    )
 
 
 def notification_outline_required(
@@ -3817,14 +3994,13 @@ def notification_outline_required(
 
 def muted_inactive_polling_interval_seconds(
     *,
-    window_focused: bool,
-    tray_suspended: bool,
+    window_on_screen: bool,
 ) -> float:
-    if tray_suspended:
-        return MUTED_INACTIVE_TRAY_POLL_INTERVAL_SECONDS
-    if window_focused:
-        return MUTED_INACTIVE_FOCUSED_POLL_INTERVAL_SECONDS
-    return MUTED_INACTIVE_UNFOCUSED_POLL_INTERVAL_SECONDS
+    return (
+        MUTED_INACTIVE_ON_SCREEN_POLL_INTERVAL_SECONDS
+        if window_on_screen
+        else MUTED_INACTIVE_OFF_SCREEN_POLL_INTERVAL_SECONDS
+    )
 
 
 def network_idle_wait_seconds(
@@ -4266,6 +4442,8 @@ class MessageLogBrowser(QTextBrowser):
             tuple[QColor, int, int],
         ] = {}
         self.collapsed_fade_blocks: dict[int, QColor] = {}
+        self.unread_divider_block_number: int | None = None
+        self.unread_divider_alpha = 255
         self.horizontalScrollBar().rangeChanged.connect(
             self._lock_horizontal_scroll
         )
@@ -4280,6 +4458,62 @@ class MessageLogBrowser(QTextBrowser):
         scrollbar.setRange(0, 0)
         scrollbar.setValue(0)
         scrollbar.blockSignals(signals_were_blocked)
+
+    def _block_content_vertical_bounds(
+        self,
+        block: Any,
+    ) -> tuple[int, int]:
+        """Return text-layout bounds without the block's outer margins."""
+        layout = block.layout()
+        if layout is not None:
+            content_rect = layout.boundingRect().translated(
+                layout.position()
+            )
+        else:
+            content_rect = (
+                self.document().documentLayout().blockBoundingRect(block)
+            )
+
+        # Separator margin bands are painted separately after Qt draws the
+        # document, so this helper deliberately keeps the content-only layout
+        # rectangle for that path.
+        aligned_rect = content_rect.toAlignedRect()
+        scroll_y = self.verticalScrollBar().value()
+        painted_top = aligned_rect.top() - scroll_y
+        painted_bottom = aligned_rect.bottom() + 1 - scroll_y
+        return painted_top, max(painted_top + 1, painted_bottom)
+
+    @staticmethod
+    def _nearest_pixel_edge(value: float) -> int:
+        """Resolve one document edge without creating overlapping rows."""
+        return int(math.floor(float(value) + 0.5))
+
+    def _block_row_vertical_bounds(
+        self,
+        block: Any,
+    ) -> tuple[int, int]:
+        """Return a row whose bottom is the next row's exact top edge."""
+        document_layout = self.document().documentLayout()
+        block_rect = document_layout.blockBoundingRect(block)
+        next_block = block.next()
+        if next_block.isValid():
+            bottom_edge = document_layout.blockBoundingRect(
+                next_block
+            ).top()
+        else:
+            bottom_edge = block_rect.top() + block_rect.height()
+
+        # Round each shared edge once. Aligning every QRect independently
+        # makes neighboring rows overlap whenever their coordinates are
+        # fractional, so the later alternating color steals an edge pixel.
+        scroll_y = self.verticalScrollBar().value()
+        painted_top = self._nearest_pixel_edge(block_rect.top()) - scroll_y
+        painted_bottom = self._nearest_pixel_edge(bottom_edge) - scroll_y
+        return painted_top, max(painted_top + 1, painted_bottom)
+
+    def _unread_divider_y(self, block: Any) -> int:
+        _block_top, block_bottom = self._block_row_vertical_bounds(block)
+        return block_bottom - 1
 
     def _text_shadow_clip_region(
         self,
@@ -4357,8 +4591,11 @@ class MessageLogBrowser(QTextBrowser):
             last_block + 1,
         )
 
+        # Enforce opacity on the painter as well as the format. QTextLayout
+        # can use its default foreground for characters outside an explicit
+        # format range on wrapped lines; painter opacity guarantees those
+        # fallback glyphs can never become opaque black.
         shadow_color = QColor(0, 0, 0)
-        shadow_color.setAlphaF(0.15)
         shadow_format = QTextCharFormat()
         shadow_format.setForeground(shadow_color)
         transparent_spoiler_format = QTextCharFormat()
@@ -4413,6 +4650,7 @@ class MessageLogBrowser(QTextBrowser):
                 Qt.ClipOperation.ReplaceClip,
             )
             painter.translate(1, 1)
+            painter.setOpacity(0.15)
             layout.draw(painter, layout_origin, shadow_ranges)
             painter.restore()
             layout.draw(painter, layout_origin)
@@ -4532,8 +4770,6 @@ class MessageLogBrowser(QTextBrowser):
             self.document().blockCount() - 1,
             last_block + 1,
         )
-        document_layout = self.document().documentLayout()
-        scroll_y = self.verticalScrollBar().value()
         painter = QPainter(viewport)
         painter.setClipRegion(event.region())
         for block_number in range(first_block, last_block + 1):
@@ -4543,16 +4779,14 @@ class MessageLogBrowser(QTextBrowser):
             block = self.document().findBlockByNumber(block_number)
             if not block.isValid():
                 continue
-            block_rect = document_layout.blockBoundingRect(block)
-            top = round(block_rect.top()) - scroll_y
-            height = max(1, round(block_rect.height()))
-            if top > paint_rect.bottom() or top + height < paint_rect.top():
+            top, bottom = self._block_row_vertical_bounds(block)
+            if top > paint_rect.bottom() or bottom <= paint_rect.top():
                 continue
             painter.fillRect(
                 0,
                 top,
                 viewport_width,
-                height + 1,
+                bottom - top,
                 background,
             )
         painter.end()
@@ -4564,8 +4798,6 @@ class MessageLogBrowser(QTextBrowser):
 
         viewport = self.viewport()
         viewport_width = viewport.width()
-        document_layout = self.document().documentLayout()
-        scroll_y = self.verticalScrollBar().value()
         painter = QPainter(viewport)
         painter.setClipRegion(event.region())
         for block_number, padding in (
@@ -4575,12 +4807,10 @@ class MessageLogBrowser(QTextBrowser):
             block = self.document().findBlockByNumber(block_number)
             if not block.isValid():
                 continue
-            block_rect = document_layout.blockBoundingRect(block)
-            top = round(block_rect.top()) - scroll_y
-            height = max(1, round(block_rect.height()))
+            top, bottom = self._block_content_vertical_bounds(block)
             if (
-                top > event.rect().bottom()
-                or top + height < event.rect().top()
+                top - top_padding > event.rect().bottom()
+                or bottom + bottom_padding <= event.rect().top()
             ):
                 continue
             painter.fillRect(
@@ -4592,16 +4822,68 @@ class MessageLogBrowser(QTextBrowser):
             )
             painter.fillRect(
                 0,
-                top + height,
+                bottom,
                 viewport_width,
                 bottom_padding,
                 background,
             )
         painter.end()
 
+    def _paint_final_row_background_tail(self, event: Any) -> None:
+        """Extend a final gray message stripe through the viewport bottom."""
+        if not self.row_background_blocks:
+            return
+
+        last_block_number = max(self.row_background_blocks)
+        background = self.row_background_blocks[last_block_number]
+        if background != QColor(MESSAGE_ROW_BACKGROUNDS[1]):
+            return
+
+        block = self.document().findBlockByNumber(last_block_number)
+        if not block.isValid():
+            return
+        _top, bottom = self._block_row_vertical_bounds(block)
+
+        viewport = self.viewport()
+        viewport_height = viewport.height()
+        if bottom <= 0 or bottom >= viewport_height:
+            return
+
+        painter = QPainter(viewport)
+        painter.setClipRegion(event.region())
+        painter.fillRect(
+            0,
+            bottom,
+            viewport.width(),
+            viewport_height - bottom,
+            background,
+        )
+        painter.end()
+
+    def _paint_unread_divider(self, event: Any) -> None:
+        block_number = self.unread_divider_block_number
+        if block_number is None or self.unread_divider_alpha <= 0:
+            return
+        block = self.document().findBlockByNumber(block_number)
+        if not block.isValid():
+            return
+        y = self._unread_divider_y(block)
+        if y < event.rect().top() or y > event.rect().bottom():
+            return
+        color = QColor("#ff8a00")
+        color.setAlpha(max(0, min(255, self.unread_divider_alpha)))
+        painter = QPainter(self.viewport())
+        painter.setClipRegion(event.region())
+        painter.fillRect(0, y, self.viewport().width(), 1, color)
+        painter.end()
+
     def paintEvent(self, event: Any) -> None:
         self._paint_row_backgrounds(event)
         super().paintEvent(event)
+        # QTextBrowser clears the document's trailing margin with its base
+        # color. If the newest row is gray, continue that stripe through the
+        # otherwise-white pixels at the bottom edge of the viewport.
+        self._paint_final_row_background_tail(event)
         # QTextDocument paints block backgrounds only behind the text line,
         # not inside block margins. These bands contain no text, so they can
         # safely be completed after the base document paint.
@@ -4615,6 +4897,7 @@ class MessageLogBrowser(QTextBrowser):
         # Qt's selection colors cannot replace them.
         self._paint_spoilers(event)
         if not self.collapsed_fade_blocks:
+            self._paint_unread_divider(event)
             return
 
         viewport = self.viewport()
@@ -4688,6 +4971,7 @@ class MessageLogBrowser(QTextBrowser):
                 fade_brush,
             )
         painter.end()
+        self._paint_unread_divider(event)
 
 
 class MainWindow(QMainWindow):
@@ -4879,7 +5163,8 @@ class EncryptedChatClient(QObject):
         self.network_wakeup_event = threading.Event()
         self.window_focused_event = threading.Event()
         self.window_focused_event.set()
-        self.tray_mode_event = threading.Event()
+        self.window_on_screen_event = threading.Event()
+        self.window_on_screen_event.set()
         self.subscription_refresh_event = threading.Event()
         self.subscription_response_lock = threading.Lock()
         self.subscription_response: requests.Response | None = None
@@ -4902,16 +5187,22 @@ class EncryptedChatClient(QObject):
         self.seen_ntfy_message_ids: set[str] = set()
         self.message_log: list[dict[str, Any]] = []
         self.draft_message_id = uuid.uuid4().hex
+        self.chatroom_drafts: dict[str, str] = {}
+        self.read_divider_message_ids: dict[str, str] = {}
+        self.read_divider_visible_seconds: dict[str, float] = {}
+        self._read_divider_last_tick = time.monotonic()
         self._last_outbound_message_order = 0
         self.current_estimated_packet_size = 0
         self.message_size_check_pending = False
         self.rendered_message_items: dict[str, dict[str, Any]] = {}
         self.rendered_message_blocks: dict[int, str] = {}
+        self.rendered_message_last_blocks: dict[str, int] = {}
         self.rendered_image_links: dict[str, str] = {}
         self.rendered_link_targets: dict[str, tuple[str, str]] = {}
         self.rendered_link_senders: dict[str, str] = {}
         self.rendered_image_positions: dict[str, list[int]] = {}
         self.rendered_image_candidates: dict[str, list[int]] = {}
+        self.rendered_loaded_image_urls: set[str] = set()
         self.viewport_embedded_image_urls: set[str] = set()
         self.image_preview_cache: dict[str, RemoteMediaPreview | None] = {}
         self.pending_image_previews: set[str] = set()
@@ -4923,6 +5214,25 @@ class EncryptedChatClient(QObject):
         self.current_image_preview_url: str | None = None
         self.current_image_preview_client_id: str | None = None
         self.recent_chatroom_switch_times: list[float] = []
+        self.rendered_history_message_limit = (
+            INITIAL_HISTORY_RENDER_MESSAGES
+        )
+        self._history_render_generation = 0
+        self._older_history_page_scheduled = False
+        self._loading_older_history_page = False
+        self._history_render_updates_suppressed = False
+        self._history_initial_render_complete = False
+        self._older_history_user_request: tuple[int, str] | None = None
+        self._message_render_generation = 0
+        self._message_render_job: dict[str, Any] | None = None
+        self._rendering_message_log = False
+        self._pending_live_render_message_ids: list[str] = []
+        self._media_rerender_in_progress = False
+        self.embedded_image_preview_sizes: dict[str, tuple[int, int]] = {}
+        self.history_load_executor = DaemonTaskPool(
+            max_workers=2,
+            thread_name_prefix="SpriteLinkHistory",
+        )
         self.image_fetch_executor = DaemonTaskPool(
             max_workers=3,
             thread_name_prefix="SpriteLinkImage",
@@ -4938,6 +5248,18 @@ class EncryptedChatClient(QObject):
             self.config_data.get("active_chatroom_id", GLOBAL_CHATROOM_ID)
         )
         self._update_window_title()
+        startup_unread_boundary = self.config_data.setdefault(
+            "unread_after_message_ids",
+            {},
+        ).pop(self.active_chatroom_id, None)
+        if (
+            isinstance(startup_unread_boundary, str)
+            and startup_unread_boundary
+            and startup_unread_boundary != UNREAD_FROM_START_MARKER
+        ):
+            self.read_divider_message_ids[self.active_chatroom_id] = (
+                startup_unread_boundary
+            )
         cleared_stale_unread = (
             self.config_data.setdefault("unread_counts", {}).pop(
                 self.active_chatroom_id,
@@ -4949,7 +5271,7 @@ class EncryptedChatClient(QObject):
             room["id"] for room in self._chatroom_definitions()
         }
         self.notification_started_at = int(time.time())
-        if cleared_stale_unread:
+        if cleared_stale_unread or startup_unread_boundary is not None:
             try:
                 save_config(self.config_data)
             except Exception:
@@ -5097,6 +5419,18 @@ class EncryptedChatClient(QObject):
             self._show_pending_chat_tooltip
         )
 
+        self.timed_mute_timer = QTimer(self)
+        self.timed_mute_timer.setInterval(15_000)
+        self.timed_mute_timer.timeout.connect(
+            self._refresh_timed_chatroom_mutes
+        )
+
+        self.unread_divider_timer = QTimer(self)
+        self.unread_divider_timer.setInterval(100)
+        self.unread_divider_timer.timeout.connect(
+            self._update_unread_divider_fade
+        )
+
         self.ui_event_available.connect(self._process_ui_queue)
 
         self._apply_theme()
@@ -5112,6 +5446,8 @@ class EncryptedChatClient(QObject):
         QTimer.singleShot(0, self._check_for_updates)
         self.update_check_timer.start()
         self.background_history_prune_timer.start()
+        self.timed_mute_timer.start()
+        self.unread_divider_timer.start()
         self._start_network_thread()
 
     def _font_style_strategy(self) -> QFont.StyleStrategy:
@@ -5472,11 +5808,22 @@ class EncryptedChatClient(QObject):
         self.last_inline_animation_frame_at.clear()
 
     def _sync_window_activity(self) -> None:
-        if (
-            self._tray_ui_suspended
-            or not self.root.isVisible()
-            or self.root.isMinimized()
-        ):
+        window_on_screen = (
+            not self._tray_ui_suspended
+            and self.root.isVisible()
+            and not self.root.isMinimized()
+        )
+        state_changed = (
+            self.window_on_screen_event.is_set() != window_on_screen
+        )
+        if window_on_screen:
+            self.window_on_screen_event.set()
+        else:
+            self.window_on_screen_event.clear()
+        if state_changed:
+            self.network_wakeup_event.set()
+
+        if not window_on_screen:
             self._pause_animated_media()
             return
         for url in self.rendered_image_positions:
@@ -5488,8 +5835,8 @@ class EncryptedChatClient(QObject):
         if self._tray_ui_suspended:
             return
         self._tray_ui_suspended = True
-        self.tray_mode_event.set()
-        self.network_wakeup_event.set()
+        self._reset_history_render_window()
+        self._sync_window_activity()
         self.viewport_media_timer.stop()
         self._hide_chat_tooltip()
         if self.link_warning_overlay.isVisible():
@@ -5501,14 +5848,17 @@ class EncryptedChatClient(QObject):
         self.image_preview_cache.clear()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
+        self.rendered_message_last_blocks.clear()
         self.rendered_image_links.clear()
         self.rendered_link_targets.clear()
         self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
+        self.rendered_loaded_image_urls.clear()
         self.viewport_embedded_image_urls.clear()
         self.chat_display.row_background_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
+        self.chat_display.unread_divider_block_number = None
         self.chat_display.setExtraSelections([])
         self._reset_chat_document()
         self._message_font_cache.clear()
@@ -5524,8 +5874,6 @@ class EncryptedChatClient(QObject):
         if not self._tray_ui_suspended:
             return
         self._tray_ui_suspended = False
-        self.tray_mode_event.clear()
-        self.network_wakeup_event.set()
         self.root.setUpdatesEnabled(True)
         self._render_message_log(scroll_to_bottom=True)
         self._sync_window_activity()
@@ -5570,10 +5918,7 @@ class EncryptedChatClient(QObject):
     def _clear_tray_notification(self) -> None:
         if not self._tray_normal_icon.isNull():
             self.tray_icon.setIcon(self._tray_normal_icon)
-            self.root.setWindowIcon(self._tray_normal_icon)
-            app = QApplication.instance()
-            if app is not None:
-                app.setWindowIcon(self._tray_normal_icon)
+        set_windows_taskbar_attention(int(self.root.winId()), False)
         self.tray_icon.setToolTip(APP_NAME)
 
     def _has_unread_messages(self) -> bool:
@@ -5591,12 +5936,9 @@ class EncryptedChatClient(QObject):
 
     def _mark_tray_notification(self) -> None:
         if not self._tray_notification_icon.isNull():
-            self.root.setWindowIcon(self._tray_notification_icon)
-            app = QApplication.instance()
-            if app is not None:
-                app.setWindowIcon(self._tray_notification_icon)
             if self.tray_icon.isVisible():
                 self.tray_icon.setIcon(self._tray_notification_icon)
+        set_windows_taskbar_attention(int(self.root.winId()), True)
         if self.tray_icon.isVisible():
             self.tray_icon.setToolTip(f"{APP_NAME} — new messages")
 
@@ -5965,10 +6307,91 @@ class EncryptedChatClient(QObject):
         self._run_message_size_check()
 
     def _muted_chatroom_ids(self) -> set[str]:
-        return {
+        muted_ids = {
             str(room_id)
             for room_id in self.config_data.get("muted_chatrooms", [])
         }
+        now = time.time()
+        for room_id, raw_deadline in self.config_data.get(
+            "muted_chatroom_deadlines",
+            {},
+        ).items():
+            try:
+                if float(raw_deadline) <= now:
+                    muted_ids.discard(str(room_id))
+            except (TypeError, ValueError):
+                muted_ids.discard(str(room_id))
+        return muted_ids
+
+    def _chatroom_mute_deadline(self, room_id: str) -> float | None:
+        raw_deadline = self.config_data.get(
+            "muted_chatroom_deadlines",
+            {},
+        ).get(room_id)
+        if raw_deadline is None:
+            return None
+        try:
+            deadline = float(raw_deadline)
+        except (TypeError, ValueError):
+            return None
+        return deadline if math.isfinite(deadline) else None
+
+    def _chatroom_unmute_label(self, room_id: str) -> str:
+        deadline = self._chatroom_mute_deadline(room_id)
+        if deadline is None:
+            return "Unmute"
+        remaining_seconds = max(0.0, deadline - time.time())
+        if remaining_seconds > 60 * 60:
+            hours = max(1, math.ceil(remaining_seconds / (60 * 60)))
+            return f"Unmute ({hours} {'hr' if hours == 1 else 'hrs'})"
+        minutes = max(1, math.ceil(remaining_seconds / 60))
+        return f"Unmute ({minutes} min)"
+
+    def _refresh_timed_chatroom_mutes(self) -> None:
+        raw_deadlines = self.config_data.get(
+            "muted_chatroom_deadlines",
+            {},
+        )
+        if not isinstance(raw_deadlines, dict):
+            raw_deadlines = {}
+            self.config_data["muted_chatroom_deadlines"] = raw_deadlines
+        now = time.time()
+        expired_ids: set[str] = set()
+        for room_id, raw_deadline in list(raw_deadlines.items()):
+            try:
+                expired = float(raw_deadline) <= now
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                expired_ids.add(str(room_id))
+                raw_deadlines.pop(room_id, None)
+
+        open_context = getattr(self, "_open_chatroom_mute_context", None)
+        if open_context is not None:
+            context_room_id, context_menu, context_action = open_context
+            if context_room_id in expired_ids:
+                context_menu.close()
+            elif context_room_id in self._muted_chatroom_ids():
+                context_action.setText(
+                    self._chatroom_unmute_label(context_room_id)
+                )
+
+        if not expired_ids:
+            return
+        muted_ids = {
+            str(room_id)
+            for room_id in self.config_data.get("muted_chatrooms", [])
+        }
+        muted_ids.difference_update(expired_ids)
+        self.config_data["muted_chatrooms"] = sorted(muted_ids)
+        try:
+            save_config(self.config_data)
+        except Exception:
+            pass
+        self._request_subscription_refresh()
+        self.network_wakeup_event.set()
+        if hasattr(self, "chatrooms_list"):
+            self._refresh_chatroom_list()
 
     def _is_chatroom_muted(self, room_id: str) -> bool:
         return room_id in self._muted_chatroom_ids()
@@ -6091,6 +6514,120 @@ class EncryptedChatClient(QObject):
             self.config_data["unread_counts"] = unread_counts
         return unread_counts
 
+    def _unread_after_message_ids(self) -> dict[str, str]:
+        boundaries = self.config_data.setdefault(
+            "unread_after_message_ids",
+            {},
+        )
+        if not isinstance(boundaries, dict):
+            boundaries = {}
+            self.config_data["unread_after_message_ids"] = boundaries
+        return boundaries
+
+    def _set_unread_boundary_if_missing(
+        self,
+        room_id: str,
+        message_id: str | None,
+    ) -> None:
+        boundaries = self._unread_after_message_ids()
+        if room_id not in boundaries:
+            boundaries[room_id] = message_id or UNREAD_FROM_START_MARKER
+
+    def _consume_unread_boundary(self, room_id: str) -> bool:
+        message_id = self._unread_after_message_ids().pop(room_id, None)
+        if not isinstance(message_id, str) or not message_id:
+            return False
+        if message_id == UNREAD_FROM_START_MARKER:
+            return True
+        self.read_divider_message_ids[room_id] = message_id
+        self.read_divider_visible_seconds[room_id] = 0.0
+        return True
+
+    @staticmethod
+    def _message_id_from_log_item(item: dict[str, Any] | None) -> str | None:
+        if not isinstance(item, dict):
+            return None
+        message = item.get("message")
+        if not isinstance(message, dict):
+            return None
+        message_id = message.get("i")
+        return (
+            str(message_id)
+            if isinstance(message_id, str) and message_id
+            else None
+        )
+
+    def _apply_active_unread_divider_block(self) -> None:
+        if not hasattr(self, "chat_display"):
+            return
+        if self._rendering_message_log:
+            # Block numbers change after every staggered prepend. Keep the
+            # divider hidden until the complete document map is stable so its
+            # line cannot appear to move through partially rendered history.
+            self.chat_display.unread_divider_block_number = None
+            self.chat_display.viewport().update()
+            return
+        message_id = self._unread_after_message_ids().get(
+            self.active_chatroom_id
+        ) or self.read_divider_message_ids.get(self.active_chatroom_id)
+        block_number = (
+            self.rendered_message_last_blocks.get(message_id)
+            if message_id
+            else None
+        )
+        self.chat_display.unread_divider_block_number = block_number
+        elapsed = self.read_divider_visible_seconds.get(
+            self.active_chatroom_id,
+            0.0,
+        )
+        self.chat_display.unread_divider_alpha = (
+            255
+            if elapsed <= 3.0
+            else max(0, round(255 * (1.0 - ((elapsed - 3.0) / 3.0))))
+        )
+        self.chat_display.viewport().update()
+
+    def _update_unread_divider_fade(self) -> None:
+        now = time.monotonic()
+        elapsed_since_tick = max(0.0, now - self._read_divider_last_tick)
+        self._read_divider_last_tick = now
+        if self._rendering_message_log:
+            self._apply_active_unread_divider_block()
+            return
+        room_id = self.active_chatroom_id
+        message_id = self.read_divider_message_ids.get(room_id)
+        if not message_id or not hasattr(self, "chat_display"):
+            return
+        block_number = self.rendered_message_last_blocks.get(message_id)
+        if block_number is None:
+            return
+        block = self.chat_display.document().findBlockByNumber(block_number)
+        if not block.isValid():
+            return
+        divider_y = self.chat_display._unread_divider_y(block)
+        is_visible = 0 <= divider_y < self.chat_display.viewport().height()
+        is_focused = (
+            self.window_focused_event.is_set()
+            and self.root.isActiveWindow()
+            and self.root.isVisible()
+            and not self.root.isMinimized()
+            and not self._tray_ui_suspended
+        )
+        if is_visible and is_focused:
+            visible_seconds = self.read_divider_visible_seconds.get(
+                room_id,
+                0.0,
+            ) + elapsed_since_tick
+            self.read_divider_visible_seconds[room_id] = visible_seconds
+            if visible_seconds >= 6.0:
+                self.read_divider_message_ids.pop(room_id, None)
+                self.read_divider_visible_seconds.pop(room_id, None)
+                self.chat_display.unread_divider_block_number = None
+                self.chat_display.unread_divider_alpha = 0
+                self.chat_display.viewport().update()
+                return
+        self._apply_active_unread_divider_block()
+
     def _clear_desktop_notification(
         self,
         room_id: str,
@@ -6125,16 +6662,22 @@ class EncryptedChatClient(QObject):
 
     def _mark_chatroom_read(self, room_id: str) -> None:
         self._clear_desktop_notification(room_id)
+        had_boundary = self._consume_unread_boundary(room_id)
         unread_counts = self._unread_counts()
-        if room_id not in unread_counts:
+        had_unread = room_id in unread_counts
+        if room_id not in unread_counts and not had_boundary:
             self._clear_tray_notification_if_no_unread()
             return
         unread_counts.pop(room_id, None)
         self._clear_tray_notification_if_no_unread()
+        if room_id == self.active_chatroom_id:
+            self._apply_active_unread_divider_block()
         try:
             save_config(self.config_data)
         except Exception:
             pass
+        if (had_unread or had_boundary) and hasattr(self, "chatrooms_list"):
+            self._refresh_chatroom_list()
 
     def _add_chatroom(self) -> None:
         dialog = AddChatroomChoiceDialog(self.root)
@@ -6391,7 +6934,7 @@ class EncryptedChatClient(QObject):
 
         room_id = str(item.data(Qt.ItemDataRole.UserRole))
         is_muted = self._is_chatroom_muted(room_id)
-        menu = QMenu(self.root)
+        menu = ClickableSubmenuMenu(self.root)
 
         edit_action = menu.addAction("Edit")
         edit_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
@@ -6405,10 +6948,47 @@ class EncryptedChatClient(QObject):
             lambda: self._copy_chatroom_invite_code(room_id)
         )
 
-        mute_action = menu.addAction("Unmute" if is_muted else "Mute")
-        mute_action.triggered.connect(
-            lambda: self._set_chatroom_muted(room_id, not is_muted)
-        )
+        mute_action = None
+        if is_muted:
+            mute_action = menu.addAction(
+                self._chatroom_unmute_label(room_id)
+            )
+            mute_action.triggered.connect(
+                lambda: self._set_chatroom_muted(room_id, False)
+            )
+        else:
+            mute_menu = menu.addMenu("Mute")
+            forever_action = mute_menu.addAction("Forever")
+            one_hour_action = mute_menu.addAction("For 1 hour")
+            eight_hour_action = mute_menu.addAction("For 8 hours")
+            twenty_four_hour_action = mute_menu.addAction("For 24 hours")
+            forever_action.triggered.connect(
+                lambda: self._set_chatroom_muted(room_id, True)
+            )
+            one_hour_action.triggered.connect(
+                lambda: self._set_chatroom_muted(
+                    room_id,
+                    True,
+                    duration_seconds=60 * 60,
+                )
+            )
+            eight_hour_action.triggered.connect(
+                lambda: self._set_chatroom_muted(
+                    room_id,
+                    True,
+                    duration_seconds=8 * 60 * 60,
+                )
+            )
+            twenty_four_hour_action.triggered.connect(
+                lambda: self._set_chatroom_muted(
+                    room_id,
+                    True,
+                    duration_seconds=24 * 60 * 60,
+                )
+            )
+            mute_menu.menuAction().triggered.connect(
+                lambda: self._set_chatroom_muted(room_id, True)
+            )
 
         remove_action = menu.addAction("Remove")
         remove_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
@@ -6416,14 +6996,38 @@ class EncryptedChatClient(QObject):
             remove_action.triggered.connect(
                 lambda: self._remove_chatroom(room_id)
             )
+        self._open_chatroom_mute_context = (
+            (room_id, menu, mute_action)
+            if mute_action is not None
+            else None
+        )
         menu.exec(self.chatrooms_list.mapToGlobal(position))
+        self._open_chatroom_mute_context = None
 
-    def _set_chatroom_muted(self, room_id: str, muted: bool) -> None:
+    def _set_chatroom_muted(
+        self,
+        room_id: str,
+        muted: bool,
+        *,
+        duration_seconds: int | None = None,
+    ) -> None:
         muted_ids = self._muted_chatroom_ids()
+        deadlines = self.config_data.setdefault(
+            "muted_chatroom_deadlines",
+            {},
+        )
         if muted:
             muted_ids.add(room_id)
+            if duration_seconds is None:
+                deadlines.pop(room_id, None)
+            else:
+                deadlines[room_id] = time.time() + max(
+                    1,
+                    int(duration_seconds),
+                )
         else:
             muted_ids.discard(room_id)
+            deadlines.pop(room_id, None)
         self.config_data["muted_chatrooms"] = sorted(muted_ids)
         try:
             save_config(self.config_data)
@@ -6462,11 +7066,22 @@ class EncryptedChatClient(QObject):
         muted_ids = self._muted_chatroom_ids()
         muted_ids.discard(room_id)
         self.config_data["muted_chatrooms"] = sorted(muted_ids)
+        self.config_data.get("muted_chatroom_deadlines", {}).pop(
+            room_id,
+            None,
+        )
         self._clear_desktop_notification(room_id)
         self._unread_counts().pop(room_id, None)
+        self.config_data.get("unread_after_message_ids", {}).pop(
+            room_id,
+            None,
+        )
+        self.read_divider_message_ids.pop(room_id, None)
+        self.read_divider_visible_seconds.pop(room_id, None)
         self._clear_tray_notification_if_no_unread()
         self.config_data.get("room_profiles", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
+        self.chatroom_drafts.pop(room_id, None)
         self._request_subscription_refresh()
 
         if self.active_chatroom_id == room_id:
@@ -6504,7 +7119,9 @@ class EncryptedChatClient(QObject):
             self.active_chatroom_id in muted_room_ids
             or room_id in muted_room_ids
         )
-        self._persist_local_history()
+        # Every message mutation is persisted when it occurs. Rewriting the
+        # complete history again here made leaving a long room needlessly
+        # proportional to its retained message count.
         self.active_chatroom_id = room_id
         self.config_data["active_chatroom_id"] = room_id
         self._switch_active_chatroom(
@@ -6516,10 +7133,12 @@ class EncryptedChatClient(QObject):
         self,
         *,
         poll_immediately: bool,
+        bypass_rate_limits: bool = False,
     ) -> None:
         self.network_control_queue.put({
             "room_id": self.active_chatroom_id,
             "poll_immediately": poll_immediately,
+            "bypass_rate_limits": bypass_rate_limits,
         })
         self.network_wakeup_event.set()
 
@@ -6546,11 +7165,344 @@ class EncryptedChatClient(QObject):
         )
         if refresh_subscription:
             self._request_subscription_refresh()
-        self.message_entry.clear()
-        self.message_entry.clear_formatting_state()
-        self._sync_formatting_buttons()
-        self._run_message_size_check()
+        self._restore_active_chatroom_draft()
         self._refresh_chatroom_list()
+
+    def _reset_history_render_window(self) -> None:
+        self._set_history_render_updates_suppressed(False)
+        self._history_render_generation += 1
+        self._older_history_page_scheduled = False
+        self._loading_older_history_page = False
+        self._history_initial_render_complete = False
+        self._older_history_user_request = None
+        self._message_render_generation += 1
+        self._message_render_job = None
+        self._rendering_message_log = False
+        self._pending_live_render_message_ids.clear()
+        self._media_rerender_in_progress = False
+        self.rendered_history_message_limit = (
+            INITIAL_HISTORY_RENDER_MESSAGES
+        )
+
+    def _set_history_render_updates_suppressed(
+        self,
+        suppressed: bool,
+    ) -> None:
+        suppressed = bool(suppressed)
+        if self._history_render_updates_suppressed == suppressed:
+            return
+        self._history_render_updates_suppressed = suppressed
+        if suppressed:
+            # A scroll action queued before a document transaction must not
+            # observe the temporary zero-position created by clear/rebuild.
+            self._older_history_user_request = None
+        self.chat_display.setUpdatesEnabled(not suppressed)
+        if not suppressed:
+            self.chat_display.viewport().update()
+
+    def _on_chat_history_scrolled(self, _value: int) -> None:
+        self.viewport_media_timer.start(
+            VIEWPORT_MEDIA_UPDATE_DELAY_MS
+        )
+
+    def _on_chat_history_scroll_action(self, _action: int) -> None:
+        # Queue at most one request once a genuine user scroll reaches the
+        # oldest 20 percent of the loaded history. actionTriggered exposes the
+        # new slider position before Qt propagates it to value(), so use that
+        # position to begin loading before the visible rows reach the top.
+        scrollbar = self.chat_display.verticalScrollBar()
+        if (
+            self._older_history_user_request is not None
+            or self._history_render_updates_suppressed
+            or self._rendering_message_log
+            or self._loading_older_history_page
+            or self._media_rerender_in_progress
+            or not scroll_position_is_near_history_start(
+                scrollbar.sliderPosition(),
+                scrollbar.minimum(),
+                scrollbar.maximum(),
+            )
+        ):
+            return
+        request = (
+            self._history_render_generation,
+            self.active_chatroom_id,
+        )
+        self._older_history_user_request = request
+        QTimer.singleShot(
+            0,
+            lambda: self._request_older_history_page_from_user_scroll(
+                request
+            ),
+        )
+
+    def _request_older_history_page_from_user_scroll(
+        self,
+        request: tuple[int, str],
+    ) -> None:
+        if self._older_history_user_request != request:
+            return
+        self._older_history_user_request = None
+        generation, room_id = request
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+        ):
+            return
+
+        scrollbar = self.chat_display.verticalScrollBar()
+        if (
+            not scroll_position_is_near_history_start(
+                scrollbar.value(),
+                scrollbar.minimum(),
+                scrollbar.maximum(),
+            )
+            or self._tray_ui_suspended
+            or self._rendering_message_log
+            or self._loading_older_history_page
+        ):
+            return
+        self._schedule_older_history_page()
+
+    def _schedule_older_history_page(self) -> None:
+        if (
+            self._older_history_page_scheduled
+            or self._loading_older_history_page
+            or self._tray_ui_suspended
+            or self.rendered_history_message_limit >= len(self.message_log)
+        ):
+            return
+        self._older_history_page_scheduled = True
+        generation = self._history_render_generation
+        room_id = self.active_chatroom_id
+        QTimer.singleShot(
+            0,
+            lambda: self._load_older_history_page(
+                generation,
+                room_id,
+            ),
+        )
+
+    def _load_older_history_page(
+        self,
+        generation: int,
+        room_id: str,
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            return
+        self._older_history_page_scheduled = False
+        if (
+            self._loading_older_history_page
+            or self.rendered_history_message_limit >= len(self.message_log)
+        ):
+            return
+
+        previous_limit = min(
+            len(self.message_log),
+            self.rendered_history_message_limit,
+        )
+        next_limit = min(
+            len(self.message_log),
+            previous_limit + HISTORY_RENDER_PAGE_MESSAGES,
+        )
+        self._loading_older_history_page = True
+        self._prepend_older_history_page(
+            generation,
+            room_id,
+            previous_limit,
+            next_limit,
+        )
+
+    def _prepend_older_history_page(
+        self,
+        generation: int,
+        room_id: str,
+        previous_limit: int,
+        next_limit: int,
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            self._loading_older_history_page = False
+            return
+
+        new_items = self.message_log[-next_limit:-previous_limit]
+        muted_ids = self._room_preference_ids("muted_users")
+        collapsed_ids = self._room_preference_ids("collapsed_messages")
+        trusted_user_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
+        )
+        display_groups = group_messages_for_display(new_items, muted_ids)
+        unread_boundary_id = self._unread_after_message_ids().get(
+            self.active_chatroom_id
+        ) or self.read_divider_message_ids.get(self.active_chatroom_id)
+        if unread_boundary_id:
+            boundary_split_groups: list[list[dict[str, Any]]] = []
+            for group in display_groups:
+                boundary_index = next(
+                    (
+                        index
+                        for index, source in enumerate(group)
+                        if self._message_id_from_log_item(source)
+                        == unread_boundary_id
+                    ),
+                    -1,
+                )
+                if 0 <= boundary_index < len(group) - 1:
+                    boundary_split_groups.append(group[:boundary_index + 1])
+                    boundary_split_groups.append(group[boundary_index + 1:])
+                else:
+                    boundary_split_groups.append(group)
+            display_groups = boundary_split_groups
+
+        self.rendered_history_message_limit = next_limit
+        if not display_groups:
+            self._finish_older_history_page(generation, room_id)
+            return
+
+        following_timestamp = (
+            self._display_timestamp_for_item(
+                self.message_log[-previous_limit]
+            )
+            if previous_limit > 0
+            else None
+        )
+        render_steps: list[dict[str, Any]] = []
+        for index, group in enumerate(display_groups):
+            if index + 1 < len(display_groups):
+                next_timestamp = self._display_timestamp_for_item(
+                    display_groups[index + 1][0]
+                )
+            else:
+                next_timestamp = following_timestamp
+            separator_specs = [
+                [separator_text, ""]
+                for separator_text in (
+                    message_log_separator_texts(
+                        self._display_timestamp_for_item(group[-1]),
+                        next_timestamp,
+                    )
+                    if next_timestamp is not None
+                    else ()
+                )
+            ]
+            render_steps.append({
+                "group": group,
+                "background_color": "",
+                "separators_after": separator_specs,
+            })
+
+        following_background_index = 0
+        if previous_limit > 0:
+            following_message_id = self._message_id_from_log_item(
+                self.message_log[-previous_limit]
+            )
+            following_block_number = self.rendered_message_last_blocks.get(
+                following_message_id
+            )
+            following_background = self.chat_display.row_background_blocks.get(
+                following_block_number
+            )
+            if isinstance(following_background, QColor):
+                following_background_name = (
+                    following_background.name().casefold()
+                )
+                for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS):
+                    if QColor(color).name().casefold() == following_background_name:
+                        following_background_index = index
+                        break
+
+        prepended_row_count = sum(
+            1 + len(step["separators_after"])
+            for step in render_steps
+        )
+        stripe_index = (
+            following_background_index - prepended_row_count
+        ) % len(MESSAGE_ROW_BACKGROUNDS)
+        for step in render_steps:
+            step["background_color"] = MESSAGE_ROW_BACKGROUNDS[
+                stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+            ]
+            stripe_index += 1
+            for separator_spec in step["separators_after"]:
+                separator_spec[1] = MESSAGE_ROW_BACKGROUNDS[
+                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                ]
+                stripe_index += 1
+
+        document = self.chat_display.document()
+        row_selections: list[QTextEdit.ExtraSelection] = []
+        for block_number, background in sorted(
+            self.chat_display.row_background_blocks.items()
+        ):
+            block = document.findBlockByNumber(block_number)
+            if not block.isValid():
+                continue
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = QTextCursor(block)
+            selection.cursor.clearSelection()
+            selection.format.setBackground(QColor(background))
+            selection.format.setProperty(
+                QTextFormat.Property.FullWidthSelection,
+                True,
+            )
+            row_selections.append(selection)
+
+        self._message_render_generation += 1
+        message_generation = self._message_render_generation
+        self._rendering_message_log = True
+        self._apply_active_unread_divider_block()
+        self._hide_chat_tooltip()
+        self._message_render_job = {
+            "generation": message_generation,
+            "room_id": room_id,
+            "scroll_to_bottom": False,
+            "on_finished": lambda: self._finish_older_history_page(
+                generation,
+                room_id,
+            ),
+            "muted_ids": muted_ids,
+            "collapsed_ids": collapsed_ids,
+            "trusted_user_ids": trusted_user_ids,
+            "row_selections": row_selections,
+            "display_groups": display_groups,
+            "render_steps": render_steps,
+            "unread_boundary_id": unread_boundary_id,
+            "newest_first": False,
+            "preserve_viewport_while_prepending": True,
+            "cursor": self.chat_display.textCursor(),
+            "previous_timestamp": None,
+            "previous_message_id": None,
+            "first_item": False,
+            "stripe_index": 0,
+            "stripe_shift": 0,
+            "index": len(render_steps) - 1,
+        }
+        self._continue_message_log_render(message_generation)
+
+    def _finish_older_history_page(
+        self,
+        generation: int,
+        room_id: str,
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            self._loading_older_history_page = False
+            return
+        self._loading_older_history_page = False
+        self.viewport_media_timer.start(
+            VIEWPORT_MEDIA_UPDATE_DELAY_MS
+        )
+        self._flush_pending_live_message_render()
 
     def _build_chat_tab(self) -> None:
         layout = QVBoxLayout(self.chat_tab)
@@ -6610,9 +7562,10 @@ class EncryptedChatClient(QObject):
         self.chat_display.viewport().setMouseTracking(True)
         self.chat_display.viewport().installEventFilter(self)
         self.chat_display.verticalScrollBar().valueChanged.connect(
-            lambda _value: self.viewport_media_timer.start(
-                VIEWPORT_MEDIA_UPDATE_DELAY_MS
-            )
+            self._on_chat_history_scrolled
+        )
+        self.chat_display.verticalScrollBar().actionTriggered.connect(
+            self._on_chat_history_scroll_action
         )
         content_layout.addWidget(self.chat_display, 1)
 
@@ -6788,6 +7741,9 @@ class EncryptedChatClient(QObject):
             self._sync_formatting_buttons
         )
         self.message_entry.send_requested.connect(self._send_current_message)
+        self.message_entry.formatting_shortcut_requested.connect(
+            self._toggle_composer_formatting_shortcut
+        )
         compose_layout.addWidget(self.message_entry, 0, 0)
 
         self.send_button = QPushButton("Send")
@@ -6896,6 +7852,16 @@ class EncryptedChatClient(QObject):
         self.message_entry.apply_formatting(style, enabled)
         self.message_entry.setFocus()
         self._sync_formatting_buttons()
+
+    def _toggle_composer_formatting_shortcut(self, style: str) -> None:
+        buttons = {
+            "bold": self.bold_format_button,
+            "italic": self.italic_format_button,
+            "underline": self.underline_format_button,
+        }
+        button = buttons.get(style)
+        if button is not None:
+            button.click()
 
     def _sync_formatting_buttons(self) -> None:
         if not hasattr(self, "bold_format_button"):
@@ -7547,6 +8513,8 @@ class EncryptedChatClient(QObject):
 
         if is_likely_nsfw_image_url(url):
             return
+        if url not in self.rendered_loaded_image_urls:
+            return
         image_positions = self.rendered_image_positions.get(url, [])
         if not image_positions:
             return
@@ -7657,7 +8625,7 @@ class EncryptedChatClient(QObject):
         self.image_preview_label.clear()
         self.image_preview_url_label.clear()
         self.image_preview_url_label.setToolTip("")
-        if url and url not in self.rendered_image_positions:
+        if url and url not in self.rendered_loaded_image_urls:
             controller = self.animated_media_controllers.pop(url, None)
             if controller is not None:
                 controller.stop()
@@ -8435,7 +9403,23 @@ class EncryptedChatClient(QObject):
             self._identity_private_key(),
         )
 
+    def _restore_active_chatroom_draft(self) -> None:
+        self._cancel_pending_message_size_check()
+        signals_were_blocked = self.message_entry.blockSignals(True)
+        try:
+            self.message_entry.set_message_text(
+                self.chatroom_drafts.get(self.active_chatroom_id, "")
+            )
+        finally:
+            self.message_entry.blockSignals(signals_were_blocked)
+        self._sync_formatting_buttons()
+        self._resize_message_entry()
+        self._run_message_size_check()
+
     def _schedule_composer_update(self) -> None:
+        self.chatroom_drafts[self.active_chatroom_id] = (
+            self.message_entry.to_message_text()
+        )
         self.message_resize_timer.start(0)
         self.message_size_check_pending = True
         self.message_size_timer.start(MESSAGE_SIZE_DEBOUNCE_MS)
@@ -8646,14 +9630,6 @@ class EncryptedChatClient(QObject):
 
         encryption_key = self._active_chatroom()["key"]
 
-        if not self.connected:
-            messagebox.showwarning(
-                "Not connected",
-                "The client is not currently connected to the selected server.",
-                parent=self.root,
-            )
-            return
-
         message = self._build_draft_message(text)
         (
             message["i"],
@@ -8703,6 +9679,14 @@ class EncryptedChatClient(QObject):
                 parent=self.root,
             )
             return
+
+        if not self.connected:
+            self.status_var.set("Connecting")
+            self._restart_connection_error_delay()
+            self._request_network_refresh(
+                poll_immediately=True,
+                bypass_rate_limits=True,
+            )
 
         # The network worker consumes this FIFO queue synchronously. A newer
         # message never starts its POST until every earlier one has finished.
@@ -8900,9 +9884,17 @@ class EncryptedChatClient(QObject):
             latest_control: dict[str, Any] | None = None
             while True:
                 try:
-                    latest_control = self.network_control_queue.get_nowait()
+                    pending_control = (
+                        self.network_control_queue.get_nowait()
+                    )
                 except queue.Empty:
                     break
+                if (
+                    latest_control is None
+                    or bool(pending_control.get("bypass_rate_limits"))
+                    or not bool(latest_control.get("bypass_rate_limits"))
+                ):
+                    latest_control = pending_control
 
             while True:
                 try:
@@ -8929,16 +9921,13 @@ class EncryptedChatClient(QObject):
                 rooms[0],
             )
             active_room_id = active_room["id"]
-            window_focused = self.window_focused_event.is_set()
-            tray_suspended = self.tray_mode_event.is_set()
+            window_on_screen = self.window_on_screen_event.is_set()
             poll_interval = polling_interval_seconds(
-                window_focused=window_focused,
-                tray_suspended=tray_suspended,
+                window_on_screen=window_on_screen,
             )
             muted_poll_interval = (
                 muted_inactive_polling_interval_seconds(
-                    window_focused=window_focused,
-                    tray_suspended=tray_suspended,
+                    window_on_screen=window_on_screen,
                 )
             )
             valid_room_ids = {room["id"] for room in rooms}
@@ -8971,17 +9960,21 @@ class EncryptedChatClient(QObject):
                     if poll_immediately:
                         urgent_room_ids.add(active_room_id)
                         forced_active_poll_room_id = active_room_id
-                        background_delay_debt += (
-                            immediate_poll_borrowed_seconds(
-                                now=now,
-                                last_global_poll_at=last_global_poll_at,
-                                poll_interval=poll_interval,
+                        bypass_rate_limits = bool(
+                            latest_control.get("bypass_rate_limits", False)
+                        )
+                        if not bypass_rate_limits:
+                            background_delay_debt += (
+                                immediate_poll_borrowed_seconds(
+                                    now=now,
+                                    last_global_poll_at=last_global_poll_at,
+                                    poll_interval=poll_interval,
+                                )
                             )
-                        )
-                        background_repayment_checks = max(
-                            background_repayment_checks,
-                            CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS,
-                        )
+                            background_repayment_checks = max(
+                                background_repayment_checks,
+                                CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS,
+                            )
                         background_delay_until = None
                         background_delay_slice = 0.0
                     else:
@@ -9428,7 +10421,7 @@ class EncryptedChatClient(QObject):
 
     def _process_ui_queue(self) -> None:
         try:
-            while True:
+            for _event_index in range(UI_EVENT_BATCH_LIMIT):
                 event_type, payload = self.ui_queue.get_nowait()
 
                 if event_type == "status":
@@ -9447,7 +10440,7 @@ class EncryptedChatClient(QObject):
                             history_scan=history_scan,
                         )
                         continue
-                    added = 0
+                    added_message_ids: list[str] = []
 
                     for item in sorted(items, key=self._message_sort_key):
                         if self._accept_network_message(
@@ -9462,12 +10455,16 @@ class EncryptedChatClient(QObject):
                                 ),
                             ),
                         ):
-                            added += 1
+                            added_message_ids.append(
+                                str(item["message"]["i"])
+                            )
 
-                    if added:
+                    if added_message_ids:
                         self.message_log.sort(key=self._message_sort_key)
                         self._persist_local_history()
-                        self._render_message_log(scroll_to_bottom=True)
+                        self._queue_live_message_render(
+                            added_message_ids
+                        )
 
                 elif event_type == "send_succeeded":
                     self._record_successful_send()
@@ -9487,6 +10484,58 @@ class EncryptedChatClient(QObject):
                         warning=True,
                     )
 
+                elif event_type == "history_chunk_loaded":
+                    generation = int(payload.get("generation", -1))
+                    room_id = str(payload.get("room_id", ""))
+                    if (
+                        generation != self._history_render_generation
+                        or room_id != self.active_chatroom_id
+                    ):
+                        continue
+
+                    initial_chunk = bool(payload.get("initial", False))
+                    accepted_items: list[dict[str, Any]] = []
+                    for item in payload.get("items", []):
+                        message = item.get("message")
+                        if not isinstance(message, dict):
+                            continue
+                        message_id = str(message.get("i", ""))
+                        if (
+                            not message_id
+                            or message_id in self.seen_client_message_ids
+                        ):
+                            continue
+                        self.seen_client_message_ids.add(message_id)
+                        ntfy_id = item.get("ntfy_id")
+                        if isinstance(ntfy_id, str) and ntfy_id:
+                            self.seen_ntfy_message_ids.add(ntfy_id)
+                        accepted_items.append(item)
+
+                    if initial_chunk:
+                        self.message_log.extend(accepted_items)
+                        self.message_log.sort(key=self._message_sort_key)
+                    elif accepted_items:
+                        # The worker emits saved-history chunks newest-first.
+                        # Every later chunk is older than the current prefix,
+                        # so prepend it without repeatedly sorting the growing
+                        # retained history on the GUI thread.
+                        self.message_log[0:0] = accepted_items
+                    if initial_chunk:
+                        if self.message_log and not self._tray_ui_suspended:
+                            self._render_message_log(
+                                scroll_to_bottom=True,
+                                on_finished=lambda: (
+                                    self._finish_initial_history_render(
+                                        generation,
+                                        room_id,
+                                    )
+                                ),
+                            )
+                        else:
+                            self._finish_initial_history_render(
+                                generation,
+                                room_id,
+                            )
                 elif event_type == "image_preview_loaded":
                     url = str(payload.get("url", ""))
                     data = payload.get("data")
@@ -9544,7 +10593,7 @@ class EncryptedChatClient(QObject):
                         media is not None
                         and url in self.viewport_embedded_image_urls
                     ):
-                        self._rerender_preserving_scroll()
+                        self._update_viewport_media()
 
                 elif event_type == "update_check_result":
                     if isinstance(payload, dict):
@@ -9562,6 +10611,8 @@ class EncryptedChatClient(QObject):
 
         except queue.Empty:
             pass
+        if not self.ui_queue.empty():
+            QTimer.singleShot(0, self._process_ui_queue)
 
     def _accept_background_messages(
         self,
@@ -9597,6 +10648,9 @@ class EncryptedChatClient(QObject):
         muted_user_ids = self._room_preference_ids_for_key(
             "muted_users",
             encryption_key,
+        )
+        previous_message_id = self._message_id_from_log_item(
+            history[-1] if history else None
         )
         added = 0
         unread_added = 0
@@ -9643,6 +10697,10 @@ class EncryptedChatClient(QObject):
                 notification_started_at=self.notification_started_at,
             )
             if should_notify and not is_local:
+                self._set_unread_boundary_if_missing(
+                    room_id,
+                    previous_message_id,
+                )
                 unread_added += 1
                 sender_id = str(message.get("c", ""))
                 is_muted_notification = (
@@ -9669,6 +10727,7 @@ class EncryptedChatClient(QObject):
                     and duplicate_ordinal <= 2
                 ):
                     self._play_notification_sound()
+            previous_message_id = client_message_id
 
         if not added:
             return
@@ -9693,6 +10752,7 @@ class EncryptedChatClient(QObject):
                 save_config(self.config_data)
             except Exception:
                 pass
+            self._apply_active_unread_divider_block()
             self._refresh_chatroom_list()
 
     def _accept_network_message(
@@ -9718,6 +10778,9 @@ class EncryptedChatClient(QObject):
         self.seen_client_message_ids.add(client_message_id)
 
         is_local = message["c"] == self._authenticated_client_id()
+        previous_message_id = self._message_id_from_log_item(
+            self.message_log[-1] if self.message_log else None
+        )
         duplicate_ordinal = consecutive_duplicate_message_ordinal(
             self.message_log,
             message,
@@ -9734,6 +10797,26 @@ class EncryptedChatClient(QObject):
             persist=persist,
             render=render,
         )
+
+        if (
+            play_chime
+            and not is_local
+            and not self.window_focused_event.is_set()
+        ):
+            self._set_unread_boundary_if_missing(
+                self.active_chatroom_id,
+                previous_message_id,
+            )
+            unread_counts = self._unread_counts()
+            unread_counts[self.active_chatroom_id] = (
+                int(unread_counts.get(self.active_chatroom_id, 0) or 0) + 1
+            )
+            try:
+                save_config(self.config_data)
+            except Exception:
+                pass
+            self._apply_active_unread_divider_block()
+            self._refresh_chatroom_list()
 
         is_muted_notification = (
             self._is_chatroom_muted(self.active_chatroom_id)
@@ -9801,10 +10884,228 @@ class EncryptedChatClient(QObject):
         history_limit = self._chatroom_history_limit()
         if len(self.message_log) > history_limit:
             del self.message_log[:-history_limit]
+        # The visible history is a growing suffix for the lifetime of this
+        # room view. A newly received message must extend that suffix instead
+        # of pushing its oldest already-loaded message out of the document.
+        self.rendered_history_message_limit = min(
+            len(self.message_log),
+            self.rendered_history_message_limit + 1,
+        )
         if persist:
             self._persist_local_history()
         if render:
+            self._queue_live_message_render([str(message["i"])])
+
+    def _queue_live_message_render(
+        self,
+        message_ids: list[str],
+    ) -> None:
+        for message_id in message_ids:
+            if (
+                message_id
+                and message_id
+                not in self._pending_live_render_message_ids
+            ):
+                self._pending_live_render_message_ids.append(message_id)
+        self._flush_pending_live_message_render()
+
+    def _flush_pending_live_message_render(self) -> None:
+        if (
+            not self._pending_live_render_message_ids
+            or self._tray_ui_suspended
+            or self._rendering_message_log
+            or self._history_render_updates_suppressed
+            or self._media_rerender_in_progress
+        ):
+            return
+
+        pending_ids = list(self._pending_live_render_message_ids)
+        pending_id_set = set(pending_ids)
+        items = [
+            item
+            for item in self.message_log
+            if self._message_id_from_log_item(item) in pending_id_set
+            and self._message_id_from_log_item(item)
+            not in self.rendered_message_last_blocks
+        ]
+        self._pending_live_render_message_ids.clear()
+        if not items:
+            return
+
+        if not self._append_live_message_items(items):
+            # A delayed or duplicate message can belong inside an existing
+            # rendered group instead of after it. Keep that exceptional case
+            # correct; normal live arrivals never enter the history renderer.
             self._render_message_log(scroll_to_bottom=True)
+
+    def _append_live_message_items(
+        self,
+        items: list[dict[str, Any]],
+    ) -> bool:
+        if not items or self._tray_ui_suspended:
+            return True
+
+        items = sorted(items, key=self._message_sort_key)
+        rendered_ids = set(self.rendered_message_last_blocks)
+        rendered_items = [
+            item
+            for item in self.message_log
+            if self._message_id_from_log_item(item) in rendered_ids
+        ]
+        previous_item = (
+            max(rendered_items, key=self._message_sort_key)
+            if rendered_items
+            else None
+        )
+        if (
+            previous_item is not None
+            and self._message_sort_key(items[0])
+            <= self._message_sort_key(previous_item)
+        ):
+            return False
+
+        muted_ids = self._room_preference_ids("muted_users")
+        if previous_item is not None:
+            boundary_groups = group_messages_for_display(
+                [previous_item, items[0]],
+                muted_ids,
+            )
+            if len(boundary_groups) == 1:
+                # Consecutive repeated messages are represented by one row.
+                # Updating that already-rendered row needs the correctness
+                # fallback above instead of appending a second row.
+                return False
+
+        collapsed_ids = self._room_preference_ids("collapsed_messages")
+        trusted_user_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
+        )
+        display_groups = group_messages_for_display(items, muted_ids)
+        unread_boundary_id = self._unread_after_message_ids().get(
+            self.active_chatroom_id
+        ) or self.read_divider_message_ids.get(self.active_chatroom_id)
+        if unread_boundary_id:
+            boundary_split_groups: list[list[dict[str, Any]]] = []
+            for group in display_groups:
+                boundary_index = next(
+                    (
+                        index
+                        for index, source in enumerate(group)
+                        if self._message_id_from_log_item(source)
+                        == unread_boundary_id
+                    ),
+                    -1,
+                )
+                if 0 <= boundary_index < len(group) - 1:
+                    boundary_split_groups.append(
+                        group[:boundary_index + 1]
+                    )
+                    boundary_split_groups.append(
+                        group[boundary_index + 1:]
+                    )
+                else:
+                    boundary_split_groups.append(group)
+            display_groups = boundary_split_groups
+
+        background_indices = {
+            QColor(color).name().casefold(): index
+            for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS)
+        }
+        stripe_index = 0
+        previous_timestamp: int | None = None
+        previous_message_id: str | None = None
+        if previous_item is not None:
+            previous_timestamp = self._display_timestamp_for_item(
+                previous_item
+            )
+            previous_message_id = self._message_id_from_log_item(
+                previous_item
+            )
+            previous_block_number = self.rendered_message_last_blocks.get(
+                previous_message_id
+            )
+            previous_background = self.chat_display.row_background_blocks.get(
+                previous_block_number
+            )
+            if isinstance(previous_background, QColor):
+                stripe_index = (
+                    background_indices.get(
+                        previous_background.name().casefold(),
+                        -1,
+                    )
+                    + 1
+                ) % len(MESSAGE_ROW_BACKGROUNDS)
+
+        self._hide_chat_tooltip()
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        first_item = self.chat_display.document().isEmpty()
+        row_selections: list[QTextEdit.ExtraSelection] = []
+        for group in display_groups:
+            item = self._display_item_for_group(group, muted_ids)
+            current_timestamp = self._display_timestamp_for_item(group[0])
+            separator_texts = (
+                message_log_separator_texts(
+                    previous_timestamp,
+                    current_timestamp,
+                )
+                if previous_timestamp is not None
+                else ()
+            )
+            last_separator_block_number: int | None = None
+            for separator_text in separator_texts:
+                last_separator_block_number = self._insert_log_separator(
+                    cursor,
+                    separator_text,
+                    MESSAGE_ROW_BACKGROUNDS[
+                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                    ],
+                    row_selections,
+                )
+                stripe_index += 1
+            if (
+                last_separator_block_number is not None
+                and unread_boundary_id
+                and previous_message_id == unread_boundary_id
+            ):
+                self.rendered_message_last_blocks[unread_boundary_id] = (
+                    last_separator_block_number
+                )
+            if not first_item and not separator_texts:
+                cursor.insertBlock()
+
+            self._insert_message_item(
+                cursor,
+                item,
+                muted_ids=muted_ids,
+                collapsed_ids=collapsed_ids,
+                trusted_user_ids=trusted_user_ids,
+                background_color=MESSAGE_ROW_BACKGROUNDS[
+                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                ],
+                row_selections=row_selections,
+            )
+            stripe_index += 1
+            first_item = False
+            previous_timestamp = self._display_timestamp_for_item(group[-1])
+            previous_message_id = self._message_id_from_log_item(group[-1])
+
+        self.chat_display.row_background_blocks.update({
+            selection.cursor.block().blockNumber(): QColor(
+                selection.format.background().color()
+            )
+            for selection in row_selections
+            if selection.cursor.block().isValid()
+        })
+        self._bottom_align_short_message_log()
+        self.chat_display.setExtraSelections([])
+        self._apply_active_unread_divider_block()
+        self.chat_display.horizontalScrollBar().setValue(0)
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
+        self.chat_display.viewport().update()
+        return True
 
     def _load_saved_history_for_current_room(self) -> None:
         server_url = normalize_server_url(
@@ -9815,57 +11116,138 @@ class EncryptedChatClient(QObject):
         if not server_url or not encryption_key:
             return
 
-        entries = load_chatroom_history(server_url, encryption_key)
-        for item in entries[-self._chatroom_history_limit():]:
-            message = item.get("message")
-            if not isinstance(message, dict):
-                continue
-
-            stored_ntfy_time = int(
-                item.get("ntfy_time", message.get("t", 0)) or 0
+        generation = self._history_render_generation
+        room_id = self.active_chatroom_id
+        history_limit = self._chatroom_history_limit()
+        try:
+            self.history_load_executor.submit(
+                self._load_saved_history_worker,
+                generation,
+                room_id,
+                server_url,
+                encryption_key,
+                history_limit,
             )
-            try:
-                self._validate_decrypted_message(
-                    message,
-                    encryption_key,
-                    ntfy_time=(
-                        stored_ntfy_time
-                        if stored_ntfy_time > 0
-                        else None
-                    ),
+        except RuntimeError:
+            pass
+
+    def _load_saved_history_worker(
+        self,
+        generation: int,
+        room_id: str,
+        server_url: str,
+        encryption_key: str,
+        history_limit: int,
+    ) -> None:
+        entries = load_chatroom_history(server_url, encryption_key)[
+            -history_limit:
+        ]
+        first_chunk = True
+        chunk_end = len(entries)
+        while chunk_end > 0 and not self._closing:
+            chunk_start = max(
+                0,
+                chunk_end - INITIAL_HISTORY_RENDER_MESSAGES,
+            )
+            prepared_items: list[dict[str, Any]] = []
+            for item in entries[chunk_start:chunk_end]:
+                message = item.get("message")
+                if not isinstance(message, dict):
+                    continue
+
+                stored_ntfy_time = int(
+                    item.get("ntfy_time", message.get("t", 0)) or 0
                 )
-            except Exception:
-                continue
+                try:
+                    self._validate_decrypted_message(
+                        message,
+                        encryption_key,
+                        ntfy_time=(
+                            stored_ntfy_time
+                            if stored_ntfy_time > 0
+                            else None
+                        ),
+                    )
+                except Exception:
+                    continue
 
-            client_message_id = message["i"]
-            if client_message_id in self.seen_client_message_ids:
-                continue
+                ntfy_id = item.get("ntfy_id")
+                if not isinstance(ntfy_id, str) or not ntfy_id:
+                    ntfy_id = None
+                prepared_items.append({
+                    "message": message,
+                    "is_local": (
+                        message["c"] == self._authenticated_client_id()
+                    ),
+                    "warning": None,
+                    "ntfy_id": ntfy_id,
+                    "ntfy_time": stored_ntfy_time,
+                    **(
+                        {"display_sort_time": int(item["display_sort_time"])}
+                        if type(item.get("display_sort_time")) is int
+                        else {}
+                    ),
+                })
 
-            ntfy_id = item.get("ntfy_id")
-            if isinstance(ntfy_id, str) and ntfy_id:
-                self.seen_ntfy_message_ids.add(ntfy_id)
-            else:
-                ntfy_id = None
+            self._queue_ui_event((
+                "history_chunk_loaded",
+                {
+                    "generation": generation,
+                    "room_id": room_id,
+                    "items": prepared_items,
+                    "initial": first_chunk,
+                },
+            ))
+            first_chunk = False
+            chunk_end = chunk_start
 
-            self.seen_client_message_ids.add(client_message_id)
-            self.message_log.append({
-                "message": message,
-                "is_local": (
-                    message["c"] == self._authenticated_client_id()
-                ),
-                "warning": None,
-                "ntfy_id": ntfy_id,
-                "ntfy_time": stored_ntfy_time,
-                **(
-                    {"display_sort_time": int(item["display_sort_time"])}
-                    if type(item.get("display_sort_time")) is int
-                    else {}
-                ),
-            })
+        if first_chunk and not self._closing:
+            self._queue_ui_event((
+                "history_chunk_loaded",
+                {
+                    "generation": generation,
+                    "room_id": room_id,
+                    "items": [],
+                    "initial": True,
+                },
+            ))
 
-        self.message_log.sort(key=self._message_sort_key)
-        if self.message_log:
-            self._render_message_log(scroll_to_bottom=True)
+    def _finish_initial_history_render(
+        self,
+        generation: int,
+        room_id: str,
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+        ):
+            self._set_history_render_updates_suppressed(False)
+            return
+        self.chat_display.document().documentLayout().documentSize()
+        QTimer.singleShot(
+            0,
+            lambda: self._finalize_initial_history_render(
+                generation,
+                room_id,
+            ),
+        )
+
+    def _finalize_initial_history_render(
+        self,
+        generation: int,
+        room_id: str,
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+        ):
+            self._set_history_render_updates_suppressed(False)
+            return
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self._set_history_render_updates_suppressed(False)
+        self._history_initial_render_complete = True
+        self._flush_pending_live_message_render()
 
     def _persist_local_history(self) -> None:
         server_url = normalize_server_url(
@@ -10080,12 +11462,130 @@ class EncryptedChatClient(QObject):
         self._rerender_preserving_scroll()
 
     def _rerender_preserving_scroll(self) -> None:
+        if (
+            self._rendering_message_log
+            or self._loading_older_history_page
+            or self._media_rerender_in_progress
+        ):
+            self.viewport_media_timer.start(
+                VIEWPORT_MEDIA_UPDATE_DELAY_MS
+            )
+            return
+        anchor = self._capture_chat_view_anchor()
+        generation = self._history_render_generation
+        room_id = self.active_chatroom_id
+        self._media_rerender_in_progress = True
+        self._set_history_render_updates_suppressed(True)
+        self._render_message_log(
+            scroll_to_bottom=False,
+            on_finished=lambda: self._finish_preserving_scroll_rerender(
+                generation,
+                room_id,
+                anchor,
+            ),
+        )
+
+    def _capture_chat_view_anchor(self) -> dict[str, Any]:
         scrollbar = self.chat_display.verticalScrollBar()
-        maximum = max(1, scrollbar.maximum())
-        fraction = scrollbar.value() / maximum
-        self._render_message_log(scroll_to_bottom=False)
+        value = scrollbar.value()
+        maximum = scrollbar.maximum()
+        anchor: dict[str, Any] = {
+            "at_bottom": value >= maximum - 1,
+            "distance_from_bottom": max(0, maximum - value),
+            "message_id": None,
+            "viewport_offset": 0.0,
+        }
+        document = self.chat_display.document()
+        cursor = self.chat_display.cursorForPosition(QPoint(0, 0))
+        block = cursor.block()
+        while block.isValid():
+            message_id = self.rendered_message_blocks.get(
+                block.blockNumber()
+            )
+            if message_id:
+                block_top = (
+                    document.documentLayout()
+                    .blockBoundingRect(block)
+                    .top()
+                )
+                anchor["message_id"] = message_id
+                anchor["viewport_offset"] = block_top - value
+                break
+            block = block.next()
+        return anchor
+
+    def _finish_preserving_scroll_rerender(
+        self,
+        generation: int,
+        room_id: str,
+        anchor: dict[str, Any],
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+        ):
+            return
+        self.chat_display.document().documentLayout().documentSize()
+        QTimer.singleShot(
+            0,
+            lambda: self._restore_preserving_scroll_rerender(
+                generation,
+                room_id,
+                anchor,
+            ),
+        )
+
+    def _restore_preserving_scroll_rerender(
+        self,
+        generation: int,
+        room_id: str,
+        anchor: dict[str, Any],
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+        ):
+            return
+
+        self._restore_chat_view_anchor(anchor)
+        self._media_rerender_in_progress = False
+        self._set_history_render_updates_suppressed(False)
+        self._flush_pending_live_message_render()
+
+    def _restore_chat_view_anchor(
+        self,
+        anchor: dict[str, Any],
+    ) -> None:
+
         scrollbar = self.chat_display.verticalScrollBar()
-        scrollbar.setValue(round(fraction * scrollbar.maximum()))
+        if bool(anchor.get("at_bottom")):
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            message_id = str(anchor.get("message_id") or "")
+            anchor_blocks = [
+                block_number
+                for block_number, rendered_message_id
+                in self.rendered_message_blocks.items()
+                if rendered_message_id == message_id
+            ]
+            if anchor_blocks:
+                block = self.chat_display.document().findBlockByNumber(
+                    min(anchor_blocks)
+                )
+                block_top = (
+                    self.chat_display.document().documentLayout()
+                    .blockBoundingRect(block)
+                    .top()
+                )
+                scrollbar.setValue(round(
+                    block_top - float(anchor.get("viewport_offset", 0.0))
+                ))
+            else:
+                scrollbar.setValue(max(
+                    scrollbar.minimum(),
+                    scrollbar.maximum()
+                    - max(0, int(anchor.get("distance_from_bottom", 0))),
+                ))
 
     def _schedule_chat_tooltip(
         self,
@@ -10276,6 +11776,16 @@ class EncryptedChatClient(QObject):
             or not hasattr(self, "chat_display")
         ):
             return
+        if (
+            self._rendering_message_log
+            or self._loading_older_history_page
+            or self._history_render_updates_suppressed
+            or self._media_rerender_in_progress
+        ):
+            self.viewport_media_timer.start(
+                VIEWPORT_MEDIA_UPDATE_DELAY_MS
+            )
+            return
         viewport = self.chat_display.viewport()
         viewport_height = max(1, viewport.height())
         document = self.chat_display.document()
@@ -10309,9 +11819,199 @@ class EncryptedChatClient(QObject):
                 RemoteMediaPreview,
             )
         }
-        currently_rendered_urls = set(self.rendered_image_positions)
-        if cached_desired_urls != currently_rendered_urls:
-            self._rerender_preserving_scroll()
+        currently_rendered_urls = set(self.rendered_loaded_image_urls)
+        urls_to_load = cached_desired_urls - currently_rendered_urls
+        urls_to_unload = currently_rendered_urls - desired_urls
+        if urls_to_load or urls_to_unload:
+            self._refresh_viewport_image_resources(
+                urls_to_load,
+                urls_to_unload,
+            )
+
+    def _set_rendered_inline_image(
+        self,
+        url: str,
+        preview: QImage,
+        *,
+        loaded: bool,
+    ) -> None:
+        positions = self.rendered_image_positions.get(url, [])
+        if not positions:
+            self.rendered_loaded_image_urls.discard(url)
+            return
+
+        width = max(1, preview.width())
+        height = max(1, preview.height())
+        if loaded:
+            self.embedded_image_preview_sizes[url] = (width, height)
+
+        resource_token = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        resource_url = QUrl(
+            f"spritelink-chat-image-resource:{resource_token}"
+        )
+        document = self.chat_display.document()
+        document.addResource(
+            QTextDocument.ResourceType.ImageResource,
+            resource_url,
+            preview,
+        )
+        maximum_position = max(0, document.characterCount() - 1)
+        geometry_changed = False
+        changed_image_blocks: set[int] = set()
+        for position in positions:
+            if position < 0 or position > maximum_position:
+                continue
+            cursor = QTextCursor(document)
+            cursor.setPosition(position)
+            if not cursor.movePosition(
+                QTextCursor.MoveOperation.NextCharacter,
+                QTextCursor.MoveMode.KeepAnchor,
+            ):
+                continue
+            image_format = cursor.charFormat().toImageFormat()
+            if image_format.name() != resource_url.toString():
+                continue
+            size_changed = (
+                int(round(image_format.width())) != width
+                or int(round(image_format.height())) != height
+            )
+            if size_changed:
+                image_format.setWidth(width)
+                image_format.setHeight(height)
+                geometry_changed = True
+                changed_image_blocks.add(cursor.block().position())
+
+            # Reapply the inline format on every decoded resource swap. Qt can
+            # otherwise retain the placeholder pixels when the real preview
+            # happens to have the same geometry.
+            cursor.setCharFormat(image_format)
+            document.markContentsDirty(position, 1)
+
+        if geometry_changed:
+            # Image-only messages top-align their username and profile icon
+            # against the preview.  Those text baseline offsets were created
+            # from the placeholder height, so resize them in the same hidden
+            # transaction as the image character instead of waiting for a
+            # later document rebuild.
+            for block_position in changed_image_blocks:
+                self._realign_inline_image_block_text(
+                    document,
+                    block_position,
+                )
+            # Inline-object size changes can leave the surrounding block with
+            # stale line geometry until another scroll event. Complete layout
+            # while the viewport transaction is still hidden; its saved
+            # anchor is restored before updates are enabled again.
+            document.documentLayout().documentSize()
+        self.chat_display.viewport().update()
+
+        if loaded:
+            self.rendered_loaded_image_urls.add(url)
+        else:
+            self.rendered_loaded_image_urls.discard(url)
+
+    def _realign_inline_image_block_text(
+        self,
+        document: QTextDocument,
+        block_position: int,
+    ) -> None:
+        block = document.findBlock(block_position)
+        if not block.isValid():
+            return
+
+        block_start = block.position()
+        block_end = block_start + max(0, block.length() - 1)
+        preview_height = 0
+        text_characters: list[tuple[QTextCursor, QTextCharFormat]] = []
+
+        for position in range(block_start, block_end):
+            cursor = QTextCursor(document)
+            cursor.setPosition(position)
+            if not cursor.movePosition(
+                QTextCursor.MoveOperation.NextCharacter,
+                QTextCursor.MoveMode.KeepAnchor,
+            ):
+                continue
+            formatting = cursor.charFormat()
+            if formatting.isImageFormat():
+                image_format = formatting.toImageFormat()
+                if image_format.name().startswith(
+                    "spritelink-chat-image-resource:"
+                ):
+                    preview_height = max(
+                        preview_height,
+                        max(1, int(round(image_format.height()))),
+                    )
+                continue
+            text_characters.append((cursor, formatting))
+
+        if preview_height <= 0:
+            return
+
+        for cursor, formatting in text_characters:
+            font_height = max(1, QFontMetrics(formatting.font()).height())
+            upward_pixels = max(
+                0.0,
+                (preview_height - font_height) / 2.0,
+            )
+            formatting.setBaselineOffset(
+                upward_pixels * 100.0 / font_height
+            )
+            cursor.setCharFormat(formatting)
+            document.markContentsDirty(cursor.selectionStart(), 1)
+
+    def _refresh_viewport_image_resources(
+        self,
+        urls_to_load: set[str],
+        urls_to_unload: set[str],
+    ) -> None:
+        anchor = self._capture_chat_view_anchor()
+        generation = self._history_render_generation
+        room_id = self.active_chatroom_id
+        self._media_rerender_in_progress = True
+        self._set_history_render_updates_suppressed(True)
+
+        for url in urls_to_unload:
+            preview_size = self.embedded_image_preview_sizes.get(url)
+            if preview_size is None:
+                preview_size = (
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
+                )
+                self.embedded_image_preview_sizes[url] = preview_size
+            self._set_rendered_inline_image(
+                url,
+                self._unloaded_image_placeholder(*preview_size),
+                loaded=False,
+            )
+            if self.current_image_preview_url != url:
+                controller = self.animated_media_controllers.pop(
+                    url,
+                    None,
+                )
+                if controller is not None:
+                    controller.stop()
+                    controller.deleteLater()
+                self.last_inline_animation_frame_at.pop(url, None)
+
+        for url in urls_to_load:
+            media = self.image_preview_cache.get(url)
+            if not isinstance(media, RemoteMediaPreview):
+                continue
+            preview = self._embedded_media_preview(url, media)
+            self._set_rendered_inline_image(
+                url,
+                preview,
+                loaded=True,
+            )
+            if not is_likely_nsfw_image_url(url):
+                self._ensure_animated_media_controller(url, media)
+
+        self._finish_preserving_scroll_rerender(
+            generation,
+            room_id,
+            anchor,
+        )
 
     def _schedule_image_preview_fetch(self, url: str) -> None:
         if (
@@ -10540,13 +12240,11 @@ class EncryptedChatClient(QObject):
         ):
             if event.type() == QEvent.Type.WindowActivate:
                 self.window_focused_event.set()
-                self.network_wakeup_event.set()
                 self._sync_connection_error_timer()
                 if hasattr(self, "tray_icon"):
                     self._mark_chatroom_read(self.active_chatroom_id)
             elif event.type() == QEvent.Type.WindowDeactivate:
                 self.window_focused_event.clear()
-                self.network_wakeup_event.set()
                 self._sync_connection_error_timer()
             elif event.type() == QEvent.Type.WindowStateChange:
                 QTimer.singleShot(0, self._sync_window_activity)
@@ -10574,6 +12272,21 @@ class EncryptedChatClient(QObject):
                 self.viewport_media_timer.start(
                     VIEWPORT_MEDIA_UPDATE_DELAY_MS
                 )
+
+            elif (
+                event.type() == QEvent.Type.Wheel
+                and event.angleDelta().y() > 0
+                and self.chat_display.verticalScrollBar().value()
+                <= self.chat_display.verticalScrollBar().minimum()
+            ):
+                # A wheel-up at the top is still meaningful when the first
+                # pages do not fill a tall viewport and the scrollbar cannot
+                # emit a changed value.
+                # Use the same tokenized/coalesced entrypoint as the
+                # scrollbar. Calling the request callback directly would omit
+                # its required generation/room token and crash when the user
+                # overscrolls an already-exhausted history.
+                self._on_chat_history_scroll_action(0)
 
             elif event.type() == QEvent.Type.MouseMove:
                 anchor = self.chat_display.anchorAt(event.position().toPoint())
@@ -10856,23 +12569,35 @@ class EncryptedChatClient(QObject):
 
         displayed_image = image
         resource_suffix = ""
-        if align_top:
+        top_padding = (
+            max(
+                0,
+                TOP_ALIGNED_PROFILE_ICON_PADDING
+                - PROFILE_ICON_VERTICAL_OFFSET_PX,
+            )
+            if align_top
+            else PROFILE_ICON_VERTICAL_OFFSET_PX
+        )
+        bottom_padding = (
+            0
+            if align_top
+            else PROFILE_ICON_VERTICAL_OFFSET_PX
+        )
+        if top_padding or bottom_padding:
             padded_image = QImage(
                 image.width(),
-                image.height() + TOP_ALIGNED_PROFILE_ICON_PADDING,
+                image.height() + top_padding + bottom_padding,
                 QImage.Format.Format_ARGB32,
             )
             padded_image.fill(Qt.GlobalColor.transparent)
             painter = QPainter(padded_image)
-            painter.drawImage(
-                0,
-                TOP_ALIGNED_PROFILE_ICON_PADDING,
-                image,
-            )
+            painter.drawImage(0, top_padding, image)
             painter.end()
             padded_image.setDevicePixelRatio(1.0)
             displayed_image = padded_image
-            resource_suffix = "-top-padded"
+            resource_suffix = (
+                f"-vertical-offset-{PROFILE_ICON_VERTICAL_OFFSET_PX}"
+            )
 
         opacity = max(0.0, min(1.0, opacity))
         if opacity < 1.0:
@@ -10909,10 +12634,12 @@ class EncryptedChatClient(QObject):
         image_format.setAnchorHref(f"spritelink:{message_id}")
         # Inline images participate in Qt's automatic line-height calculation,
         # so a short text line expands to the icon's native 16-pixel height.
+        # A normal 16 px icon belongs at y=2 in the fixed 24 px row:
+        # centered at y=4, then shifted upward by exactly 2 px. Aligning the
+        # padded 20 px canvas to the row top avoids AlignMiddle's half-pixel
+        # rounding, which previously reduced the visible shift to one pixel.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
-            if align_top
-            else QTextCharFormat.VerticalAlignment.AlignMiddle
         )
         cursor.insertImage(image_format)
         return True
@@ -11173,15 +12900,15 @@ class EncryptedChatClient(QObject):
         frame: QImage,
     ) -> QImage:
         preserve_native_size = (
-            frame.width() <= INLINE_MEDIA_NO_UPSCALE_EDGE
-            and frame.height() <= INLINE_MEDIA_NO_UPSCALE_EDGE
+            frame.width() <= EMBEDDED_IMAGE_MAX_WIDTH
+            and frame.height() <= EMBEDDED_IMAGE_MAX_HEIGHT
         )
         if preserve_native_size:
             preview = frame.copy()
         else:
             preview = frame.scaled(
-                EMBEDDED_IMAGE_MAX_EDGE,
-                EMBEDDED_IMAGE_MAX_EDGE,
+                EMBEDDED_IMAGE_MAX_WIDTH,
+                EMBEDDED_IMAGE_MAX_HEIGHT,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
@@ -11189,8 +12916,8 @@ class EncryptedChatClient(QObject):
             return preview
 
         canvas = QImage(
-            EMBEDDED_IMAGE_MAX_EDGE,
-            EMBEDDED_IMAGE_MAX_EDGE,
+            EMBEDDED_IMAGE_MAX_WIDTH,
+            EMBEDDED_IMAGE_MAX_HEIGHT,
             QImage.Format.Format_ARGB32_Premultiplied,
         )
         canvas.fill(Qt.GlobalColor.transparent)
@@ -11214,6 +12941,23 @@ class EncryptedChatClient(QObject):
             return self._scaled_inline_media_frame(media, media.frame)
         return self._animated_media_loading_placeholder()
 
+    def _unloaded_image_placeholder(
+        self,
+        width: int,
+        height: int,
+    ) -> QImage:
+        placeholder = QImage(
+            max(1, int(width)),
+            max(1, int(height)),
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        placeholder.fill(QColor("#d0d0d0"))
+        painter = QPainter(placeholder)
+        painter.setPen(QColor("#aaaaaa"))
+        painter.drawRect(placeholder.rect().adjusted(0, 0, -1, -1))
+        painter.end()
+        return placeholder
+
     def _insert_embedded_image_preview(
         self,
         cursor: QTextCursor,
@@ -11221,11 +12965,29 @@ class EncryptedChatClient(QObject):
         client_id: str,
     ) -> bool:
         media = self.image_preview_cache.get(url)
-        if not isinstance(media, RemoteMediaPreview):
-            return False
-        if not is_likely_nsfw_image_url(url):
-            self._ensure_animated_media_controller(url, media)
-        preview = self._embedded_media_preview(url, media)
+        show_loaded_preview = (
+            url in self.viewport_embedded_image_urls
+            and isinstance(media, RemoteMediaPreview)
+        )
+        if show_loaded_preview:
+            assert isinstance(media, RemoteMediaPreview)
+            if not is_likely_nsfw_image_url(url):
+                self._ensure_animated_media_controller(url, media)
+            preview = self._embedded_media_preview(url, media)
+            self.embedded_image_preview_sizes[url] = (
+                preview.width(),
+                preview.height(),
+            )
+        else:
+            preview_size = self.embedded_image_preview_sizes.get(url)
+            if preview_size is None:
+                preview_size = (
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
+                )
+                self.embedded_image_preview_sizes[url] = preview_size
+            preview = self._unloaded_image_placeholder(*preview_size)
+
         link_token = hashlib.sha256(
             f"{client_id}\0{url}".encode("utf-8")
         ).hexdigest()
@@ -11255,12 +13017,14 @@ class EncryptedChatClient(QObject):
         self.rendered_image_positions.setdefault(url, []).append(
             image_position
         )
+        if show_loaded_preview:
+            self.rendered_loaded_image_urls.add(url)
         return True
 
     def _animated_media_loading_placeholder(self) -> QImage:
         placeholder = QImage(
-            EMBEDDED_IMAGE_MAX_EDGE,
-            EMBEDDED_IMAGE_MAX_EDGE,
+            EMBEDDED_IMAGE_MAX_WIDTH,
+            EMBEDDED_IMAGE_MAX_HEIGHT,
             QImage.Format.Format_ARGB32_Premultiplied,
         )
         placeholder.fill(QColor("#ececec"))
@@ -11320,7 +13084,7 @@ class EncryptedChatClient(QObject):
         text: str,
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
-    ) -> bool:
+    ) -> int:
         if cursor.block().text():
             cursor.insertBlock()
         separator_block = QTextBlockFormat()
@@ -11332,8 +13096,9 @@ class EncryptedChatClient(QObject):
         separator_block.setBackground(QColor(background_color))
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
+        separator_block_number = cursor.block().blockNumber()
         self.chat_display.row_background_padding_blocks[
-            cursor.block().blockNumber()
+            separator_block_number
         ] = (QColor(background_color), 7, 7)
 
         selection = QTextEdit.ExtraSelection()
@@ -11348,7 +13113,7 @@ class EncryptedChatClient(QObject):
 
         cursor.insertBlock()
         cursor.setBlockFormat(QTextBlockFormat())
-        return True
+        return separator_block_number
 
     def _reset_chat_document(self) -> None:
         document = QTextDocument(self.chat_display)
@@ -11415,39 +13180,243 @@ class EncryptedChatClient(QObject):
             )
         return item
 
-    def _render_message_log(self, *, scroll_to_bottom: bool) -> None:
+    def _render_message_log(
+        self,
+        *,
+        scroll_to_bottom: bool,
+        on_finished: Any | None = None,
+    ) -> None:
         if self._tray_ui_suspended:
             return
+
+        previous_job = self._message_render_job
+        if (
+            on_finished is None
+            and isinstance(previous_job, dict)
+            and callable(previous_job.get("on_finished"))
+        ):
+            on_finished = previous_job["on_finished"]
+
+        previous_message_backgrounds: dict[str, str] = {}
+        for block_number, message_id in self.rendered_message_blocks.items():
+            background = self.chat_display.row_background_blocks.get(
+                block_number
+            )
+            if isinstance(background, QColor) and background.isValid():
+                previous_message_backgrounds.setdefault(
+                    message_id,
+                    background.name().casefold(),
+                )
+
+        self._message_render_generation += 1
+        generation = self._message_render_generation
+        self._rendering_message_log = True
         self._hide_chat_tooltip()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
+        self.rendered_message_last_blocks.clear()
         self.rendered_image_links.clear()
         self.rendered_link_targets.clear()
         self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
+        self.rendered_loaded_image_urls.clear()
         self.chat_display.clear()
         self.chat_display.row_background_blocks.clear()
         self.chat_display.row_background_padding_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
+        self.chat_display.unread_divider_block_number = None
 
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
         trusted_user_ids = self._room_preference_ids(
             "trusted_link_and_image_users"
         )
         row_selections: list[QTextEdit.ExtraSelection] = []
-        previous_timestamp: int | None = None
-        first_item = True
-        stripe_index = 0
 
+        visible_message_limit = max(
+            INITIAL_HISTORY_RENDER_MESSAGES,
+            int(self.rendered_history_message_limit),
+        )
+        visible_message_items = self.message_log[-visible_message_limit:]
         display_groups = group_messages_for_display(
-            self.message_log,
+            visible_message_items,
             muted_ids,
         )
+        unread_boundary_id = self._unread_after_message_ids().get(
+            self.active_chatroom_id
+        ) or self.read_divider_message_ids.get(self.active_chatroom_id)
+        if unread_boundary_id:
+            boundary_split_groups: list[list[dict[str, Any]]] = []
+            for group in display_groups:
+                boundary_index = next(
+                    (
+                        index
+                        for index, source in enumerate(group)
+                        if self._message_id_from_log_item(source)
+                        == unread_boundary_id
+                    ),
+                    -1,
+                )
+                if 0 <= boundary_index < len(group) - 1:
+                    boundary_split_groups.append(group[:boundary_index + 1])
+                    boundary_split_groups.append(group[boundary_index + 1:])
+                else:
+                    boundary_split_groups.append(group)
+            display_groups = boundary_split_groups
+
+        # Calculate the final chronological stripe/separator plan once, then
+        # execute it backwards.  The newest row becomes visible immediately;
+        # each later GUI turn prepends one older row while preserving the
+        # completed document's normal oldest-to-newest order.
+        render_steps: list[dict[str, Any]] = []
+        previous_timestamp: int | None = None
+        stripe_index = 0
         for group in display_groups:
+            separator_specs: list[tuple[str, str]] = []
+            current_timestamp = self._display_timestamp_for_item(group[0])
+            if previous_timestamp is not None:
+                for separator_text in message_log_separator_texts(
+                    previous_timestamp,
+                    current_timestamp,
+                ):
+                    separator_specs.append((
+                        separator_text,
+                        MESSAGE_ROW_BACKGROUNDS[
+                            stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                        ],
+                    ))
+                    stripe_index += 1
+            if render_steps:
+                render_steps[-1]["separators_after"] = separator_specs
+            render_steps.append({
+                "group": group,
+                "background_color": MESSAGE_ROW_BACKGROUNDS[
+                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                ],
+                "separators_after": [],
+            })
+            stripe_index += 1
+            previous_timestamp = self._display_timestamp_for_item(group[-1])
+
+        # Expanding the visible suffix can prepend an odd number of message
+        # and separator rows. Anchor the new plan to any message that was
+        # already rendered so existing white/gray stripes never swap places.
+        background_indices = {
+            QColor(color).name().casefold(): index
+            for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS)
+        }
+        stripe_shift = 0
+        for step in render_steps:
+            planned_index = background_indices.get(
+                QColor(str(step["background_color"])).name().casefold()
+            )
+            if planned_index is None:
+                continue
+            for source in reversed(step["group"]):
+                message_id = self._message_id_from_log_item(source)
+                previous_color = previous_message_backgrounds.get(
+                    message_id
+                )
+                previous_index = background_indices.get(previous_color or "")
+                if previous_index is None:
+                    continue
+                stripe_shift = (
+                    previous_index - planned_index
+                ) % len(MESSAGE_ROW_BACKGROUNDS)
+                break
+            else:
+                continue
+            break
+
+        if stripe_shift:
+            for step in render_steps:
+                planned_index = background_indices[
+                    QColor(str(step["background_color"])).name().casefold()
+                ]
+                step["background_color"] = MESSAGE_ROW_BACKGROUNDS[
+                    (planned_index + stripe_shift)
+                    % len(MESSAGE_ROW_BACKGROUNDS)
+                ]
+                step["separators_after"] = [
+                    (
+                        separator_text,
+                        MESSAGE_ROW_BACKGROUNDS[
+                            (
+                                background_indices[
+                                    QColor(background_color)
+                                    .name()
+                                    .casefold()
+                                ]
+                                + stripe_shift
+                            )
+                            % len(MESSAGE_ROW_BACKGROUNDS)
+                        ],
+                    )
+                    for separator_text, background_color
+                    in step["separators_after"]
+                ]
+
+        self._message_render_job = {
+            "generation": generation,
+            "room_id": self.active_chatroom_id,
+            "scroll_to_bottom": scroll_to_bottom,
+            "on_finished": on_finished,
+            "muted_ids": muted_ids,
+            "collapsed_ids": collapsed_ids,
+            "trusted_user_ids": trusted_user_ids,
+            "row_selections": row_selections,
+            "display_groups": display_groups,
+            "render_steps": render_steps,
+            "unread_boundary_id": unread_boundary_id,
+            "newest_first": bool(scroll_to_bottom),
+            "cursor": self.chat_display.textCursor(),
+            "previous_timestamp": None,
+            "previous_message_id": None,
+            "first_item": True,
+            "stripe_index": 0,
+            "stripe_shift": stripe_shift,
+            "index": (
+                len(render_steps) - 1
+                if scroll_to_bottom
+                else 0
+            ),
+        }
+        if scroll_to_bottom:
+            self._continue_message_log_render(generation)
+        else:
+            self._continue_message_log_render_forward(generation)
+
+    def _continue_message_log_render_forward(
+        self,
+        generation: int,
+    ) -> None:
+        job = self._message_render_job
+        if (
+            not isinstance(job, dict)
+            or generation != self._message_render_generation
+            or generation != job.get("generation")
+            or job.get("room_id") != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            return
+
+        cursor = job["cursor"]
+        muted_ids = job["muted_ids"]
+        collapsed_ids = job["collapsed_ids"]
+        trusted_user_ids = job["trusted_user_ids"]
+        row_selections = job["row_selections"]
+        display_groups = job["display_groups"]
+        unread_boundary_id = job["unread_boundary_id"]
+        index = int(job["index"])
+        previous_timestamp = job["previous_timestamp"]
+        previous_message_id = job["previous_message_id"]
+        first_item = bool(job["first_item"])
+        stripe_index = int(job["stripe_index"])
+        stripe_shift = int(job["stripe_shift"])
+
+        if index < len(display_groups):
+            group = display_groups[index]
             item = self._display_item_for_group(group, muted_ids)
             current_timestamp = self._display_timestamp_for_item(group[0])
             separator_texts = (
@@ -11458,16 +13427,26 @@ class EncryptedChatClient(QObject):
                 if previous_timestamp is not None
                 else ()
             )
+            last_separator_block_number: int | None = None
             for separator_text in separator_texts:
-                if self._insert_log_separator(
+                last_separator_block_number = self._insert_log_separator(
                     cursor,
                     separator_text,
                     MESSAGE_ROW_BACKGROUNDS[
-                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                        (stripe_index + stripe_shift)
+                        % len(MESSAGE_ROW_BACKGROUNDS)
                     ],
                     row_selections,
-                ):
-                    stripe_index += 1
+                )
+                stripe_index += 1
+            if (
+                last_separator_block_number is not None
+                and unread_boundary_id
+                and previous_message_id == unread_boundary_id
+            ):
+                self.rendered_message_last_blocks[unread_boundary_id] = (
+                    last_separator_block_number
+                )
             if not first_item and not separator_texts:
                 cursor.insertBlock()
 
@@ -11478,13 +13457,31 @@ class EncryptedChatClient(QObject):
                 collapsed_ids=collapsed_ids,
                 trusted_user_ids=trusted_user_ids,
                 background_color=MESSAGE_ROW_BACKGROUNDS[
-                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                    (stripe_index + stripe_shift)
+                    % len(MESSAGE_ROW_BACKGROUNDS)
                 ],
                 row_selections=row_selections,
             )
             stripe_index += 1
             first_item = False
             previous_timestamp = self._display_timestamp_for_item(group[-1])
+            previous_message_id = self._message_id_from_log_item(group[-1])
+            index += 1
+
+        job["index"] = index
+        job["previous_timestamp"] = previous_timestamp
+        job["previous_message_id"] = previous_message_id
+        job["first_item"] = first_item
+        job["stripe_index"] = stripe_index
+
+        if index < len(display_groups):
+            QTimer.singleShot(
+                MESSAGE_RENDER_STEP_DELAY_MS,
+                lambda: self._continue_message_log_render_forward(
+                    generation
+                ),
+            )
+            return
 
         self.chat_display.row_background_blocks = {
             selection.cursor.block().blockNumber(): QColor(
@@ -11493,10 +13490,13 @@ class EncryptedChatClient(QObject):
             for selection in row_selections
             if selection.cursor.block().isValid()
         }
-        self.chat_display.setExtraSelections(row_selections)
+        self.chat_display.setExtraSelections([])
+        self._message_render_job = None
+        self._rendering_message_log = False
+        self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
 
-        active_animated_urls = set(self.rendered_image_positions)
+        active_animated_urls = set(self.rendered_loaded_image_urls)
         if self.current_image_preview_url:
             active_animated_urls.add(self.current_image_preview_url)
         for url in list(self.animated_media_controllers):
@@ -11507,12 +13507,285 @@ class EncryptedChatClient(QObject):
             controller.deleteLater()
             self.last_inline_animation_frame_at.pop(url, None)
 
-        if scroll_to_bottom:
+        self.viewport_media_timer.start(
+            VIEWPORT_MEDIA_UPDATE_DELAY_MS
+        )
+        on_finished = job.get("on_finished")
+        if callable(on_finished):
+            on_finished()
+        QTimer.singleShot(0, self._flush_pending_live_message_render)
+
+    def _insert_log_separator_before_newer_content(
+        self,
+        cursor: QTextCursor,
+        text: str,
+        background_color: str,
+        row_selections: list[QTextEdit.ExtraSelection],
+    ) -> int:
+        # Unlike the append-oriented separator helper, this leaves no trailing
+        # empty block: the already-rendered newer content is immediately next.
+        if cursor.block().text():
+            cursor.insertBlock()
+        separator_block = QTextBlockFormat()
+        separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        separator_block.setTopMargin(7)
+        separator_block.setBottomMargin(7)
+        separator_block.setBackground(QColor(background_color))
+        cursor.setBlockFormat(separator_block)
+        cursor.insertText(text, self._text_format("#777777"))
+        separator_block_number = cursor.block().blockNumber()
+        self.chat_display.row_background_padding_blocks[
+            separator_block_number
+        ] = (QColor(background_color), 7, 7)
+
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = QTextCursor(cursor.block())
+        selection.cursor.clearSelection()
+        selection.format.setBackground(QColor(background_color))
+        selection.format.setProperty(
+            QTextFormat.Property.FullWidthSelection,
+            True,
+        )
+        row_selections.append(selection)
+        return separator_block_number
+
+    def _bottom_align_short_message_log(self) -> None:
+        document = self.chat_display.document()
+        root_frame = document.rootFrame()
+        frame_format = root_frame.frameFormat()
+        if frame_format.topMargin() != 0.0:
+            frame_format.setTopMargin(0.0)
+            root_frame.setFrameFormat(frame_format)
+
+        content_height = (
+            document.documentLayout().documentSize().height()
+        )
+        top_margin = max(
+            0.0,
+            float(self.chat_display.viewport().height()) - content_height,
+        )
+        if top_margin <= 0.0:
+            return
+        frame_format = root_frame.frameFormat()
+        frame_format.setTopMargin(top_margin)
+        root_frame.setFrameFormat(frame_format)
+
+    def _continue_message_log_render(self, generation: int) -> None:
+        job = self._message_render_job
+        if (
+            not isinstance(job, dict)
+            or generation != self._message_render_generation
+            or generation != job.get("generation")
+            or job.get("room_id") != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            return
+
+        muted_ids = job["muted_ids"]
+        collapsed_ids = job["collapsed_ids"]
+        trusted_user_ids = job["trusted_user_ids"]
+        row_selections = job["row_selections"]
+        render_steps = job["render_steps"]
+        unread_boundary_id = job["unread_boundary_id"]
+        index = int(job["index"])
+        preserve_anchor: dict[str, Any] | None = None
+        if index >= 0:
+            step = render_steps[index]
+            group = step["group"]
+            item = self._display_item_for_group(group, muted_ids)
+            document = self.chat_display.document()
+            old_block_count = document.blockCount()
+            old_character_count = document.characterCount()
+            preserve_anchor = (
+                self._capture_chat_view_anchor()
+                if (
+                    bool(job.get("preserve_viewport_while_prepending"))
+                    and bool(self.rendered_message_blocks)
+                )
+                else None
+            )
+
+            # Integer block/character positions do not follow QTextDocument
+            # edits automatically. Preserve the existing newer rows, clear the
+            # live maps to avoid low-number collisions, then shift them by the
+            # exact amount inserted at the front.
+            old_message_blocks = dict(self.rendered_message_blocks)
+            old_message_last_blocks = dict(
+                self.rendered_message_last_blocks
+            )
+            old_image_positions = {
+                url: list(positions)
+                for url, positions in self.rendered_image_positions.items()
+            }
+            old_image_candidates = {
+                url: list(positions)
+                for url, positions in self.rendered_image_candidates.items()
+            }
+            old_padding_blocks = dict(
+                self.chat_display.row_background_padding_blocks
+            )
+            old_collapsed_blocks = dict(
+                self.chat_display.collapsed_fade_blocks
+            )
+            old_row_selections = [
+                (
+                    selection.cursor.position(),
+                    QTextCharFormat(selection.format),
+                )
+                for selection in row_selections
+            ]
+
+            self.rendered_message_blocks.clear()
+            self.rendered_message_last_blocks.clear()
+            self.rendered_image_positions.clear()
+            self.rendered_image_candidates.clear()
+            self.chat_display.row_background_padding_blocks.clear()
+            self.chat_display.collapsed_fade_blocks.clear()
+            row_selections.clear()
+
+            cursor = QTextCursor(document)
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            if old_message_blocks:
+                # insertBlock() leaves the cursor in the existing block when
+                # splitting at position zero. Move back into the new blank
+                # block so the prepended sender cannot share or reformat the
+                # first already-rendered message.
+                cursor.insertBlock()
+                cursor.movePosition(
+                    QTextCursor.MoveOperation.PreviousBlock
+                )
+            self._insert_message_item(
+                cursor,
+                item,
+                muted_ids=muted_ids,
+                collapsed_ids=collapsed_ids,
+                trusted_user_ids=trusted_user_ids,
+                background_color=str(step["background_color"]),
+                row_selections=row_selections,
+            )
+
+            last_separator_block_number: int | None = None
+            for separator_text, background_color in step[
+                "separators_after"
+            ]:
+                last_separator_block_number = (
+                    self._insert_log_separator_before_newer_content(
+                        cursor,
+                        str(separator_text),
+                        str(background_color),
+                        row_selections,
+                    )
+                )
+
+            block_delta = document.blockCount() - old_block_count
+            character_delta = (
+                document.characterCount() - old_character_count
+            )
+            self.rendered_message_blocks.update({
+                block_number + block_delta: message_id
+                for block_number, message_id in old_message_blocks.items()
+            })
+            self.rendered_message_last_blocks.update({
+                message_id: block_number + block_delta
+                for message_id, block_number
+                in old_message_last_blocks.items()
+            })
+            for url, positions in old_image_positions.items():
+                self.rendered_image_positions.setdefault(url, []).extend(
+                    position + character_delta
+                    for position in positions
+                )
+            for url, positions in old_image_candidates.items():
+                self.rendered_image_candidates.setdefault(url, []).extend(
+                    position + character_delta
+                    for position in positions
+                )
+            self.chat_display.row_background_padding_blocks.update({
+                block_number + block_delta: value
+                for block_number, value in old_padding_blocks.items()
+            })
+            self.chat_display.collapsed_fade_blocks.update({
+                block_number + block_delta: value
+                for block_number, value in old_collapsed_blocks.items()
+            })
+            for position, formatting in old_row_selections:
+                selection = QTextEdit.ExtraSelection()
+                selection.cursor = QTextCursor(document)
+                selection.cursor.setPosition(
+                    position + character_delta
+                )
+                selection.cursor.clearSelection()
+                selection.format = QTextCharFormat(formatting)
+                row_selections.append(selection)
+
+            if (
+                last_separator_block_number is not None
+                and unread_boundary_id
+                and self._message_id_from_log_item(group[-1])
+                == unread_boundary_id
+            ):
+                self.rendered_message_last_blocks[unread_boundary_id] = (
+                    last_separator_block_number
+                )
+            index -= 1
+
+        job["index"] = index
+
+        self.chat_display.row_background_blocks = {
+            selection.cursor.block().blockNumber(): QColor(
+                selection.format.background().color()
+            )
+            for selection in row_selections
+            if selection.cursor.block().isValid()
+        }
+        self._bottom_align_short_message_log()
+        if isinstance(preserve_anchor, dict):
+            # QTextDocument insertion and layout stay on the GUI thread, but
+            # only one displayed group is added per turn. Capture the user's
+            # current viewport immediately before each insertion and restore
+            # that live anchor immediately afterward. Scrolling therefore
+            # remains interactive throughout the page load instead of being
+            # frozen behind one hidden full-document transaction.
+            self.chat_display.document().documentLayout().documentSize()
+            self._restore_chat_view_anchor(preserve_anchor)
+        if index >= 0:
+            if bool(job["scroll_to_bottom"]):
+                scrollbar = self.chat_display.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
+            self.chat_display.viewport().update()
+            QTimer.singleShot(
+                MESSAGE_RENDER_STEP_DELAY_MS,
+                lambda: self._continue_message_log_render(generation),
+            )
+            return
+
+        self.chat_display.setExtraSelections([])
+        self._message_render_job = None
+        self._rendering_message_log = False
+        self._apply_active_unread_divider_block()
+        self.chat_display.horizontalScrollBar().setValue(0)
+
+        active_animated_urls = set(self.rendered_loaded_image_urls)
+        if self.current_image_preview_url:
+            active_animated_urls.add(self.current_image_preview_url)
+        for url in list(self.animated_media_controllers):
+            if url in active_animated_urls:
+                continue
+            controller = self.animated_media_controllers.pop(url)
+            controller.stop()
+            controller.deleteLater()
+            self.last_inline_animation_frame_at.pop(url, None)
+
+        if bool(job["scroll_to_bottom"]):
             scrollbar = self.chat_display.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
         self.viewport_media_timer.start(
             VIEWPORT_MEDIA_UPDATE_DELAY_MS
         )
+        on_finished = job.get("on_finished")
+        if callable(on_finished):
+            on_finished()
+        QTimer.singleShot(0, self._flush_pending_live_message_render)
 
     def _insert_message_item(
         self,
@@ -11613,17 +13886,12 @@ class EncryptedChatClient(QObject):
                 image_url,
                 [],
             ).append(message_start_position)
-        active_image_urls = [
-            image_url
-            for image_url in image_urls
-            if (
-                image_url in self.viewport_embedded_image_urls
-                and isinstance(
-                    self.image_preview_cache.get(image_url),
-                    RemoteMediaPreview,
-                )
-            )
-        ]
+        # Every trusted image gets an inline object during its first
+        # message render. Visibility determines whether that object contains
+        # the decoded preview or a 48x48 placeholder; it must never determine
+        # whether the object exists. Otherwise the first decode callback has
+        # no image character to refresh until scrolling rebuilds the row.
+        displayed_image_urls = list(image_urls)
 
         username_color = (
             self._blend_toward_chat_background(original_color)
@@ -11660,23 +13928,35 @@ class EncryptedChatClient(QObject):
         top_align_height = 0
         if (
             not is_collapsed
-            and bool(active_image_urls)
+            and bool(displayed_image_urls)
             and not message_text_without_image_links(
                 plain_display_text,
                 set(image_urls),
             ).strip()
         ):
-            for url in active_image_urls:
+            for url in displayed_image_urls:
                 cached_media = self.image_preview_cache.get(url)
-                if isinstance(cached_media, RemoteMediaPreview):
+                if (
+                    url in self.viewport_embedded_image_urls
+                    and isinstance(cached_media, RemoteMediaPreview)
+                ):
                     preview_height = self._embedded_media_preview(
                         url,
                         cached_media,
                     ).height()
-                    top_align_height = max(
-                        top_align_height,
-                        preview_height,
-                    )
+                else:
+                    preview_size = self.embedded_image_preview_sizes.get(url)
+                    if preview_size is None:
+                        preview_size = (
+                            EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
+                            EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
+                        )
+                        self.embedded_image_preview_sizes[url] = preview_size
+                    preview_height = preview_size[1]
+                top_align_height = max(
+                    top_align_height,
+                    preview_height,
+                )
         align_message_top = top_align_height > 0
 
         has_profile_icon = self._insert_profile_icon(
@@ -11737,7 +14017,7 @@ class EncryptedChatClient(QObject):
             set(image_urls),
         )
         add_image_line_break = (
-            bool(active_image_urls)
+            bool(displayed_image_urls)
             and bool(visible_text_without_images.strip())
             and not visible_text_without_images.rstrip(" \t").endswith(
                 ("\n", "\r")
@@ -11771,7 +14051,7 @@ class EncryptedChatClient(QObject):
         cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
         if add_image_line_break:
             cursor.insertBlock()
-        for image_url in active_image_urls:
+        for image_url in displayed_image_urls:
             if self._insert_embedded_image_preview(
                 cursor,
                 image_url,
@@ -11800,7 +14080,16 @@ class EncryptedChatClient(QObject):
             block_format.setLeftMargin(10)
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
-            block_format.setBackground(QColor(background_color))
+            # Only date/hour separators may contribute vertical margins.
+            # Ordinary message blocks always occupy fixed 24-pixel lines.
+            block_format.setTopMargin(0.0)
+            block_format.setBottomMargin(0.0)
+            # The custom full-width painter owns the entire normal stripe.
+            # Clear any inherited QTextBlock background so Qt cannot repaint
+            # the middle with independently rasterized vertical bounds.
+            block_format.clearProperty(
+                QTextFormat.Property.BackgroundBrush
+            )
             if block.blockNumber() not in embedded_media_block_numbers:
                 block_format.setLineHeight(
                     float(MESSAGE_LINE_HEIGHT_PX),
@@ -11821,6 +14110,10 @@ class EncryptedChatClient(QObject):
                 block.blockNumber()
             ] = message_id
             block = block.next()
+        for source_message_id in source_message_ids:
+            self.rendered_message_last_blocks[source_message_id] = (
+                final_block_number
+            )
 
         if is_collapsed:
             collapsed_block = document.findBlock(message_start_position)
@@ -11856,6 +14149,7 @@ class EncryptedChatClient(QObject):
         scrollbar.setValue(scrollbar.maximum())
 
     def _clear_visible_room(self) -> None:
+        self._reset_history_render_window()
         self._hide_chat_tooltip()
         if self.link_warning_overlay.isVisible():
             self._hide_link_warning_popup()
@@ -11866,11 +14160,13 @@ class EncryptedChatClient(QObject):
         self.message_log.clear()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
+        self.rendered_message_last_blocks.clear()
         self.rendered_image_links.clear()
         self.rendered_link_targets.clear()
         self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
+        self.rendered_loaded_image_urls.clear()
         self.viewport_embedded_image_urls.clear()
         self.viewport_media_timer.stop()
         for controller in self.animated_media_controllers.values():
@@ -11881,6 +14177,7 @@ class EncryptedChatClient(QObject):
         self.chat_display.row_background_blocks.clear()
         self.chat_display.row_background_padding_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
+        self.chat_display.unread_divider_block_number = None
         self.chat_display.setExtraSelections([])
         self._reset_chat_document()
 
@@ -12294,6 +14591,10 @@ class EncryptedChatClient(QObject):
             controller.stop()
         self.animated_media_controllers.clear()
         self.last_inline_animation_frame_at.clear()
+        self.history_load_executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
         self.image_fetch_executor.shutdown(
             wait=False,
             cancel_futures=True,

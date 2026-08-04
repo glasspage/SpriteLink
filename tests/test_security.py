@@ -55,9 +55,47 @@ class LazyViewportMediaTests(unittest.TestCase):
         insert_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_message_item
         )
-        self.assertIn("active_image_urls", insert_source)
-        self.assertIn("viewport_embedded_image_urls", insert_source)
+        self.assertIn("displayed_image_urls", insert_source)
+        self.assertIn("displayed_image_urls = list(image_urls)", insert_source)
+        self.assertNotIn(
+            "image_url in self.viewport_embedded_image_urls",
+            insert_source,
+        )
         self.assertNotIn("_schedule_image_preview_fetch", insert_source)
+
+    def test_fresh_images_reserve_an_inline_object_before_visibility(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        preview_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_embedded_image_preview
+        )
+
+        self.assertIn("displayed_image_urls = list(image_urls)", insert_source)
+        self.assertIn(
+            "for image_url in displayed_image_urls:",
+            insert_source,
+        )
+        self.assertIn(
+            "self.rendered_image_positions.setdefault(url, []).append",
+            preview_source,
+        )
+        self.assertIn(
+            "preview = self._unloaded_image_placeholder(*preview_size)",
+            preview_source,
+        )
+        self.assertIn(
+            "preview_size = self.embedded_image_preview_sizes.get(url)",
+            insert_source,
+        )
+        self.assertIn(
+            "self.embedded_image_preview_sizes[url] = preview_size",
+            insert_source,
+        )
+        self.assertNotIn(
+            "preview_height = self.embedded_image_preview_sizes[",
+            insert_source,
+        )
 
     def test_scroll_resize_and_render_refresh_lazy_media(self) -> None:
         build_source = inspect.getsource(
@@ -69,18 +107,156 @@ class LazyViewportMediaTests(unittest.TestCase):
         )
         self.assertIn("QEvent.Type.Resize", event_source)
         render_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._render_message_log
+            SPRITELINK.EncryptedChatClient._continue_message_log_render
         )
         self.assertIn("viewport_media_timer.start", render_source)
+
+    def test_unloaded_images_keep_their_rendered_pixel_size(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_embedded_image_preview
+        )
+        placeholder_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._unloaded_image_placeholder
+        )
+        self.assertIn(
+            "self.embedded_image_preview_sizes[url] =",
+            insert_source,
+        )
+        self.assertIn(
+            "self.embedded_image_preview_sizes.get(url)",
+            insert_source,
+        )
+        self.assertIn(
+            "preview = self._unloaded_image_placeholder(*preview_size)",
+            insert_source,
+        )
+        self.assertEqual(SPRITELINK.EMBEDDED_IMAGE_PLACEHOLDER_SIZE, 48)
+        self.assertIn("EMBEDDED_IMAGE_PLACEHOLDER_SIZE", insert_source)
+        self.assertNotIn("preview_size is None:\n                return False", insert_source)
+        self.assertIn('placeholder.fill(QColor("#d0d0d0"))', placeholder_source)
+        self.assertIn("max(1, int(width))", placeholder_source)
+        self.assertIn("max(1, int(height))", placeholder_source)
+
+    def test_image_resources_swap_in_place_with_a_stable_view_anchor(
+        self,
+    ) -> None:
+        viewport_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._update_viewport_media
+        )
+        refresh_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._refresh_viewport_image_resources
+        )
+        resource_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._set_rendered_inline_image
+        )
+        capture_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._capture_chat_view_anchor
+        )
+        finish_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._finish_preserving_scroll_rerender
+        )
+        restore_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._restore_preserving_scroll_rerender
+        )
+        anchor_restore_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._restore_chat_view_anchor
+        )
+        action_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._on_chat_history_scroll_action
+        )
+
+        self.assertIn("_refresh_viewport_image_resources(", viewport_source)
+        self.assertNotIn("_rerender_preserving_scroll()", viewport_source)
+        self.assertIn("_capture_chat_view_anchor()", refresh_source)
+        self.assertIn(
+            "_set_history_render_updates_suppressed(True)",
+            refresh_source,
+        )
+        self.assertIn("document.addResource(", resource_source)
+        self.assertIn("cursor.setCharFormat(image_format)", resource_source)
+        self.assertIn("document.markContentsDirty(position, 1)", resource_source)
+        self.assertIn("geometry_changed = False", resource_source)
+        self.assertIn("if size_changed:", resource_source)
+        self.assertIn(
+            "document.documentLayout().documentSize()",
+            resource_source,
+        )
+        self.assertIn("changed_image_blocks", resource_source)
+        self.assertIn(
+            "_realign_inline_image_block_text(",
+            resource_source,
+        )
+        self.assertIn("self.chat_display.viewport().update()", resource_source)
+        self.assertNotIn("self.chat_display.clear()", refresh_source)
+        self.assertIn("cursorForPosition(QPoint(0, 0))", capture_source)
+        self.assertIn("rendered_message_blocks", capture_source)
+        self.assertIn("blockBoundingRect(block)", capture_source)
+        self.assertIn("QTimer.singleShot(", finish_source)
+        self.assertIn(
+            "_restore_chat_view_anchor(anchor)",
+            restore_source,
+        )
+        self.assertIn(
+            "if bool(anchor.get(\"at_bottom\"))",
+            anchor_restore_source,
+        )
+        self.assertIn(
+            "block_top - float(anchor.get",
+            anchor_restore_source,
+        )
+        self.assertIn(
+            "self._media_rerender_in_progress = False",
+            restore_source,
+        )
+        self.assertIn(
+            "or self._history_render_updates_suppressed",
+            action_source,
+        )
+        self.assertIn(
+            "or self._media_rerender_in_progress",
+            action_source,
+        )
+        self.assertIn(
+            "scroll_position_is_near_history_start(",
+            action_source,
+        )
+        self.assertIn("scrollbar.sliderPosition()", action_source)
+
+    def test_loaded_image_geometry_realigns_its_existing_username(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._realign_inline_image_block_text
+        )
+
+        self.assertIn("document.findBlock(block_position)", source)
+        self.assertIn("formatting.isImageFormat()", source)
+        self.assertIn(
+            '"spritelink-chat-image-resource:"',
+            source,
+        )
+        self.assertIn("preview_height = max(", source)
+        self.assertIn("QFontMetrics(formatting.font()).height()", source)
+        self.assertIn("formatting.setBaselineOffset(", source)
+        self.assertIn("cursor.setCharFormat(formatting)", source)
+        self.assertIn("document.markContentsDirty", source)
 
     def test_far_animations_are_stopped_and_removed(self) -> None:
         viewport_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._update_viewport_media
         )
         self.assertIn(
-            "cached_desired_urls != currently_rendered_urls",
+            "urls_to_unload = currently_rendered_urls - desired_urls",
             viewport_source,
         )
+        refresh_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._refresh_viewport_image_resources
+        )
+        self.assertIn("controller.stop()", refresh_source)
         clear_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._clear_visible_room
         )
@@ -358,18 +534,342 @@ class BehaviorSettingsTests(unittest.TestCase):
         load_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._load_saved_history_for_current_room
         )
+        worker_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._load_saved_history_worker
+        )
         persist_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._persist_local_history
         )
         add_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._add_message_to_log
         )
-        self.assertIn("load_chatroom_history(", load_source)
+        self.assertIn("history_load_executor.submit(", load_source)
+        self.assertIn("load_chatroom_history(", worker_source)
         self.assertIn("save_chatroom_history(", persist_source)
         self.assertNotIn("save_config(", persist_source)
         self.assertIn("_chatroom_history_limit()", load_source)
         self.assertIn("_chatroom_history_limit()", persist_source)
         self.assertIn("_chatroom_history_limit()", add_source)
+
+    def test_long_chatroom_history_loading_is_threaded_and_staggered(
+        self,
+    ) -> None:
+        self.assertEqual(SPRITELINK.INITIAL_HISTORY_RENDER_MESSAGES, 50)
+        self.assertEqual(SPRITELINK.HISTORY_RENDER_PAGE_MESSAGES, 50)
+        self.assertEqual(
+            SPRITELINK.HISTORY_PREFETCH_SCROLL_FRACTION,
+            0.20,
+        )
+        self.assertEqual(SPRITELINK.MESSAGE_RENDER_STEP_DELAY_MS, 1)
+        self.assertEqual(SPRITELINK.UI_EVENT_BATCH_LIMIT, 8)
+
+        load_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._load_saved_history_for_current_room
+        )
+        worker_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._load_saved_history_worker
+        )
+        queue_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._process_ui_queue
+        )
+        self.assertIn("history_load_executor.submit(", load_source)
+        self.assertNotIn("load_chatroom_history(", load_source)
+        self.assertIn("load_chatroom_history(", worker_source)
+        self.assertIn(
+            "chunk_end - INITIAL_HISTORY_RENDER_MESSAGES",
+            worker_source,
+        )
+        self.assertIn('"history_chunk_loaded"', worker_source)
+        self.assertIn('"history_chunk_loaded"', queue_source)
+        self.assertIn("range(UI_EVENT_BATCH_LIMIT)", queue_source)
+        self.assertIn("self.message_log[0:0] = accepted_items", queue_source)
+        self.assertIn("_queue_live_message_render(", queue_source)
+        self.assertNotIn(
+            "_render_message_log(scroll_to_bottom=True)",
+            queue_source,
+        )
+
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._render_message_log
+        )
+        continue_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._continue_message_log_render
+        )
+        self.assertIn(
+            "visible_message_items = "
+            "self.message_log[-visible_message_limit:]",
+            render_source,
+        )
+        self.assertIn("previous_message_backgrounds", render_source)
+        self.assertIn("stripe_shift", render_source)
+        self.assertIn(
+            "previous_index - planned_index",
+            render_source,
+        )
+        self.assertNotIn("while index <", continue_source)
+        self.assertIn('"index": (', render_source)
+        self.assertIn("len(render_steps) - 1", render_source)
+        self.assertIn("if scroll_to_bottom", render_source)
+        self.assertIn("else 0", render_source)
+        self.assertIn('step = render_steps[index]', continue_source)
+        self.assertIn("index -= 1", continue_source)
+        self.assertIn(
+            "cursor.movePosition(QTextCursor.MoveOperation.Start)",
+            continue_source,
+        )
+        self.assertIn("if old_message_blocks:", continue_source)
+        self.assertIn("cursor.insertBlock()", continue_source)
+        self.assertIn(
+            "QTextCursor.MoveOperation.PreviousBlock",
+            continue_source,
+        )
+        self.assertLess(
+            continue_source.index("cursor.insertBlock()"),
+            continue_source.index("self._insert_message_item("),
+        )
+        bottom_align_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._bottom_align_short_message_log
+        )
+        self.assertIn("frame_format.setTopMargin(0.0)", bottom_align_source)
+        self.assertIn("viewport().height()", bottom_align_source)
+        self.assertIn("frame_format.setTopMargin(top_margin)", bottom_align_source)
+        self.assertIn(
+            "self._bottom_align_short_message_log()",
+            continue_source,
+        )
+        self.assertIn(
+            "_insert_log_separator_before_newer_content",
+            continue_source,
+        )
+        forward_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._continue_message_log_render_forward
+        )
+        self.assertIn(
+            "group = display_groups[index]",
+            forward_source,
+        )
+        self.assertIn("index += 1", forward_source)
+        self.assertIn(
+            "self._insert_log_separator(",
+            forward_source,
+        )
+        self.assertIn("stripe_shift = int(job[\"stripe_shift\"])", forward_source)
+        self.assertIn("stripe_index + stripe_shift", forward_source)
+        self.assertNotIn(
+            "_insert_log_separator_before_newer_content",
+            forward_source,
+        )
+        self.assertIn(
+            "if scroll_to_bottom:",
+            render_source,
+        )
+        self.assertIn(
+            "self._continue_message_log_render_forward(generation)",
+            render_source,
+        )
+        self.assertIn("block_number + block_delta", continue_source)
+        self.assertIn("position + character_delta", continue_source)
+        self.assertLess(
+            continue_source.index('step = render_steps[index]'),
+            continue_source.index("index -= 1"),
+        )
+        self.assertIn(
+            "QTimer.singleShot(\n"
+            "                MESSAGE_RENDER_STEP_DELAY_MS,",
+            continue_source,
+        )
+        self.assertIn(
+            "scrollbar.setValue(scrollbar.maximum())",
+            continue_source,
+        )
+
+        scroll_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._on_chat_history_scrolled
+        )
+        self.assertNotIn("_schedule_older_history_page()", scroll_source)
+        scroll_request = (
+            SPRITELINK.EncryptedChatClient
+            ._request_older_history_page_from_user_scroll
+        )
+        action_source = inspect.getsource(scroll_request)
+        self.assertIn("_schedule_older_history_page()", action_source)
+        scroll_action_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._on_chat_history_scroll_action
+        )
+        self.assertIn(
+            "self._older_history_user_request is not None",
+            scroll_action_source,
+        )
+        self.assertIn(
+            "self._older_history_user_request = request",
+            scroll_action_source,
+        )
+        self.assertIn(
+            "scrollbar.sliderPosition()",
+            scroll_action_source,
+        )
+        self.assertIn(
+            "scroll_position_is_near_history_start(",
+            scroll_action_source,
+        )
+        self.assertTrue(
+            SPRITELINK.scroll_position_is_near_history_start(20, 0, 100)
+        )
+        self.assertFalse(
+            SPRITELINK.scroll_position_is_near_history_start(21, 0, 100)
+        )
+        self.assertTrue(
+            SPRITELINK.scroll_position_is_near_history_start(30, 10, 110)
+        )
+        self.assertFalse(
+            SPRITELINK.scroll_position_is_near_history_start(31, 10, 110)
+        )
+        event_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
+        self.assertIn(
+            "self._on_chat_history_scroll_action(0)",
+            event_source,
+        )
+        self.assertNotIn(
+            "self._request_older_history_page_from_user_scroll,",
+            event_source,
+        )
+        self.assertIn(
+            "if self._older_history_user_request != request",
+            action_source,
+        )
+        self.assertIn(
+            "self._older_history_user_request = None",
+            action_source,
+        )
+        self.assertIn(
+            "scrollbar.value()",
+            action_source,
+        )
+        self.assertIn(
+            "scroll_position_is_near_history_start(",
+            action_source,
+        )
+        page_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._load_older_history_page
+        )
+        prepend_page_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._prepend_older_history_page
+        )
+        finish_page_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._finish_older_history_page
+        )
+        self.assertIn("HISTORY_RENDER_PAGE_MESSAGES", page_source)
+        self.assertIn("_prepend_older_history_page(", page_source)
+        self.assertNotIn("_render_message_log(", page_source)
+        self.assertNotIn(
+            "_set_history_render_updates_suppressed(True)",
+            page_source,
+        )
+        self.assertIn(
+            '"preserve_viewport_while_prepending": True',
+            prepend_page_source,
+        )
+        self.assertIn(
+            "self._continue_message_log_render(message_generation)",
+            prepend_page_source,
+        )
+        self.assertNotIn("self.chat_display.clear()", prepend_page_source)
+        self.assertNotIn(
+            "_set_history_render_updates_suppressed(",
+            prepend_page_source,
+        )
+        self.assertNotIn(
+            "_schedule_older_history_page()",
+            finish_page_source,
+        )
+        self.assertIn(
+            "self.viewport_media_timer.start(",
+            finish_page_source,
+        )
+        self.assertIn(
+            "preserve_anchor = (",
+            continue_source,
+        )
+        self.assertIn(
+            "self._capture_chat_view_anchor()",
+            continue_source,
+        )
+        self.assertIn(
+            "self._restore_chat_view_anchor(preserve_anchor)",
+            continue_source,
+        )
+        self.assertLess(
+            continue_source.index("self._capture_chat_view_anchor()"),
+            continue_source.index("self._insert_message_item("),
+        )
+        self.assertGreater(
+            continue_source.index(
+                "self._restore_chat_view_anchor(preserve_anchor)"
+            ),
+            continue_source.index("self._insert_message_item("),
+        )
+        queue_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._process_ui_queue
+        )
+        finish_initial_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._finalize_initial_history_render
+        )
+        self.assertNotIn(
+            "_maybe_prefetch_initial_history_page",
+            queue_source,
+        )
+        self.assertNotIn(
+            "_schedule_older_history_page()",
+            finish_initial_source,
+        )
+        reset_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._reset_history_render_window
+        )
+        self.assertIn(
+            "self._older_history_user_request = None",
+            reset_source,
+        )
+        build_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        self.assertIn("actionTriggered.connect", build_source)
+        switch_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._activate_chatroom
+        )
+        self.assertNotIn("_persist_local_history()", switch_source)
+
+        add_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._add_message_to_log
+        )
+        self.assertIn(
+            "self.rendered_history_message_limit + 1",
+            add_source,
+        )
+        self.assertIn("min(\n            len(self.message_log)", add_source)
+        self.assertIn("_queue_live_message_render(", add_source)
+        self.assertNotIn("_render_message_log(", add_source)
+
+        live_append_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._append_live_message_items
+        )
+        self.assertIn("self._insert_message_item(", live_append_source)
+        self.assertIn(
+            "cursor.movePosition(QTextCursor.MoveOperation.End)",
+            live_append_source,
+        )
+        self.assertIn(
+            "self.chat_display.row_background_blocks.update({",
+            live_append_source,
+        )
+        self.assertNotIn("self.chat_display.clear()", live_append_source)
+        self.assertNotIn("QTimer.singleShot(", live_append_source)
 
     def test_settings_never_embed_chatroom_history(self) -> None:
         config = SPRITELINK.default_config()
@@ -769,6 +1269,7 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
         }]
         client._message_sort_key = SPRITELINK.message_item_sort_key
         client._chatroom_history_limit.return_value = 100
+        client.rendered_history_message_limit = 1
 
         SPRITELINK.EncryptedChatClient._add_message_to_log(
             client,
@@ -931,6 +1432,8 @@ class TrayBehaviorTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._mark_tray_notification
         )
         self.assertIn("_tray_notification_icon", mark_source)
+        self.assertIn("set_windows_taskbar_attention", mark_source)
+        self.assertNotIn("setWindowIcon", mark_source)
         restore_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._restore_from_tray
         )
@@ -1145,13 +1648,83 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertNotIn("horizontalAdvance(username)", source)
         self.assertIn("setLeftMargin(10)", source)
         self.assertIn("setTextIndent(0)", source)
-        self.assertIn("setBackground(QColor(background_color))", source)
+        self.assertNotIn("block_format.setBackground(", source)
+        self.assertIn(
+            "block_format.clearProperty(",
+            source,
+        )
+        self.assertIn(
+            "QTextFormat.Property.BackgroundBrush",
+            source,
+        )
+        self.assertIn("setTopMargin(0.0)", source)
+        self.assertIn("setBottomMargin(0.0)", source)
+        self.assertIn("LineHeightTypes.FixedHeight", source)
+
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._continue_message_log_render
+        )
+        self.assertIn("setExtraSelections([])", render_source)
+        self.assertNotIn(
+            "setExtraSelections(row_selections)",
+            render_source,
+        )
+
+        content_bounds_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._block_content_vertical_bounds
+        )
+        self.assertIn("layout.boundingRect()", content_bounds_source)
+        self.assertIn(
+            "content_rect.toAlignedRect()",
+            content_bounds_source,
+        )
+        self.assertNotIn("round(", content_bounds_source)
+
+        row_bounds_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._block_row_vertical_bounds
+        )
+        self.assertIn("blockBoundingRect(block)", row_bounds_source)
+        self.assertIn("next_block = block.next()", row_bounds_source)
+        self.assertIn("blockBoundingRect(", row_bounds_source)
+        self.assertIn("_nearest_pixel_edge", row_bounds_source)
+        self.assertNotIn(
+            "row_background_padding_blocks",
+            row_bounds_source,
+        )
+        self.assertNotIn("layout.boundingRect()", row_bounds_source)
+        self.assertNotIn("toAlignedRect()", row_bounds_source)
+        self.assertNotIn("round(", row_bounds_source)
+
+        browser = mock.Mock()
+        block = mock.Mock()
+        next_block = mock.Mock()
+        block.next.return_value = next_block
+        next_block.isValid.return_value = True
+        document_layout = (
+            browser.document.return_value.documentLayout.return_value
+        )
+        document_layout.blockBoundingRect.side_effect = (
+            SPRITELINK.QRectF(0.0, 10.25, 100.0, 22.5),
+            SPRITELINK.QRectF(0.0, 32.75, 100.0, 22.5),
+        )
+        browser.verticalScrollBar.return_value.value.return_value = 3
+        browser._nearest_pixel_edge = (
+            SPRITELINK.MessageLogBrowser._nearest_pixel_edge
+        )
+        top, bottom = (
+            SPRITELINK.MessageLogBrowser._block_row_vertical_bounds(
+                browser,
+                block,
+            )
+        )
+        self.assertEqual((top, bottom), (7, 30))
 
         background_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_row_backgrounds
         )
-        self.assertIn("blockBoundingRect(block)", background_source)
-        self.assertIn("viewport_width", background_source)
+        self.assertIn("_block_row_vertical_bounds(block)", background_source)
+        self.assertIn("bottom - top", background_source)
+        self.assertNotIn("height + 1", background_source)
         paint_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser.paintEvent
         )
@@ -1159,6 +1732,19 @@ class RuntimeOptimizationTests(unittest.TestCase):
             paint_source.index("_paint_row_backgrounds(event)"),
             paint_source.index("super().paintEvent(event)"),
         )
+        self.assertGreater(
+            paint_source.index("_paint_final_row_background_tail(event)"),
+            paint_source.index("super().paintEvent(event)"),
+        )
+
+        tail_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser
+            ._paint_final_row_background_tail
+        )
+        self.assertIn("max(self.row_background_blocks)", tail_source)
+        self.assertIn("MESSAGE_ROW_BACKGROUNDS[1]", tail_source)
+        self.assertIn("_block_row_vertical_bounds(block)", tail_source)
+        self.assertIn("viewport_height - bottom", tail_source)
 
     def test_status_line_uses_chatroom_name_and_delayed_error(self) -> None:
         self.assertEqual(
@@ -1230,46 +1816,41 @@ class RuntimeOptimizationTests(unittest.TestCase):
     def test_network_worker_waits_until_real_work_is_due(self) -> None:
         self.assertEqual(
             SPRITELINK.polling_interval_seconds(
-                window_focused=True,
-                tray_suspended=False,
+                window_on_screen=True,
             ),
             6.0,
         )
         self.assertEqual(
             SPRITELINK.polling_interval_seconds(
-                window_focused=False,
-                tray_suspended=False,
+                window_on_screen=False,
             ),
             9.0,
         )
         self.assertEqual(
-            SPRITELINK.polling_interval_seconds(
-                window_focused=False,
-                tray_suspended=True,
-            ),
-            12.0,
-        )
-        self.assertEqual(
             SPRITELINK.muted_inactive_polling_interval_seconds(
-                window_focused=True,
-                tray_suspended=False,
+                window_on_screen=True,
             ),
             5 * 60.0,
         )
         self.assertEqual(
             SPRITELINK.muted_inactive_polling_interval_seconds(
-                window_focused=False,
-                tray_suspended=False,
+                window_on_screen=False,
             ),
             7.5 * 60.0,
         )
-        self.assertEqual(
-            SPRITELINK.muted_inactive_polling_interval_seconds(
-                window_focused=False,
-                tray_suspended=True,
-            ),
-            10 * 60.0,
+
+        activity_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._sync_window_activity
         )
+        network_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._network_loop
+        )
+        self.assertIn("not self._tray_ui_suspended", activity_source)
+        self.assertIn("self.root.isVisible()", activity_source)
+        self.assertIn("not self.root.isMinimized()", activity_source)
+        self.assertIn("self.window_on_screen_event", activity_source)
+        self.assertNotIn("window_focused_event", network_source)
+        self.assertNotIn("tray_mode_event", network_source)
         self.assertEqual(
             SPRITELINK.network_idle_wait_seconds(
                 now=100.0,
@@ -1508,19 +2089,50 @@ class RuntimeOptimizationTests(unittest.TestCase):
         )
         self.assertIn("poll_message_should_notify", background_source)
 
-    def test_network_wakes_immediately_for_send_config_and_focus(self) -> None:
+    def test_network_wakes_for_work_and_window_visibility_changes(self) -> None:
         refresh_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._request_network_refresh
         )
         send_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._send_current_message
         )
+        activity_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._sync_window_activity
+        )
         event_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient.eventFilter
         )
         self.assertIn("network_wakeup_event.set()", refresh_source)
         self.assertIn("network_wakeup_event.set()", send_source)
-        self.assertIn("network_wakeup_event.set()", event_source)
+        self.assertIn("network_wakeup_event.set()", activity_source)
+        self.assertNotIn("network_wakeup_event.set()", event_source)
+
+    def test_send_reconnect_bypasses_poll_rate_limits(self) -> None:
+        client = mock.Mock()
+        client.active_chatroom_id = "room-a"
+        SPRITELINK.EncryptedChatClient._request_network_refresh(
+            client,
+            poll_immediately=True,
+            bypass_rate_limits=True,
+        )
+        client.network_control_queue.put.assert_called_once_with({
+            "room_id": "room-a",
+            "poll_immediately": True,
+            "bypass_rate_limits": True,
+        })
+        client.network_wakeup_event.set.assert_called_once_with()
+
+        send_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._send_current_message
+        )
+        loop_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._network_loop
+        )
+        self.assertNotIn('"Not connected"', send_source)
+        self.assertIn("if not self.connected:", send_source)
+        self.assertIn("bypass_rate_limits=True", send_source)
+        self.assertIn("pending_control.get(\"bypass_rate_limits\")", loop_source)
+        self.assertIn("if not bypass_rate_limits:", loop_source)
 
     def test_ui_queue_is_signal_driven_instead_of_polled(self) -> None:
         init_source = inspect.getsource(
@@ -1578,6 +2190,108 @@ class RuntimeOptimizationTests(unittest.TestCase):
         self.assertIn("_tooltip_for_message_item", show_source)
 
 
+    def test_unread_divider_tracks_the_next_row_background_edge(
+        self,
+    ) -> None:
+        browser = mock.Mock()
+        block = mock.Mock()
+        browser._block_row_vertical_bounds.return_value = (42, 65)
+
+        divider_y = SPRITELINK.MessageLogBrowser._unread_divider_y(
+            browser,
+            block,
+        )
+
+        self.assertEqual(divider_y, 64)
+        browser._block_row_vertical_bounds.assert_called_once_with(block)
+        paint_source = inspect.getsource(
+            SPRITELINK.MessageLogBrowser._paint_unread_divider
+        )
+        fade_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._update_unread_divider_fade
+        )
+        self.assertIn("_unread_divider_y(block)", paint_source)
+        self.assertIn("_unread_divider_y(block)", fade_source)
+
+    def test_unread_divider_waits_for_staggered_render_to_finish(
+        self,
+    ) -> None:
+        apply_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._apply_active_unread_divider_block
+        )
+        fade_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._update_unread_divider_fade
+        )
+        prepend_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._prepend_older_history_page
+        )
+        self.assertIn("if self._rendering_message_log:", apply_source)
+        self.assertIn(
+            "self.chat_display.unread_divider_block_number = None",
+            apply_source,
+        )
+        self.assertIn("if self._rendering_message_log:", fade_source)
+        self.assertLess(
+            prepend_source.index("self._rendering_message_log = True"),
+            prepend_source.index(
+                "self._apply_active_unread_divider_block()"
+            ),
+        )
+
+        for continuation in (
+            SPRITELINK.EncryptedChatClient
+            ._continue_message_log_render_forward,
+            SPRITELINK.EncryptedChatClient._continue_message_log_render,
+        ):
+            source = inspect.getsource(continuation)
+            self.assertLess(
+                source.rindex("self._rendering_message_log = False"),
+                source.rindex(
+                    "self._apply_active_unread_divider_block()"
+                ),
+            )
+
+    def test_unread_divider_moves_below_a_separator_before_unread(
+        self,
+    ) -> None:
+        separator_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._insert_log_separator_before_newer_content
+        )
+        self.assertIn(") -> int:", separator_source)
+        self.assertIn("return separator_block_number", separator_source)
+        self.assertNotIn("cursor.insertBlock()\n        return", separator_source)
+
+        render_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._continue_message_log_render
+        )
+        self.assertIn(
+            "self._message_id_from_log_item(group[-1])",
+            render_source,
+        )
+        self.assertIn(
+            "== unread_boundary_id",
+            render_source,
+        )
+        self.assertIn(
+            "self.rendered_message_last_blocks[unread_boundary_id] =",
+            render_source,
+        )
+        self.assertIn(
+            "last_separator_block_number",
+            render_source,
+        )
+        self.assertLess(
+            render_source.index(
+                "_insert_log_separator_before_newer_content"
+            ),
+            render_source.index(
+                "self.rendered_message_last_blocks[unread_boundary_id] ="
+            ),
+        )
+
+
 class QualityOfLifeUpdateTests(unittest.TestCase):
     def test_single_instance_mutex_rejects_a_second_process(self) -> None:
         kernel32 = mock.Mock()
@@ -1628,14 +2342,25 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
         )
         edit_at = source.index('menu.addAction("Edit")')
         copy_at = source.index('menu.addAction("Copy Invite Code")')
-        mute_at = source.index(
-            'menu.addAction("Unmute" if is_muted else "Mute")'
-        )
+        mute_at = source.index('mute_menu = menu.addMenu("Mute")')
         remove_at = source.index('menu.addAction("Remove")')
+        forever_at = source.index('mute_menu.addAction("Forever")')
+        one_hour_at = source.index('mute_menu.addAction("For 1 hour")')
+        eight_hours_at = source.index('mute_menu.addAction("For 8 hours")')
+        twenty_four_hours_at = source.index(
+            'mute_menu.addAction("For 24 hours")'
+        )
         self.assertLess(edit_at, copy_at)
         self.assertLess(copy_at, mute_at)
         self.assertLess(mute_at, remove_at)
+        self.assertLess(forever_at, one_hour_at)
+        self.assertLess(one_hour_at, eight_hours_at)
+        self.assertLess(eight_hours_at, twenty_four_hours_at)
         self.assertIn("_copy_chatroom_invite_code(room_id)", source)
+        self.assertIn("mute_menu.menuAction().triggered.connect", source)
+        self.assertIn("duration_seconds=60 * 60", source)
+        self.assertIn("duration_seconds=8 * 60 * 60", source)
+        self.assertIn("duration_seconds=24 * 60 * 60", source)
 
     def test_user_and_message_context_menus_are_separated(self) -> None:
         user_source = inspect.getsource(
@@ -1901,19 +2626,25 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
         self.assertIn('"SpriteLinkSubscriptionRefreshClose"', refresh_source)
         self.assertIn("daemon=True", refresh_source)
 
-    def test_tray_state_selects_the_tray_poll_interval(self) -> None:
+    def test_minimized_and_tray_windows_share_off_screen_polling(self) -> None:
         suspend_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._suspend_for_tray
         )
         resume_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._resume_from_tray
         )
+        event_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient.eventFilter
+        )
         loop_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._network_loop
         )
-        self.assertIn("tray_mode_event.set()", suspend_source)
-        self.assertIn("tray_mode_event.clear()", resume_source)
-        self.assertIn("tray_mode_event.is_set()", loop_source)
+        self.assertIn("_sync_window_activity()", suspend_source)
+        self.assertIn("_sync_window_activity()", resume_source)
+        self.assertIn("WindowStateChange", event_source)
+        self.assertIn("_sync_window_activity", event_source)
+        self.assertIn("window_on_screen_event.is_set()", loop_source)
+        self.assertNotIn("tray_mode_event", loop_source)
 
 
 
@@ -2408,6 +3139,7 @@ class LinkSafetyTests(unittest.TestCase):
             "https://cdn.klipy.com/example.gif",
             "https://images.unsplash.com/example",
             "https://raw.githubusercontent.com/owner/repo/main/image.png",
+            "https://adriansblinkiecollection.neocities.org/blinkies.html",
         )
         for url in trusted_urls:
             with self.subTest(url=url):
@@ -2418,6 +3150,8 @@ class LinkSafetyTests(unittest.TestCase):
             "https://github.com.evil.example/login",
             "https://notgithub.com/login",
             "https://discord.com.evil.example/invite",
+            "https://adriansblinkiecollection.neocities.org.evil.example/",
+            "https://sub.adriansblinkiecollection.neocities.org/",
             "https://example.com/",
         ):
             with self.subTest(url=url):
@@ -3560,8 +4294,15 @@ class Version120ReleaseTests(unittest.TestCase):
         chat_shadow_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_text_shadows
         )
-        self.assertIn("setAlphaF(0.15)", chat_shadow_source)
+        self.assertNotIn("setAlphaF(0.15)", chat_shadow_source)
         self.assertIn("painter.translate(1, 1)", chat_shadow_source)
+        self.assertIn("painter.setOpacity(0.15)", chat_shadow_source)
+        self.assertLess(
+            chat_shadow_source.index("painter.setOpacity(0.15)"),
+            chat_shadow_source.index(
+                "layout.draw(painter, layout_origin, shadow_ranges)"
+            ),
+        )
         self.assertIn("layout.draw", chat_shadow_source)
         self.assertIn(
             "-self.verticalScrollBar().value()",
@@ -3591,16 +4332,30 @@ class Version120ReleaseTests(unittest.TestCase):
             toggle_source.index("_apply_application_font_strategy()"),
         )
 
-    def test_taskbar_and_tray_icons_share_unread_state(self) -> None:
+    def test_taskbar_flashes_without_changing_the_window_icon(self) -> None:
         mark_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._mark_tray_notification
         )
         clear_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._clear_tray_notification
         )
+        flash_source = inspect.getsource(
+            SPRITELINK.set_windows_taskbar_attention
+        )
+        self.assertIn(
+            "set_windows_taskbar_attention(int(self.root.winId()), True)",
+            mark_source,
+        )
+        self.assertIn(
+            "set_windows_taskbar_attention(int(self.root.winId()), False)",
+            clear_source,
+        )
         for source in (mark_source, clear_source):
-            self.assertIn("root.setWindowIcon", source)
-            self.assertIn("app.setWindowIcon", source)
+            self.assertNotIn("root.setWindowIcon", source)
+            self.assertNotIn("app.setWindowIcon", source)
+        self.assertIn("ctypes.windll.user32.FlashWindowEx", flash_source)
+        self.assertIn("FLASHW_TRAY | FLASHW_TIMERNOFG", flash_source)
+        self.assertIn("FLASHW_STOP", flash_source)
 
     def test_silent_windows_toast_payload_and_message_format(self) -> None:
         command = SPRITELINK.silent_windows_notification_command(
@@ -3854,6 +4609,31 @@ class Version120ReleaseTests(unittest.TestCase):
             source,
         )
         self.assertIn("embedded_media_block_numbers", source)
+
+        icon_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_profile_icon
+        )
+        self.assertEqual(SPRITELINK.PROFILE_ICON_VERTICAL_OFFSET_PX, 2)
+        self.assertIn(
+            "else PROFILE_ICON_VERTICAL_OFFSET_PX",
+            icon_source,
+        )
+        self.assertNotIn(
+            "VerticalAlignment.AlignMiddle",
+            icon_source,
+        )
+        self.assertIn(
+            "VerticalAlignment.AlignTop",
+            icon_source,
+        )
+        self.assertIn(
+            "TOP_ALIGNED_PROFILE_ICON_PADDING",
+            icon_source,
+        )
+        self.assertIn(
+            "- PROFILE_ICON_VERTICAL_OFFSET_PX",
+            icon_source,
+        )
 
         separator_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_log_separator
