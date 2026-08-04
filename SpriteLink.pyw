@@ -7248,34 +7248,194 @@ class EncryptedChatClient(QObject):
         ):
             return
 
-        scrollbar = self.chat_display.verticalScrollBar()
-        previous_value = scrollbar.value()
-        previous_maximum = scrollbar.maximum()
-        previous_distance_from_bottom = max(
-            0,
-            previous_maximum - previous_value,
-        )
-        self.rendered_history_message_limit = min(
+        previous_limit = min(
             len(self.message_log),
-            self.rendered_history_message_limit
-            + HISTORY_RENDER_PAGE_MESSAGES,
+            self.rendered_history_message_limit,
+        )
+        next_limit = min(
+            len(self.message_log),
+            previous_limit + HISTORY_RENDER_PAGE_MESSAGES,
         )
         self._loading_older_history_page = True
-        self._set_history_render_updates_suppressed(True)
-        self._render_message_log(
-            scroll_to_bottom=False,
-            on_finished=lambda: self._finish_older_history_page(
+        self._prepend_older_history_page(
+            generation,
+            room_id,
+            previous_limit,
+            next_limit,
+        )
+
+    def _prepend_older_history_page(
+        self,
+        generation: int,
+        room_id: str,
+        previous_limit: int,
+        next_limit: int,
+    ) -> None:
+        if (
+            generation != self._history_render_generation
+            or room_id != self.active_chatroom_id
+            or self._tray_ui_suspended
+        ):
+            self._loading_older_history_page = False
+            return
+
+        new_items = self.message_log[-next_limit:-previous_limit]
+        muted_ids = self._room_preference_ids("muted_users")
+        collapsed_ids = self._room_preference_ids("collapsed_messages")
+        trusted_user_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
+        )
+        display_groups = group_messages_for_display(new_items, muted_ids)
+        unread_boundary_id = self._unread_after_message_ids().get(
+            self.active_chatroom_id
+        ) or self.read_divider_message_ids.get(self.active_chatroom_id)
+        if unread_boundary_id:
+            boundary_split_groups: list[list[dict[str, Any]]] = []
+            for group in display_groups:
+                boundary_index = next(
+                    (
+                        index
+                        for index, source in enumerate(group)
+                        if self._message_id_from_log_item(source)
+                        == unread_boundary_id
+                    ),
+                    -1,
+                )
+                if 0 <= boundary_index < len(group) - 1:
+                    boundary_split_groups.append(group[:boundary_index + 1])
+                    boundary_split_groups.append(group[boundary_index + 1:])
+                else:
+                    boundary_split_groups.append(group)
+            display_groups = boundary_split_groups
+
+        self.rendered_history_message_limit = next_limit
+        if not display_groups:
+            self._finish_older_history_page(generation, room_id)
+            return
+
+        following_timestamp = (
+            self._display_timestamp_for_item(
+                self.message_log[-previous_limit]
+            )
+            if previous_limit > 0
+            else None
+        )
+        render_steps: list[dict[str, Any]] = []
+        for index, group in enumerate(display_groups):
+            if index + 1 < len(display_groups):
+                next_timestamp = self._display_timestamp_for_item(
+                    display_groups[index + 1][0]
+                )
+            else:
+                next_timestamp = following_timestamp
+            separator_specs = [
+                [separator_text, ""]
+                for separator_text in (
+                    message_log_separator_texts(
+                        self._display_timestamp_for_item(group[-1]),
+                        next_timestamp,
+                    )
+                    if next_timestamp is not None
+                    else ()
+                )
+            ]
+            render_steps.append({
+                "group": group,
+                "background_color": "",
+                "separators_after": separator_specs,
+            })
+
+        following_background_index = 0
+        if previous_limit > 0:
+            following_message_id = self._message_id_from_log_item(
+                self.message_log[-previous_limit]
+            )
+            following_block_number = self.rendered_message_last_blocks.get(
+                following_message_id
+            )
+            following_background = self.chat_display.row_background_blocks.get(
+                following_block_number
+            )
+            if isinstance(following_background, QColor):
+                following_background_name = (
+                    following_background.name().casefold()
+                )
+                for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS):
+                    if QColor(color).name().casefold() == following_background_name:
+                        following_background_index = index
+                        break
+
+        prepended_row_count = sum(
+            1 + len(step["separators_after"])
+            for step in render_steps
+        )
+        stripe_index = (
+            following_background_index - prepended_row_count
+        ) % len(MESSAGE_ROW_BACKGROUNDS)
+        for step in render_steps:
+            step["background_color"] = MESSAGE_ROW_BACKGROUNDS[
+                stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+            ]
+            stripe_index += 1
+            for separator_spec in step["separators_after"]:
+                separator_spec[1] = MESSAGE_ROW_BACKGROUNDS[
+                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                ]
+                stripe_index += 1
+
+        document = self.chat_display.document()
+        row_selections: list[QTextEdit.ExtraSelection] = []
+        for block_number, background in sorted(
+            self.chat_display.row_background_blocks.items()
+        ):
+            block = document.findBlockByNumber(block_number)
+            if not block.isValid():
+                continue
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = QTextCursor(block)
+            selection.cursor.clearSelection()
+            selection.format.setBackground(QColor(background))
+            selection.format.setProperty(
+                QTextFormat.Property.FullWidthSelection,
+                True,
+            )
+            row_selections.append(selection)
+
+        self._message_render_generation += 1
+        message_generation = self._message_render_generation
+        self._rendering_message_log = True
+        self._hide_chat_tooltip()
+        self._message_render_job = {
+            "generation": message_generation,
+            "room_id": room_id,
+            "scroll_to_bottom": False,
+            "on_finished": lambda: self._finish_older_history_page(
                 generation,
                 room_id,
-                previous_distance_from_bottom,
             ),
-        )
+            "muted_ids": muted_ids,
+            "collapsed_ids": collapsed_ids,
+            "trusted_user_ids": trusted_user_ids,
+            "row_selections": row_selections,
+            "display_groups": display_groups,
+            "render_steps": render_steps,
+            "unread_boundary_id": unread_boundary_id,
+            "newest_first": False,
+            "preserve_viewport_while_prepending": True,
+            "cursor": self.chat_display.textCursor(),
+            "previous_timestamp": None,
+            "previous_message_id": None,
+            "first_item": False,
+            "stripe_index": 0,
+            "stripe_shift": 0,
+            "index": len(render_steps) - 1,
+        }
+        self._continue_message_log_render(message_generation)
 
     def _finish_older_history_page(
         self,
         generation: int,
         room_id: str,
-        previous_distance_from_bottom: int,
     ) -> None:
         if (
             generation != self._history_render_generation
@@ -7283,46 +7443,11 @@ class EncryptedChatClient(QObject):
             or self._tray_ui_suspended
         ):
             self._loading_older_history_page = False
-            self._set_history_render_updates_suppressed(False)
             return
-
-        # QTextDocument can defer its final height until the event loop gets
-        # control again. Force layout once, then restore on the next turn
-        # while updates remain disabled so no intermediate scroll position is
-        # ever painted.
-        self.chat_display.document().documentLayout().documentSize()
-        QTimer.singleShot(
-            0,
-            lambda: self._restore_older_history_page_view(
-                generation,
-                room_id,
-                previous_distance_from_bottom,
-            ),
-        )
-
-    def _restore_older_history_page_view(
-        self,
-        generation: int,
-        room_id: str,
-        previous_distance_from_bottom: int,
-    ) -> None:
-        if (
-            generation != self._history_render_generation
-            or room_id != self.active_chatroom_id
-            or self._tray_ui_suspended
-        ):
-            self._loading_older_history_page = False
-            self._set_history_render_updates_suppressed(False)
-            return
-
-        scrollbar = self.chat_display.verticalScrollBar()
-        new_maximum = scrollbar.maximum()
-        scrollbar.setValue(max(
-            scrollbar.minimum(),
-            new_maximum - max(0, previous_distance_from_bottom),
-        ))
         self._loading_older_history_page = False
-        self._set_history_render_updates_suppressed(False)
+        self.viewport_media_timer.start(
+            VIEWPORT_MEDIA_UPDATE_DELAY_MS
+        )
 
     def _build_chat_tab(self) -> None:
         layout = QVBoxLayout(self.chat_tab)
@@ -11151,6 +11276,15 @@ class EncryptedChatClient(QObject):
         ):
             return
 
+        self._restore_chat_view_anchor(anchor)
+        self._media_rerender_in_progress = False
+        self._set_history_render_updates_suppressed(False)
+
+    def _restore_chat_view_anchor(
+        self,
+        anchor: dict[str, Any],
+    ) -> None:
+
         scrollbar = self.chat_display.verticalScrollBar()
         if bool(anchor.get("at_bottom")):
             scrollbar.setValue(scrollbar.maximum())
@@ -11180,8 +11314,6 @@ class EncryptedChatClient(QObject):
                     scrollbar.maximum()
                     - max(0, int(anchor.get("distance_from_bottom", 0))),
                 ))
-        self._media_rerender_in_progress = False
-        self._set_history_render_updates_suppressed(False)
 
     def _schedule_chat_tooltip(
         self,
@@ -13183,6 +13315,7 @@ class EncryptedChatClient(QObject):
         render_steps = job["render_steps"]
         unread_boundary_id = job["unread_boundary_id"]
         index = int(job["index"])
+        preserve_anchor: dict[str, Any] | None = None
         if index >= 0:
             step = render_steps[index]
             group = step["group"]
@@ -13190,6 +13323,14 @@ class EncryptedChatClient(QObject):
             document = self.chat_display.document()
             old_block_count = document.blockCount()
             old_character_count = document.characterCount()
+            preserve_anchor = (
+                self._capture_chat_view_anchor()
+                if (
+                    bool(job.get("preserve_viewport_while_prepending"))
+                    and bool(self.rendered_message_blocks)
+                )
+                else None
+            )
 
             # Integer block/character positions do not follow QTextDocument
             # edits automatically. Preserve the existing newer rows, clear the
@@ -13325,6 +13466,15 @@ class EncryptedChatClient(QObject):
             if selection.cursor.block().isValid()
         }
         self._bottom_align_short_message_log()
+        if isinstance(preserve_anchor, dict):
+            # QTextDocument insertion and layout stay on the GUI thread, but
+            # only one displayed group is added per turn. Capture the user's
+            # current viewport immediately before each insertion and restore
+            # that live anchor immediately afterward. Scrolling therefore
+            # remains interactive throughout the page load instead of being
+            # frozen behind one hidden full-document transaction.
+            self.chat_display.document().documentLayout().documentSize()
+            self._restore_chat_view_anchor(preserve_anchor)
         if index >= 0:
             if bool(job["scroll_to_bottom"]):
                 scrollbar = self.chat_display.verticalScrollBar()

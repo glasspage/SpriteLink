@@ -739,33 +739,61 @@ class BehaviorSettingsTests(unittest.TestCase):
         page_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._load_older_history_page
         )
+        prepend_page_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._prepend_older_history_page
+        )
         finish_page_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._finish_older_history_page
         )
-        restore_page_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._restore_older_history_page_view
-        )
         self.assertIn("HISTORY_RENDER_PAGE_MESSAGES", page_source)
-        self.assertIn("on_finished=", page_source)
-        self.assertIn(
-            "QTimer.singleShot(",
-            finish_page_source,
-        )
-        self.assertIn(
-            "new_maximum - max(0, previous_distance_from_bottom)",
-            restore_page_source,
-        )
+        self.assertIn("_prepend_older_history_page(", page_source)
+        self.assertNotIn("_render_message_log(", page_source)
         self.assertNotIn(
-            "_schedule_older_history_page()",
-            finish_page_source,
-        )
-        self.assertNotIn(
-            "_schedule_older_history_page()",
-            restore_page_source,
-        )
-        self.assertIn(
             "_set_history_render_updates_suppressed(True)",
             page_source,
+        )
+        self.assertIn(
+            '"preserve_viewport_while_prepending": True',
+            prepend_page_source,
+        )
+        self.assertIn(
+            "self._continue_message_log_render(message_generation)",
+            prepend_page_source,
+        )
+        self.assertNotIn("self.chat_display.clear()", prepend_page_source)
+        self.assertNotIn(
+            "_set_history_render_updates_suppressed(",
+            prepend_page_source,
+        )
+        self.assertNotIn(
+            "_schedule_older_history_page()",
+            finish_page_source,
+        )
+        self.assertIn(
+            "self.viewport_media_timer.start(",
+            finish_page_source,
+        )
+        self.assertIn(
+            "preserve_anchor = (",
+            continue_source,
+        )
+        self.assertIn(
+            "self._capture_chat_view_anchor()",
+            continue_source,
+        )
+        self.assertIn(
+            "self._restore_chat_view_anchor(preserve_anchor)",
+            continue_source,
+        )
+        self.assertLess(
+            continue_source.index("self._capture_chat_view_anchor()"),
+            continue_source.index("self._insert_message_item("),
+        )
+        self.assertGreater(
+            continue_source.index(
+                "self._restore_chat_view_anchor(preserve_anchor)"
+            ),
+            continue_source.index("self._insert_message_item("),
         )
         queue_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._process_ui_queue
