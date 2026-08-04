@@ -56,9 +56,34 @@ class LazyViewportMediaTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._insert_message_item
         )
         self.assertIn("displayed_image_urls", insert_source)
-        self.assertIn("viewport_embedded_image_urls", insert_source)
-        self.assertIn("embedded_image_preview_sizes", insert_source)
+        self.assertIn("displayed_image_urls = list(image_urls)", insert_source)
+        self.assertNotIn(
+            "image_url in self.viewport_embedded_image_urls",
+            insert_source,
+        )
         self.assertNotIn("_schedule_image_preview_fetch", insert_source)
+
+    def test_fresh_images_reserve_an_inline_object_before_visibility(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        preview_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_embedded_image_preview
+        )
+
+        self.assertIn("displayed_image_urls = list(image_urls)", insert_source)
+        self.assertIn(
+            "for image_url in displayed_image_urls:",
+            insert_source,
+        )
+        self.assertIn(
+            "self.rendered_image_positions.setdefault(url, []).append",
+            preview_source,
+        )
+        self.assertIn(
+            "preview = self._unloaded_image_placeholder(*preview_size)",
+            preview_source,
+        )
 
     def test_scroll_resize_and_render_refresh_lazy_media(self) -> None:
         build_source = inspect.getsource(
