@@ -5179,6 +5179,7 @@ class EncryptedChatClient(QObject):
         self._message_render_generation = 0
         self._message_render_job: dict[str, Any] | None = None
         self._rendering_message_log = False
+        self._pending_live_render_message_ids: list[str] = []
         self._media_rerender_in_progress = False
         self.embedded_image_preview_sizes: dict[str, tuple[int, int]] = {}
         self.history_load_executor = DaemonTaskPool(
@@ -7126,6 +7127,7 @@ class EncryptedChatClient(QObject):
         self._message_render_generation += 1
         self._message_render_job = None
         self._rendering_message_log = False
+        self._pending_live_render_message_ids.clear()
         self._media_rerender_in_progress = False
         self.rendered_history_message_limit = (
             INITIAL_HISTORY_RENDER_MESSAGES
@@ -7448,6 +7450,7 @@ class EncryptedChatClient(QObject):
         self.viewport_media_timer.start(
             VIEWPORT_MEDIA_UPDATE_DELAY_MS
         )
+        self._flush_pending_live_message_render()
 
     def _build_chat_tab(self) -> None:
         layout = QVBoxLayout(self.chat_tab)
@@ -10385,7 +10388,7 @@ class EncryptedChatClient(QObject):
                             history_scan=history_scan,
                         )
                         continue
-                    added = 0
+                    added_message_ids: list[str] = []
 
                     for item in sorted(items, key=self._message_sort_key):
                         if self._accept_network_message(
@@ -10400,12 +10403,16 @@ class EncryptedChatClient(QObject):
                                 ),
                             ),
                         ):
-                            added += 1
+                            added_message_ids.append(
+                                str(item["message"]["i"])
+                            )
 
-                    if added:
+                    if added_message_ids:
                         self.message_log.sort(key=self._message_sort_key)
                         self._persist_local_history()
-                        self._render_message_log(scroll_to_bottom=True)
+                        self._queue_live_message_render(
+                            added_message_ids
+                        )
 
                 elif event_type == "send_succeeded":
                     self._record_successful_send()
@@ -10835,7 +10842,218 @@ class EncryptedChatClient(QObject):
         if persist:
             self._persist_local_history()
         if render:
+            self._queue_live_message_render([str(message["i"])])
+
+    def _queue_live_message_render(
+        self,
+        message_ids: list[str],
+    ) -> None:
+        for message_id in message_ids:
+            if (
+                message_id
+                and message_id
+                not in self._pending_live_render_message_ids
+            ):
+                self._pending_live_render_message_ids.append(message_id)
+        self._flush_pending_live_message_render()
+
+    def _flush_pending_live_message_render(self) -> None:
+        if (
+            not self._pending_live_render_message_ids
+            or self._tray_ui_suspended
+            or self._rendering_message_log
+            or self._history_render_updates_suppressed
+            or self._media_rerender_in_progress
+        ):
+            return
+
+        pending_ids = list(self._pending_live_render_message_ids)
+        pending_id_set = set(pending_ids)
+        items = [
+            item
+            for item in self.message_log
+            if self._message_id_from_log_item(item) in pending_id_set
+            and self._message_id_from_log_item(item)
+            not in self.rendered_message_last_blocks
+        ]
+        self._pending_live_render_message_ids.clear()
+        if not items:
+            return
+
+        if not self._append_live_message_items(items):
+            # A delayed or duplicate message can belong inside an existing
+            # rendered group instead of after it. Keep that exceptional case
+            # correct; normal live arrivals never enter the history renderer.
             self._render_message_log(scroll_to_bottom=True)
+
+    def _append_live_message_items(
+        self,
+        items: list[dict[str, Any]],
+    ) -> bool:
+        if not items or self._tray_ui_suspended:
+            return True
+
+        items = sorted(items, key=self._message_sort_key)
+        rendered_ids = set(self.rendered_message_last_blocks)
+        rendered_items = [
+            item
+            for item in self.message_log
+            if self._message_id_from_log_item(item) in rendered_ids
+        ]
+        previous_item = (
+            max(rendered_items, key=self._message_sort_key)
+            if rendered_items
+            else None
+        )
+        if (
+            previous_item is not None
+            and self._message_sort_key(items[0])
+            <= self._message_sort_key(previous_item)
+        ):
+            return False
+
+        muted_ids = self._room_preference_ids("muted_users")
+        if previous_item is not None:
+            boundary_groups = group_messages_for_display(
+                [previous_item, items[0]],
+                muted_ids,
+            )
+            if len(boundary_groups) == 1:
+                # Consecutive repeated messages are represented by one row.
+                # Updating that already-rendered row needs the correctness
+                # fallback above instead of appending a second row.
+                return False
+
+        collapsed_ids = self._room_preference_ids("collapsed_messages")
+        trusted_user_ids = self._room_preference_ids(
+            "trusted_link_and_image_users"
+        )
+        display_groups = group_messages_for_display(items, muted_ids)
+        unread_boundary_id = self._unread_after_message_ids().get(
+            self.active_chatroom_id
+        ) or self.read_divider_message_ids.get(self.active_chatroom_id)
+        if unread_boundary_id:
+            boundary_split_groups: list[list[dict[str, Any]]] = []
+            for group in display_groups:
+                boundary_index = next(
+                    (
+                        index
+                        for index, source in enumerate(group)
+                        if self._message_id_from_log_item(source)
+                        == unread_boundary_id
+                    ),
+                    -1,
+                )
+                if 0 <= boundary_index < len(group) - 1:
+                    boundary_split_groups.append(
+                        group[:boundary_index + 1]
+                    )
+                    boundary_split_groups.append(
+                        group[boundary_index + 1:]
+                    )
+                else:
+                    boundary_split_groups.append(group)
+            display_groups = boundary_split_groups
+
+        background_indices = {
+            QColor(color).name().casefold(): index
+            for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS)
+        }
+        stripe_index = 0
+        previous_timestamp: int | None = None
+        previous_message_id: str | None = None
+        if previous_item is not None:
+            previous_timestamp = self._display_timestamp_for_item(
+                previous_item
+            )
+            previous_message_id = self._message_id_from_log_item(
+                previous_item
+            )
+            previous_block_number = self.rendered_message_last_blocks.get(
+                previous_message_id
+            )
+            previous_background = self.chat_display.row_background_blocks.get(
+                previous_block_number
+            )
+            if isinstance(previous_background, QColor):
+                stripe_index = (
+                    background_indices.get(
+                        previous_background.name().casefold(),
+                        -1,
+                    )
+                    + 1
+                ) % len(MESSAGE_ROW_BACKGROUNDS)
+
+        self._hide_chat_tooltip()
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        first_item = self.chat_display.document().isEmpty()
+        row_selections: list[QTextEdit.ExtraSelection] = []
+        for group in display_groups:
+            item = self._display_item_for_group(group, muted_ids)
+            current_timestamp = self._display_timestamp_for_item(group[0])
+            separator_texts = (
+                message_log_separator_texts(
+                    previous_timestamp,
+                    current_timestamp,
+                )
+                if previous_timestamp is not None
+                else ()
+            )
+            last_separator_block_number: int | None = None
+            for separator_text in separator_texts:
+                last_separator_block_number = self._insert_log_separator(
+                    cursor,
+                    separator_text,
+                    MESSAGE_ROW_BACKGROUNDS[
+                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                    ],
+                    row_selections,
+                )
+                stripe_index += 1
+            if (
+                last_separator_block_number is not None
+                and unread_boundary_id
+                and previous_message_id == unread_boundary_id
+            ):
+                self.rendered_message_last_blocks[unread_boundary_id] = (
+                    last_separator_block_number
+                )
+            if not first_item and not separator_texts:
+                cursor.insertBlock()
+
+            self._insert_message_item(
+                cursor,
+                item,
+                muted_ids=muted_ids,
+                collapsed_ids=collapsed_ids,
+                trusted_user_ids=trusted_user_ids,
+                background_color=MESSAGE_ROW_BACKGROUNDS[
+                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                ],
+                row_selections=row_selections,
+            )
+            stripe_index += 1
+            first_item = False
+            previous_timestamp = self._display_timestamp_for_item(group[-1])
+            previous_message_id = self._message_id_from_log_item(group[-1])
+
+        self.chat_display.row_background_blocks.update({
+            selection.cursor.block().blockNumber(): QColor(
+                selection.format.background().color()
+            )
+            for selection in row_selections
+            if selection.cursor.block().isValid()
+        })
+        self._bottom_align_short_message_log()
+        self.chat_display.setExtraSelections([])
+        self._apply_active_unread_divider_block()
+        self.chat_display.horizontalScrollBar().setValue(0)
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
+        self.chat_display.viewport().update()
+        return True
 
     def _load_saved_history_for_current_room(self) -> None:
         server_url = normalize_server_url(
@@ -10977,6 +11195,7 @@ class EncryptedChatClient(QObject):
         scrollbar.setValue(scrollbar.maximum())
         self._set_history_render_updates_suppressed(False)
         self._history_initial_render_complete = True
+        self._flush_pending_live_message_render()
 
     def _persist_local_history(self) -> None:
         server_url = normalize_server_url(
@@ -11279,6 +11498,7 @@ class EncryptedChatClient(QObject):
         self._restore_chat_view_anchor(anchor)
         self._media_rerender_in_progress = False
         self._set_history_render_updates_suppressed(False)
+        self._flush_pending_live_message_render()
 
     def _restore_chat_view_anchor(
         self,
@@ -13241,6 +13461,7 @@ class EncryptedChatClient(QObject):
         self._rendering_message_log = False
         if callable(on_finished):
             on_finished()
+        QTimer.singleShot(0, self._flush_pending_live_message_render)
 
     def _insert_log_separator_before_newer_content(
         self,
@@ -13512,6 +13733,7 @@ class EncryptedChatClient(QObject):
         self._rendering_message_log = False
         if callable(on_finished):
             on_finished()
+        QTimer.singleShot(0, self._flush_pending_live_message_render)
 
     def _insert_message_item(
         self,
