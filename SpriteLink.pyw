@@ -5105,6 +5105,7 @@ class EncryptedChatClient(QObject):
         self.rendered_link_senders: dict[str, str] = {}
         self.rendered_image_positions: dict[str, list[int]] = {}
         self.rendered_image_candidates: dict[str, list[int]] = {}
+        self.rendered_loaded_image_urls: set[str] = set()
         self.viewport_embedded_image_urls: set[str] = set()
         self.image_preview_cache: dict[str, RemoteMediaPreview | None] = {}
         self.pending_image_previews: set[str] = set()
@@ -5755,6 +5756,7 @@ class EncryptedChatClient(QObject):
         self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
+        self.rendered_loaded_image_urls.clear()
         self.viewport_embedded_image_urls.clear()
         self.chat_display.row_background_blocks.clear()
         self.chat_display.collapsed_fade_blocks.clear()
@@ -8272,6 +8274,8 @@ class EncryptedChatClient(QObject):
 
         if is_likely_nsfw_image_url(url):
             return
+        if url not in self.rendered_loaded_image_urls:
+            return
         image_positions = self.rendered_image_positions.get(url, [])
         if not image_positions:
             return
@@ -8382,7 +8386,7 @@ class EncryptedChatClient(QObject):
         self.image_preview_label.clear()
         self.image_preview_url_label.clear()
         self.image_preview_url_label.setToolTip("")
-        if url and url not in self.rendered_image_positions:
+        if url and url not in self.rendered_loaded_image_urls:
             controller = self.animated_media_controllers.pop(url, None)
             if controller is not None:
                 controller.stop()
@@ -10346,7 +10350,7 @@ class EncryptedChatClient(QObject):
                         media is not None
                         and url in self.viewport_embedded_image_urls
                     ):
-                        self._rerender_preserving_scroll()
+                        self._update_viewport_media()
 
                 elif event_type == "update_check_result":
                     if isinstance(payload, dict):
@@ -10637,6 +10641,13 @@ class EncryptedChatClient(QObject):
         history_limit = self._chatroom_history_limit()
         if len(self.message_log) > history_limit:
             del self.message_log[:-history_limit]
+        # The visible history is a growing suffix for the lifetime of this
+        # room view. A newly received message must extend that suffix instead
+        # of pushing its oldest already-loaded message out of the document.
+        self.rendered_history_message_limit = min(
+            len(self.message_log),
+            self.rendered_history_message_limit + 1,
+        )
         if persist:
             self._persist_local_history()
         if render:
@@ -11302,6 +11313,16 @@ class EncryptedChatClient(QObject):
             or not hasattr(self, "chat_display")
         ):
             return
+        if (
+            self._rendering_message_log
+            or self._loading_older_history_page
+            or self._history_render_updates_suppressed
+            or self._media_rerender_in_progress
+        ):
+            self.viewport_media_timer.start(
+                VIEWPORT_MEDIA_UPDATE_DELAY_MS
+            )
+            return
         viewport = self.chat_display.viewport()
         viewport_height = max(1, viewport.height())
         document = self.chat_display.document()
@@ -11335,9 +11356,118 @@ class EncryptedChatClient(QObject):
                 RemoteMediaPreview,
             )
         }
-        currently_rendered_urls = set(self.rendered_image_positions)
-        if cached_desired_urls != currently_rendered_urls:
-            self._rerender_preserving_scroll()
+        currently_rendered_urls = set(self.rendered_loaded_image_urls)
+        urls_to_load = cached_desired_urls - currently_rendered_urls
+        urls_to_unload = currently_rendered_urls - desired_urls
+        if urls_to_load or urls_to_unload:
+            self._refresh_viewport_image_resources(
+                urls_to_load,
+                urls_to_unload,
+            )
+
+    def _set_rendered_inline_image(
+        self,
+        url: str,
+        preview: QImage,
+        *,
+        loaded: bool,
+    ) -> None:
+        positions = self.rendered_image_positions.get(url, [])
+        if not positions:
+            self.rendered_loaded_image_urls.discard(url)
+            return
+
+        width = max(1, preview.width())
+        height = max(1, preview.height())
+        if loaded:
+            self.embedded_image_preview_sizes[url] = (width, height)
+
+        resource_token = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        resource_url = QUrl(
+            f"spritelink-chat-image-resource:{resource_token}"
+        )
+        document = self.chat_display.document()
+        document.addResource(
+            QTextDocument.ResourceType.ImageResource,
+            resource_url,
+            preview,
+        )
+        maximum_position = max(0, document.characterCount() - 1)
+        for position in positions:
+            if position < 0 or position > maximum_position:
+                continue
+            cursor = QTextCursor(document)
+            cursor.setPosition(position)
+            if not cursor.movePosition(
+                QTextCursor.MoveOperation.NextCharacter,
+                QTextCursor.MoveMode.KeepAnchor,
+            ):
+                continue
+            image_format = cursor.charFormat().toImageFormat()
+            if image_format.name() != resource_url.toString():
+                continue
+            image_format.setWidth(width)
+            image_format.setHeight(height)
+            cursor.setCharFormat(image_format)
+            document.markContentsDirty(position, 1)
+
+        if loaded:
+            self.rendered_loaded_image_urls.add(url)
+        else:
+            self.rendered_loaded_image_urls.discard(url)
+
+    def _refresh_viewport_image_resources(
+        self,
+        urls_to_load: set[str],
+        urls_to_unload: set[str],
+    ) -> None:
+        anchor = self._capture_chat_view_anchor()
+        generation = self._history_render_generation
+        room_id = self.active_chatroom_id
+        self._media_rerender_in_progress = True
+        self._set_history_render_updates_suppressed(True)
+
+        for url in urls_to_unload:
+            preview_size = self.embedded_image_preview_sizes.get(url)
+            if preview_size is None:
+                preview_size = (
+                    EMBEDDED_IMAGE_MAX_WIDTH,
+                    EMBEDDED_IMAGE_MAX_HEIGHT,
+                )
+                self.embedded_image_preview_sizes[url] = preview_size
+            self._set_rendered_inline_image(
+                url,
+                self._unloaded_image_placeholder(*preview_size),
+                loaded=False,
+            )
+            if self.current_image_preview_url != url:
+                controller = self.animated_media_controllers.pop(
+                    url,
+                    None,
+                )
+                if controller is not None:
+                    controller.stop()
+                    controller.deleteLater()
+                self.last_inline_animation_frame_at.pop(url, None)
+
+        for url in urls_to_load:
+            media = self.image_preview_cache.get(url)
+            if not isinstance(media, RemoteMediaPreview):
+                continue
+            preview = self._embedded_media_preview(url, media)
+            self._set_rendered_inline_image(
+                url,
+                preview,
+                loaded=True,
+            )
+            if not is_likely_nsfw_image_url(url):
+                self._ensure_animated_media_controller(url, media)
+
+        self._finish_preserving_scroll_rerender(
+            generation,
+            room_id,
+            anchor,
+        )
 
     def _schedule_image_preview_fetch(self, url: str) -> None:
         if (
@@ -12307,7 +12437,11 @@ class EncryptedChatClient(QObject):
         else:
             preview_size = self.embedded_image_preview_sizes.get(url)
             if preview_size is None:
-                return False
+                preview_size = (
+                    EMBEDDED_IMAGE_MAX_WIDTH,
+                    EMBEDDED_IMAGE_MAX_HEIGHT,
+                )
+                self.embedded_image_preview_sizes[url] = preview_size
             preview = self._unloaded_image_placeholder(*preview_size)
 
         link_token = hashlib.sha256(
@@ -12336,10 +12470,11 @@ class EncryptedChatClient(QObject):
         image_format.setAnchorHref(anchor)
         image_position = cursor.position()
         cursor.insertImage(image_format)
+        self.rendered_image_positions.setdefault(url, []).append(
+            image_position
+        )
         if show_loaded_preview:
-            self.rendered_image_positions.setdefault(url, []).append(
-                image_position
-            )
+            self.rendered_loaded_image_urls.add(url)
         return True
 
     def _animated_media_loading_placeholder(self) -> QImage:
@@ -12518,6 +12653,17 @@ class EncryptedChatClient(QObject):
         ):
             on_finished = previous_job["on_finished"]
 
+        previous_message_backgrounds: dict[str, str] = {}
+        for block_number, message_id in self.rendered_message_blocks.items():
+            background = self.chat_display.row_background_blocks.get(
+                block_number
+            )
+            if isinstance(background, QColor) and background.isValid():
+                previous_message_backgrounds.setdefault(
+                    message_id,
+                    background.name().casefold(),
+                )
+
         self._message_render_generation += 1
         generation = self._message_render_generation
         self._rendering_message_log = True
@@ -12530,6 +12676,7 @@ class EncryptedChatClient(QObject):
         self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
+        self.rendered_loaded_image_urls.clear()
         self.chat_display.clear()
         self.chat_display.row_background_blocks.clear()
         self.chat_display.row_background_padding_blocks.clear()
@@ -12608,6 +12755,64 @@ class EncryptedChatClient(QObject):
             stripe_index += 1
             previous_timestamp = self._display_timestamp_for_item(group[-1])
 
+        # Expanding the visible suffix can prepend an odd number of message
+        # and separator rows. Anchor the new plan to any message that was
+        # already rendered so existing white/gray stripes never swap places.
+        background_indices = {
+            QColor(color).name().casefold(): index
+            for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS)
+        }
+        stripe_shift = 0
+        for step in render_steps:
+            planned_index = background_indices.get(
+                QColor(str(step["background_color"])).name().casefold()
+            )
+            if planned_index is None:
+                continue
+            for source in reversed(step["group"]):
+                message_id = self._message_id_from_log_item(source)
+                previous_color = previous_message_backgrounds.get(
+                    message_id
+                )
+                previous_index = background_indices.get(previous_color or "")
+                if previous_index is None:
+                    continue
+                stripe_shift = (
+                    previous_index - planned_index
+                ) % len(MESSAGE_ROW_BACKGROUNDS)
+                break
+            else:
+                continue
+            break
+
+        if stripe_shift:
+            for step in render_steps:
+                planned_index = background_indices[
+                    QColor(str(step["background_color"])).name().casefold()
+                ]
+                step["background_color"] = MESSAGE_ROW_BACKGROUNDS[
+                    (planned_index + stripe_shift)
+                    % len(MESSAGE_ROW_BACKGROUNDS)
+                ]
+                step["separators_after"] = [
+                    (
+                        separator_text,
+                        MESSAGE_ROW_BACKGROUNDS[
+                            (
+                                background_indices[
+                                    QColor(background_color)
+                                    .name()
+                                    .casefold()
+                                ]
+                                + stripe_shift
+                            )
+                            % len(MESSAGE_ROW_BACKGROUNDS)
+                        ],
+                    )
+                    for separator_text, background_color
+                    in step["separators_after"]
+                ]
+
         self._message_render_job = {
             "generation": generation,
             "room_id": self.active_chatroom_id,
@@ -12626,6 +12831,7 @@ class EncryptedChatClient(QObject):
             "previous_message_id": None,
             "first_item": True,
             "stripe_index": 0,
+            "stripe_shift": stripe_shift,
             "index": (
                 len(render_steps) - 1
                 if scroll_to_bottom
@@ -12663,6 +12869,7 @@ class EncryptedChatClient(QObject):
         previous_message_id = job["previous_message_id"]
         first_item = bool(job["first_item"])
         stripe_index = int(job["stripe_index"])
+        stripe_shift = int(job["stripe_shift"])
 
         if index < len(display_groups):
             group = display_groups[index]
@@ -12682,7 +12889,8 @@ class EncryptedChatClient(QObject):
                     cursor,
                     separator_text,
                     MESSAGE_ROW_BACKGROUNDS[
-                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                        (stripe_index + stripe_shift)
+                        % len(MESSAGE_ROW_BACKGROUNDS)
                     ],
                     row_selections,
                 )
@@ -12705,7 +12913,8 @@ class EncryptedChatClient(QObject):
                 collapsed_ids=collapsed_ids,
                 trusted_user_ids=trusted_user_ids,
                 background_color=MESSAGE_ROW_BACKGROUNDS[
-                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                    (stripe_index + stripe_shift)
+                    % len(MESSAGE_ROW_BACKGROUNDS)
                 ],
                 row_selections=row_selections,
             )
@@ -12741,7 +12950,7 @@ class EncryptedChatClient(QObject):
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
 
-        active_animated_urls = set(self.rendered_image_positions)
+        active_animated_urls = set(self.rendered_loaded_image_urls)
         if self.current_image_preview_url:
             active_animated_urls.add(self.current_image_preview_url)
         for url in list(self.animated_media_controllers):
@@ -12991,7 +13200,7 @@ class EncryptedChatClient(QObject):
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
 
-        active_animated_urls = set(self.rendered_image_positions)
+        active_animated_urls = set(self.rendered_loaded_image_urls)
         if self.current_image_preview_url:
             active_animated_urls.add(self.current_image_preview_url)
         for url in list(self.animated_media_controllers):
@@ -13396,6 +13605,7 @@ class EncryptedChatClient(QObject):
         self.rendered_link_senders.clear()
         self.rendered_image_positions.clear()
         self.rendered_image_candidates.clear()
+        self.rendered_loaded_image_urls.clear()
         self.viewport_embedded_image_urls.clear()
         self.viewport_media_timer.stop()
         for controller in self.animated_media_controllers.values():

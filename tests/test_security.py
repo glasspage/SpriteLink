@@ -93,15 +93,25 @@ class LazyViewportMediaTests(unittest.TestCase):
             "preview = self._unloaded_image_placeholder(*preview_size)",
             insert_source,
         )
+        self.assertIn("EMBEDDED_IMAGE_MAX_WIDTH", insert_source)
+        self.assertIn("EMBEDDED_IMAGE_MAX_HEIGHT", insert_source)
+        self.assertNotIn("preview_size is None:\n                return False", insert_source)
         self.assertIn('placeholder.fill(QColor("#d0d0d0"))', placeholder_source)
         self.assertIn("max(1, int(width))", placeholder_source)
         self.assertIn("max(1, int(height))", placeholder_source)
 
-    def test_image_rerenders_preserve_a_message_anchor_transactionally(
+    def test_image_resources_swap_in_place_with_a_stable_view_anchor(
         self,
     ) -> None:
-        rerender_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._rerender_preserving_scroll
+        viewport_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._update_viewport_media
+        )
+        refresh_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._refresh_viewport_image_resources
+        )
+        resource_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._set_rendered_inline_image
         )
         capture_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._capture_chat_view_anchor
@@ -119,17 +129,22 @@ class LazyViewportMediaTests(unittest.TestCase):
             ._on_chat_history_scroll_action
         )
 
-        self.assertIn("_capture_chat_view_anchor()", rerender_source)
+        self.assertIn("_refresh_viewport_image_resources(", viewport_source)
+        self.assertNotIn("_rerender_preserving_scroll()", viewport_source)
+        self.assertIn("_capture_chat_view_anchor()", refresh_source)
         self.assertIn(
             "_set_history_render_updates_suppressed(True)",
-            rerender_source,
+            refresh_source,
         )
-        self.assertNotIn("fraction", rerender_source)
+        self.assertIn("document.addResource(", resource_source)
+        self.assertIn("cursor.setCharFormat(image_format)", resource_source)
+        self.assertIn("document.markContentsDirty(position, 1)", resource_source)
+        self.assertNotIn("self.chat_display.clear()", refresh_source)
         self.assertIn("cursorForPosition(QPoint(0, 0))", capture_source)
         self.assertIn("rendered_message_blocks", capture_source)
         self.assertIn("blockBoundingRect(block)", capture_source)
         self.assertIn("QTimer.singleShot(", finish_source)
-        self.assertIn('if bool(anchor.get("at_bottom"))', restore_source)
+        self.assertIn("if bool(anchor.get(\"at_bottom\"))", restore_source)
         self.assertIn("block_top - float(anchor.get", restore_source)
         self.assertIn(
             "self._media_rerender_in_progress = False",
@@ -153,9 +168,14 @@ class LazyViewportMediaTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._update_viewport_media
         )
         self.assertIn(
-            "cached_desired_urls != currently_rendered_urls",
+            "urls_to_unload = currently_rendered_urls - desired_urls",
             viewport_source,
         )
+        refresh_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._refresh_viewport_image_resources
+        )
+        self.assertIn("controller.stop()", refresh_source)
         clear_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._clear_visible_room
         )
@@ -490,6 +510,12 @@ class BehaviorSettingsTests(unittest.TestCase):
             "self.message_log[-visible_message_limit:]",
             render_source,
         )
+        self.assertIn("previous_message_backgrounds", render_source)
+        self.assertIn("stripe_shift", render_source)
+        self.assertIn(
+            "previous_index - planned_index",
+            render_source,
+        )
         self.assertNotIn("while index <", continue_source)
         self.assertIn('"index": (', render_source)
         self.assertIn("len(render_steps) - 1", render_source)
@@ -539,6 +565,8 @@ class BehaviorSettingsTests(unittest.TestCase):
             "self._insert_log_separator(",
             forward_source,
         )
+        self.assertIn("stripe_shift = int(job[\"stripe_shift\"])", forward_source)
+        self.assertIn("stripe_index + stripe_shift", forward_source)
         self.assertNotIn(
             "_insert_log_separator_before_newer_content",
             forward_source,
@@ -582,7 +610,7 @@ class BehaviorSettingsTests(unittest.TestCase):
             ._on_chat_history_scroll_action
         )
         self.assertIn(
-            "self._older_history_user_request is not None",
+            "if self._older_history_user_request is not None",
             scroll_action_source,
         )
         self.assertIn(
@@ -670,6 +698,15 @@ class BehaviorSettingsTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._activate_chatroom
         )
         self.assertNotIn("_persist_local_history()", switch_source)
+
+        add_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._add_message_to_log
+        )
+        self.assertIn(
+            "self.rendered_history_message_limit + 1",
+            add_source,
+        )
+        self.assertIn("min(\n            len(self.message_log)", add_source)
 
     def test_settings_never_embed_chatroom_history(self) -> None:
         config = SPRITELINK.default_config()
