@@ -314,6 +314,9 @@ MESSAGE_RENDER_STEP_DELAY_MS = 1
 UI_EVENT_BATCH_LIMIT = 8
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 TRAY_NOTIFICATION_OUTLINE_COLOR = "#ff7a00"
+FLASHW_STOP = 0x00000000
+FLASHW_TRAY = 0x00000002
+FLASHW_TIMERNOFG = 0x0000000C
 MINIMIZE_TO_TRAY_1_2_MIGRATION_KEY = (
     "minimize_to_tray_1_2_default_applied"
 )
@@ -1084,6 +1087,50 @@ class DATA_BLOB(ctypes.Structure):
         ("cbData", wintypes.DWORD),
         ("pbData", ctypes.POINTER(ctypes.c_byte)),
     ]
+
+
+class FLASHWINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("hwnd", wintypes.HWND),
+        ("dwFlags", wintypes.DWORD),
+        ("uCount", wintypes.UINT),
+        ("dwTimeout", wintypes.DWORD),
+    ]
+
+
+def set_windows_taskbar_attention(
+    window_handle: int,
+    enabled: bool,
+) -> bool:
+    """Start or stop native Windows taskbar-button flashing."""
+    if (
+        os.name != "nt"
+        or not hasattr(ctypes, "windll")
+        or int(window_handle) == 0
+    ):
+        return False
+
+    flags = (
+        FLASHW_TRAY | FLASHW_TIMERNOFG
+        if enabled
+        else FLASHW_STOP
+    )
+    info = FLASHWINFO(
+        ctypes.sizeof(FLASHWINFO),
+        wintypes.HWND(int(window_handle)),
+        flags,
+        0,
+        0,
+    )
+    try:
+        flash_window_ex = ctypes.windll.user32.FlashWindowEx
+        flash_window_ex.argtypes = [ctypes.POINTER(FLASHWINFO)]
+        flash_window_ex.restype = wintypes.BOOL
+        flash_window_ex(ctypes.byref(info))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _bytes_to_blob(data: bytes) -> tuple[DATA_BLOB, Any]:
@@ -5871,10 +5918,7 @@ class EncryptedChatClient(QObject):
     def _clear_tray_notification(self) -> None:
         if not self._tray_normal_icon.isNull():
             self.tray_icon.setIcon(self._tray_normal_icon)
-            self.root.setWindowIcon(self._tray_normal_icon)
-            app = QApplication.instance()
-            if app is not None:
-                app.setWindowIcon(self._tray_normal_icon)
+        set_windows_taskbar_attention(int(self.root.winId()), False)
         self.tray_icon.setToolTip(APP_NAME)
 
     def _has_unread_messages(self) -> bool:
@@ -5892,12 +5936,9 @@ class EncryptedChatClient(QObject):
 
     def _mark_tray_notification(self) -> None:
         if not self._tray_notification_icon.isNull():
-            self.root.setWindowIcon(self._tray_notification_icon)
-            app = QApplication.instance()
-            if app is not None:
-                app.setWindowIcon(self._tray_notification_icon)
             if self.tray_icon.isVisible():
                 self.tray_icon.setIcon(self._tray_notification_icon)
+        set_windows_taskbar_attention(int(self.root.winId()), True)
         if self.tray_icon.isVisible():
             self.tray_icon.setToolTip(f"{APP_NAME} — new messages")
 
@@ -6519,6 +6560,13 @@ class EncryptedChatClient(QObject):
     def _apply_active_unread_divider_block(self) -> None:
         if not hasattr(self, "chat_display"):
             return
+        if self._rendering_message_log:
+            # Block numbers change after every staggered prepend. Keep the
+            # divider hidden until the complete document map is stable so its
+            # line cannot appear to move through partially rendered history.
+            self.chat_display.unread_divider_block_number = None
+            self.chat_display.viewport().update()
+            return
         message_id = self._unread_after_message_ids().get(
             self.active_chatroom_id
         ) or self.read_divider_message_ids.get(self.active_chatroom_id)
@@ -6543,6 +6591,9 @@ class EncryptedChatClient(QObject):
         now = time.monotonic()
         elapsed_since_tick = max(0.0, now - self._read_divider_last_tick)
         self._read_divider_last_tick = now
+        if self._rendering_message_log:
+            self._apply_active_unread_divider_block()
+            return
         room_id = self.active_chatroom_id
         message_id = self.read_divider_message_ids.get(room_id)
         if not message_id or not hasattr(self, "chat_display"):
@@ -7406,6 +7457,7 @@ class EncryptedChatClient(QObject):
         self._message_render_generation += 1
         message_generation = self._message_render_generation
         self._rendering_message_log = True
+        self._apply_active_unread_divider_block()
         self._hide_chat_tooltip()
         self._message_render_job = {
             "generation": message_generation,
@@ -13439,6 +13491,8 @@ class EncryptedChatClient(QObject):
             if selection.cursor.block().isValid()
         }
         self.chat_display.setExtraSelections([])
+        self._message_render_job = None
+        self._rendering_message_log = False
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
 
@@ -13457,8 +13511,6 @@ class EncryptedChatClient(QObject):
             VIEWPORT_MEDIA_UPDATE_DELAY_MS
         )
         on_finished = job.get("on_finished")
-        self._message_render_job = None
-        self._rendering_message_log = False
         if callable(on_finished):
             on_finished()
         QTimer.singleShot(0, self._flush_pending_live_message_render)
@@ -13708,6 +13760,8 @@ class EncryptedChatClient(QObject):
             return
 
         self.chat_display.setExtraSelections([])
+        self._message_render_job = None
+        self._rendering_message_log = False
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
 
@@ -13729,8 +13783,6 @@ class EncryptedChatClient(QObject):
             VIEWPORT_MEDIA_UPDATE_DELAY_MS
         )
         on_finished = job.get("on_finished")
-        self._message_render_job = None
-        self._rendering_message_log = False
         if callable(on_finished):
             on_finished()
         QTimer.singleShot(0, self._flush_pending_live_message_render)

@@ -1432,6 +1432,8 @@ class TrayBehaviorTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._mark_tray_notification
         )
         self.assertIn("_tray_notification_icon", mark_source)
+        self.assertIn("set_windows_taskbar_attention", mark_source)
+        self.assertNotIn("setWindowIcon", mark_source)
         restore_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._restore_from_tray
         )
@@ -2210,6 +2212,45 @@ class RuntimeOptimizationTests(unittest.TestCase):
         )
         self.assertIn("_unread_divider_y(block)", paint_source)
         self.assertIn("_unread_divider_y(block)", fade_source)
+
+    def test_unread_divider_waits_for_staggered_render_to_finish(
+        self,
+    ) -> None:
+        apply_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._apply_active_unread_divider_block
+        )
+        fade_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._update_unread_divider_fade
+        )
+        prepend_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._prepend_older_history_page
+        )
+        self.assertIn("if self._rendering_message_log:", apply_source)
+        self.assertIn(
+            "self.chat_display.unread_divider_block_number = None",
+            apply_source,
+        )
+        self.assertIn("if self._rendering_message_log:", fade_source)
+        self.assertLess(
+            prepend_source.index("self._rendering_message_log = True"),
+            prepend_source.index(
+                "self._apply_active_unread_divider_block()"
+            ),
+        )
+
+        for continuation in (
+            SPRITELINK.EncryptedChatClient
+            ._continue_message_log_render_forward,
+            SPRITELINK.EncryptedChatClient._continue_message_log_render,
+        ):
+            source = inspect.getsource(continuation)
+            self.assertLess(
+                source.rindex("self._rendering_message_log = False"),
+                source.rindex(
+                    "self._apply_active_unread_divider_block()"
+                ),
+            )
 
     def test_unread_divider_moves_below_a_separator_before_unread(
         self,
@@ -4291,16 +4332,30 @@ class Version120ReleaseTests(unittest.TestCase):
             toggle_source.index("_apply_application_font_strategy()"),
         )
 
-    def test_taskbar_and_tray_icons_share_unread_state(self) -> None:
+    def test_taskbar_flashes_without_changing_the_window_icon(self) -> None:
         mark_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._mark_tray_notification
         )
         clear_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._clear_tray_notification
         )
+        flash_source = inspect.getsource(
+            SPRITELINK.set_windows_taskbar_attention
+        )
+        self.assertIn(
+            "set_windows_taskbar_attention(int(self.root.winId()), True)",
+            mark_source,
+        )
+        self.assertIn(
+            "set_windows_taskbar_attention(int(self.root.winId()), False)",
+            clear_source,
+        )
         for source in (mark_source, clear_source):
-            self.assertIn("root.setWindowIcon", source)
-            self.assertIn("app.setWindowIcon", source)
+            self.assertNotIn("root.setWindowIcon", source)
+            self.assertNotIn("app.setWindowIcon", source)
+        self.assertIn("ctypes.windll.user32.FlashWindowEx", flash_source)
+        self.assertIn("FLASHW_TRAY | FLASHW_TIMERNOFG", flash_source)
+        self.assertIn("FLASHW_STOP", flash_source)
 
     def test_silent_windows_toast_payload_and_message_format(self) -> None:
         command = SPRITELINK.silent_windows_notification_command(
