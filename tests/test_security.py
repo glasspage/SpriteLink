@@ -4280,6 +4280,46 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertIn('setObjectName("chatTab")', build_source)
         self.assertIn('setObjectName("chatroomsPanel")', sidebar_source)
 
+    def test_glassy_controls_keep_edges_arrows_and_modal_blur(self) -> None:
+        stylesheet = SPRITELINK.GLASSY_STYLESHEET
+        self.assertIn("border: 1px solid #496f87", stylesheet)
+        self.assertNotIn("border-top-color: #ffffff", stylesheet)
+        self.assertIn("QTextBrowser#chatViewport", stylesheet)
+        self.assertIn("QPushButton#identityMenuButton", stylesheet)
+        self.assertIn("QPushButton#fontMenuButton", stylesheet)
+        self.assertIn("QPushButton#formattingMenuButton", stylesheet)
+
+        combo_paint_source = inspect.getsource(
+            SPRITELINK.ThemeComboBox.paintEvent
+        )
+        self.assertIn('property("spritelinkGlassy")', combo_paint_source)
+        self.assertIn("drawPolygon", combo_paint_source)
+
+        overlay_source = inspect.getsource(SPRITELINK.ConfigOverlay)
+        self.assertIn("QGraphicsBlurEffect", overlay_source)
+        self.assertIn("QualityHint", overlay_source)
+        self.assertIn("parent.grab()", overlay_source)
+        self.assertIn("painter.drawPixmap", overlay_source)
+
+        chat_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._build_chat_tab
+        )
+        self.assertIn('setObjectName("chatViewport")', chat_source)
+        self.assertIn('setObjectName("identityMenuButton")', chat_source)
+        self.assertIn('setObjectName("fontMenuButton")', chat_source)
+        self.assertIn(
+            'setObjectName("formattingMenuButton")',
+            chat_source,
+        )
+
+        panel_style_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._config_panel_stylesheet
+        )
+        self.assertIn(
+            "border: 1px solid rgba(49, 91, 118, 245)",
+            panel_style_source,
+        )
+
     def test_legacy_theme_names_keep_their_equivalent_theme(self) -> None:
         for legacy_name, expected_name in (
             ("Windows Classic", "Classic"),

@@ -98,7 +98,9 @@ try:
         QDialog,
         QFrame,
         QFileDialog,
+        QGraphicsBlurEffect,
         QGraphicsOpacityEffect,
+        QGraphicsScene,
         QGridLayout,
         QHBoxLayout,
         QLabel,
@@ -242,7 +244,6 @@ GLASSY_NOTIFICATION_BUTTON_STYLESHEET = (
     " stop:1 rgba(222, 137, 45, 238));"
     " color: #633100;"
     " border: 1px solid #a65c12;"
-    " border-top-color: #fff3d6;"
     " border-radius: 5px;"
     " padding: 4px 10px;"
     "}"
@@ -809,8 +810,7 @@ QPushButton {
         stop:0.50 rgba(196, 224, 243, 236),
         stop:1 rgba(153, 197, 225, 236)
     );
-    border: 1px solid #5f8faa;
-    border-top-color: #ffffff;
+    border: 1px solid #496f87;
     border-radius: 5px;
     padding: 4px 10px;
     min-height: 18px;
@@ -845,11 +845,17 @@ QPushButton:disabled {
     background: rgba(226, 237, 244, 142);
     border-color: rgba(99, 132, 151, 110);
 }
+QPushButton#identityMenuButton,
+QPushButton#fontMenuButton,
+QPushButton#formattingMenuButton {
+    min-height: 17px;
+    padding-top: 2px;
+    padding-bottom: 2px;
+}
 QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
     color: #172532;
     background-color: rgba(255, 255, 255, 226);
-    border: 1px solid rgba(72, 119, 148, 225);
-    border-top-color: rgba(49, 91, 118, 235);
+    border: 1px solid rgba(49, 91, 118, 235);
     border-radius: 4px;
     selection-background-color: #5ba7d5;
     selection-color: #ffffff;
@@ -874,6 +880,15 @@ QComboBox::drop-down {
     );
     border-top-right-radius: 4px;
     border-bottom-right-radius: 4px;
+}
+QComboBox::down-arrow {
+    image: none;
+    width: 0px;
+    height: 0px;
+}
+QTextBrowser#chatViewport {
+    border: 1px solid #365f78;
+    border-radius: 4px;
 }
 QComboBox QAbstractItemView, QMenu {
     color: #172532;
@@ -3809,25 +3824,93 @@ class ConfigOverlay(QWidget):
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.panel: QFrame | None = None
+        self._glassy = False
+        self._blurred_background: QPixmap | None = None
         self.setObjectName("configOverlay")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(
-            "QWidget#configOverlay { background-color: rgba(0, 0, 0, 105); }"
+        app = QApplication.instance()
+        self.apply_theme(
+            bool(app is not None and app.property("spritelinkGlassy"))
         )
 
     def apply_theme(self, glassy: bool) -> None:
+        self._glassy = glassy
         if glassy:
             self.setStyleSheet(
                 "QWidget#configOverlay {"
-                " background-color: rgba(20, 54, 76, 82);"
+                " background-color: transparent;"
                 "}"
             )
+            if self.isVisible():
+                self._refresh_blurred_background()
         else:
+            self._blurred_background = None
             self.setStyleSheet(
                 "QWidget#configOverlay {"
                 " background-color: rgba(0, 0, 0, 105);"
                 "}"
             )
+        self.update()
+
+    @staticmethod
+    def _blur_pixmap(source: QPixmap) -> QPixmap | None:
+        if source.isNull():
+            return None
+
+        blurred = QPixmap(source.size())
+        blurred.setDevicePixelRatio(source.devicePixelRatio())
+        blurred.fill(Qt.GlobalColor.transparent)
+
+        scene = QGraphicsScene()
+        item = scene.addPixmap(source)
+        effect = QGraphicsBlurEffect()
+        effect.setBlurRadius(11.0)
+        effect.setBlurHints(QGraphicsBlurEffect.BlurHint.QualityHint)
+        item.setGraphicsEffect(effect)
+        source_rect = item.boundingRect()
+        scene.setSceneRect(source_rect)
+
+        painter = QPainter(blurred)
+        scene.render(painter, source_rect, source_rect)
+        painter.end()
+        return blurred
+
+    def _refresh_blurred_background(self) -> None:
+        if not self._glassy:
+            self._blurred_background = None
+            return
+
+        parent = self.parentWidget()
+        if parent is None:
+            self._blurred_background = None
+            return
+
+        was_visible = self.isVisible()
+        focused_widget = QApplication.focusWidget() if was_visible else None
+        if was_visible:
+            super().hide()
+        self._blurred_background = self._blur_pixmap(parent.grab())
+        if was_visible:
+            super().show()
+            self.raise_()
+            if (
+                focused_widget is not None
+                and self.isAncestorOf(focused_widget)
+            ):
+                focused_widget.setFocus()
+
+    def show(self) -> None:
+        self._refresh_blurred_background()
+        super().show()
+
+    def paintEvent(self, event: Any) -> None:
+        if self._glassy and self._blurred_background is not None:
+            painter = QPainter(self)
+            painter.drawPixmap(self.rect(), self._blurred_background)
+            painter.fillRect(self.rect(), QColor(20, 54, 76, 82))
+            painter.end()
+            return
+        super().paintEvent(event)
 
     def mousePressEvent(self, event: Any) -> None:
         if (
@@ -4470,9 +4553,14 @@ class ThemeComboBox(QComboBox):
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
         app = QApplication.instance()
-        if app is None or not bool(
+        if app is None:
+            return
+
+        windows_classic = bool(
             app.property("spritelinkWindowsClassic")
-        ):
+        )
+        glassy = bool(app.property("spritelinkGlassy"))
+        if not windows_classic and not glassy:
             return
 
         center_x = self.width() - 11
@@ -4484,7 +4572,7 @@ class ThemeComboBox(QComboBox):
         ])
         painter = QPainter(self)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#000000"))
+        painter.setBrush(QColor("#000000" if windows_classic else "#24485f"))
         painter.drawPolygon(arrow)
         painter.end()
 
@@ -5894,8 +5982,7 @@ class EncryptedChatClient(QObject):
                 " stop:0 rgba(255, 255, 255, 232),"
                 " stop:0.42 rgba(225, 242, 252, 220),"
                 " stop:1 rgba(174, 211, 234, 210));"
-                " border: 1px solid rgba(73, 119, 148, 235);"
-                " border-top: 2px solid rgba(255, 255, 255, 245);"
+                " border: 1px solid rgba(49, 91, 118, 245);"
                 " border-radius: 9px; }"
             )
         return (
@@ -7894,6 +7981,7 @@ class EncryptedChatClient(QObject):
         layout.addWidget(self.chat_content, 1)
 
         self.chat_display = MessageLogBrowser()
+        self.chat_display.setObjectName("chatViewport")
         self.chat_display.setReadOnly(True)
         self.chat_display.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.chat_display.setOpenLinks(False)
@@ -7924,18 +8012,21 @@ class EncryptedChatClient(QObject):
         composer_actions.setContentsMargins(0, 0, 0, 0)
         composer_actions.setSpacing(6)
         self.identity_menu_button = QPushButton("Identity")
+        self.identity_menu_button.setObjectName("identityMenuButton")
         self.identity_menu_button.setCheckable(True)
         self.identity_menu_button.toggled.connect(
             self._on_identity_menu_toggled
         )
         composer_actions.addWidget(self.identity_menu_button)
         self.font_menu_button = QPushButton("Font")
+        self.font_menu_button.setObjectName("fontMenuButton")
         self.font_menu_button.setCheckable(True)
         self.font_menu_button.toggled.connect(
             self._on_font_menu_toggled
         )
         composer_actions.addWidget(self.font_menu_button)
         self.formatting_menu_button = QPushButton("Formatting")
+        self.formatting_menu_button.setObjectName("formattingMenuButton")
         self.formatting_menu_button.setCheckable(True)
         self.formatting_menu_button.toggled.connect(
             self._on_formatting_menu_toggled
