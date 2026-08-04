@@ -540,7 +540,7 @@ class BehaviorSettingsTests(unittest.TestCase):
     def test_long_chatroom_history_loading_is_threaded_and_staggered(
         self,
     ) -> None:
-        self.assertEqual(SPRITELINK.INITIAL_HISTORY_RENDER_MESSAGES, 100)
+        self.assertEqual(SPRITELINK.INITIAL_HISTORY_RENDER_MESSAGES, 50)
         self.assertEqual(SPRITELINK.HISTORY_RENDER_PAGE_MESSAGES, 50)
         self.assertEqual(SPRITELINK.MESSAGE_RENDER_STEP_DELAY_MS, 1)
         self.assertEqual(SPRITELINK.UI_EVENT_BATCH_LIMIT, 8)
