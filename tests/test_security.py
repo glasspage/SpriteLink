@@ -84,6 +84,18 @@ class LazyViewportMediaTests(unittest.TestCase):
             "preview = self._unloaded_image_placeholder(*preview_size)",
             preview_source,
         )
+        self.assertIn(
+            "preview_size = self.embedded_image_preview_sizes.get(url)",
+            insert_source,
+        )
+        self.assertIn(
+            "self.embedded_image_preview_sizes[url] = preview_size",
+            insert_source,
+        )
+        self.assertNotIn(
+            "preview_height = self.embedded_image_preview_sizes[",
+            insert_source,
+        )
 
     def test_scroll_resize_and_render_refresh_lazy_media(self) -> None:
         build_source = inspect.getsource(
