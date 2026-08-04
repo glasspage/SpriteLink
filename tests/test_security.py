@@ -182,6 +182,11 @@ class LazyViewportMediaTests(unittest.TestCase):
             "document.documentLayout().documentSize()",
             resource_source,
         )
+        self.assertIn("changed_image_blocks", resource_source)
+        self.assertIn(
+            "_realign_inline_image_block_text(",
+            resource_source,
+        )
         self.assertIn("self.chat_display.viewport().update()", resource_source)
         self.assertNotIn("self.chat_display.clear()", refresh_source)
         self.assertIn("cursorForPosition(QPoint(0, 0))", capture_source)
@@ -206,6 +211,24 @@ class LazyViewportMediaTests(unittest.TestCase):
             "or scrollbar.value() > scrollbar.minimum()",
             action_source,
         )
+
+    def test_loaded_image_geometry_realigns_its_existing_username(self) -> None:
+        source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._realign_inline_image_block_text
+        )
+
+        self.assertIn("document.findBlock(block_position)", source)
+        self.assertIn("formatting.isImageFormat()", source)
+        self.assertIn(
+            '"spritelink-chat-image-resource:"',
+            source,
+        )
+        self.assertIn("preview_height = max(", source)
+        self.assertIn("QFontMetrics(formatting.font()).height()", source)
+        self.assertIn("formatting.setBaselineOffset(", source)
+        self.assertIn("cursor.setCharFormat(formatting)", source)
+        self.assertIn("document.markContentsDirty", source)
 
     def test_far_animations_are_stopped_and_removed(self) -> None:
         viewport_source = inspect.getsource(

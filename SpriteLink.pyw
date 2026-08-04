@@ -11395,6 +11395,7 @@ class EncryptedChatClient(QObject):
         )
         maximum_position = max(0, document.characterCount() - 1)
         geometry_changed = False
+        changed_image_blocks: set[int] = set()
         for position in positions:
             if position < 0 or position > maximum_position:
                 continue
@@ -11416,6 +11417,7 @@ class EncryptedChatClient(QObject):
                 image_format.setWidth(width)
                 image_format.setHeight(height)
                 geometry_changed = True
+                changed_image_blocks.add(cursor.block().position())
 
             # Reapply the inline format on every decoded resource swap. Qt can
             # otherwise retain the placeholder pixels when the real preview
@@ -11424,6 +11426,16 @@ class EncryptedChatClient(QObject):
             document.markContentsDirty(position, 1)
 
         if geometry_changed:
+            # Image-only messages top-align their username and profile icon
+            # against the preview.  Those text baseline offsets were created
+            # from the placeholder height, so resize them in the same hidden
+            # transaction as the image character instead of waiting for a
+            # later document rebuild.
+            for block_position in changed_image_blocks:
+                self._realign_inline_image_block_text(
+                    document,
+                    block_position,
+                )
             # Inline-object size changes can leave the surrounding block with
             # stale line geometry until another scroll event. Complete layout
             # while the viewport transaction is still hidden; its saved
@@ -11435,6 +11447,56 @@ class EncryptedChatClient(QObject):
             self.rendered_loaded_image_urls.add(url)
         else:
             self.rendered_loaded_image_urls.discard(url)
+
+    def _realign_inline_image_block_text(
+        self,
+        document: QTextDocument,
+        block_position: int,
+    ) -> None:
+        block = document.findBlock(block_position)
+        if not block.isValid():
+            return
+
+        block_start = block.position()
+        block_end = block_start + max(0, block.length() - 1)
+        preview_height = 0
+        text_characters: list[tuple[QTextCursor, QTextCharFormat]] = []
+
+        for position in range(block_start, block_end):
+            cursor = QTextCursor(document)
+            cursor.setPosition(position)
+            if not cursor.movePosition(
+                QTextCursor.MoveOperation.NextCharacter,
+                QTextCursor.MoveMode.KeepAnchor,
+            ):
+                continue
+            formatting = cursor.charFormat()
+            if formatting.isImageFormat():
+                image_format = formatting.toImageFormat()
+                if image_format.name().startswith(
+                    "spritelink-chat-image-resource:"
+                ):
+                    preview_height = max(
+                        preview_height,
+                        max(1, int(round(image_format.height()))),
+                    )
+                continue
+            text_characters.append((cursor, formatting))
+
+        if preview_height <= 0:
+            return
+
+        for cursor, formatting in text_characters:
+            font_height = max(1, QFontMetrics(formatting.font()).height())
+            upward_pixels = max(
+                0.0,
+                (preview_height - font_height) / 2.0,
+            )
+            formatting.setBaselineOffset(
+                upward_pixels * 100.0 / font_height
+            )
+            cursor.setCharFormat(formatting)
+            document.markContentsDirty(cursor.selectionStart(), 1)
 
     def _refresh_viewport_image_resources(
         self,
@@ -14210,4 +14272,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
