@@ -161,6 +161,9 @@ class LazyViewportMediaTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient
             ._restore_preserving_scroll_rerender
         )
+        anchor_restore_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._restore_chat_view_anchor
+        )
         action_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient
             ._on_chat_history_scroll_action
@@ -193,8 +196,18 @@ class LazyViewportMediaTests(unittest.TestCase):
         self.assertIn("rendered_message_blocks", capture_source)
         self.assertIn("blockBoundingRect(block)", capture_source)
         self.assertIn("QTimer.singleShot(", finish_source)
-        self.assertIn("if bool(anchor.get(\"at_bottom\"))", restore_source)
-        self.assertIn("block_top - float(anchor.get", restore_source)
+        self.assertIn(
+            "_restore_chat_view_anchor(anchor)",
+            restore_source,
+        )
+        self.assertIn(
+            "if bool(anchor.get(\"at_bottom\"))",
+            anchor_restore_source,
+        )
+        self.assertIn(
+            "block_top - float(anchor.get",
+            anchor_restore_source,
+        )
         self.assertIn(
             "self._media_rerender_in_progress = False",
             restore_source,
