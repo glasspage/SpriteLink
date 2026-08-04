@@ -233,6 +233,33 @@ NOTIFICATION_BUTTON_STYLESHEET = (
     "QPushButton:hover { background-color: #f3c78d; }"
     "QPushButton:pressed { background-color: #efb968; }"
 )
+GLASSY_NOTIFICATION_BUTTON_STYLESHEET = (
+    "QPushButton {"
+    " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    " stop:0 rgba(255, 250, 232, 245),"
+    " stop:0.46 rgba(255, 226, 170, 238),"
+    " stop:0.5 rgba(247, 190, 105, 238),"
+    " stop:1 rgba(222, 137, 45, 238));"
+    " color: #633100;"
+    " border: 1px solid #a65c12;"
+    " border-top-color: #fff3d6;"
+    " border-radius: 5px;"
+    " padding: 4px 10px;"
+    "}"
+    "QPushButton:hover {"
+    " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    " stop:0 rgba(255, 255, 244, 250),"
+    " stop:0.46 rgba(255, 235, 191, 245),"
+    " stop:0.5 rgba(255, 205, 124, 245),"
+    " stop:1 rgba(235, 153, 58, 245));"
+    "}"
+    "QPushButton:pressed, QPushButton:checked {"
+    " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    " stop:0 rgba(211, 130, 38, 245),"
+    " stop:1 rgba(255, 220, 157, 245));"
+    " border-color: #834508;"
+    "}"
+)
 WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET = (
     "QPushButton {"
     " background-color: #f8d8ad;"
@@ -260,7 +287,12 @@ WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET = (
 )
 
 
-def notification_button_stylesheet(windows_classic: bool) -> str:
+def notification_button_stylesheet(
+    windows_classic: bool,
+    glassy: bool = False,
+) -> str:
+    if glassy:
+        return GLASSY_NOTIFICATION_BUTTON_STYLESHEET
     return (
         WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET
         if windows_classic
@@ -331,6 +363,7 @@ SERVER_PRESETS: dict[str, str] = {
 DEFAULT_THEME = "Classic"
 THEMES = (
     DEFAULT_THEME,
+    "Glassy",
     "Modern",
 )
 LEGACY_THEME_NAMES = {
@@ -731,6 +764,198 @@ QToolTip {
 }
 QFrame[frameShape="4"], QFrame[frameShape="5"] {
     color: #808080;
+}
+"""
+
+GLASSY_STYLESHEET = """
+QMainWindow, QDialog {
+    background: rgba(224, 240, 250, 188);
+    color: #172532;
+}
+QWidget#glassRoot {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 rgba(242, 251, 255, 218),
+        stop:0.40 rgba(207, 231, 246, 192),
+        stop:1 rgba(151, 195, 224, 178)
+    );
+}
+QWidget#chatroomsPanel {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(251, 254, 255, 202),
+        stop:0.78 rgba(218, 238, 250, 188),
+        stop:1 rgba(172, 207, 230, 174)
+    );
+    border-right: 1px solid rgba(78, 129, 164, 210);
+}
+QWidget#chatTab {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(250, 254, 255, 190),
+        stop:0.20 rgba(230, 244, 252, 178),
+        stop:1 rgba(202, 227, 242, 166)
+    );
+}
+QLabel {
+    background: transparent;
+}
+QPushButton {
+    color: #142638;
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 246),
+        stop:0.46 rgba(235, 247, 254, 238),
+        stop:0.50 rgba(196, 224, 243, 236),
+        stop:1 rgba(153, 197, 225, 236)
+    );
+    border: 1px solid #5f8faa;
+    border-top-color: #ffffff;
+    border-radius: 5px;
+    padding: 4px 10px;
+    min-height: 18px;
+}
+QPushButton:hover {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 252),
+        stop:0.46 rgba(236, 252, 255, 246),
+        stop:0.50 rgba(182, 231, 250, 244),
+        stop:1 rgba(102, 184, 226, 242)
+    );
+    border-color: #3c7fa7;
+}
+QPushButton:pressed, QPushButton:checked {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(105, 168, 207, 242),
+        stop:0.52 rgba(164, 209, 235, 242),
+        stop:1 rgba(222, 244, 254, 244)
+    );
+    border-color: #376d8d;
+    padding-top: 5px;
+    padding-bottom: 3px;
+}
+QPushButton:default {
+    border: 2px solid #4387b2;
+    padding: 3px 9px;
+}
+QPushButton:disabled {
+    color: rgba(49, 68, 82, 125);
+    background: rgba(226, 237, 244, 142);
+    border-color: rgba(99, 132, 151, 110);
+}
+QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
+    color: #172532;
+    background-color: rgba(255, 255, 255, 226);
+    border: 1px solid rgba(72, 119, 148, 225);
+    border-top-color: rgba(49, 91, 118, 235);
+    border-radius: 4px;
+    selection-background-color: #5ba7d5;
+    selection-color: #ffffff;
+}
+QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus,
+QListWidget:focus, QComboBox:focus {
+    border: 1px solid #3188bd;
+}
+QLineEdit, QPlainTextEdit {
+    padding: 3px 5px;
+}
+QComboBox {
+    padding: 3px 24px 3px 7px;
+}
+QComboBox::drop-down {
+    width: 22px;
+    border-left: 1px solid rgba(89, 132, 158, 190);
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 230),
+        stop:1 rgba(153, 201, 230, 230)
+    );
+    border-top-right-radius: 4px;
+    border-bottom-right-radius: 4px;
+}
+QComboBox QAbstractItemView, QMenu {
+    color: #172532;
+    background-color: rgba(247, 252, 255, 246);
+    border: 1px solid #608aa3;
+    selection-background-color: #62a9d2;
+    selection-color: #ffffff;
+}
+QListWidget::item:selected, QMenu::item:selected {
+    color: #ffffff;
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #3f91c2,
+        stop:1 #80c2e7
+    );
+}
+QMenu::item:disabled {
+    color: rgba(41, 57, 70, 120);
+}
+QFrame[frameShape="6"] {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 192),
+        stop:1 rgba(191, 220, 237, 176)
+    );
+    border: 1px solid rgba(87, 131, 158, 205);
+    border-radius: 6px;
+}
+QScrollArea, QScrollArea > QWidget > QWidget {
+    background: transparent;
+    border: none;
+}
+QScrollBar:vertical {
+    background: rgba(220, 238, 248, 155);
+    width: 14px;
+    margin: 1px;
+    border-radius: 6px;
+}
+QScrollBar::handle:vertical {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(255, 255, 255, 235),
+        stop:0.45 rgba(165, 207, 232, 232),
+        stop:1 rgba(102, 167, 207, 232)
+    );
+    border: 1px solid #648fa9;
+    border-radius: 5px;
+    min-height: 24px;
+}
+QScrollBar::handle:vertical:hover {
+    background: rgba(115, 190, 229, 240);
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+    height: 0px;
+}
+QProgressBar {
+    color: #172532;
+    background-color: rgba(255, 255, 255, 188);
+    border: 1px solid #6f9bb5;
+    border-radius: 4px;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #c7f5ff,
+        stop:0.48 #72cee9,
+        stop:0.52 #39a8d4,
+        stop:1 #197aa9
+    );
+    border-radius: 3px;
+}
+QToolTip {
+    color: #172532;
+    background-color: rgba(248, 253, 255, 246);
+    border: 1px solid #668da4;
+    padding: 3px;
+}
+QFrame[frameShape="4"], QFrame[frameShape="5"] {
+    color: rgba(73, 115, 140, 190);
 }
 """
 
@@ -3590,6 +3815,20 @@ class ConfigOverlay(QWidget):
             "QWidget#configOverlay { background-color: rgba(0, 0, 0, 105); }"
         )
 
+    def apply_theme(self, glassy: bool) -> None:
+        if glassy:
+            self.setStyleSheet(
+                "QWidget#configOverlay {"
+                " background-color: rgba(20, 54, 76, 82);"
+                "}"
+            )
+        else:
+            self.setStyleSheet(
+                "QWidget#configOverlay {"
+                " background-color: rgba(0, 0, 0, 105);"
+                "}"
+            )
+
     def mousePressEvent(self, event: Any) -> None:
         if (
             self.panel is not None
@@ -5560,6 +5799,9 @@ class EncryptedChatClient(QObject):
     def _is_windows_classic_theme(self) -> bool:
         return self.theme_var.get() == "Classic"
 
+    def _is_glassy_theme(self) -> bool:
+        return self.theme_var.get() == "Glassy"
+
     def _windows_classic_palette(self) -> QPalette:
         palette = QPalette()
         colors = {
@@ -5597,6 +5839,43 @@ class EncryptedChatClient(QObject):
         )
         return palette
 
+    def _glassy_palette(self) -> QPalette:
+        palette = QPalette(self._basic_palette)
+        colors = {
+            QPalette.ColorRole.Window: QColor(224, 240, 250, 188),
+            QPalette.ColorRole.WindowText: QColor("#172532"),
+            QPalette.ColorRole.Base: QColor(255, 255, 255, 226),
+            QPalette.ColorRole.AlternateBase: QColor(222, 239, 249, 216),
+            QPalette.ColorRole.ToolTipBase: QColor(248, 253, 255, 246),
+            QPalette.ColorRole.ToolTipText: QColor("#172532"),
+            QPalette.ColorRole.Text: QColor("#172532"),
+            QPalette.ColorRole.Button: QColor(191, 221, 239, 226),
+            QPalette.ColorRole.ButtonText: QColor("#142638"),
+            QPalette.ColorRole.BrightText: QColor("#ffffff"),
+            QPalette.ColorRole.Light: QColor("#ffffff"),
+            QPalette.ColorRole.Midlight: QColor("#dceff9"),
+            QPalette.ColorRole.Mid: QColor("#83afc9"),
+            QPalette.ColorRole.Dark: QColor("#527d96"),
+            QPalette.ColorRole.Shadow: QColor("#29485b"),
+            QPalette.ColorRole.Highlight: QColor("#4b9bc9"),
+            QPalette.ColorRole.HighlightedText: QColor("#ffffff"),
+            QPalette.ColorRole.Link: QColor("#006fae"),
+            QPalette.ColorRole.LinkVisited: QColor("#5e4b9e"),
+        }
+        for role, color in colors.items():
+            palette.setColor(role, color)
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.Text,
+            QColor(49, 68, 82, 125),
+        )
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.ButtonText,
+            QColor(49, 68, 82, 125),
+        )
+        return palette
+
     def _config_panel_stylesheet(self) -> str:
         if self._is_windows_classic_theme():
             return (
@@ -5606,6 +5885,18 @@ class EncryptedChatClient(QObject):
                 " border-right: 2px solid #000000;"
                 " border-bottom: 2px solid #000000;"
                 " border-radius: 0px; }"
+            )
+        if self._is_glassy_theme():
+            return (
+                "QFrame#configPanel {"
+                " background: qlineargradient("
+                " x1:0, y1:0, x2:1, y2:1,"
+                " stop:0 rgba(255, 255, 255, 232),"
+                " stop:0.42 rgba(225, 242, 252, 220),"
+                " stop:1 rgba(174, 211, 234, 210));"
+                " border: 1px solid rgba(73, 119, 148, 235);"
+                " border-top: 2px solid rgba(255, 255, 255, 245);"
+                " border-radius: 9px; }"
             )
         return (
             "QFrame#configPanel { background: palette(window); "
@@ -5646,16 +5937,50 @@ class EncryptedChatClient(QObject):
                 caption = "#000080"
                 text = "#ffffff"
                 corner_preference = 1  # DWMWCP_DONOTROUND
+                backdrop = 1  # DWMSBT_NONE
+            elif self._is_glassy_theme():
+                border = "#6292af"
+                caption = None
+                text = "#102637"
+                corner_preference = 2  # DWMWCP_ROUND
+                backdrop = 3  # DWMSBT_TRANSIENTWINDOW (acrylic)
             else:
                 border = "#d0d0d0"
                 caption = "#f0f0f0"
                 text = "#000000"
                 corner_preference = 0  # DWMWCP_DEFAULT
+                backdrop = 1  # DWMSBT_NONE
 
             set_attribute(33, corner_preference)  # DWMWA_WINDOW_CORNER_PREFERENCE
             set_attribute(34, self._windows_colorref(border))
-            set_attribute(35, self._windows_colorref(caption))
+            set_attribute(
+                35,
+                0xFFFFFFFF  # DWMWA_COLOR_DEFAULT keeps acrylic visible.
+                if caption is None
+                else self._windows_colorref(caption),
+            )
             set_attribute(36, self._windows_colorref(text))
+            set_attribute(38, backdrop)  # DWMWA_SYSTEMBACKDROP_TYPE
+
+            class Margins(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_int),
+                    ("right", ctypes.c_int),
+                    ("top", ctypes.c_int),
+                    ("bottom", ctypes.c_int),
+                ]
+
+            glass_margin = -1 if self._is_glassy_theme() else 0
+            margins = Margins(
+                glass_margin,
+                glass_margin,
+                glass_margin,
+                glass_margin,
+            )
+            dwmapi.DwmExtendFrameIntoClientArea(
+                hwnd,
+                ctypes.byref(margins),
+            )
         except Exception:
             # Older Windows versions do not expose the color attributes.
             pass
@@ -5988,6 +6313,10 @@ class EncryptedChatClient(QObject):
             )
             app.setPalette(self._windows_classic_palette())
             app.setStyleSheet(WINDOWS_CLASSIC_STYLESHEET)
+        elif self._is_glassy_theme():
+            style_name = available_styles.get("fusion", "Fusion")
+            app.setPalette(self._glassy_palette())
+            app.setStyleSheet(GLASSY_STYLESHEET)
         else:
             style_name = available_styles.get(
                 self._basic_style_name.casefold()
@@ -6009,6 +6338,7 @@ class EncryptedChatClient(QObject):
             "spritelinkWindowsClassic",
             self._is_windows_classic_theme(),
         )
+        app.setProperty("spritelinkGlassy", self._is_glassy_theme())
         for widget in app.allWidgets():
             if isinstance(widget, ThemeComboBox):
                 widget.update()
@@ -6029,6 +6359,15 @@ class EncryptedChatClient(QObject):
             self.link_warning_panel.setStyleSheet(
                 self._config_panel_stylesheet()
             )
+        for overlay_name in (
+            "config_overlay",
+            "message_limit_overlay",
+            "image_preview_overlay",
+            "link_warning_overlay",
+        ):
+            overlay = getattr(self, overlay_name, None)
+            if isinstance(overlay, ConfigOverlay):
+                overlay.apply_theme(self._is_glassy_theme())
         if hasattr(self, "message_size_bar"):
             self._draw_message_size_bar()
         if hasattr(self, "chatrooms_toggle"):
@@ -6063,6 +6402,8 @@ class EncryptedChatClient(QObject):
 
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("glassRoot")
+        central.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         central_layout = QHBoxLayout(central)
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.setSpacing(0)
@@ -6070,6 +6411,8 @@ class EncryptedChatClient(QObject):
 
         self._build_chatroom_sidebar(central_layout)
         self.chat_tab = QWidget()
+        self.chat_tab.setObjectName("chatTab")
+        self.chat_tab.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         central_layout.addWidget(self.chat_tab, 1)
 
         self._build_chat_tab()
@@ -6080,6 +6423,11 @@ class EncryptedChatClient(QObject):
 
     def _build_chatroom_sidebar(self, root_layout: QHBoxLayout) -> None:
         self.chatrooms_panel = QWidget()
+        self.chatrooms_panel.setObjectName("chatroomsPanel")
+        self.chatrooms_panel.setAttribute(
+            Qt.WidgetAttribute.WA_StyledBackground,
+            True,
+        )
         self.chatrooms_panel.setFixedWidth(CHATROOM_SIDEBAR_WIDTH)
         panel_layout = QVBoxLayout(self.chatrooms_panel)
         panel_layout.setContentsMargins(6, 10, 8, 10)
@@ -6470,7 +6818,8 @@ class EncryptedChatClient(QObject):
         if has_visible_unread:
             self.chatrooms_toggle.setStyleSheet(
                 notification_button_stylesheet(
-                    self._is_windows_classic_theme()
+                    self._is_windows_classic_theme(),
+                    self._is_glassy_theme(),
                 )
             )
         else:
@@ -6482,7 +6831,8 @@ class EncryptedChatClient(QObject):
         if self.available_update is not None:
             self.config_toggle.setStyleSheet(
                 notification_button_stylesheet(
-                    self._is_windows_classic_theme()
+                    self._is_windows_classic_theme(),
+                    self._is_glassy_theme(),
                 )
             )
             self.config_toggle.setToolTip(
@@ -6501,7 +6851,8 @@ class EncryptedChatClient(QObject):
         ):
             self.update_button.setStyleSheet(
                 notification_button_stylesheet(
-                    self._is_windows_classic_theme()
+                    self._is_windows_classic_theme(),
+                    self._is_glassy_theme(),
                 )
             )
         else:
@@ -9570,6 +9921,25 @@ class EncryptedChatClient(QObject):
                 " QProgressBar::chunk { background-color: "
                 + ("#800000" if at_or_over_limit else "#007f82")
                 + "; }"
+            )
+        elif self._is_glassy_theme():
+            self.message_size_bar.setStyleSheet(
+                "QProgressBar { background-color: rgba(255,255,255,188);"
+                " border: 1px solid #6f9bb5; border-radius: 4px; color: "
+                + ("#ffffff" if at_or_over_limit else "#172532")
+                + "; text-align: center; }"
+                " QProgressBar::chunk {"
+                " background: qlineargradient("
+                " x1:0, y1:0, x2:0, y2:1,"
+                + (
+                    " stop:0 #ffb9b9, stop:0.48 #df6262,"
+                    " stop:0.52 #b72f2f, stop:1 #7e1717"
+                    if at_or_over_limit
+                    else
+                    " stop:0 #c7f5ff, stop:0.48 #72cee9,"
+                    " stop:0.52 #39a8d4, stop:1 #197aa9"
+                )
+                + "); border-radius: 3px; }"
             )
         else:
             self.message_size_bar.setStyleSheet(
