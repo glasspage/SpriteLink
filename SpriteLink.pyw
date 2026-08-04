@@ -376,6 +376,7 @@ TOOLTIP_SPACER_DATA_URI = (
 )
 EMBEDDED_IMAGE_MAX_WIDTH = 256
 EMBEDDED_IMAGE_MAX_HEIGHT = 96
+EMBEDDED_IMAGE_PLACEHOLDER_SIZE = 48
 NSFW_IMAGE_PLACEHOLDER_SIZE = 64
 TOP_ALIGNED_PROFILE_ICON_PADDING = 3
 IMAGE_PREVIEW_MAX_WIDTH = CONFIG_POPUP_MAX_WIDTH - 32
@@ -11393,6 +11394,7 @@ class EncryptedChatClient(QObject):
             preview,
         )
         maximum_position = max(0, document.characterCount() - 1)
+        geometry_changed = False
         for position in positions:
             if position < 0 or position > maximum_position:
                 continue
@@ -11406,10 +11408,28 @@ class EncryptedChatClient(QObject):
             image_format = cursor.charFormat().toImageFormat()
             if image_format.name() != resource_url.toString():
                 continue
-            image_format.setWidth(width)
-            image_format.setHeight(height)
+            size_changed = (
+                int(round(image_format.width())) != width
+                or int(round(image_format.height())) != height
+            )
+            if size_changed:
+                image_format.setWidth(width)
+                image_format.setHeight(height)
+                geometry_changed = True
+
+            # Reapply the inline format on every decoded resource swap. Qt can
+            # otherwise retain the placeholder pixels when the real preview
+            # happens to have the same geometry.
             cursor.setCharFormat(image_format)
             document.markContentsDirty(position, 1)
+
+        if geometry_changed:
+            # Inline-object size changes can leave the surrounding block with
+            # stale line geometry until another scroll event. Complete layout
+            # while the viewport transaction is still hidden; its saved
+            # anchor is restored before updates are enabled again.
+            document.documentLayout().documentSize()
+        self.chat_display.viewport().update()
 
         if loaded:
             self.rendered_loaded_image_urls.add(url)
@@ -11431,8 +11451,8 @@ class EncryptedChatClient(QObject):
             preview_size = self.embedded_image_preview_sizes.get(url)
             if preview_size is None:
                 preview_size = (
-                    EMBEDDED_IMAGE_MAX_WIDTH,
-                    EMBEDDED_IMAGE_MAX_HEIGHT,
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
                 )
                 self.embedded_image_preview_sizes[url] = preview_size
             self._set_rendered_inline_image(
@@ -12438,8 +12458,8 @@ class EncryptedChatClient(QObject):
             preview_size = self.embedded_image_preview_sizes.get(url)
             if preview_size is None:
                 preview_size = (
-                    EMBEDDED_IMAGE_MAX_WIDTH,
-                    EMBEDDED_IMAGE_MAX_HEIGHT,
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
                 )
                 self.embedded_image_preview_sizes[url] = preview_size
             preview = self._unloaded_image_placeholder(*preview_size)
@@ -13322,20 +13342,12 @@ class EncryptedChatClient(QObject):
                 image_url,
                 [],
             ).append(message_start_position)
-        displayed_image_urls = [
-            image_url
-            for image_url in image_urls
-            if (
-                (
-                    image_url in self.viewport_embedded_image_urls
-                    and isinstance(
-                        self.image_preview_cache.get(image_url),
-                        RemoteMediaPreview,
-                    )
-                )
-                or image_url in self.embedded_image_preview_sizes
-            )
-        ]
+        # Every trusted image gets an inline object during its first
+        # message render. Visibility determines whether that object contains
+        # the decoded preview or a 48x48 placeholder; it must never determine
+        # whether the object exists. Otherwise the first decode callback has
+        # no image character to refresh until scrolling rebuilds the row.
+        displayed_image_urls = list(image_urls)
 
         username_color = (
             self._blend_toward_chat_background(original_color)
@@ -13389,9 +13401,14 @@ class EncryptedChatClient(QObject):
                         cached_media,
                     ).height()
                 else:
-                    preview_height = self.embedded_image_preview_sizes[
-                        url
-                    ][1]
+                    preview_size = self.embedded_image_preview_sizes.get(url)
+                    if preview_size is None:
+                        preview_size = (
+                            EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
+                            EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
+                        )
+                        self.embedded_image_preview_sizes[url] = preview_size
+                    preview_height = preview_size[1]
                 top_align_height = max(
                     top_align_height,
                     preview_height,
@@ -14193,3 +14210,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

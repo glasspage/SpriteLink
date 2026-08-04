@@ -56,9 +56,46 @@ class LazyViewportMediaTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._insert_message_item
         )
         self.assertIn("displayed_image_urls", insert_source)
-        self.assertIn("viewport_embedded_image_urls", insert_source)
-        self.assertIn("embedded_image_preview_sizes", insert_source)
+        self.assertIn("displayed_image_urls = list(image_urls)", insert_source)
+        self.assertNotIn(
+            "image_url in self.viewport_embedded_image_urls",
+            insert_source,
+        )
         self.assertNotIn("_schedule_image_preview_fetch", insert_source)
+
+    def test_fresh_images_reserve_an_inline_object_before_visibility(self) -> None:
+        insert_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_message_item
+        )
+        preview_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._insert_embedded_image_preview
+        )
+
+        self.assertIn("displayed_image_urls = list(image_urls)", insert_source)
+        self.assertIn(
+            "for image_url in displayed_image_urls:",
+            insert_source,
+        )
+        self.assertIn(
+            "self.rendered_image_positions.setdefault(url, []).append",
+            preview_source,
+        )
+        self.assertIn(
+            "preview = self._unloaded_image_placeholder(*preview_size)",
+            preview_source,
+        )
+        self.assertIn(
+            "preview_size = self.embedded_image_preview_sizes.get(url)",
+            insert_source,
+        )
+        self.assertIn(
+            "self.embedded_image_preview_sizes[url] = preview_size",
+            insert_source,
+        )
+        self.assertNotIn(
+            "preview_height = self.embedded_image_preview_sizes[",
+            insert_source,
+        )
 
     def test_scroll_resize_and_render_refresh_lazy_media(self) -> None:
         build_source = inspect.getsource(
@@ -93,8 +130,8 @@ class LazyViewportMediaTests(unittest.TestCase):
             "preview = self._unloaded_image_placeholder(*preview_size)",
             insert_source,
         )
-        self.assertIn("EMBEDDED_IMAGE_MAX_WIDTH", insert_source)
-        self.assertIn("EMBEDDED_IMAGE_MAX_HEIGHT", insert_source)
+        self.assertEqual(SPRITELINK.EMBEDDED_IMAGE_PLACEHOLDER_SIZE, 48)
+        self.assertIn("EMBEDDED_IMAGE_PLACEHOLDER_SIZE", insert_source)
         self.assertNotIn("preview_size is None:\n                return False", insert_source)
         self.assertIn('placeholder.fill(QColor("#d0d0d0"))', placeholder_source)
         self.assertIn("max(1, int(width))", placeholder_source)
@@ -139,6 +176,13 @@ class LazyViewportMediaTests(unittest.TestCase):
         self.assertIn("document.addResource(", resource_source)
         self.assertIn("cursor.setCharFormat(image_format)", resource_source)
         self.assertIn("document.markContentsDirty(position, 1)", resource_source)
+        self.assertIn("geometry_changed = False", resource_source)
+        self.assertIn("if size_changed:", resource_source)
+        self.assertIn(
+            "document.documentLayout().documentSize()",
+            resource_source,
+        )
+        self.assertIn("self.chat_display.viewport().update()", resource_source)
         self.assertNotIn("self.chat_display.clear()", refresh_source)
         self.assertIn("cursorForPosition(QPoint(0, 0))", capture_source)
         self.assertIn("rendered_message_blocks", capture_source)
