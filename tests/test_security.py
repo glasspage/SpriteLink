@@ -208,9 +208,10 @@ class LazyViewportMediaTests(unittest.TestCase):
             action_source,
         )
         self.assertIn(
-            "or scrollbar.value() > scrollbar.minimum()",
+            "scroll_position_is_near_history_start(",
             action_source,
         )
+        self.assertIn("scrollbar.sliderPosition()", action_source)
 
     def test_loaded_image_geometry_realigns_its_existing_username(self) -> None:
         source = inspect.getsource(
@@ -542,6 +543,10 @@ class BehaviorSettingsTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(SPRITELINK.INITIAL_HISTORY_RENDER_MESSAGES, 50)
         self.assertEqual(SPRITELINK.HISTORY_RENDER_PAGE_MESSAGES, 50)
+        self.assertEqual(
+            SPRITELINK.HISTORY_PREFETCH_SCROLL_FRACTION,
+            0.20,
+        )
         self.assertEqual(SPRITELINK.MESSAGE_RENDER_STEP_DELAY_MS, 1)
         self.assertEqual(SPRITELINK.UI_EVENT_BATCH_LIMIT, 8)
 
@@ -684,6 +689,26 @@ class BehaviorSettingsTests(unittest.TestCase):
             "self._older_history_user_request = request",
             scroll_action_source,
         )
+        self.assertIn(
+            "scrollbar.sliderPosition()",
+            scroll_action_source,
+        )
+        self.assertIn(
+            "scroll_position_is_near_history_start(",
+            scroll_action_source,
+        )
+        self.assertTrue(
+            SPRITELINK.scroll_position_is_near_history_start(20, 0, 100)
+        )
+        self.assertFalse(
+            SPRITELINK.scroll_position_is_near_history_start(21, 0, 100)
+        )
+        self.assertTrue(
+            SPRITELINK.scroll_position_is_near_history_start(30, 10, 110)
+        )
+        self.assertFalse(
+            SPRITELINK.scroll_position_is_near_history_start(31, 10, 110)
+        )
         event_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient.eventFilter
         )
@@ -701,6 +726,14 @@ class BehaviorSettingsTests(unittest.TestCase):
         )
         self.assertIn(
             "self._older_history_user_request = None",
+            action_source,
+        )
+        self.assertIn(
+            "scrollbar.value()",
+            action_source,
+        )
+        self.assertIn(
+            "scroll_position_is_near_history_start(",
             action_source,
         )
         page_source = inspect.getsource(
