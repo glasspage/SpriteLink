@@ -1742,9 +1742,18 @@ class RuntimeOptimizationTests(unittest.TestCase):
             ._paint_final_row_background_tail
         )
         self.assertIn("max(self.row_background_blocks)", tail_source)
-        self.assertIn("MESSAGE_ROW_BACKGROUNDS[1]", tail_source)
+        self.assertNotIn("MESSAGE_ROW_BACKGROUNDS[1]", tail_source)
         self.assertIn("_block_row_vertical_bounds(block)", tail_source)
         self.assertIn("viewport_height - bottom", tail_source)
+
+        forward_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient
+            ._continue_message_log_render_forward
+        )
+        self.assertIn(
+            "self._bottom_align_short_message_log()",
+            forward_source,
+        )
 
     def test_status_line_uses_chatroom_name_and_delayed_error(self) -> None:
         self.assertEqual(
@@ -4238,7 +4247,7 @@ class Version120ReleaseTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._build_config_tab
         )
         self.assertLess(
-            source.index('QLabel("Themes")'),
+            source.index('QLabel("Theme")'),
             source.index('QCheckBox("Text Shadows")'),
         )
         self.assertLess(
@@ -4299,6 +4308,9 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertIn("QGraphicsBlurEffect", overlay_source)
         self.assertIn("QualityHint", overlay_source)
         self.assertIn("parent.grab()", overlay_source)
+        self.assertIn("blur_radius * 2.0", overlay_source)
+        self.assertIn("source_width - 1.0", overlay_source)
+        self.assertIn("source_height - 1.0", overlay_source)
         self.assertIn("painter.drawPixmap", overlay_source)
 
         chat_source = inspect.getsource(

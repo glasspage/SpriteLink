@@ -3857,21 +3857,128 @@ class ConfigOverlay(QWidget):
         if source.isNull():
             return None
 
-        blurred = QPixmap(source.size())
-        blurred.setDevicePixelRatio(source.devicePixelRatio())
-        blurred.fill(Qt.GlobalColor.transparent)
+        blur_radius = 11.0
+        padding = int(math.ceil(blur_radius * 2.0))
+        device_ratio = source.devicePixelRatio()
+        source_size = source.deviceIndependentSize()
+        source_width = float(source_size.width())
+        source_height = float(source_size.height())
+        padded = QPixmap(
+            max(
+                1,
+                int(math.ceil(
+                    (source_width + (padding * 2)) * device_ratio
+                )),
+            ),
+            max(
+                1,
+                int(math.ceil(
+                    (source_height + (padding * 2)) * device_ratio
+                )),
+            ),
+        )
+        padded.setDevicePixelRatio(device_ratio)
+        padded.fill(Qt.GlobalColor.transparent)
+
+        # A blur fades toward transparency outside its source. Without a
+        # gutter, the live unblurred controls beneath this overlay show
+        # through along the window edges. Stretch each outermost source row
+        # and column into the gutter so the blur stays opaque everywhere.
+        source_rect = QRectF(0.0, 0.0, source_width, source_height)
+        padded_painter = QPainter(padded)
+        padded_painter.drawPixmap(
+            QRectF(
+                float(padding),
+                float(padding),
+                source_width,
+                source_height,
+            ),
+            source,
+            source_rect,
+        )
+        padded_painter.drawPixmap(
+            QRectF(0.0, float(padding), float(padding), source_height),
+            source,
+            QRectF(0.0, 0.0, 1.0, source_height),
+        )
+        padded_painter.drawPixmap(
+            QRectF(
+                float(padding) + source_width,
+                float(padding),
+                float(padding),
+                source_height,
+            ),
+            source,
+            QRectF(source_width - 1.0, 0.0, 1.0, source_height),
+        )
+        padded_painter.drawPixmap(
+            QRectF(
+                float(padding),
+                0.0,
+                source_width,
+                float(padding),
+            ),
+            source,
+            QRectF(0.0, 0.0, source_width, 1.0),
+        )
+        padded_painter.drawPixmap(
+            QRectF(
+                float(padding),
+                float(padding) + source_height,
+                source_width,
+                float(padding),
+            ),
+            source,
+            QRectF(0.0, source_height - 1.0, source_width, 1.0),
+        )
+        for target_x, target_y, source_x, source_y in (
+            (0.0, 0.0, 0.0, 0.0),
+            (float(padding) + source_width, 0.0, source_width - 1.0, 0.0),
+            (0.0, float(padding) + source_height, 0.0, source_height - 1.0),
+            (
+                float(padding) + source_width,
+                float(padding) + source_height,
+                source_width - 1.0,
+                source_height - 1.0,
+            ),
+        ):
+            padded_painter.drawPixmap(
+                QRectF(
+                    target_x,
+                    target_y,
+                    float(padding),
+                    float(padding),
+                ),
+                source,
+                QRectF(source_x, source_y, 1.0, 1.0),
+            )
+        padded_painter.end()
+
+        blurred_padded = QPixmap(padded.size())
+        blurred_padded.setDevicePixelRatio(device_ratio)
+        blurred_padded.fill(Qt.GlobalColor.transparent)
 
         scene = QGraphicsScene()
-        item = scene.addPixmap(source)
+        item = scene.addPixmap(padded)
         effect = QGraphicsBlurEffect()
-        effect.setBlurRadius(11.0)
+        effect.setBlurRadius(blur_radius)
         effect.setBlurHints(QGraphicsBlurEffect.BlurHint.QualityHint)
         item.setGraphicsEffect(effect)
-        source_rect = item.boundingRect()
-        scene.setSceneRect(source_rect)
+        padded_rect = item.boundingRect()
+        scene.setSceneRect(padded_rect)
 
+        painter = QPainter(blurred_padded)
+        scene.render(painter, padded_rect, padded_rect)
+        painter.end()
+
+        blurred = QPixmap(source.size())
+        blurred.setDevicePixelRatio(device_ratio)
+        blurred.fill(Qt.GlobalColor.transparent)
         painter = QPainter(blurred)
-        scene.render(painter, source_rect, source_rect)
+        painter.drawPixmap(
+            QPointF(-float(padding), -float(padding)),
+            blurred_padded,
+        )
         painter.end()
         return blurred
 
@@ -3906,7 +4013,7 @@ class ConfigOverlay(QWidget):
     def paintEvent(self, event: Any) -> None:
         if self._glassy and self._blurred_background is not None:
             painter = QPainter(self)
-            painter.drawPixmap(self.rect(), self._blurred_background)
+            painter.drawPixmap(QPoint(0, 0), self._blurred_background)
             painter.fillRect(self.rect(), QColor(20, 54, 76, 82))
             painter.end()
             return
@@ -5157,15 +5264,12 @@ class MessageLogBrowser(QTextBrowser):
         painter.end()
 
     def _paint_final_row_background_tail(self, event: Any) -> None:
-        """Extend a final gray message stripe through the viewport bottom."""
+        """Extend the final message stripe through the viewport bottom."""
         if not self.row_background_blocks:
             return
 
         last_block_number = max(self.row_background_blocks)
         background = self.row_background_blocks[last_block_number]
-        if background != QColor(MESSAGE_ROW_BACKGROUNDS[1]):
-            return
-
         block = self.document().findBlockByNumber(last_block_number)
         if not block.isValid():
             return
@@ -9093,7 +9197,7 @@ class EncryptedChatClient(QObject):
         layout.addWidget(self._heading("Appearance"), row, 0, 1, 3)
         row += 1
 
-        layout.addWidget(QLabel("Themes"), row, 0)
+        layout.addWidget(QLabel("Theme"), row, 0)
         self.theme_combo = ThemeComboBox()
         self.theme_combo.addItems(list(THEMES))
         self.theme_combo.setCurrentText(str(self.theme_var.get()))
@@ -13951,6 +14055,11 @@ class EncryptedChatClient(QObject):
             for selection in row_selections
             if selection.cursor.block().isValid()
         }
+        # Forward rendering is used when a theme/style replacement rebuilds
+        # the log while preserving its anchor. Short documents have no
+        # scrollbar position to restore, so reapply their root-frame margin
+        # explicitly instead of letting the messages snap to the top.
+        self._bottom_align_short_message_log()
         self.chat_display.setExtraSelections([])
         self._message_render_job = None
         self._rendering_message_log = False
