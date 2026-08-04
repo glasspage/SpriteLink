@@ -309,6 +309,7 @@ CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
 INITIAL_HISTORY_RENDER_MESSAGES = 50
 HISTORY_RENDER_PAGE_MESSAGES = 50
+HISTORY_PREFETCH_SCROLL_FRACTION = 0.20
 MESSAGE_RENDER_STEP_DELAY_MS = 1
 UI_EVENT_BATCH_LIMIT = 8
 BACKGROUND_HISTORY_PRUNE_INTERVAL_MS = 60 * 60 * 1000
@@ -3914,6 +3915,19 @@ def vertical_range_is_near_viewport(
     )
 
 
+def scroll_position_is_near_history_start(
+    position: int,
+    minimum: int,
+    maximum: int,
+) -> bool:
+    scroll_span = max(0, int(maximum) - int(minimum))
+    trigger_position = (
+        int(minimum)
+        + scroll_span * HISTORY_PREFETCH_SCROLL_FRACTION
+    )
+    return int(position) <= trigger_position
+
+
 def polling_interval_seconds(*, window_on_screen: bool) -> float:
     return (
         ON_SCREEN_POLL_INTERVAL_SECONDS
@@ -7139,9 +7153,10 @@ class EncryptedChatClient(QObject):
         )
 
     def _on_chat_history_scroll_action(self, _action: int) -> None:
-        # Queue at most one request for the action that actually reached the
-        # top. Repeated actionTriggered signals from the same wheel/slider
-        # gesture must not survive a page transaction and request another one.
+        # Queue at most one request once a genuine user scroll reaches the
+        # oldest 20 percent of the loaded history. actionTriggered exposes the
+        # new slider position before Qt propagates it to value(), so use that
+        # position to begin loading before the visible rows reach the top.
         scrollbar = self.chat_display.verticalScrollBar()
         if (
             self._older_history_user_request is not None
@@ -7149,7 +7164,11 @@ class EncryptedChatClient(QObject):
             or self._rendering_message_log
             or self._loading_older_history_page
             or self._media_rerender_in_progress
-            or scrollbar.value() > scrollbar.minimum()
+            or not scroll_position_is_near_history_start(
+                scrollbar.sliderPosition(),
+                scrollbar.minimum(),
+                scrollbar.maximum(),
+            )
         ):
             return
         request = (
@@ -7180,7 +7199,11 @@ class EncryptedChatClient(QObject):
 
         scrollbar = self.chat_display.verticalScrollBar()
         if (
-            scrollbar.value() > scrollbar.minimum()
+            not scroll_position_is_near_history_start(
+                scrollbar.value(),
+                scrollbar.minimum(),
+                scrollbar.maximum(),
+            )
             or self._tray_ui_suspended
             or self._rendering_message_log
             or self._loading_older_history_page
