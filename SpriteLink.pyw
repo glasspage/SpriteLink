@@ -13322,12 +13322,20 @@ class EncryptedChatClient(QObject):
                 image_url,
                 [],
             ).append(message_start_position)
-        # Every trusted image needs an inline object from its first render.
-        # Viewport visibility controls whether that object uses the real
-        # preview or an unloaded placeholder; it must not control whether the
-        # object exists.  Otherwise a freshly started client has no character
-        # position for the first in-place preview swap to update.
-        displayed_image_urls = list(image_urls)
+        displayed_image_urls = [
+            image_url
+            for image_url in image_urls
+            if (
+                (
+                    image_url in self.viewport_embedded_image_urls
+                    and isinstance(
+                        self.image_preview_cache.get(image_url),
+                        RemoteMediaPreview,
+                    )
+                )
+                or image_url in self.embedded_image_preview_sizes
+            )
+        ]
 
         username_color = (
             self._blend_toward_chat_background(original_color)
@@ -13381,14 +13389,9 @@ class EncryptedChatClient(QObject):
                         cached_media,
                     ).height()
                 else:
-                    preview_size = self.embedded_image_preview_sizes.get(url)
-                    if preview_size is None:
-                        preview_size = (
-                            EMBEDDED_IMAGE_MAX_WIDTH,
-                            EMBEDDED_IMAGE_MAX_HEIGHT,
-                        )
-                        self.embedded_image_preview_sizes[url] = preview_size
-                    preview_height = preview_size[1]
+                    preview_height = self.embedded_image_preview_sizes[
+                        url
+                    ][1]
                 top_align_height = max(
                     top_align_height,
                     preview_height,

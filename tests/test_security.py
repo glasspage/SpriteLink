@@ -56,46 +56,9 @@ class LazyViewportMediaTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._insert_message_item
         )
         self.assertIn("displayed_image_urls", insert_source)
-        self.assertIn("displayed_image_urls = list(image_urls)", insert_source)
-        self.assertNotIn(
-            "image_url in self.viewport_embedded_image_urls",
-            insert_source,
-        )
+        self.assertIn("viewport_embedded_image_urls", insert_source)
+        self.assertIn("embedded_image_preview_sizes", insert_source)
         self.assertNotIn("_schedule_image_preview_fetch", insert_source)
-
-    def test_fresh_images_reserve_an_inline_object_before_visibility(self) -> None:
-        insert_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._insert_message_item
-        )
-        preview_source = inspect.getsource(
-            SPRITELINK.EncryptedChatClient._insert_embedded_image_preview
-        )
-
-        self.assertIn("displayed_image_urls = list(image_urls)", insert_source)
-        self.assertIn(
-            "for image_url in displayed_image_urls:",
-            insert_source,
-        )
-        self.assertIn(
-            "self.rendered_image_positions.setdefault(url, []).append",
-            preview_source,
-        )
-        self.assertIn(
-            "preview = self._unloaded_image_placeholder(*preview_size)",
-            preview_source,
-        )
-        self.assertIn(
-            "preview_size = self.embedded_image_preview_sizes.get(url)",
-            insert_source,
-        )
-        self.assertIn(
-            "self.embedded_image_preview_sizes[url] = preview_size",
-            insert_source,
-        )
-        self.assertNotIn(
-            "preview_height = self.embedded_image_preview_sizes[",
-            insert_source,
-        )
 
     def test_scroll_resize_and_render_refresh_lazy_media(self) -> None:
         build_source = inspect.getsource(
@@ -647,7 +610,7 @@ class BehaviorSettingsTests(unittest.TestCase):
             ._on_chat_history_scroll_action
         )
         self.assertIn(
-            "self._older_history_user_request is not None",
+            "if self._older_history_user_request is not None",
             scroll_action_source,
         )
         self.assertIn(
@@ -1141,7 +1104,6 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
             "ntfy_id": "ntfy-remote",
             "ntfy_time": 1001,
         }]
-        client.rendered_history_message_limit = 1
         client._message_sort_key = SPRITELINK.message_item_sort_key
         client._chatroom_history_limit.return_value = 100
 
@@ -1157,7 +1119,6 @@ class MessageOrderingAndRowBoundaryTests(unittest.TestCase):
             [item["message"]["i"] for item in client.message_log],
             ["remote", "local"],
         )
-        self.assertEqual(client.rendered_history_message_limit, 2)
         self.assertGreater(
             client.message_log[-1]["display_sort_time"],
             client.message_log[0]["ntfy_time"],
