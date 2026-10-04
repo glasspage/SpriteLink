@@ -3826,6 +3826,12 @@ class ConfigOverlay(QWidget):
         self.panel: QFrame | None = None
         self._glassy = False
         self._blurred_background: QPixmap | None = None
+        self._background_refresh_timer = QTimer(self)
+        self._background_refresh_timer.setSingleShot(True)
+        self._background_refresh_timer.setInterval(0)
+        self._background_refresh_timer.timeout.connect(
+            self._refresh_visible_background
+        )
         self.setObjectName("configOverlay")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         app = QApplication.instance()
@@ -3841,9 +3847,9 @@ class ConfigOverlay(QWidget):
                 " background-color: transparent;"
                 "}"
             )
-            if self.isVisible():
-                self._refresh_blurred_background()
+            self.schedule_background_refresh()
         else:
+            self._background_refresh_timer.stop()
             self._blurred_background = None
             self.setStyleSheet(
                 "QWidget#configOverlay {"
@@ -3852,10 +3858,36 @@ class ConfigOverlay(QWidget):
             )
         self.update()
 
+    def schedule_background_refresh(self) -> None:
+        # Capture after stylesheet, composer and layout updates have settled.
+        # Repeated resize events share one pending capture.
+        if self._glassy and self.isVisible():
+            self._background_refresh_timer.start()
+
+    def _refresh_visible_background(self) -> None:
+        if self._glassy and self.isVisible():
+            self._refresh_blurred_background()
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self.schedule_background_refresh()
+
     @staticmethod
     def _blur_pixmap(source: QPixmap) -> QPixmap | None:
         if source.isNull():
             return None
+
+        # Glassy captures retain the translucent palette/stylesheet alpha.
+        # Flatten before blurring so sharp live controls cannot show through
+        # the blurred composer, even away from the padded window edges.
+        background = QColor(224, 240, 250)
+        opaque_source = QPixmap(source.size())
+        opaque_source.setDevicePixelRatio(source.devicePixelRatio())
+        opaque_source.fill(background)
+        painter = QPainter(opaque_source)
+        painter.drawPixmap(QPoint(0, 0), source)
+        painter.end()
+        source = opaque_source
 
         blur_radius = 11.0
         padding = int(math.ceil(blur_radius * 2.0))
@@ -3884,7 +3916,13 @@ class ConfigOverlay(QWidget):
         # gutter, the live unblurred controls beneath this overlay show
         # through along the window edges. Stretch each outermost source row
         # and column into the gutter so the blur stays opaque everywhere.
-        source_rect = QRectF(0.0, 0.0, source_width, source_height)
+        # QPainter pixmap source rectangles use physical pixels; destination
+        # rectangles and graphics-scene bounds use device-independent units.
+        source_pixel_width = float(source.width())
+        source_pixel_height = float(source.height())
+        source_rect = QRectF(
+            0.0, 0.0, source_pixel_width, source_pixel_height
+        )
         padded_painter = QPainter(padded)
         padded_painter.drawPixmap(
             QRectF(
@@ -3899,7 +3937,7 @@ class ConfigOverlay(QWidget):
         padded_painter.drawPixmap(
             QRectF(0.0, float(padding), float(padding), source_height),
             source,
-            QRectF(0.0, 0.0, 1.0, source_height),
+            QRectF(0.0, 0.0, 1.0, source_pixel_height),
         )
         padded_painter.drawPixmap(
             QRectF(
@@ -3909,7 +3947,7 @@ class ConfigOverlay(QWidget):
                 source_height,
             ),
             source,
-            QRectF(source_width - 1.0, 0.0, 1.0, source_height),
+            QRectF(source_pixel_width - 1.0, 0.0, 1.0, source_pixel_height),
         )
         padded_painter.drawPixmap(
             QRectF(
@@ -3919,7 +3957,7 @@ class ConfigOverlay(QWidget):
                 float(padding),
             ),
             source,
-            QRectF(0.0, 0.0, source_width, 1.0),
+            QRectF(0.0, 0.0, source_pixel_width, 1.0),
         )
         padded_painter.drawPixmap(
             QRectF(
@@ -3929,17 +3967,17 @@ class ConfigOverlay(QWidget):
                 float(padding),
             ),
             source,
-            QRectF(0.0, source_height - 1.0, source_width, 1.0),
+            QRectF(0.0, source_pixel_height - 1.0, source_pixel_width, 1.0),
         )
         for target_x, target_y, source_x, source_y in (
             (0.0, 0.0, 0.0, 0.0),
-            (float(padding) + source_width, 0.0, source_width - 1.0, 0.0),
-            (0.0, float(padding) + source_height, 0.0, source_height - 1.0),
+            (float(padding) + source_width, 0.0, source_pixel_width - 1.0, 0.0),
+            (0.0, float(padding) + source_height, 0.0, source_pixel_height - 1.0),
             (
                 float(padding) + source_width,
                 float(padding) + source_height,
-                source_width - 1.0,
-                source_height - 1.0,
+                source_pixel_width - 1.0,
+                source_pixel_height - 1.0,
             ),
         ):
             padded_painter.drawPixmap(
@@ -3973,7 +4011,8 @@ class ConfigOverlay(QWidget):
 
         blurred = QPixmap(source.size())
         blurred.setDevicePixelRatio(device_ratio)
-        blurred.fill(Qt.GlobalColor.transparent)
+        # Also cover any rounding/blur-kernel transparency at the crop edge.
+        blurred.fill(background)
         painter = QPainter(blurred)
         painter.drawPixmap(
             QPointF(-float(padding), -float(padding)),
@@ -3983,6 +4022,7 @@ class ConfigOverlay(QWidget):
         return blurred
 
     def _refresh_blurred_background(self) -> None:
+        self._background_refresh_timer.stop()
         if not self._glassy:
             self._blurred_background = None
             return
@@ -3996,15 +4036,18 @@ class ConfigOverlay(QWidget):
         focused_widget = QApplication.focusWidget() if was_visible else None
         if was_visible:
             super().hide()
-        self._blurred_background = self._blur_pixmap(parent.grab())
-        if was_visible:
-            super().show()
-            self.raise_()
-            if (
-                focused_widget is not None
-                and self.isAncestorOf(focused_widget)
-            ):
-                focused_widget.setFocus()
+        try:
+            self._blurred_background = self._blur_pixmap(parent.grab())
+        finally:
+            if was_visible:
+                super().show()
+                self.raise_()
+                if (
+                    focused_widget is not None
+                    and self.isAncestorOf(focused_widget)
+                ):
+                    focused_widget.setFocus()
+        self.update()
 
     def show(self) -> None:
         self._refresh_blurred_background()
@@ -4013,7 +4056,8 @@ class ConfigOverlay(QWidget):
     def paintEvent(self, event: Any) -> None:
         if self._glassy and self._blurred_background is not None:
             painter = QPainter(self)
-            painter.drawPixmap(QPoint(0, 0), self._blurred_background)
+            # Cover the full overlay while a resized capture is queued.
+            painter.drawPixmap(self.rect(), self._blurred_background)
             painter.fillRect(self.rect(), QColor(20, 54, 76, 82))
             painter.end()
             return
@@ -7741,6 +7785,10 @@ class EncryptedChatClient(QObject):
         self.chat_display.setUpdatesEnabled(not suppressed)
         if not suppressed:
             self.chat_display.viewport().update()
+            # Theme swaps rebuild the log in batches. Recapture once the
+            # complete document and its saved scroll anchor are restored.
+            for overlay in self.chat_content.findChildren(ConfigOverlay):
+                overlay.schedule_background_refresh()
 
     def _on_chat_history_scrolled(self, _value: int) -> None:
         self.viewport_media_timer.start(

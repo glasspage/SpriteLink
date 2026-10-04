@@ -4309,8 +4309,8 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertIn("QualityHint", overlay_source)
         self.assertIn("parent.grab()", overlay_source)
         self.assertIn("blur_radius * 2.0", overlay_source)
-        self.assertIn("source_width - 1.0", overlay_source)
-        self.assertIn("source_height - 1.0", overlay_source)
+        self.assertIn("source_pixel_width - 1.0", overlay_source)
+        self.assertIn("source_pixel_height - 1.0", overlay_source)
         self.assertIn("painter.drawPixmap", overlay_source)
 
         chat_source = inspect.getsource(
