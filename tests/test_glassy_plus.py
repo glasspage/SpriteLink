@@ -69,6 +69,17 @@ class GlassyPlusTests(unittest.TestCase):
         self.assertFalse(self.client._set_windows_legacy_blur.call_args.args[1])
         self.assertIn((38, 1), self.calls)
 
+    def test_original_glassy_has_solid_caption_and_no_backdrop(self):
+        self.theme = "Glassy"
+        self.apply()
+        self.assertIn((38, 1), self.calls)
+        self.assertIn((35, self.client._windows_colorref("#d0e7f4")), self.calls)
+        self.assertFalse(self.window.property("spritelinkDesktopBlur"))
+        margins = self.dwm.DwmExtendFrameIntoClientArea.call_args.args[1]
+        values = ctypes.cast(margins, ctypes.POINTER(ctypes.c_int))
+        self.assertEqual([values[i] for i in range(4)], [0, 0, 0, 0])
+        self.client._set_windows_legacy_blur.assert_not_called()
+
     def test_failed_backends_keep_opaque_fallback(self):
         self.fail_backdrop = True
         self.client._set_windows_legacy_blur.return_value = False

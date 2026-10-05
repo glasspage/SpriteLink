@@ -5,6 +5,7 @@ on:
     paths:
       - "SpriteLink.pyw"
       - "spritelink_update.py"
+      - "spritelink_glass.py"
       - "SL.ico"
       - "sounds/**"
       - "requirements*.txt"

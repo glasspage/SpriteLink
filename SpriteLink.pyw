@@ -5487,6 +5487,9 @@ class MessageLogBrowser(QTextBrowser):
         self._paint_unread_divider(event)
 
 
+from spritelink_glass import DesktopGlass
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -5497,6 +5500,7 @@ class MainWindow(QMainWindow):
             # The format stays fixed when themes are swapped at runtime.
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.close_callback: Any = None
+        self.desktop_glass = DesktopGlass(self)
 
     def paintEvent(self, event: Any) -> None:
         # Clear every damaged pixel before painting translucent children;
@@ -5508,6 +5512,8 @@ class MainWindow(QMainWindow):
         painter = QPainter(self)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         painter.fillRect(event.rect(), background)
+        if self.desktop_glass.frame is not None:
+            painter.drawImage(QPoint(), self.desktop_glass.frame)
         painter.end()
         super().paintEvent(event)
 
@@ -5516,6 +5522,7 @@ class MainWindow(QMainWindow):
         if self.close_callback is not None:
             should_close = bool(self.close_callback())
         if should_close:
+            self.desktop_glass.stop()
             event.accept()
         else:
             event.ignore()
@@ -6282,10 +6289,12 @@ class EncryptedChatClient(QObject):
                 backdrop = 1  # DWMSBT_NONE
             elif self._is_glassy_theme():
                 border = "#6292af"
-                caption = None
+                caption = None if self._is_glassy_plus_theme() else "#d0e7f4"
                 text = "#102637"
                 corner_preference = 2  # DWMWCP_ROUND
-                backdrop = 3  # DWMSBT_TRANSIENTWINDOW (acrylic)
+                # Only Glassy+ uses a desktop backdrop. Glassy keeps a solid caption.
+                backdrop = 3 if self._is_glassy_plus_theme() else 1
+                # DWMSBT_TRANSIENTWINDOW (acrylic) / DWMSBT_NONE
             else:
                 border = "#d0d0d0"
                 caption = "#f0f0f0"
@@ -6312,7 +6321,7 @@ class EncryptedChatClient(QObject):
                     ("bottom", ctypes.c_int),
                 ]
 
-            glass_margin = -1 if self._is_glassy_theme() else 0
+            glass_margin = -1 if self._is_glassy_plus_theme() else 0
             margins = Margins(
                 glass_margin,
                 glass_margin,
@@ -6339,10 +6348,17 @@ class EncryptedChatClient(QObject):
                 desktop_blur = self._set_windows_legacy_blur(hwnd, True)
                 window.setProperty("spritelinkLegacyBlur", desktop_blur)
             window.setProperty("spritelinkDesktopBlur", desktop_blur)
+            if isinstance(window, MainWindow):
+                if self._is_glassy_plus_theme():
+                    window.desktop_glass.start()
+                else:
+                    window.desktop_glass.stop()
             window.update()
         except Exception:
             # Older Windows versions do not expose the color attributes.
             window.setProperty("spritelinkDesktopBlur", False)
+            if isinstance(window, MainWindow):
+                window.desktop_glass.stop()
             window.update()
 
     def _apply_dialog_window_theme(self, dialog: QDialog) -> None:
@@ -9378,6 +9394,11 @@ class EncryptedChatClient(QObject):
         layout.addWidget(QLabel("Theme"), row, 0)
         self.theme_combo = ThemeComboBox()
         self.theme_combo.addItems(list(THEMES))
+        self.theme_combo.setItemData(
+            THEMES.index("Glassy+"),
+            "Excluded from screenshots and screen recordings while custom glass is active.",
+            Qt.ItemDataRole.ToolTipRole,
+        )
         self.theme_combo.setCurrentText(str(self.theme_var.get()))
         self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
         self.theme_var.bind(self.theme_combo.setCurrentText)
