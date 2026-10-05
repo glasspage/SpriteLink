@@ -4240,7 +4240,7 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertEqual(SPRITELINK.DEFAULT_THEME, "Classic")
         self.assertEqual(
             SPRITELINK.THEMES,
-            ("Classic", "Glassy", "Modern"),
+            ("Classic", "Glassy", "Glassy+", "Modern"),
         )
 
         source = inspect.getsource(

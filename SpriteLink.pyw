@@ -365,6 +365,7 @@ DEFAULT_THEME = "Classic"
 THEMES = (
     DEFAULT_THEME,
     "Glassy",
+    "Glassy+",
     "Modern",
 )
 LEGACY_THEME_NAMES = {
@@ -637,6 +638,16 @@ DEFAULT_MESSAGE_FONT = "Arial"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
+GLASSY_PLUS_MESSAGE_ROW_BACKGROUNDS = ("#38ffffff", "#50d7e7f2")
+
+
+def message_row_backgrounds() -> tuple[str, str]:
+    app = QApplication.instance()
+    if app is not None and bool(app.property("spritelinkGlassyPlus")):
+        return GLASSY_PLUS_MESSAGE_ROW_BACKGROUNDS
+    return MESSAGE_ROW_BACKGROUNDS
+
+
 MESSAGE_LINE_HEIGHT_PX = 24
 SPOILER_DISPLAY_HEIGHT_PX = 22
 COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
@@ -971,6 +982,33 @@ QToolTip {
 }
 QFrame[frameShape="4"], QFrame[frameShape="5"] {
     color: rgba(73, 115, 140, 190);
+}
+"""
+
+GLASSY_PLUS_STYLESHEET = GLASSY_STYLESHEET + """
+QMainWindow {
+    background: transparent;
+}
+QWidget#glassRoot {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 rgba(242, 251, 255, 54),
+        stop:0.40 rgba(207, 231, 246, 42),
+        stop:1 rgba(151, 195, 224, 66)
+    );
+}
+QWidget#chatTab {
+    background: transparent;
+}
+QWidget#chatroomsPanel {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(251, 254, 255, 80),
+        stop:1 rgba(172, 207, 230, 64)
+    );
+}
+QTextBrowser#chatViewport {
+    background-color: rgba(255, 255, 255, 72);
 }
 """
 
@@ -5452,7 +5490,26 @@ class MessageLogBrowser(QTextBrowser):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        if os.name == "nt":
+            # Allocate an alpha backing store before the native HWND exists.
+            # Keep the native frame: DWM composites the client area's alpha,
+            # so no layered/frameless window or titlebar replacement is needed.
+            # The format stays fixed when themes are swapped at runtime.
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.close_callback: Any = None
+
+    def paintEvent(self, event: Any) -> None:
+        # Clear every damaged pixel before painting translucent children;
+        # otherwise repeated repaints can accumulate tint over the backdrop.
+        background = self.palette().color(QPalette.ColorRole.Window)
+        background.setAlpha(
+            0 if bool(self.property("spritelinkDesktopBlur")) else 255
+        )
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(event.rect(), background)
+        painter.end()
+        super().paintEvent(event)
 
     def closeEvent(self, event: Any) -> None:
         should_close = True
@@ -6036,7 +6093,10 @@ class EncryptedChatClient(QObject):
         return self.theme_var.get() == "Classic"
 
     def _is_glassy_theme(self) -> bool:
-        return self.theme_var.get() == "Glassy"
+        return self.theme_var.get() in ("Glassy", "Glassy+")
+
+    def _is_glassy_plus_theme(self) -> bool:
+        return self.theme_var.get() == "Glassy+"
 
     def _windows_classic_palette(self) -> QPalette:
         palette = QPalette()
@@ -6100,6 +6160,12 @@ class EncryptedChatClient(QObject):
         }
         for role, color in colors.items():
             palette.setColor(role, color)
+        if self._is_glassy_plus_theme():
+            palette.setColor(QPalette.ColorRole.Window, QColor(224, 240, 250, 0))
+            palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255, 72))
+            palette.setColor(
+                QPalette.ColorRole.AlternateBase, QColor(215, 231, 242, 80)
+            )
         palette.setColor(
             QPalette.ColorGroup.Disabled,
             QPalette.ColorRole.Text,
@@ -6147,6 +6213,39 @@ class EncryptedChatClient(QObject):
             | (qt_color.blue() << 16)
         )
 
+    @staticmethod
+    def _set_windows_legacy_blur(hwnd: Any, enabled: bool) -> bool:
+        # Windows 10/early Windows 11 have no DWMWA_SYSTEMBACKDROP_TYPE.
+        # The legacy accent policy provides live blur behind the same alpha
+        # surface. Prefer the supported DWM acrylic API when available.
+        try:
+            class AccentPolicy(ctypes.Structure):
+                _fields_ = [
+                    ("state", ctypes.c_uint),
+                    ("flags", ctypes.c_uint),
+                    ("gradient_color", ctypes.c_uint),
+                    ("animation_id", ctypes.c_uint),
+                ]
+
+            class CompositionData(ctypes.Structure):
+                _fields_ = [
+                    ("attribute", ctypes.c_int),
+                    ("data", ctypes.c_void_p),
+                    ("size", ctypes.c_size_t),
+                ]
+
+            policy = AccentPolicy(3 if enabled else 0, 0, 0, 0)
+            # WCA_ACCENT_POLICY; ACCENT_ENABLE_BLURBEHIND / ACCENT_DISABLED.
+            data = CompositionData(
+                19, ctypes.addressof(policy), ctypes.sizeof(policy)
+            )
+            set_composition = ctypes.windll.user32.SetWindowCompositionAttribute
+            set_composition.argtypes = [wintypes.HWND, ctypes.POINTER(CompositionData)]
+            set_composition.restype = wintypes.BOOL
+            return bool(set_composition(hwnd, ctypes.byref(data)))
+        except (AttributeError, OSError):
+            return False
+
     def _apply_window_titlebar_theme(self, window: QWidget) -> None:
         if os.name != "nt" or not hasattr(ctypes, "windll"):
             return
@@ -6154,15 +6253,23 @@ class EncryptedChatClient(QObject):
         try:
             hwnd = wintypes.HWND(int(window.winId()))
             dwmapi = ctypes.windll.dwmapi
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD
+            ]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+            dwmapi.DwmExtendFrameIntoClientArea.argtypes = [
+                wintypes.HWND, ctypes.c_void_p
+            ]
+            dwmapi.DwmExtendFrameIntoClientArea.restype = ctypes.c_long
 
-            def set_attribute(attribute: int, value: int) -> None:
+            def set_attribute(attribute: int, value: int) -> int:
                 data = ctypes.c_uint(value)
-                dwmapi.DwmSetWindowAttribute(
+                return int(dwmapi.DwmSetWindowAttribute(
                     hwnd,
                     ctypes.c_uint(attribute),
                     ctypes.byref(data),
                     ctypes.sizeof(data),
-                )
+                ))
 
             # Keep both themes light, then color the Windows 11 non-client
             # frame where the DWM color attributes are supported.
@@ -6195,7 +6302,7 @@ class EncryptedChatClient(QObject):
                 else self._windows_colorref(caption),
             )
             set_attribute(36, self._windows_colorref(text))
-            set_attribute(38, backdrop)  # DWMWA_SYSTEMBACKDROP_TYPE
+            backdrop_result = set_attribute(38, backdrop)  # DWMWA_SYSTEMBACKDROP_TYPE
 
             class Margins(ctypes.Structure):
                 _fields_ = [
@@ -6212,13 +6319,31 @@ class EncryptedChatClient(QObject):
                 glass_margin,
                 glass_margin,
             )
-            dwmapi.DwmExtendFrameIntoClientArea(
+            frame_result = dwmapi.DwmExtendFrameIntoClientArea(
                 hwnd,
                 ctypes.byref(margins),
             )
+            if bool(window.property("spritelinkLegacyBlur")):
+                self._set_windows_legacy_blur(hwnd, False)
+                window.setProperty("spritelinkLegacyBlur", False)
+            desktop_blur = (
+                self._is_glassy_plus_theme()
+                and frame_result == 0
+                and backdrop_result == 0
+            )
+            if (
+                self._is_glassy_plus_theme()
+                and frame_result == 0
+                and not desktop_blur
+            ):
+                desktop_blur = self._set_windows_legacy_blur(hwnd, True)
+                window.setProperty("spritelinkLegacyBlur", desktop_blur)
+            window.setProperty("spritelinkDesktopBlur", desktop_blur)
+            window.update()
         except Exception:
             # Older Windows versions do not expose the color attributes.
-            pass
+            window.setProperty("spritelinkDesktopBlur", False)
+            window.update()
 
     def _apply_dialog_window_theme(self, dialog: QDialog) -> None:
         """Apply native theme properties after a dialog window exists."""
@@ -6551,7 +6676,11 @@ class EncryptedChatClient(QObject):
         elif self._is_glassy_theme():
             style_name = available_styles.get("fusion", "Fusion")
             app.setPalette(self._glassy_palette())
-            app.setStyleSheet(GLASSY_STYLESHEET)
+            app.setStyleSheet(
+                GLASSY_PLUS_STYLESHEET
+                if self._is_glassy_plus_theme()
+                else GLASSY_STYLESHEET
+            )
         else:
             style_name = available_styles.get(
                 self._basic_style_name.casefold()
@@ -6574,6 +6703,7 @@ class EncryptedChatClient(QObject):
             self._is_windows_classic_theme(),
         )
         app.setProperty("spritelinkGlassy", self._is_glassy_theme())
+        app.setProperty("spritelinkGlassyPlus", self._is_glassy_plus_theme())
         for widget in app.allWidgets():
             if isinstance(widget, ThemeComboBox):
                 widget.update()
@@ -8003,7 +8133,7 @@ class EncryptedChatClient(QObject):
                 following_background_name = (
                     following_background.name().casefold()
                 )
-                for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS):
+                for index, color in enumerate(message_row_backgrounds()):
                     if QColor(color).name().casefold() == following_background_name:
                         following_background_index = index
                         break
@@ -8014,15 +8144,15 @@ class EncryptedChatClient(QObject):
         )
         stripe_index = (
             following_background_index - prepended_row_count
-        ) % len(MESSAGE_ROW_BACKGROUNDS)
+        ) % len(message_row_backgrounds())
         for step in render_steps:
-            step["background_color"] = MESSAGE_ROW_BACKGROUNDS[
-                stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+            step["background_color"] = message_row_backgrounds()[
+                stripe_index % len(message_row_backgrounds())
             ]
             stripe_index += 1
             for separator_spec in step["separators_after"]:
-                separator_spec[1] = MESSAGE_ROW_BACKGROUNDS[
-                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                separator_spec[1] = message_row_backgrounds()[
+                    stripe_index % len(message_row_backgrounds())
                 ]
                 stripe_index += 1
 
@@ -11622,7 +11752,7 @@ class EncryptedChatClient(QObject):
 
         background_indices = {
             QColor(color).name().casefold(): index
-            for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS)
+            for index, color in enumerate(message_row_backgrounds())
         }
         stripe_index = 0
         previous_timestamp: int | None = None
@@ -11647,7 +11777,7 @@ class EncryptedChatClient(QObject):
                         -1,
                     )
                     + 1
-                ) % len(MESSAGE_ROW_BACKGROUNDS)
+                ) % len(message_row_backgrounds())
 
         self._hide_chat_tooltip()
         cursor = self.chat_display.textCursor()
@@ -11670,8 +11800,8 @@ class EncryptedChatClient(QObject):
                 last_separator_block_number = self._insert_log_separator(
                     cursor,
                     separator_text,
-                    MESSAGE_ROW_BACKGROUNDS[
-                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                    message_row_backgrounds()[
+                        stripe_index % len(message_row_backgrounds())
                     ],
                     row_selections,
                 )
@@ -11693,8 +11823,8 @@ class EncryptedChatClient(QObject):
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
                 trusted_user_ids=trusted_user_ids,
-                background_color=MESSAGE_ROW_BACKGROUNDS[
-                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                background_color=message_row_backgrounds()[
+                    stripe_index % len(message_row_backgrounds())
                 ],
                 row_selections=row_selections,
             )
@@ -13895,8 +14025,8 @@ class EncryptedChatClient(QObject):
                 ):
                     separator_specs.append((
                         separator_text,
-                        MESSAGE_ROW_BACKGROUNDS[
-                            stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                        message_row_backgrounds()[
+                            stripe_index % len(message_row_backgrounds())
                         ],
                     ))
                     stripe_index += 1
@@ -13904,8 +14034,8 @@ class EncryptedChatClient(QObject):
                 render_steps[-1]["separators_after"] = separator_specs
             render_steps.append({
                 "group": group,
-                "background_color": MESSAGE_ROW_BACKGROUNDS[
-                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                "background_color": message_row_backgrounds()[
+                    stripe_index % len(message_row_backgrounds())
                 ],
                 "separators_after": [],
             })
@@ -13917,7 +14047,7 @@ class EncryptedChatClient(QObject):
         # already rendered so existing white/gray stripes never swap places.
         background_indices = {
             QColor(color).name().casefold(): index
-            for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS)
+            for index, color in enumerate(message_row_backgrounds())
         }
         stripe_shift = 0
         for step in render_steps:
@@ -13936,7 +14066,7 @@ class EncryptedChatClient(QObject):
                     continue
                 stripe_shift = (
                     previous_index - planned_index
-                ) % len(MESSAGE_ROW_BACKGROUNDS)
+                ) % len(message_row_backgrounds())
                 break
             else:
                 continue
@@ -13947,14 +14077,14 @@ class EncryptedChatClient(QObject):
                 planned_index = background_indices[
                     QColor(str(step["background_color"])).name().casefold()
                 ]
-                step["background_color"] = MESSAGE_ROW_BACKGROUNDS[
+                step["background_color"] = message_row_backgrounds()[
                     (planned_index + stripe_shift)
-                    % len(MESSAGE_ROW_BACKGROUNDS)
+                    % len(message_row_backgrounds())
                 ]
                 step["separators_after"] = [
                     (
                         separator_text,
-                        MESSAGE_ROW_BACKGROUNDS[
+                        message_row_backgrounds()[
                             (
                                 background_indices[
                                     QColor(background_color)
@@ -13963,7 +14093,7 @@ class EncryptedChatClient(QObject):
                                 ]
                                 + stripe_shift
                             )
-                            % len(MESSAGE_ROW_BACKGROUNDS)
+                            % len(message_row_backgrounds())
                         ],
                     )
                     for separator_text, background_color
@@ -14045,9 +14175,9 @@ class EncryptedChatClient(QObject):
                 last_separator_block_number = self._insert_log_separator(
                     cursor,
                     separator_text,
-                    MESSAGE_ROW_BACKGROUNDS[
+                    message_row_backgrounds()[
                         (stripe_index + stripe_shift)
-                        % len(MESSAGE_ROW_BACKGROUNDS)
+                        % len(message_row_backgrounds())
                     ],
                     row_selections,
                 )
@@ -14069,9 +14199,9 @@ class EncryptedChatClient(QObject):
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
                 trusted_user_ids=trusted_user_ids,
-                background_color=MESSAGE_ROW_BACKGROUNDS[
+                background_color=message_row_backgrounds()[
                     (stripe_index + stripe_shift)
-                    % len(MESSAGE_ROW_BACKGROUNDS)
+                    % len(message_row_backgrounds())
                 ],
                 row_selections=row_selections,
             )
