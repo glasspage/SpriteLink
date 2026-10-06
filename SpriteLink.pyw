@@ -397,7 +397,8 @@ CLASSIC_COLOR_SCHEMES = (
          window="#ffffff", tooltip="#ffffff"),
     dict(name="Plum", face="#a89890", shadow="#786058", light="#d8d0c8",
          title="#484060", highlight="#008080", highlight_text="#d8d0c8",
-         window="#d8d0c8", tooltip="#d5ccc8"),
+         window="#d8d0c8", tooltip="#d5ccc8",
+         chat_backgrounds=("#d8d0c8", "#cec6be")),
 )
 
 
@@ -467,9 +468,8 @@ def classic_theme_stylesheet(stylesheet: str, position: int) -> str:
     styled = styled.replace(f"background-color: {scheme['light']}", f"background-color: {scheme['window']}")
     styled = styled.replace("selection-color: #000000", f"selection-color: {scheme['highlight_text']}")
     styled = re.sub(r"(QListWidget::item:selected, QMenu::item:selected\s*\{[^}]*?)color: #000000", lambda match: match.group(1) + f"color: {scheme['highlight_text']}", styled)
-    # Retain SpriteLink's light chat backdrop and alternating row contrast,
-    # even for Classic schemes whose original edit-window color was tinted.
-    return styled + "\nQTextBrowser#chatViewport { background-color: #ffffff; }"
+    background = scheme.get("chat_backgrounds", ("#ffffff",))[0]
+    return styled + f"\nQTextBrowser#chatViewport {{ background-color: {background}; }}"
 
 DEFAULT_WINDOW_WIDTH = 840
 DEFAULT_WINDOW_HEIGHT = 650
@@ -741,6 +741,9 @@ GLASSY_MESSAGE_ROW_BACKGROUNDS = ("#38ffffff", "#50d7e7f2")
 
 def message_row_backgrounds() -> tuple[str, str]:
     app = QApplication.instance()
+    if app is not None and bool(app.property("spritelinkWindowsClassic")):
+        position = int(app.property("spritelinkClassicColor") or 0)
+        return CLASSIC_COLOR_SCHEMES[position].get("chat_backgrounds", MESSAGE_ROW_BACKGROUNDS)
     if app is not None and bool(app.property("spritelinkGlassy")):
         degrees = int(app.property("spritelinkThemeHue") or 0)
         if degrees:
@@ -5059,6 +5062,10 @@ class ThemeSlider(QSlider):
         ).adjusted(0.5, 0.5, -0.5, -0.5)
         enabled = self.isEnabled()
         highlighted = self.hasFocus() or handle.contains(self.mapFromGlobal(QCursor.pos()))
+        # A Color slider can preview its own thumb without restyling the app.
+        degrees = self.property("spritelinkPreviewHue")
+        if degrees is None:
+            degrees = int(app.property("spritelinkThemeHue") or 0)
         if bool(app.property("spritelinkModern")):
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -5066,17 +5073,17 @@ class ThemeSlider(QSlider):
             painter.setBrush(QColor("#ffffff" if enabled else "#f0f0f0"))
             painter.drawEllipse(rect)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(shift_theme_color("#0067c0") if enabled else QColor("#b8b8b8"))
+            painter.setBrush(shift_theme_color("#0067c0", degrees) if enabled else QColor("#b8b8b8"))
             radius = 3.0 if self.isSliderDown() else 5.0 if highlighted else 4.0
             painter.drawEllipse(rect.center(), radius, radius)
             painter.end()
             return
-        border = shift_theme_color("#496f87" if enabled else "#7391a4")
+        border = shift_theme_color("#496f87" if enabled else "#7391a4", degrees)
         if enabled and highlighted:
-            border = shift_theme_color("#246a92")
+            border = shift_theme_color("#246a92", degrees)
         gradient = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-        gradient.setColorAt(0, shift_theme_color("#ffffff" if enabled else "#e6eef3"))
-        gradient.setColorAt(1, shift_theme_color("#99c5e1" if enabled else "#dae7ef"))
+        gradient.setColorAt(0, shift_theme_color("#ffffff" if enabled else "#e6eef3", degrees))
+        gradient.setColorAt(1, shift_theme_color("#99c5e1" if enabled else "#dae7ef", degrees))
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(border, 1.0))
@@ -6205,10 +6212,7 @@ class EncryptedChatClient(QObject):
             self.config_data.get("theme", DEFAULT_THEME)
         )
         self.config_data["theme_colors"] = normalize_theme_colors(self.config_data.get("theme_colors"))
-        self.theme_color_apply_timer = QTimer(self)
-        self.theme_color_apply_timer.setSingleShot(True)
-        self.theme_color_apply_timer.setInterval(30)
-        self.theme_color_apply_timer.timeout.connect(self._apply_theme_colors)
+        self._saved_theme_colors = dict(self.config_data["theme_colors"])
         self.theme_color_save_timer = QTimer(self)
         self.theme_color_save_timer.setSingleShot(True)
         self.theme_color_save_timer.setInterval(400)
@@ -7100,6 +7104,7 @@ class EncryptedChatClient(QObject):
         theme = "Classic" if self._is_windows_classic_theme() else "Glassy" if self._is_glassy_theme() else "Modern"
         position = client_theme_color(self, theme)
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
+        app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
 
         available_styles = {
             name.casefold(): name for name in QStyleFactory.keys()
@@ -7185,6 +7190,7 @@ class EncryptedChatClient(QObject):
         if hasattr(self, "update_button"):
             self._update_update_button_style()
         self._apply_titlebar_theme()
+        self._applied_theme_color = (theme, position)
 
     def _heading(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -10452,6 +10458,7 @@ class EncryptedChatClient(QObject):
             slider.setTickInterval(1 if classic else 0)
             position = client_theme_color(self, theme)
             slider.setValue(position)
+            slider.setProperty("spritelinkPreviewHue", None)
             slider.setToolTip(CLASSIC_COLOR_SCHEMES[position]["name"] if classic else "")
         finally:
             slider.blockSignals(was_blocked)
@@ -10463,18 +10470,26 @@ class EncryptedChatClient(QObject):
         self.config_data["theme_colors"] = normalize_theme_colors(colors)
         if theme == "Classic":
             self.theme_color_slider.setToolTip(CLASSIC_COLOR_SCHEMES[colors[theme]]["name"])
-        # Preview at most once per frame batch; persist after the user pauses.
-        if not self.theme_color_apply_timer.isActive():
-            self.theme_color_apply_timer.start()
-        self.theme_color_save_timer.start()
+        self.theme_color_slider.setProperty("spritelinkPreviewHue", None if theme == "Classic" else value)
+        self.theme_color_slider.update()
+        # Stylesheet repolish and log/blur refreshes are deliberately excluded
+        # from dragging, even if the user pauses while holding the thumb.
+        if self.theme_color_slider.isSliderDown():
+            self.theme_color_save_timer.stop()
+        else:
+            self.theme_color_save_timer.start()
 
-    def _apply_theme_colors(self) -> None:
+    def _apply_theme_colors(self) -> bool:
         app = QApplication.instance()
         if app is None:
-            return
+            return False
         theme = str(self.theme_var.get())
         position = client_theme_color(self, theme)
+        if getattr(self, "_applied_theme_color", None) == (theme, position):
+            self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
+            return False
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
+        app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
         if theme == "Classic":
             palette = self._windows_classic_palette()
             stylesheet = classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position)
@@ -10484,30 +10499,56 @@ class EncryptedChatClient(QObject):
         else:
             palette = self._modern_palette()
             stylesheet = hue_theme_stylesheet(MODERN_STYLESHEET, position)
-        # Retain the native/proxy style and explicit widget fonts while the
-        # slider moves; replacing the entire style on every tick is expensive.
-        app.setPalette(palette)
-        app.setStyleSheet(stylesheet)
-        for name in ("config_panel", "message_limit_panel", "image_preview_panel", "link_warning_panel"):
-            panel = getattr(self, name, None)
-            if panel is not None:
-                panel.setStyleSheet(self._config_panel_stylesheet())
+        # Repolish can reset explicitly assigned families and NoAntialias.
+        # Keep the existing fonts, including Classic headings and user fonts.
+        application_font = QFont(app.font())
+        fonts = [(widget, QFont(widget.font())) for widget in app.allWidgets()
+                 if widget.testAttribute(Qt.WidgetAttribute.WA_SetFont)]
+        root = getattr(self, "root", None)
+        updates_enabled = root is not None and root.updatesEnabled()
+        if updates_enabled:
+            root.setUpdatesEnabled(False)
+        try:
+            app.setPalette(palette)
+            app.setStyleSheet(stylesheet)
+            panel_stylesheet = self._config_panel_stylesheet()
+            for name in ("config_panel", "message_limit_panel", "image_preview_panel", "link_warning_panel"):
+                panel = getattr(self, name, None)
+                if panel is not None and panel.styleSheet() != panel_stylesheet:
+                    panel.setStyleSheet(panel_stylesheet)
+            if app.font() != application_font:
+                app.setFont(application_font)
+            for widget, font in fonts:
+                if widget.font() != font:
+                    widget.setFont(font)
+            if hasattr(self, "message_size_bar"):
+                self._draw_message_size_bar()
+        finally:
+            if updates_enabled:
+                root.setUpdatesEnabled(True)
         for name in ("config_overlay", "message_limit_overlay", "image_preview_overlay", "link_warning_overlay"):
             overlay = getattr(self, name, None)
             if isinstance(overlay, ConfigOverlay):
                 overlay.apply_theme(theme == "Glassy")
-        if hasattr(self, "message_size_bar"):
-            self._draw_message_size_bar()
         self._apply_titlebar_theme()
+        self._applied_theme_color = (theme, position)
+        self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
+        return True
 
     def _save_theme_colors(self) -> None:
-        # Commit the latest preview before updating tinted Glassy row brushes.
-        self.theme_color_apply_timer.stop()
-        self._apply_theme_colors()
-        if self._is_glassy_theme() and hasattr(self, "chat_display"):
+        if self.theme_color_slider.isSliderDown():
+            return
+        changed = self._apply_theme_colors()
+        # Rebuild changed row brushes once after the committed style update,
+        # keeping history, scroll position, and rendered message fonts intact.
+        if changed and hasattr(self, "chat_display"):
             self._rerender_preserving_scroll()
+        colors = normalize_theme_colors(self.config_data.get("theme_colors"))
+        if getattr(self, "_saved_theme_colors", None) == colors:
+            return
         try:
             save_config(self.config_data)
+            self._saved_theme_colors = dict(colors)
         except Exception as exc:
             messagebox.showerror("Could not save theme color", str(exc), parent=self.root)
 
@@ -10522,7 +10563,6 @@ class EncryptedChatClient(QObject):
 
         self.theme_var.set(theme)
         self.config_data["theme"] = theme
-        self.theme_color_apply_timer.stop()
         self.theme_color_save_timer.stop()
         self._apply_theme()
         self._apply_application_font_strategy()
@@ -10532,6 +10572,7 @@ class EncryptedChatClient(QObject):
 
         try:
             save_config(self.config_data)
+            self._saved_theme_colors = normalize_theme_colors(self.config_data.get("theme_colors"))
         except Exception as exc:
             messagebox.showerror(
                 "Could not save theme",
@@ -15853,7 +15894,6 @@ class EncryptedChatClient(QObject):
 
         self._closing = True
         self._minimized_to_tray = False
-        self.theme_color_apply_timer.stop()
         self.theme_color_save_timer.stop()
         QToolTip.hideText()
         self.update_check_timer.stop()

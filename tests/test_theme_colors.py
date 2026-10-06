@@ -22,10 +22,11 @@ class ThemeColorTests(unittest.TestCase):
 
     def setUp(self):
         self.previous_palette = QPalette(self.app.palette())
+        self.previous_font = QFont(self.app.font())
         self.previous_sheet = self.app.styleSheet()
         self.previous_properties = {name: self.app.property(name) for name in (
             "spritelinkGlassy", "spritelinkModern", "spritelinkWindowsClassic",
-            "spritelinkTextShadows", "spritelinkThemeHue",
+            "spritelinkTextShadows", "spritelinkThemeHue", "spritelinkClassicColor",
         )}
         self.window = QWidget()
         self.window.resize(340, 220)
@@ -47,22 +48,19 @@ class ThemeColorTests(unittest.TestCase):
             setattr(self.client, name, MethodType(getattr(S.EncryptedChatClient, name), self.client))
         self.client.theme_color_slider = S.ThemeSlider(Qt.Orientation.Horizontal, self.window)
         self.client.theme_color_slider.setGeometry(10, 10, 112, 24)
-        self.client.theme_color_apply_timer = QTimer(self.window)
-        self.client.theme_color_apply_timer.setSingleShot(True)
-        self.client.theme_color_apply_timer.setInterval(30)
-        self.client.theme_color_apply_timer.timeout.connect(self.client._apply_theme_colors)
         self.client.theme_color_save_timer = QTimer(self.window)
         self.client.theme_color_save_timer.setSingleShot(True)
         self.client.theme_color_save_timer.setInterval(400)
         self.client.theme_color_save_timer.timeout.connect(self.client._save_theme_colors)
         self.client.theme_color_slider.valueChanged.connect(self.client._on_theme_color_changed)
+        self.client.theme_color_slider.sliderReleased.connect(lambda: self.client._finish_theme_color_change())
         self.original_save_config = S.save_config
         self.save_patch = mock.patch.object(S, "save_config")
         self.saved = self.save_patch.start()
         self.client._apply_theme()
+        self.client._saved_theme_colors = dict(self.client.config_data["theme_colors"])
 
     def tearDown(self):
-        self.client.theme_color_apply_timer.stop()
         self.client.theme_color_save_timer.stop()
         self.window.close()
         self.window.deleteLater()
@@ -73,6 +71,7 @@ class ThemeColorTests(unittest.TestCase):
         self.app.setStyle(QStyleFactory.create("Fusion"))
         self.app.setPalette(self.previous_palette)
         self.app.setStyleSheet(self.previous_sheet)
+        self.app.setFont(self.previous_font)
 
     def test_old_and_malformed_settings_normalize_safely(self):
         self.assertEqual(S.normalize_theme_colors(None), {"Classic": 0, "Glassy": 0, "Modern": 0})
@@ -112,14 +111,24 @@ class ThemeColorTests(unittest.TestCase):
         self.assertEqual(spy.count(), 0)
         self.assertEqual(self.client.config_data["theme_colors"], {"Classic": 3, "Glassy": 94, "Modern": 218})
 
-    def test_drag_previews_latest_value_and_release_saves_once(self):
+    def test_drag_updates_only_the_thumb_and_commits_once_on_release(self):
+        self.client.chat_display = QTextBrowser(self.window)
+        self.client.theme_color_slider.setSliderDown(True)
+        sheet = self.app.styleSheet()
         for position in (15, 90, 240):
             self.client.theme_color_slider.setValue(position)
         self.saved.assert_not_called()
-        QTest.qWait(60)
+        # Pausing while holding the thumb must not trigger an expensive commit.
+        QTest.qWait(500)
+        self.assertEqual(self.app.property("spritelinkThemeHue"), 0)
+        self.assertEqual(self.app.styleSheet(), sheet)
+        self.assertEqual(self.client.theme_color_slider.property("spritelinkPreviewHue"), 240)
+        self.client._rerender_preserving_scroll.assert_not_called()
+        self.saved.assert_not_called()
+        self.client.theme_color_slider.setSliderDown(False)
         self.assertEqual(self.app.property("spritelinkThemeHue"), 240)
-        self.client._finish_theme_color_change()
         self.saved.assert_called_once()
+        self.client._rerender_preserving_scroll.assert_called_once()
         self.assertEqual(self.saved.call_args.args[0]["theme_colors"]["Modern"], 240)
         self.assertFalse(self.client.theme_color_save_timer.isActive())
         self.client._apply_application_font_strategy.assert_not_called()
@@ -129,6 +138,22 @@ class ThemeColorTests(unittest.TestCase):
         QTest.qWait(500)
         self.saved.assert_called_once()
         self.assertEqual(self.app.property("spritelinkThemeHue"), 119)
+
+    def test_returning_to_original_color_skips_repolish_log_and_save(self):
+        self.client.chat_display = QTextBrowser(self.window)
+        slider = self.client.theme_color_slider
+        slider.setSliderDown(True)
+        slider.setValue(120)
+        slider.setValue(0)
+        with mock.patch.object(self.app, "setStyleSheet") as repolish, \
+             mock.patch.object(self.app, "setPalette") as palette:
+            slider.setSliderDown(False)
+            self.client._finish_theme_color_change()
+        repolish.assert_not_called()
+        palette.assert_not_called()
+        self.saved.assert_not_called()
+        self.client._rerender_preserving_scroll.assert_not_called()
+        self.assertIsNone(slider.property("spritelinkPreviewHue"))
 
     def test_hue_rotation_preserves_alpha_saturation_and_lightness(self):
         color = QColor(153, 201, 230, 72)
@@ -157,9 +182,10 @@ class ThemeColorTests(unittest.TestCase):
             self.app.processEvents()
             self.assertEqual(self.app.palette().color(QPalette.ColorRole.Window), QColor(scheme["face"]))
             self.assertEqual(self.app.palette().color(QPalette.ColorRole.Highlight), QColor(scheme["highlight"]))
-            self.assertEqual(S.message_row_backgrounds(), S.MESSAGE_ROW_BACKGROUNDS)
+            backgrounds = scheme.get("chat_backgrounds", S.MESSAGE_ROW_BACKGROUNDS)
+            self.assertEqual(S.message_row_backgrounds(), backgrounds)
             image = browser.viewport().grab().toImage()
-            self.assertEqual(image.pixelColor(image.width() // 2, image.height() // 2), QColor("#ffffff"))
+            self.assertEqual(image.pixelColor(image.width() // 2, image.height() // 2), QColor(backgrounds[0]))
 
     def test_modern_checkbox_slider_and_focus_edge_share_shifted_accent(self):
         checkbox = QCheckBox("Accent", self.window)
@@ -207,17 +233,37 @@ class ThemeColorTests(unittest.TestCase):
             self.assertEqual(self.app.palette().color(QPalette.ColorRole.Window), window)
             self.assertEqual(S.message_row_backgrounds(), S.MESSAGE_ROW_BACKGROUNDS)
 
+    def test_classic_color_commit_preserves_tahoma_and_aliased_heading_fonts(self):
+        self.client._on_theme_changed("Classic")
+        font = QFont("Tahoma", 10)
+        font.setStyleStrategy(QFont.StyleStrategy.NoAntialias)
+        self.app.setFont(font)
+        font.setBold(True)
+        headings = [QLabel(title, self.window) for title in ("Chatrooms", "Global")]
+        for heading in headings:
+            heading.setFont(font)
+        for position in range(len(S.CLASSIC_COLOR_SCHEMES)):
+            self.client.theme_color_slider.setValue(position)
+            self.client._finish_theme_color_change()
+            self.app.processEvents()
+            self.assertEqual(self.app.font().family(), "Tahoma")
+            self.assertEqual(self.app.font().styleStrategy(), QFont.StyleStrategy.NoAntialias)
+            for heading in headings:
+                self.assertEqual(heading.font().family(), "Tahoma")
+                self.assertTrue(heading.font().bold())
+                self.assertEqual(heading.font().styleStrategy(), QFont.StyleStrategy.NoAntialias)
+
     def test_glassy_tint_and_row_brushes_change_with_alpha_preserved(self):
         self.client._on_theme_changed("Glassy")
         before = S.message_row_backgrounds()
+        self.client.chat_display = QTextBrowser(self.window)
+        self.client.theme_color_slider.setSliderDown(True)
         self.client.theme_color_slider.setValue(130)
-        self.client._apply_theme_colors()
+        self.client.theme_color_slider.setSliderDown(False)
         after = S.message_row_backgrounds()
         self.assertNotEqual(before[1], after[1])
         for original, shifted in zip(before, after):
             self.assertEqual(QColor(original).alpha(), QColor(shifted).alpha())
-        self.client.chat_display = QTextBrowser(self.window)
-        self.client._finish_theme_color_change()
         self.client._rerender_preserving_scroll.assert_called_once()
 
     def test_native_classic_titlebar_uses_selected_scheme(self):
