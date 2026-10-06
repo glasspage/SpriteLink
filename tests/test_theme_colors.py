@@ -187,6 +187,43 @@ class ThemeColorTests(unittest.TestCase):
             image = browser.viewport().grab().toImage()
             self.assertEqual(image.pixelColor(image.width() // 2, image.height() // 2), QColor(backgrounds[0]))
 
+    def test_classic_thumb_previews_each_scheme_without_refreshing_window(self):
+        self.client._on_theme_changed("Classic")
+        self.saved.reset_mock()
+        self.client.chat_display = QTextBrowser(self.window)
+        slider = self.client.theme_color_slider
+        other_slider = S.ThemeSlider(Qt.Orientation.Horizontal, self.window)
+        other_slider.setGeometry(10, 60, 112, 24)
+        self.window.show()
+        self.app.processEvents()
+        palette = QPalette(self.app.palette())
+        sheet = self.app.styleSheet()
+        other_image = other_slider.grab().toImage()
+        slider.setSliderDown(True)
+        for position, scheme in enumerate(S.CLASSIC_COLOR_SCHEMES):
+            slider.setValue(position)
+            self.app.processEvents()
+            option = QStyleOptionSlider()
+            slider.initStyleOption(option)
+            handle = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                                   QStyle.SubControl.SC_SliderHandle, slider)
+            image = slider.grab().toImage()
+            ratio = image.devicePixelRatio()
+            self.assertEqual(image.pixelColor(round(handle.center().x() * ratio),
+                                              round(handle.center().y() * ratio)), QColor(scheme["face"]))
+            self.assertEqual(self.app.palette(), palette)
+            self.assertEqual(self.app.styleSheet(), sheet)
+            self.assertEqual(other_slider.grab().toImage(), other_image)
+        QTest.qWait(500)
+        self.saved.assert_not_called()
+        self.client._rerender_preserving_scroll.assert_not_called()
+        slider.setSliderDown(False)
+        self.assertEqual(self.app.palette().color(QPalette.ColorRole.Window), QColor(scheme["face"]))
+        self.saved.assert_called_once()
+        self.client._rerender_preserving_scroll.assert_called_once()
+        self.client._on_theme_changed("Modern")
+        self.assertIsNone(slider.property("spritelinkPreviewClassicColor"))
+
     def test_modern_checkbox_slider_and_focus_edge_share_shifted_accent(self):
         checkbox = QCheckBox("Accent", self.window)
         checkbox.setChecked(True)

@@ -5036,16 +5036,33 @@ class TextShadowProxyStyle(QProxyStyle):
 
 
 class ThemeSlider(QSlider):
-    """Keep native interaction and paint theme-colored rounded handles."""
+    """Keep native interaction and paint theme-colored handles."""
 
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
         app = QApplication.instance()
-        if (app is None or not (bool(app.property("spritelinkGlassy")) or bool(app.property("spritelinkModern")))
-                or self.orientation() != Qt.Orientation.Horizontal):
+        if app is None or self.orientation() != Qt.Orientation.Horizontal:
             return
         option = QStyleOptionSlider()
         self.initStyleOption(option)
+        position = self.property("spritelinkPreviewClassicColor")
+        if bool(app.property("spritelinkWindowsClassic")) and position is not None:
+            # Repaint only the native thumb using the selected scheme's bevel
+            # and face colors. The track and application palette stay untouched.
+            scheme = CLASSIC_COLOR_SCHEMES[int(position)]
+            for role, key in (
+                (QPalette.ColorRole.Window, "face"), (QPalette.ColorRole.Button, "face"),
+                (QPalette.ColorRole.Light, "light"), (QPalette.ColorRole.Midlight, "face"),
+                (QPalette.ColorRole.Mid, "shadow"), (QPalette.ColorRole.Dark, "shadow"),
+            ):
+                option.palette.setColor(role, QColor(scheme[key]))
+            option.subControls = QStyle.SubControl.SC_SliderHandle
+            painter = QPainter(self)
+            self.style().drawComplexControl(QStyle.ComplexControl.CC_Slider, option, painter, self)
+            painter.end()
+            return
+        if not (bool(app.property("spritelinkGlassy")) or bool(app.property("spritelinkModern"))):
+            return
         handle = self.style().subControlRect(
             QStyle.ComplexControl.CC_Slider, option,
             QStyle.SubControl.SC_SliderHandle, self,
@@ -10459,6 +10476,7 @@ class EncryptedChatClient(QObject):
             position = client_theme_color(self, theme)
             slider.setValue(position)
             slider.setProperty("spritelinkPreviewHue", None)
+            slider.setProperty("spritelinkPreviewClassicColor", position if classic else None)
             slider.setToolTip(CLASSIC_COLOR_SCHEMES[position]["name"] if classic else "")
         finally:
             slider.blockSignals(was_blocked)
@@ -10471,6 +10489,7 @@ class EncryptedChatClient(QObject):
         if theme == "Classic":
             self.theme_color_slider.setToolTip(CLASSIC_COLOR_SCHEMES[colors[theme]]["name"])
         self.theme_color_slider.setProperty("spritelinkPreviewHue", None if theme == "Classic" else value)
+        self.theme_color_slider.setProperty("spritelinkPreviewClassicColor", value if theme == "Classic" else None)
         self.theme_color_slider.update()
         # Stylesheet repolish and log/blur refreshes are deliberately excluded
         # from dragging, even if the user pauses while holding the thumb.
