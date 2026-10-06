@@ -966,6 +966,9 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
     background: transparent;
     height: 0px;
 }
+QSlider:horizontal {
+    min-height: 21px;
+}
 QSlider::groove:horizontal {
     height: 5px;
     background: rgba(207, 231, 246, 210);
@@ -4705,10 +4708,10 @@ class TextShadowProxyStyle(QProxyStyle):
         ):
             color = QColor("#246a92")
         painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setPen(QPen(color, 1.0))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(QRectF(option.rect).adjusted(0.5, 0.5, -0.5, -0.5), 2, 2)
+        painter.drawRect(option.rect.adjusted(0, 0, -1, -1))
         painter.restore()
 
     def drawItemText(

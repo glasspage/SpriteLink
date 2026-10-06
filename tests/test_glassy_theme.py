@@ -141,6 +141,45 @@ class GlassyControlRenderingTests(unittest.TestCase):
                        for y in range(image.height()) for x in range(image.width()))
             self.assertGreater(dark, 25)
 
+    def test_checkbox_indicator_has_square_outlined_corners(self):
+        from PySide6.QtWidgets import QCheckBox, QStyle, QStyleOptionButton
+        checkbox = QCheckBox("Check", self.window)
+        checkbox.setGeometry(20, 20, 120, 30)
+        checkbox.show()
+        for checked in (False, True):
+            checkbox.setChecked(checked)
+            self.app.processEvents()
+            option = QStyleOptionButton()
+            checkbox.initStyleOption(option)
+            rect = checkbox.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, option, checkbox)
+            image = checkbox.grab().toImage().copy(rect)
+            for x, y in ((0, 0), (0, image.height() - 1),
+                         (image.width() - 1, 0), (image.width() - 1, image.height() - 1)):
+                self.assertLess(image.pixelColor(x, y).red(), 120)
+                self.assertEqual(image.pixelColor(x, y).alpha(), 255)
+
+    def test_compact_slider_keeps_top_and_bottom_handle_outlines(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QSlider, QStyle, QStyleOptionSlider, QSizePolicy, QVBoxLayout
+        layout = QVBoxLayout(self.window)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout.addWidget(slider)
+        layout.addStretch()
+        slider.setValue(50)
+        self.app.processEvents()
+        option = QStyleOptionSlider()
+        slider.initStyleOption(option)
+        rect = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                             QStyle.SubControl.SC_SliderHandle, slider)
+        self.assertGreaterEqual(rect.top(), 1)
+        self.assertLessEqual(rect.bottom(), slider.height() - 2)
+        image = slider.grab().toImage()
+        for y in (rect.top(), rect.bottom()):
+            color = image.pixelColor(rect.center().x(), y)
+            self.assertLess(color.red(), 120)
+            self.assertEqual(color.alpha(), 255)
+
     def test_slider_handle_has_a_visible_dark_outline(self):
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QSlider, QStyle, QStyleOptionSlider
