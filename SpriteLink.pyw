@@ -971,12 +971,16 @@ QSlider:horizontal {
 }
 QSlider::groove:horizontal {
     height: 5px;
-    background: rgba(207, 231, 246, 210);
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(190, 213, 229, 230),
+        stop:1 rgba(237, 249, 255, 230)
+    );
     border: 1px solid #648fa9;
     border-radius: 3px;
 }
 QSlider::handle:horizontal {
-    width: 12px;
+    width: 15px;
     margin: -6px 0;
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,

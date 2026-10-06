@@ -172,6 +172,7 @@ class GlassyControlRenderingTests(unittest.TestCase):
         slider.initStyleOption(option)
         rect = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
                                              QStyle.SubControl.SC_SliderHandle, slider)
+        self.assertEqual(rect.width(), rect.height())
         self.assertGreaterEqual(rect.top(), 1)
         self.assertLessEqual(rect.bottom(), slider.height() - 2)
         image = slider.grab().toImage()
@@ -196,6 +197,25 @@ class GlassyControlRenderingTests(unittest.TestCase):
         dark = sum(image.pixelColor(x, y).red() < 100
                    for y in range(image.height()) for x in range(image.width()))
         self.assertGreater(dark, 25)
+
+    def test_slider_track_has_a_subtle_vertical_gradient(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QSlider, QStyle, QStyleOptionSlider
+        slider = QSlider(Qt.Orientation.Horizontal, self.window)
+        slider.setGeometry(20, 20, 220, 30)
+        slider.setValue(50)
+        slider.show()
+        self.app.processEvents()
+        option = QStyleOptionSlider()
+        slider.initStyleOption(option)
+        rect = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                             QStyle.SubControl.SC_SliderGroove, slider)
+        image = slider.grab().toImage()
+        x = rect.left() + 20
+        top = image.pixelColor(x, rect.top() + 1)
+        bottom = image.pixelColor(x, rect.bottom() - 1)
+        self.assertGreater(bottom.red(), top.red() + 10)
+        self.assertLess(bottom.red() - top.red(), 60)
 
     def test_popup_has_no_dark_padding_above_or_below_options(self):
         combo = SPRITELINK.ThemeComboBox(self.window)
