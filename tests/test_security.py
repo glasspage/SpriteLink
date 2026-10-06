@@ -4240,7 +4240,7 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertEqual(SPRITELINK.DEFAULT_THEME, "Classic")
         self.assertEqual(
             SPRITELINK.THEMES,
-            ("Classic", "Glassy", "Glassy+", "Modern"),
+            ("Classic", "Glassy", "Modern"),
         )
 
         source = inspect.getsource(
@@ -4336,6 +4336,7 @@ class Version120ReleaseTests(unittest.TestCase):
         for legacy_name, expected_name in (
             ("Windows Classic", "Classic"),
             ("Modern (Light)", "Modern"),
+            ("Glassy+", "Glassy"),
         ):
             with self.subTest(theme=legacy_name):
                 existing_config = SPRITELINK.default_config()

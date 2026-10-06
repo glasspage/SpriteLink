@@ -4,6 +4,6 @@ It uses ntfy-compatible servers as encrypted message relays, allowing users to c
 SpriteLink is designed around the limitations of the public ntfy server, including its 4 KB message size limit, 250-message daily publish limit, and 12-hour server retention period. 
 Ideally, *SpriteLink should be left running* so it can receive and save messages before they expire from the server.
 
-The Glassy theme has a solid titlebar. Glassy+ uses native Windows blur behind the translucent window, with an opaque fallback where native blur is unavailable.
+The Glassy theme uses native Windows blur behind the translucent window, with an opaque fallback where native blur is unavailable. Saved Glassy+ settings migrate to Glassy.
 
 DISCLAIMER: The code in this repository was created with assistance from AI tools. I made the architecture, design and implementation decisions; AI was used to write the code based on them.

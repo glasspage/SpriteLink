@@ -75,6 +75,7 @@ try:
         QLinearGradient,
         QMovie,
         QPainter,
+        QPen,
         QPalette,
         QPixmap,
         QPixmapCache,
@@ -365,10 +366,10 @@ DEFAULT_THEME = "Classic"
 THEMES = (
     DEFAULT_THEME,
     "Glassy",
-    "Glassy+",
     "Modern",
 )
 LEGACY_THEME_NAMES = {
+    "Glassy+": "Glassy",
     "Windows Classic": "Classic",
     "Modern (Light)": "Modern",
 }
@@ -638,13 +639,13 @@ DEFAULT_MESSAGE_FONT = "Arial"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
-GLASSY_PLUS_MESSAGE_ROW_BACKGROUNDS = ("#38ffffff", "#50d7e7f2")
+GLASSY_MESSAGE_ROW_BACKGROUNDS = ("#38ffffff", "#50d7e7f2")
 
 
 def message_row_backgrounds() -> tuple[str, str]:
     app = QApplication.instance()
-    if app is not None and bool(app.property("spritelinkGlassyPlus")):
-        return GLASSY_PLUS_MESSAGE_ROW_BACKGROUNDS
+    if app is not None and bool(app.property("spritelinkGlassy")):
+        return GLASSY_MESSAGE_ROW_BACKGROUNDS
     return MESSAGE_ROW_BACKGROUNDS
 
 
@@ -784,30 +785,27 @@ QMainWindow, QDialog {
     background: rgba(224, 240, 250, 188);
     color: #172532;
 }
+QMainWindow {
+    background: transparent;
+}
 QWidget#glassRoot {
     background: qlineargradient(
         x1:0, y1:0, x2:1, y2:1,
-        stop:0 rgba(242, 251, 255, 218),
-        stop:0.40 rgba(207, 231, 246, 192),
-        stop:1 rgba(151, 195, 224, 178)
+        stop:0 rgba(242, 251, 255, 54),
+        stop:0.40 rgba(207, 231, 246, 42),
+        stop:1 rgba(151, 195, 224, 66)
     );
 }
 QWidget#chatroomsPanel {
     background: qlineargradient(
         x1:0, y1:0, x2:1, y2:0,
-        stop:0 rgba(251, 254, 255, 202),
-        stop:0.78 rgba(218, 238, 250, 188),
-        stop:1 rgba(172, 207, 230, 174)
+        stop:0 rgba(251, 254, 255, 80),
+        stop:1 rgba(172, 207, 230, 64)
     );
     border-right: 1px solid rgba(78, 129, 164, 210);
 }
 QWidget#chatTab {
-    background: qlineargradient(
-        x1:0, y1:0, x2:0, y2:1,
-        stop:0 rgba(250, 254, 255, 190),
-        stop:0.20 rgba(230, 244, 252, 178),
-        stop:1 rgba(202, 227, 242, 166)
-    );
+    background: transparent;
 }
 QLabel {
     background: transparent;
@@ -898,12 +896,23 @@ QComboBox::down-arrow {
     height: 0px;
 }
 QTextBrowser#chatViewport {
+    background-color: rgba(255, 255, 255, 72);
     border: 1px solid #365f78;
     border-radius: 4px;
 }
+QComboBoxPrivateContainer {
+    background-color: #f7fcff;
+    border: 1px solid #496f87;
+    padding: 0px;
+}
+QComboBox QAbstractItemView {
+    background-color: #f7fcff;
+    border-radius: 0px;
+    padding: 0px;
+}
 QComboBox QAbstractItemView, QMenu {
     color: #172532;
-    background-color: rgba(247, 252, 255, 246);
+    background-color: #f7fcff;
     border: 1px solid #608aa3;
     selection-background-color: #62a9d2;
     selection-color: #ffffff;
@@ -957,6 +966,29 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
     background: transparent;
     height: 0px;
 }
+QSlider::groove:horizontal {
+    height: 5px;
+    background: rgba(207, 231, 246, 210);
+    border: 1px solid #648fa9;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    width: 12px;
+    margin: -6px 0;
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #ffffff, stop:1 #99c5e1
+    );
+    border: 2px solid #365f78;
+    border-radius: 4px;
+}
+QSlider::handle:horizontal:hover, QSlider::handle:horizontal:focus {
+    border-color: #246a92;
+}
+QSlider::handle:horizontal:disabled {
+    background: #dae7ef;
+    border-color: #7391a4;
+}
 QProgressBar {
     color: #172532;
     background-color: rgba(255, 255, 255, 188);
@@ -982,33 +1014,6 @@ QToolTip {
 }
 QFrame[frameShape="4"], QFrame[frameShape="5"] {
     color: rgba(73, 115, 140, 190);
-}
-"""
-
-GLASSY_PLUS_STYLESHEET = GLASSY_STYLESHEET + """
-QMainWindow {
-    background: transparent;
-}
-QWidget#glassRoot {
-    background: qlineargradient(
-        x1:0, y1:0, x2:1, y2:1,
-        stop:0 rgba(242, 251, 255, 54),
-        stop:0.40 rgba(207, 231, 246, 42),
-        stop:1 rgba(151, 195, 224, 66)
-    );
-}
-QWidget#chatTab {
-    background: transparent;
-}
-QWidget#chatroomsPanel {
-    background: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0,
-        stop:0 rgba(251, 254, 255, 80),
-        stop:1 rgba(172, 207, 230, 64)
-    );
-}
-QTextBrowser#chatViewport {
-    background-color: rgba(255, 255, 255, 72);
 }
 """
 
@@ -4675,7 +4680,28 @@ def subscription_room_ids(
 
 
 class TextShadowProxyStyle(QProxyStyle):
-    """Draw standard Qt widget text with a subtle one-pixel shadow."""
+    """Theme outlines and optional subtle shadows for standard Qt widgets."""
+
+    def drawPrimitive(self, element, option, painter, widget=None) -> None:
+        super().drawPrimitive(element, option, painter, widget)
+        app = QApplication.instance()
+        if (element != QStyle.PrimitiveElement.PE_IndicatorCheckBox
+                or app is None or not bool(app.property("spritelinkGlassy"))):
+            return
+        # Preserve Fusion's checked/mixed glyph and add a reliable outline
+        # even when the translucent palette makes its native frame faint.
+        enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+        color = QColor("#365f78" if enabled else "#7391a4")
+        if enabled and option.state & (
+            QStyle.StateFlag.State_MouseOver | QStyle.StateFlag.State_HasFocus
+        ):
+            color = QColor("#246a92")
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(color, 1.5))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRectF(option.rect).adjusted(0.75, 0.75, -0.75, -0.75), 2, 2)
+        painter.restore()
 
     def drawItemText(
         self,
@@ -6093,10 +6119,7 @@ class EncryptedChatClient(QObject):
         return self.theme_var.get() == "Classic"
 
     def _is_glassy_theme(self) -> bool:
-        return self.theme_var.get() in ("Glassy", "Glassy+")
-
-    def _is_glassy_plus_theme(self) -> bool:
-        return self.theme_var.get() == "Glassy+"
+        return self.theme_var.get() == "Glassy"
 
     def _windows_classic_palette(self) -> QPalette:
         palette = QPalette()
@@ -6138,10 +6161,10 @@ class EncryptedChatClient(QObject):
     def _glassy_palette(self) -> QPalette:
         palette = QPalette(self._basic_palette)
         colors = {
-            QPalette.ColorRole.Window: QColor(224, 240, 250, 188),
+            QPalette.ColorRole.Window: QColor(224, 240, 250, 0),
             QPalette.ColorRole.WindowText: QColor("#172532"),
-            QPalette.ColorRole.Base: QColor(255, 255, 255, 226),
-            QPalette.ColorRole.AlternateBase: QColor(222, 239, 249, 216),
+            QPalette.ColorRole.Base: QColor(255, 255, 255, 72),
+            QPalette.ColorRole.AlternateBase: QColor(215, 231, 242, 80),
             QPalette.ColorRole.ToolTipBase: QColor(248, 253, 255, 246),
             QPalette.ColorRole.ToolTipText: QColor("#172532"),
             QPalette.ColorRole.Text: QColor("#172532"),
@@ -6160,12 +6183,6 @@ class EncryptedChatClient(QObject):
         }
         for role, color in colors.items():
             palette.setColor(role, color)
-        if self._is_glassy_plus_theme():
-            palette.setColor(QPalette.ColorRole.Window, QColor(224, 240, 250, 0))
-            palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255, 72))
-            palette.setColor(
-                QPalette.ColorRole.AlternateBase, QColor(215, 231, 242, 80)
-            )
         palette.setColor(
             QPalette.ColorGroup.Disabled,
             QPalette.ColorRole.Text,
@@ -6282,12 +6299,10 @@ class EncryptedChatClient(QObject):
                 backdrop = 1  # DWMSBT_NONE
             elif self._is_glassy_theme():
                 border = "#6292af"
-                caption = None if self._is_glassy_plus_theme() else "#d0e7f4"
+                caption = None
                 text = "#102637"
                 corner_preference = 2  # DWMWCP_ROUND
-                # Only Glassy+ uses a desktop backdrop. Glassy keeps a solid caption.
-                backdrop = 3 if self._is_glassy_plus_theme() else 1
-                # DWMSBT_TRANSIENTWINDOW (acrylic) / DWMSBT_NONE
+                backdrop = 3  # DWMSBT_TRANSIENTWINDOW (acrylic)
             else:
                 border = "#d0d0d0"
                 caption = "#f0f0f0"
@@ -6314,7 +6329,7 @@ class EncryptedChatClient(QObject):
                     ("bottom", ctypes.c_int),
                 ]
 
-            glass_margin = -1 if self._is_glassy_plus_theme() else 0
+            glass_margin = -1 if self._is_glassy_theme() else 0
             margins = Margins(
                 glass_margin,
                 glass_margin,
@@ -6329,12 +6344,12 @@ class EncryptedChatClient(QObject):
                 self._set_windows_legacy_blur(hwnd, False)
                 window.setProperty("spritelinkLegacyBlur", False)
             desktop_blur = (
-                self._is_glassy_plus_theme()
+                self._is_glassy_theme()
                 and frame_result == 0
                 and backdrop_result == 0
             )
             if (
-                self._is_glassy_plus_theme()
+                self._is_glassy_theme()
                 and frame_result == 0
                 and not desktop_blur
             ):
@@ -6678,11 +6693,7 @@ class EncryptedChatClient(QObject):
         elif self._is_glassy_theme():
             style_name = available_styles.get("fusion", "Fusion")
             app.setPalette(self._glassy_palette())
-            app.setStyleSheet(
-                GLASSY_PLUS_STYLESHEET
-                if self._is_glassy_plus_theme()
-                else GLASSY_STYLESHEET
-            )
+            app.setStyleSheet(GLASSY_STYLESHEET)
         else:
             style_name = available_styles.get(
                 self._basic_style_name.casefold()
@@ -6695,17 +6706,12 @@ class EncryptedChatClient(QObject):
         if style_name is not None:
             base_style = QStyleFactory.create(style_name)
             if base_style is not None:
-                app.setStyle(
-                    TextShadowProxyStyle(base_style)
-                    if text_shadows_enabled
-                    else base_style
-                )
+                app.setStyle(TextShadowProxyStyle(base_style))
         app.setProperty(
             "spritelinkWindowsClassic",
             self._is_windows_classic_theme(),
         )
         app.setProperty("spritelinkGlassy", self._is_glassy_theme())
-        app.setProperty("spritelinkGlassyPlus", self._is_glassy_plus_theme())
         for widget in app.allWidgets():
             if isinstance(widget, ThemeComboBox):
                 widget.update()
