@@ -900,7 +900,7 @@ QTextBrowser#chatViewport {
     border: 1px solid #365f78;
     border-radius: 4px;
 }
-QComboBoxPrivateContainer {
+QFrame#comboPopup {
     background-color: #f7fcff;
     border: 1px solid #496f87;
     padding: 0px;
@@ -979,7 +979,7 @@ QSlider::handle:horizontal {
         x1:0, y1:0, x2:0, y2:1,
         stop:0 #ffffff, stop:1 #99c5e1
     );
-    border: 2px solid #365f78;
+    border: 1px solid #496f87;
     border-radius: 4px;
 }
 QSlider::handle:horizontal:hover, QSlider::handle:horizontal:focus {
@@ -4682,6 +4682,14 @@ def subscription_room_ids(
 class TextShadowProxyStyle(QProxyStyle):
     """Theme outlines and optional subtle shadows for standard Qt widgets."""
 
+    def pixelMetric(self, metric, option=None, widget=None) -> int:
+        app = QApplication.instance()
+        if (metric == QStyle.PixelMetric.PM_MenuVMargin
+                and isinstance(widget, QComboBox)
+                and app is not None and bool(app.property("spritelinkGlassy"))):
+            return 0
+        return super().pixelMetric(metric, option, widget)
+
     def drawPrimitive(self, element, option, painter, widget=None) -> None:
         super().drawPrimitive(element, option, painter, widget)
         app = QApplication.instance()
@@ -4691,16 +4699,16 @@ class TextShadowProxyStyle(QProxyStyle):
         # Preserve Fusion's checked/mixed glyph and add a reliable outline
         # even when the translucent palette makes its native frame faint.
         enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
-        color = QColor("#365f78" if enabled else "#7391a4")
+        color = QColor("#496f87" if enabled else "#7391a4")
         if enabled and option.state & (
             QStyle.StateFlag.State_MouseOver | QStyle.StateFlag.State_HasFocus
         ):
             color = QColor("#246a92")
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(color, 1.5))
+        painter.setPen(QPen(color, 1.0))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(QRectF(option.rect).adjusted(0.75, 0.75, -0.75, -0.75), 2, 2)
+        painter.drawRoundedRect(QRectF(option.rect).adjusted(0.5, 0.5, -0.5, -0.5), 2, 2)
         painter.restore()
 
     def drawItemText(
@@ -4759,6 +4767,17 @@ class TextShadowProxyStyle(QProxyStyle):
 
 class ThemeComboBox(QComboBox):
     """Config combo box with Classic styling and no wheel changes."""
+
+    def showPopup(self) -> None:
+        popup = self.view().window()
+        if popup.objectName() != "comboPopup":
+            # The generic translucent QFrame rule must not style the popup's
+            # outside padding. An explicit ID takes precedence over it.
+            popup.setObjectName("comboPopup")
+            popup.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            popup.style().unpolish(popup)
+            popup.style().polish(popup)
+        super().showPopup()
 
     def wheelEvent(self, event: Any) -> None:
         # Let a containing scroll area handle the wheel without changing the

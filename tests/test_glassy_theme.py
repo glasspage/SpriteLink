@@ -177,6 +177,30 @@ class GlassyControlRenderingTests(unittest.TestCase):
                 self.assertGreater(color.blue(), 150)
             combo.hidePopup()
 
+    def test_popup_frame_cannot_inherit_translucent_panel_padding(self):
+        from PySide6.QtWidgets import QFrame
+        combo = SPRITELINK.ThemeComboBox(self.window)
+        combo.setGeometry(20, 20, 200, 30)
+        combo.addItems(list(SPRITELINK.THEMES))
+        combo.show()
+        combo.showPopup()
+        self.app.processEvents()
+        popup = combo.view().window()
+        # Reproduce the styled-panel frame used by some platform popup styles,
+        # and include real space outside the item view rather than only rows.
+        popup.setFrameShape(QFrame.Shape.StyledPanel)
+        popup.layout().setContentsMargins(0, 6, 0, 6)
+        popup.resize(popup.width(), popup.height() + 12)
+        popup.layout().activate()
+        self.app.processEvents()
+        image = popup.grab().toImage()
+        for y in (3, image.height() - 4):
+            color = image.pixelColor(image.width() // 2, y)
+            self.assertEqual(color.alpha(), 255)
+            self.assertGreater(color.red(), 230)
+            self.assertGreater(color.blue(), 230)
+        combo.hidePopup()
+
 
 if __name__ == "__main__":
     unittest.main()
