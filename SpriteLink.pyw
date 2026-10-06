@@ -980,14 +980,14 @@ QSlider::groove:horizontal {
     border-radius: 3px;
 }
 QSlider::handle:horizontal {
-    width: 15px;
-    margin: -6px 0;
+    width: 11px;
+    margin: -4px 0;
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,
         stop:0 #ffffff, stop:1 #99c5e1
     );
     border: 1px solid #496f87;
-    border-radius: 4px;
+    border-radius: 3px;
 }
 QSlider::handle:horizontal:hover, QSlider::handle:horizontal:focus {
     border-color: #246a92;
