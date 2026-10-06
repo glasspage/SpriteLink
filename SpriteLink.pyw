@@ -5058,6 +5058,12 @@ class ThemeSlider(QSlider):
                 option.palette.setColor(role, QColor(scheme[key]))
             option.subControls = QStyle.SubControl.SC_SliderHandle
             painter = QPainter(self)
+            # Some native styles fill the entire slider background even when
+            # only its handle is requested. Protect the groove/ticks/focus.
+            painter.setClipRect(self.style().subControlRect(
+                QStyle.ComplexControl.CC_Slider, option,
+                QStyle.SubControl.SC_SliderHandle, self,
+            ))
             self.style().drawComplexControl(QStyle.ComplexControl.CC_Slider, option, painter, self)
             painter.end()
             return

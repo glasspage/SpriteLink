@@ -224,6 +224,31 @@ class ThemeColorTests(unittest.TestCase):
         self.client._on_theme_changed("Modern")
         self.assertIsNone(slider.property("spritelinkPreviewClassicColor"))
 
+    def test_classic_preview_preserves_native_track_ticks_and_focus_pixels(self):
+        self.client._on_theme_changed("Classic")
+        slider = self.client.theme_color_slider
+        slider.setGeometry(10, 10, 180, 32)
+        self.window.show()
+        slider.setFocus()
+        slider.setSliderDown(True)
+        for position in range(len(S.CLASSIC_COLOR_SCHEMES)):
+            slider.setValue(position)
+            slider.setProperty("spritelinkPreviewClassicColor", None)
+            native = slider.grab().toImage()
+            slider.setProperty("spritelinkPreviewClassicColor", position)
+            preview = slider.grab().toImage()
+            option = QStyleOptionSlider()
+            slider.initStyleOption(option)
+            handle = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                                   QStyle.SubControl.SC_SliderHandle, slider)
+            ratio = preview.devicePixelRatio()
+            changed_outside_handle = sum(
+                native.pixel(x, y) != preview.pixel(x, y)
+                for y in range(preview.height()) for x in range(preview.width())
+                if not handle.contains(int(x / ratio), int(y / ratio))
+            )
+            self.assertEqual(changed_outside_handle, 0, S.CLASSIC_COLOR_SCHEMES[position]["name"])
+
     def test_modern_checkbox_slider_and_focus_edge_share_shifted_accent(self):
         checkbox = QCheckBox("Accent", self.window)
         checkbox.setChecked(True)
