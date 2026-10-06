@@ -122,6 +122,7 @@ try:
         QStyleFactory,
         QStyledItemDelegate,
         QStyleOptionButton,
+        QStyleOptionSlider,
         QStyleOptionViewItem,
         QSystemTrayIcon,
         QTextBrowser,
@@ -980,21 +981,10 @@ QSlider::groove:horizontal {
     border-radius: 3px;
 }
 QSlider::handle:horizontal {
-    width: 11px;
-    margin: -4px 0;
-    background: qlineargradient(
-        x1:0, y1:0, x2:0, y2:1,
-        stop:0 #ffffff, stop:1 #99c5e1
-    );
-    border: 1px solid #496f87;
-    border-radius: 3px;
-}
-QSlider::handle:horizontal:hover, QSlider::handle:horizontal:focus {
-    border-color: #246a92;
-}
-QSlider::handle:horizontal:disabled {
-    background: #dae7ef;
-    border-color: #7391a4;
+    width: 13px;
+    margin: -5px 0;
+    background: transparent;
+    border: 1px solid transparent;
 }
 QProgressBar {
     color: #172532;
@@ -4770,6 +4760,47 @@ class TextShadowProxyStyle(QProxyStyle):
             text,
             text_role,
         )
+
+
+class ThemeSlider(QSlider):
+    """Keep native slider interaction and paint a clean Glassy handle."""
+
+    def paintEvent(self, event: Any) -> None:
+        super().paintEvent(event)
+        app = QApplication.instance()
+        if (app is None or not bool(app.property("spritelinkGlassy"))
+                or self.orientation() != Qt.Orientation.Horizontal):
+            return
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, option,
+            QStyle.SubControl.SC_SliderHandle, self,
+        )
+        # Snap the outside to physical pixels, then inset the shared fill/stroke
+        # path by half a pen width. This keeps opposite corners symmetrical
+        # at fractional scaling without stacking two rounded stylesheet edges.
+        ratio = self.devicePixelRatioF()
+        rect = QRectF(
+            round(handle.x() * ratio) / ratio,
+            round(handle.y() * ratio) / ratio,
+            round(handle.width() * ratio) / ratio,
+            round(handle.height() * ratio) / ratio,
+        ).adjusted(0.5, 0.5, -0.5, -0.5)
+        enabled = self.isEnabled()
+        highlighted = self.hasFocus() or handle.contains(self.mapFromGlobal(QCursor.pos()))
+        border = QColor("#496f87" if enabled else "#7391a4")
+        if enabled and highlighted:
+            border = QColor("#246a92")
+        gradient = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        gradient.setColorAt(0, QColor("#ffffff" if enabled else "#e6eef3"))
+        gradient.setColorAt(1, QColor("#99c5e1" if enabled else "#dae7ef"))
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(border, 1.0))
+        painter.setBrush(QBrush(gradient))
+        painter.drawRoundedRect(rect, 3.0, 3.0)
+        painter.end()
 
 
 class ThemeComboBox(QComboBox):
@@ -9473,7 +9504,7 @@ class EncryptedChatClient(QObject):
         message_sound_volume_layout.addWidget(
             self.message_sound_volume_label
         )
-        self.message_sound_volume_slider = QSlider(
+        self.message_sound_volume_slider = ThemeSlider(
             Qt.Orientation.Horizontal
         )
         self.message_sound_volume_slider.setRange(1, 10)

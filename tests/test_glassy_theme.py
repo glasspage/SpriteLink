@@ -162,7 +162,7 @@ class GlassyControlRenderingTests(unittest.TestCase):
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QSlider, QStyle, QStyleOptionSlider, QSizePolicy, QVBoxLayout
         layout = QVBoxLayout(self.window)
-        slider = QSlider(Qt.Orientation.Horizontal)
+        slider = SPRITELINK.ThemeSlider(Qt.Orientation.Horizontal)
         slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout.addWidget(slider)
         layout.addStretch()
@@ -172,7 +172,8 @@ class GlassyControlRenderingTests(unittest.TestCase):
         slider.initStyleOption(option)
         rect = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
                                              QStyle.SubControl.SC_SliderHandle, slider)
-        self.assertEqual(rect.width(), rect.height())
+        self.assertEqual(rect.width(), 15)
+        self.assertEqual(rect.height(), 15)
         self.assertGreaterEqual(rect.top(), 1)
         self.assertLessEqual(rect.bottom(), slider.height() - 2)
         image = slider.grab().toImage()
@@ -184,7 +185,7 @@ class GlassyControlRenderingTests(unittest.TestCase):
     def test_slider_handle_has_a_visible_dark_outline(self):
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QSlider, QStyle, QStyleOptionSlider
-        slider = QSlider(Qt.Orientation.Horizontal, self.window)
+        slider = SPRITELINK.ThemeSlider(Qt.Orientation.Horizontal, self.window)
         slider.setGeometry(20, 20, 220, 30)
         slider.setValue(50)
         slider.show()
@@ -198,10 +199,30 @@ class GlassyControlRenderingTests(unittest.TestCase):
                    for y in range(image.height()) for x in range(image.width()))
         self.assertGreater(dark, 25)
 
+    def test_rounded_slider_handle_has_symmetric_corner_coverage(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QStyle, QStyleOptionSlider
+        slider = SPRITELINK.ThemeSlider(Qt.Orientation.Horizontal, self.window)
+        slider.setGeometry(20, 20, 220, 30)
+        slider.setValue(50)
+        slider.show()
+        self.app.processEvents()
+        option = QStyleOptionSlider()
+        slider.initStyleOption(option)
+        rect = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                             QStyle.SubControl.SC_SliderHandle, slider)
+        image = slider.grab().toImage().copy(rect)
+        self.assertLess(image.pixelColor(0, 0).alpha(), 50)
+        for y in range(4):
+            for x in range(4):
+                alpha = image.pixelColor(x, y).alpha()
+                self.assertLessEqual(abs(alpha - image.pixelColor(image.width() - 1 - x, y).alpha()), 3)
+                self.assertLessEqual(abs(alpha - image.pixelColor(x, image.height() - 1 - y).alpha()), 3)
+
     def test_slider_track_has_a_subtle_vertical_gradient(self):
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QSlider, QStyle, QStyleOptionSlider
-        slider = QSlider(Qt.Orientation.Horizontal, self.window)
+        slider = SPRITELINK.ThemeSlider(Qt.Orientation.Horizontal, self.window)
         slider.setGeometry(20, 20, 220, 30)
         slider.setValue(50)
         slider.show()
