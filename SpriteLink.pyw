@@ -376,6 +376,101 @@ LEGACY_THEME_NAMES = {
     "Modern (Light)": "Modern",
 }
 
+# Windows Classic/XP scheme RGB values, verified against the archived theme
+# files at https://github.com/zkedem/windows10-classic-themes . The first entry
+# retains SpriteLink's original Classic colors for existing configurations.
+CLASSIC_COLOR_SCHEMES = (
+    dict(name="Default", face="#c0c0c0", shadow="#808080", light="#ffffff",
+         title="#000080", highlight="#007f82", highlight_text="#000000",
+         window="#ffffff", tooltip="#ffffe1"),
+    dict(name="Desert", face="#d5ccbb", shadow="#a28d68", light="#eae6dd",
+         title="#008080", highlight="#008080", highlight_text="#ffffff",
+         window="#ffffff", tooltip="#ffffff"),
+    dict(name="Spruce", face="#a2c8a9", shadow="#599764", light="#d0e3d3",
+         title="#599764", highlight="#599764", highlight_text="#ffffff",
+         window="#ffffff", tooltip="#ffffff"),
+    dict(name="Slate", face="#9db9c8", shadow="#558097", light="#cedce3",
+         title="#558097", highlight="#558097", highlight_text="#ffffff",
+         window="#ffffff", tooltip="#ffffff"),
+    dict(name="Rose", face="#cfafb7", shadow="#9f6070", light="#e7d8dc",
+         title="#9f6070", highlight="#9f6070", highlight_text="#ffffff",
+         window="#ffffff", tooltip="#ffffff"),
+    dict(name="Plum", face="#a89890", shadow="#786058", light="#d8d0c8",
+         title="#484060", highlight="#008080", highlight_text="#d8d0c8",
+         window="#d8d0c8", tooltip="#d5ccc8"),
+)
+
+
+def normalize_theme_colors(value: Any) -> dict[str, int]:
+    source = value if isinstance(value, dict) else {}
+    result = {}
+    for theme in THEMES:
+        raw = source.get(theme, source.get("Glassy+", 0) if theme == "Glassy" else 0)
+        try:
+            position = int(raw) if not isinstance(raw, bool) else 0
+        except (TypeError, ValueError, OverflowError):
+            position = 0
+        maximum = len(CLASSIC_COLOR_SCHEMES) - 1 if theme == "Classic" else 359
+        result[theme] = max(0, min(maximum, position))
+    return result
+
+
+def client_theme_color(client: Any, theme: str) -> int:
+    config = getattr(client, "config_data", {})
+    return normalize_theme_colors(config.get("theme_colors") if isinstance(config, dict) else None)[theme]
+
+
+def shift_theme_color(color: Any, degrees: int | None = None) -> QColor:
+    original = QColor(color)
+    if degrees is None:
+        app = QApplication.instance()
+        degrees = int(app.property("spritelinkThemeHue") or 0) if app is not None else 0
+    if degrees % 360 == 0 or original.hslSaturation() == 0:
+        return original
+    hue, saturation, lightness, alpha = original.getHslF()
+    return QColor.fromHslF((hue + degrees / 360.0) % 1.0, saturation, lightness, alpha)
+
+
+def hue_theme_stylesheet(stylesheet: str, degrees: int) -> str:
+    if degrees == 0:
+        return stylesheet
+
+    def replace(match: Any) -> str:
+        text = match.group(0)
+        if text.startswith("#"):
+            color = QColor(text)
+        else:
+            channels = [int(part) for part in re.findall(r"\d+", text)]
+            color = QColor(*channels)
+        # Only the original blue/cyan accent family moves. Warning/error
+        # colors, visited links, and neutral whites/grays remain unchanged.
+        if not 0.45 <= color.hslHueF() <= 0.69:
+            return text
+        shifted = shift_theme_color(color, degrees)
+        if text.startswith("#"):
+            return shifted.name()
+        return f"rgba({shifted.red()}, {shifted.green()}, {shifted.blue()}, {color.alpha()})"
+
+    return re.sub(r"#[0-9a-fA-F]{6}\b|\brgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+(?:\s*,\s*\d+)?\s*\)", replace, stylesheet)
+
+
+def classic_theme_stylesheet(stylesheet: str, position: int) -> str:
+    if position == 0:
+        return stylesheet
+    scheme = CLASSIC_COLOR_SCHEMES[position]
+    replacements = {
+        "#c0c0c0": scheme["face"], "#808080": scheme["shadow"],
+        "#ffffff": scheme["light"], "#007f82": scheme["highlight"],
+        "#ffffe1": scheme["tooltip"],
+    }
+    styled = re.sub(r"#[0-9a-fA-F]{6}\b", lambda match: replacements.get(match.group(0).lower(), match.group(0)), stylesheet)
+    styled = styled.replace(f"background-color: {scheme['light']}", f"background-color: {scheme['window']}")
+    styled = styled.replace("selection-color: #000000", f"selection-color: {scheme['highlight_text']}")
+    styled = re.sub(r"(QListWidget::item:selected, QMenu::item:selected\s*\{[^}]*?)color: #000000", lambda match: match.group(1) + f"color: {scheme['highlight_text']}", styled)
+    # Retain SpriteLink's light chat backdrop and alternating row contrast,
+    # even for Classic schemes whose original edit-window color was tinted.
+    return styled + "\nQTextBrowser#chatViewport { background-color: #ffffff; }"
+
 DEFAULT_WINDOW_WIDTH = 840
 DEFAULT_WINDOW_HEIGHT = 650
 MINIMUM_WINDOW_WIDTH = 670
@@ -647,6 +742,10 @@ GLASSY_MESSAGE_ROW_BACKGROUNDS = ("#38ffffff", "#50d7e7f2")
 def message_row_backgrounds() -> tuple[str, str]:
     app = QApplication.instance()
     if app is not None and bool(app.property("spritelinkGlassy")):
+        degrees = int(app.property("spritelinkThemeHue") or 0)
+        if degrees:
+            return tuple(shift_theme_color(color, degrees).name(QColor.NameFormat.HexArgb)
+                         for color in GLASSY_MESSAGE_ROW_BACKGROUNDS)
         return GLASSY_MESSAGE_ROW_BACKGROUNDS
     return MESSAGE_ROW_BACKGROUNDS
 
@@ -866,6 +965,12 @@ QToolTip {
     border: 1px solid #b8b8b8; border-radius: 4px; padding: 4px;
 }
 QFrame[frameShape="4"], QFrame[frameShape="5"] { color: #b8b8b8; }
+QSlider:horizontal { min-height: 24px; }
+QSlider::groove:horizontal { height: 4px; background: #c7c7c7; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #0067c0; border-radius: 2px; }
+QSlider::handle:horizontal {
+    width: 18px; margin: -8px 0; background: transparent; border: 1px solid transparent;
+}
 """
 
 GLASSY_STYLESHEET = """
@@ -2999,6 +3104,7 @@ def default_config() -> dict[str, Any]:
         "server_preset": DEFAULT_SERVER_PRESET,
         "server_url": DEFAULT_SERVER_URL,
         "theme": DEFAULT_THEME,
+        "theme_colors": normalize_theme_colors(None),
         "text_shadows": True,
         "message_sound": DEFAULT_MESSAGE_SOUND,
         "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
@@ -3248,6 +3354,7 @@ def load_config() -> dict[str, Any]:
         str(config.get("theme", DEFAULT_THEME)),
     )
     config["theme"] = theme if theme in THEMES else DEFAULT_THEME
+    config["theme_colors"] = normalize_theme_colors(config.get("theme_colors"))
 
     muted_chatrooms = config.get("muted_chatrooms")
     if not isinstance(muted_chatrooms, list):
@@ -4007,7 +4114,7 @@ class ConfigOverlay(QWidget):
         # Glassy captures retain the translucent palette/stylesheet alpha.
         # Flatten before blurring so sharp live controls cannot show through
         # the blurred composer, even away from the padded window edges.
-        background = QColor(224, 240, 250)
+        background = shift_theme_color(QColor(224, 240, 250))
         opaque_source = QPixmap(source.size())
         opaque_source.setDevicePixelRatio(source.devicePixelRatio())
         opaque_source.fill(background)
@@ -4820,12 +4927,12 @@ class TextShadowProxyStyle(QProxyStyle):
             border = QColor("#858585" if enabled else "#b8b8b8")
             fill = QColor("#ffffff" if enabled else "#f0f0f0")
             if marked:
-                border = fill = QColor(
+                border = fill = shift_theme_color(
                     "#b8b8b8" if not enabled else
                     "#005ba9" if pressed else "#1975c5" if hovered else "#0067c0"
                 )
             elif hovered:
-                border = QColor("#0067c0")
+                border = shift_theme_color("#0067c0")
             rect = QRectF(option.rect).adjusted(0.5, 0.5, -0.5, -0.5)
             painter.save()
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -4858,11 +4965,11 @@ class TextShadowProxyStyle(QProxyStyle):
         # Preserve Fusion's checked/mixed glyph and add a reliable outline
         # even when the translucent palette makes its native frame faint.
         enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
-        color = QColor("#496f87" if enabled else "#7391a4")
+        color = shift_theme_color("#496f87" if enabled else "#7391a4")
         if enabled and option.state & (
             QStyle.StateFlag.State_MouseOver | QStyle.StateFlag.State_HasFocus
         ):
-            color = QColor("#246a92")
+            color = shift_theme_color("#246a92")
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setPen(QPen(color, 1.0))
@@ -4926,12 +5033,12 @@ class TextShadowProxyStyle(QProxyStyle):
 
 
 class ThemeSlider(QSlider):
-    """Keep native slider interaction and paint a clean Glassy handle."""
+    """Keep native interaction and paint theme-colored rounded handles."""
 
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
         app = QApplication.instance()
-        if (app is None or not bool(app.property("spritelinkGlassy"))
+        if (app is None or not (bool(app.property("spritelinkGlassy")) or bool(app.property("spritelinkModern")))
                 or self.orientation() != Qt.Orientation.Horizontal):
             return
         option = QStyleOptionSlider()
@@ -4952,12 +5059,24 @@ class ThemeSlider(QSlider):
         ).adjusted(0.5, 0.5, -0.5, -0.5)
         enabled = self.isEnabled()
         highlighted = self.hasFocus() or handle.contains(self.mapFromGlobal(QCursor.pos()))
-        border = QColor("#496f87" if enabled else "#7391a4")
+        if bool(app.property("spritelinkModern")):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(QColor("#a0a0a0" if enabled else "#c4c4c4"), 1.0))
+            painter.setBrush(QColor("#ffffff" if enabled else "#f0f0f0"))
+            painter.drawEllipse(rect)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(shift_theme_color("#0067c0") if enabled else QColor("#b8b8b8"))
+            radius = 3.0 if self.isSliderDown() else 5.0 if highlighted else 4.0
+            painter.drawEllipse(rect.center(), radius, radius)
+            painter.end()
+            return
+        border = shift_theme_color("#496f87" if enabled else "#7391a4")
         if enabled and highlighted:
-            border = QColor("#246a92")
+            border = shift_theme_color("#246a92")
         gradient = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-        gradient.setColorAt(0, QColor("#ffffff" if enabled else "#e6eef3"))
-        gradient.setColorAt(1, QColor("#99c5e1" if enabled else "#dae7ef"))
+        gradient.setColorAt(0, shift_theme_color("#ffffff" if enabled else "#e6eef3"))
+        gradient.setColorAt(1, shift_theme_color("#99c5e1" if enabled else "#dae7ef"))
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(border, 1.0))
@@ -5020,7 +5139,7 @@ class ThemeComboBox(QComboBox):
         ])
         painter = QPainter(self)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#000000" if windows_classic else "#24485f"))
+        painter.setBrush(QColor("#000000") if windows_classic else shift_theme_color("#24485f"))
         painter.drawPolygon(arrow)
         painter.end()
 
@@ -6085,6 +6204,15 @@ class EncryptedChatClient(QObject):
         self.theme_var = ValueModel(
             self.config_data.get("theme", DEFAULT_THEME)
         )
+        self.config_data["theme_colors"] = normalize_theme_colors(self.config_data.get("theme_colors"))
+        self.theme_color_apply_timer = QTimer(self)
+        self.theme_color_apply_timer.setSingleShot(True)
+        self.theme_color_apply_timer.setInterval(30)
+        self.theme_color_apply_timer.timeout.connect(self._apply_theme_colors)
+        self.theme_color_save_timer = QTimer(self)
+        self.theme_color_save_timer.setSingleShot(True)
+        self.theme_color_save_timer.setInterval(400)
+        self.theme_color_save_timer.timeout.connect(self._save_theme_colors)
         self.text_shadows_var = ValueModel(
             bool(self.config_data.get("text_shadows", True))
         )
@@ -6400,6 +6528,20 @@ class EncryptedChatClient(QObject):
             QPalette.ColorRole.ButtonText,
             QColor("#808080"),
         )
+        position = client_theme_color(self, "Classic")
+        if position:
+            scheme = CLASSIC_COLOR_SCHEMES[position]
+            for role, key in (
+                (QPalette.ColorRole.Window, "face"), (QPalette.ColorRole.Button, "face"),
+                (QPalette.ColorRole.Base, "window"), (QPalette.ColorRole.Light, "light"),
+                (QPalette.ColorRole.Midlight, "face"), (QPalette.ColorRole.Mid, "shadow"),
+                (QPalette.ColorRole.Dark, "shadow"), (QPalette.ColorRole.Highlight, "highlight"),
+                (QPalette.ColorRole.HighlightedText, "highlight_text"),
+                (QPalette.ColorRole.Link, "highlight"), (QPalette.ColorRole.ToolTipBase, "tooltip"),
+            ):
+                palette.setColor(role, QColor(scheme[key]))
+            for role in (QPalette.ColorRole.Text, QPalette.ColorRole.WindowText, QPalette.ColorRole.ButtonText):
+                palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(scheme["shadow"]))
         return palette
 
     def _glassy_palette(self) -> QPalette:
@@ -6425,17 +6567,18 @@ class EncryptedChatClient(QObject):
             QPalette.ColorRole.Link: QColor("#006fae"),
             QPalette.ColorRole.LinkVisited: QColor("#5e4b9e"),
         }
+        degrees = client_theme_color(self, "Glassy")
         for role, color in colors.items():
-            palette.setColor(role, color)
+            palette.setColor(role, color if role == QPalette.ColorRole.LinkVisited else shift_theme_color(color, degrees))
         palette.setColor(
             QPalette.ColorGroup.Disabled,
             QPalette.ColorRole.Text,
-            QColor(49, 68, 82, 125),
+            shift_theme_color(QColor(49, 68, 82, 125), degrees),
         )
         palette.setColor(
             QPalette.ColorGroup.Disabled,
             QPalette.ColorRole.ButtonText,
-            QColor(49, 68, 82, 125),
+            shift_theme_color(QColor(49, 68, 82, 125), degrees),
         )
         return palette
 
@@ -6460,8 +6603,9 @@ class EncryptedChatClient(QObject):
             QPalette.ColorRole.ToolTipBase: "#fbfbfb",
             QPalette.ColorRole.ToolTipText: "#1b1b1b",
         }
+        degrees = client_theme_color(self, "Modern")
         for role, color in colors.items():
-            palette.setColor(role, QColor(color))
+            palette.setColor(role, shift_theme_color(color, degrees))
         for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
                      QPalette.ColorRole.ButtonText):
             palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#777777"))
@@ -6469,16 +6613,16 @@ class EncryptedChatClient(QObject):
 
     def _config_panel_stylesheet(self) -> str:
         if self._is_windows_classic_theme():
-            return (
+            return classic_theme_stylesheet((
                 "QFrame#configPanel { background: #c0c0c0;"
                 " border-top: 2px solid #ffffff;"
                 " border-left: 2px solid #ffffff;"
                 " border-right: 2px solid #000000;"
                 " border-bottom: 2px solid #000000;"
                 " border-radius: 0px; }"
-            )
+            ), client_theme_color(self, "Classic"))
         if self._is_glassy_theme():
-            return (
+            return hue_theme_stylesheet((
                 "QFrame#configPanel {"
                 " background: qlineargradient("
                 " x1:0, y1:0, x2:1, y2:1,"
@@ -6487,7 +6631,7 @@ class EncryptedChatClient(QObject):
                 " stop:1 rgba(174, 211, 234, 210));"
                 " border: 1px solid rgba(49, 91, 118, 245);"
                 " border-radius: 9px; }"
-            )
+            ), client_theme_color(self, "Glassy"))
         return (
             "QFrame#configPanel { background: #fbfbfb; "
             "border: 1px solid #b8b8b8; border-radius: 8px; }"
@@ -6565,14 +6709,15 @@ class EncryptedChatClient(QObject):
             set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
             if self._is_windows_classic_theme():
                 border = "#000000"
-                caption = "#000080"
+                caption = CLASSIC_COLOR_SCHEMES[client_theme_color(self, "Classic")]["title"]
                 text = "#ffffff"
                 corner_preference = 1  # DWMWCP_DONOTROUND
                 backdrop = 1  # DWMSBT_NONE
             elif self._is_glassy_theme():
-                border = "#6292af"
+                degrees = client_theme_color(self, "Glassy")
+                border = shift_theme_color("#6292af", degrees).name()
                 caption = None
-                text = "#102637"
+                text = shift_theme_color("#102637", degrees).name()
                 corner_preference = 2  # DWMWCP_ROUND
                 backdrop = 3  # DWMSBT_TRANSIENTWINDOW (acrylic)
             else:
@@ -6952,6 +7097,10 @@ class EncryptedChatClient(QObject):
         if app is None:
             return
 
+        theme = "Classic" if self._is_windows_classic_theme() else "Glassy" if self._is_glassy_theme() else "Modern"
+        position = client_theme_color(self, theme)
+        app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
+
         available_styles = {
             name.casefold(): name for name in QStyleFactory.keys()
         }
@@ -6961,11 +7110,11 @@ class EncryptedChatClient(QObject):
                 available_styles.get("fusion", "Fusion"),
             )
             app.setPalette(self._windows_classic_palette())
-            app.setStyleSheet(WINDOWS_CLASSIC_STYLESHEET)
+            app.setStyleSheet(classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position))
         elif self._is_glassy_theme():
             style_name = available_styles.get("fusion", "Fusion")
             app.setPalette(self._glassy_palette())
-            app.setStyleSheet(GLASSY_STYLESHEET)
+            app.setStyleSheet(hue_theme_stylesheet(GLASSY_STYLESHEET, position))
         else:
             style_name = next(
                 (available_styles[name] for name in (
@@ -6974,7 +7123,7 @@ class EncryptedChatClient(QObject):
                 "Fusion",
             )
             app.setPalette(self._modern_palette())
-            app.setStyleSheet(MODERN_STYLESHEET)
+            app.setStyleSheet(hue_theme_stylesheet(MODERN_STYLESHEET, position))
 
         text_shadows_enabled = bool(self.text_shadows_var.get())
         app.setProperty("spritelinkTextShadows", text_shadows_enabled)
@@ -6991,6 +7140,8 @@ class EncryptedChatClient(QObject):
             "spritelinkModern",
             not self._is_windows_classic_theme() and not self._is_glassy_theme(),
         )
+        if hasattr(self, "theme_color_slider"):
+            self._sync_theme_color_slider()
         for widget in app.allWidgets():
             if isinstance(widget, ThemeComboBox):
                 widget.update()
@@ -9677,7 +9828,22 @@ class EncryptedChatClient(QObject):
         self.theme_combo.setCurrentText(str(self.theme_var.get()))
         self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
         self.theme_var.bind(self.theme_combo.setCurrentText)
-        layout.addWidget(self.theme_combo, row, 1, 1, 2)
+        layout.addWidget(self.theme_combo, row, 1)
+        color_control = QWidget()
+        color_layout = QHBoxLayout(color_control)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.setSpacing(6)
+        color_layout.addWidget(QLabel("Color"))
+        self.theme_color_slider = ThemeSlider(Qt.Orientation.Horizontal)
+        self.theme_color_slider.setAccessibleName("Theme color")
+        self.theme_color_slider.setMinimumWidth(64)
+        self.theme_color_slider.setMaximumWidth(112)
+        self.theme_color_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._sync_theme_color_slider()
+        self.theme_color_slider.valueChanged.connect(self._on_theme_color_changed)
+        self.theme_color_slider.sliderReleased.connect(self._finish_theme_color_change)
+        color_layout.addWidget(self.theme_color_slider, 1)
+        layout.addWidget(color_control, row, 2)
         row += 1
 
         self.text_shadows_checkbox = QCheckBox("Text Shadows")
@@ -10273,6 +10439,82 @@ class EncryptedChatClient(QObject):
 
         self._apply_server_preset_state()
 
+    def _sync_theme_color_slider(self) -> None:
+        slider = self.theme_color_slider
+        theme = str(self.theme_var.get())
+        classic = theme == "Classic"
+        was_blocked = slider.blockSignals(True)
+        try:
+            slider.setRange(0, len(CLASSIC_COLOR_SCHEMES) - 1 if classic else 359)
+            slider.setSingleStep(1)
+            slider.setPageStep(1 if classic else 15)
+            slider.setTickPosition(QSlider.TickPosition.TicksBelow if classic else QSlider.TickPosition.NoTicks)
+            slider.setTickInterval(1 if classic else 0)
+            position = client_theme_color(self, theme)
+            slider.setValue(position)
+            slider.setToolTip(CLASSIC_COLOR_SCHEMES[position]["name"] if classic else "")
+        finally:
+            slider.blockSignals(was_blocked)
+
+    def _on_theme_color_changed(self, value: int) -> None:
+        theme = str(self.theme_var.get())
+        colors = normalize_theme_colors(self.config_data.get("theme_colors"))
+        colors[theme] = value
+        self.config_data["theme_colors"] = normalize_theme_colors(colors)
+        if theme == "Classic":
+            self.theme_color_slider.setToolTip(CLASSIC_COLOR_SCHEMES[colors[theme]]["name"])
+        # Preview at most once per frame batch; persist after the user pauses.
+        if not self.theme_color_apply_timer.isActive():
+            self.theme_color_apply_timer.start()
+        self.theme_color_save_timer.start()
+
+    def _apply_theme_colors(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        theme = str(self.theme_var.get())
+        position = client_theme_color(self, theme)
+        app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
+        if theme == "Classic":
+            palette = self._windows_classic_palette()
+            stylesheet = classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position)
+        elif theme == "Glassy":
+            palette = self._glassy_palette()
+            stylesheet = hue_theme_stylesheet(GLASSY_STYLESHEET, position)
+        else:
+            palette = self._modern_palette()
+            stylesheet = hue_theme_stylesheet(MODERN_STYLESHEET, position)
+        # Retain the native/proxy style and explicit widget fonts while the
+        # slider moves; replacing the entire style on every tick is expensive.
+        app.setPalette(palette)
+        app.setStyleSheet(stylesheet)
+        for name in ("config_panel", "message_limit_panel", "image_preview_panel", "link_warning_panel"):
+            panel = getattr(self, name, None)
+            if panel is not None:
+                panel.setStyleSheet(self._config_panel_stylesheet())
+        for name in ("config_overlay", "message_limit_overlay", "image_preview_overlay", "link_warning_overlay"):
+            overlay = getattr(self, name, None)
+            if isinstance(overlay, ConfigOverlay):
+                overlay.apply_theme(theme == "Glassy")
+        if hasattr(self, "message_size_bar"):
+            self._draw_message_size_bar()
+        self._apply_titlebar_theme()
+
+    def _save_theme_colors(self) -> None:
+        # Commit the latest preview before updating tinted Glassy row brushes.
+        self.theme_color_apply_timer.stop()
+        self._apply_theme_colors()
+        if self._is_glassy_theme() and hasattr(self, "chat_display"):
+            self._rerender_preserving_scroll()
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            messagebox.showerror("Could not save theme color", str(exc), parent=self.root)
+
+    def _finish_theme_color_change(self) -> None:
+        self.theme_color_save_timer.stop()
+        self._save_theme_colors()
+
     def _on_theme_changed(self, value: Any) -> None:
         theme = str(value)
         if theme not in THEMES:
@@ -10280,6 +10522,8 @@ class EncryptedChatClient(QObject):
 
         self.theme_var.set(theme)
         self.config_data["theme"] = theme
+        self.theme_color_apply_timer.stop()
+        self.theme_color_save_timer.stop()
         self._apply_theme()
         self._apply_application_font_strategy()
         self._apply_active_composer_style()
@@ -10620,6 +10864,15 @@ class EncryptedChatClient(QObject):
                 + ("#303030" if at_or_over_limit else "#aaaaaa")
                 + "; border-radius: 3px; }"
             )
+
+        if self._is_windows_classic_theme():
+            self.message_size_bar.setStyleSheet(classic_theme_stylesheet(
+                self.message_size_bar.styleSheet(), client_theme_color(self, "Classic")
+            ))
+        elif self._is_glassy_theme():
+            self.message_size_bar.setStyleSheet(hue_theme_stylesheet(
+                self.message_size_bar.styleSheet(), client_theme_color(self, "Glassy")
+            ))
 
         messages_left = self._messages_left_today()
         message_limit_suffix = (
@@ -15600,6 +15853,8 @@ class EncryptedChatClient(QObject):
 
         self._closing = True
         self._minimized_to_tray = False
+        self.theme_color_apply_timer.stop()
+        self.theme_color_save_timer.stop()
         QToolTip.hideText()
         self.update_check_timer.stop()
         self.background_history_prune_timer.stop()
