@@ -6995,6 +6995,11 @@ class EncryptedChatClient(QObject):
             if isinstance(widget, ThemeComboBox):
                 widget.update()
 
+        for name in ("config_tab", "advanced_config_content"):
+            panel = getattr(self, name, None)
+            if panel is not None and isinstance(panel.layout(), QGridLayout):
+                panel.layout().setVerticalSpacing(self._config_row_spacing())
+
         if hasattr(self, "config_panel"):
             self.config_panel.setStyleSheet(
                 self._config_panel_stylesheet()
@@ -9652,11 +9657,14 @@ class EncryptedChatClient(QObject):
                 self.current_image_preview_client_id,
             )
 
+    def _config_row_spacing(self) -> int:
+        return 5 if self._is_windows_classic_theme() or self._is_glassy_theme() else 12
+
     def _build_config_tab(self) -> None:
         layout = QGridLayout(self.config_tab)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setHorizontalSpacing(10)
-        layout.setVerticalSpacing(5)
+        layout.setVerticalSpacing(self._config_row_spacing())
         layout.setColumnStretch(1, 1)
         row = 0
 
@@ -9901,7 +9909,7 @@ class EncryptedChatClient(QObject):
         advanced_layout = QGridLayout(self.advanced_config_content)
         advanced_layout.setContentsMargins(8, 2, 0, 4)
         advanced_layout.setHorizontalSpacing(10)
-        advanced_layout.setVerticalSpacing(5)
+        advanced_layout.setVerticalSpacing(self._config_row_spacing())
         advanced_layout.setColumnStretch(1, 1)
         advanced_row = 0
 
