@@ -75,6 +75,7 @@ try:
         QLinearGradient,
         QMovie,
         QPainter,
+        QPainterPath,
         QPen,
         QPalette,
         QPixmap,
@@ -844,6 +845,7 @@ QComboBox QAbstractItemView, QListWidget {
     outline: none;
 }
 QListWidget::item { padding: 3px 4px; }
+QListWidget#chatroomsList::item { padding: 0px; }
 QListWidget::item:hover { background: #eff3f7; }
 QListWidget::item:selected { background: #e2edf8; color: #1b1b1b; }
 QTextBrowser#chatViewport {
@@ -4430,6 +4432,12 @@ class ChatroomListRow(QWidget):
             opacity = QGraphicsOpacityEffect(self)
             opacity.setOpacity(0.45)
             self.setGraphicsEffect(opacity)
+        self.apply_theme()
+
+    def apply_theme(self) -> None:
+        app = QApplication.instance()
+        vertical_margin = 3 if app is not None and app.property("spritelinkModern") else 1
+        self.layout().setContentsMargins(4, vertical_margin, 4, vertical_margin)
 
 
 class ChatroomListWidget(QListWidget):
@@ -4438,6 +4446,7 @@ class ChatroomListWidget(QListWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("chatroomsList")
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
@@ -4449,6 +4458,22 @@ class ChatroomListWidget(QListWidget):
         self._pressed_room_id: str | None = None
         self._dragged_room_id: str | None = None
         self._dragged_row = -1
+
+    def refresh_row_sizes(self) -> None:
+        # Item widgets own their margins. Recalculate their height after a
+        # theme/font change instead of retaining the old font's size hint.
+        for index in range(self.count()):
+            item = self.item(index)
+            row = self.itemWidget(item)
+            if row is not None:
+                if isinstance(row, ChatroomListRow):
+                    row.apply_theme()
+                row.ensurePolished()
+                if row.layout() is not None:
+                    row.layout().invalidate()
+                    row.layout().activate()
+                item.setSizeHint(row.sizeHint())
+        self.doItemsLayout()
 
     def mousePressEvent(self, event: Any) -> None:
         is_left_press = event.button() == Qt.MouseButton.LeftButton
@@ -4766,15 +4791,67 @@ class TextShadowProxyStyle(QProxyStyle):
 
     def pixelMetric(self, metric, option=None, widget=None) -> int:
         app = QApplication.instance()
+        if (metric in (QStyle.PixelMetric.PM_IndicatorWidth,
+                       QStyle.PixelMetric.PM_IndicatorHeight)
+                and app is not None and bool(app.property("spritelinkModern"))):
+            return 20
         if (metric == QStyle.PixelMetric.PM_MenuVMargin
                 and isinstance(widget, QComboBox)
                 and app is not None and bool(app.property("spritelinkGlassy"))):
             return 0
         return super().pixelMetric(metric, option, widget)
 
-    def drawPrimitive(self, element, option, painter, widget=None) -> None:
-        super().drawPrimitive(element, option, painter, widget)
+    def styleHint(self, hint, option=None, widget=None, returnData=None) -> int:
         app = QApplication.instance()
+        if (hint in (QStyle.StyleHint.SH_EtchDisabledText,
+                     QStyle.StyleHint.SH_DitherDisabledText)
+                and app is not None and bool(app.property("spritelinkModern"))):
+            return 0
+        return super().styleHint(hint, option, widget, returnData)
+
+    def drawPrimitive(self, element, option, painter, widget=None) -> None:
+        app = QApplication.instance()
+        if (element == QStyle.PrimitiveElement.PE_IndicatorCheckBox
+                and app is not None and bool(app.property("spritelinkModern"))):
+            enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+            marked = bool(option.state & (QStyle.StateFlag.State_On | QStyle.StateFlag.State_NoChange))
+            hovered = enabled and bool(option.state & QStyle.StateFlag.State_MouseOver)
+            pressed = enabled and bool(option.state & QStyle.StateFlag.State_Sunken)
+            border = QColor("#858585" if enabled else "#b8b8b8")
+            fill = QColor("#ffffff" if enabled else "#f0f0f0")
+            if marked:
+                border = fill = QColor(
+                    "#b8b8b8" if not enabled else
+                    "#005ba9" if pressed else "#1975c5" if hovered else "#0067c0"
+                )
+            elif hovered:
+                border = QColor("#0067c0")
+            rect = QRectF(option.rect).adjusted(0.5, 0.5, -0.5, -0.5)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(border, 1.0))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, 3.0, 3.0)
+            if marked:
+                pen = QPen(QColor("#ffffff" if enabled else "#f3f3f3"), 2.0)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                path = QPainterPath()
+                def point(x: float, y: float) -> QPointF:
+                    return QPointF(rect.left() + x * rect.width(), rect.top() + y * rect.height())
+                if option.state & QStyle.StateFlag.State_NoChange:
+                    path.moveTo(point(0.28, 0.50))
+                    path.lineTo(point(0.72, 0.50))
+                else:
+                    path.moveTo(point(0.24, 0.50))
+                    path.lineTo(point(0.43, 0.69))
+                    path.lineTo(point(0.77, 0.31))
+                painter.drawPath(path)
+            painter.restore()
+            return
+        super().drawPrimitive(element, option, painter, widget)
         if (element != QStyle.PrimitiveElement.PE_IndicatorCheckBox
                 or app is None or not bool(app.property("spritelinkGlassy"))):
             return
@@ -4808,6 +4885,7 @@ class TextShadowProxyStyle(QProxyStyle):
             text
             and app is not None
             and bool(app.property("spritelinkTextShadows"))
+            and (enabled or not bool(app.property("spritelinkModern")))
         ):
             shadow_color = QColor(0, 0, 0)
             shadow_color.setAlphaF(0.15)
@@ -6188,7 +6266,10 @@ class EncryptedChatClient(QObject):
         *,
         bold: bool = False,
     ) -> QFont:
-        font = QFont(self._resolved_font_family(font_name), point_size)
+        # UI families (Segoe UI, Tahoma, etc.) must not pass through the
+        # message-font allowlist, which would silently replace them with Arial.
+        family = self._resolved_font_family(font_name) if font_name == "System" else font_name
+        font = QFont(family, point_size)
         font.setBold(bold)
         font.setStyleStrategy(self._font_style_strategy())
         return font
@@ -6208,7 +6289,7 @@ class EncryptedChatClient(QObject):
         if cached is None:
             point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
             cached = self._make_font(
-                font_name,
+                self._resolved_font_family(font_name),
                 point_size,
                 bold=bold,
             )
@@ -6264,13 +6345,16 @@ class EncryptedChatClient(QObject):
             widget.setFont(widget_font)
         self._refresh_special_widget_fonts()
         self._refresh_message_font_combo_fonts()
+        if hasattr(self, "chatrooms_list"):
+            self.chatrooms_list.refresh_row_sizes()
 
     def _ui_font_family(self) -> str:
         if self._is_windows_classic_theme():
             return "Tahoma"
         if not self._is_glassy_theme():
             families = set(QFontDatabase.families())
-            for family in ("Segoe UI Variable", "Segoe UI"):
+            # Static Segoe UI provides consistent regular/bold faces in Qt.
+            for family in ("Segoe UI", "Segoe UI Variable"):
                 if family in families:
                     return family
         return self._basic_application_font.family()
@@ -7332,6 +7416,7 @@ class EncryptedChatClient(QObject):
                 room["id"] in muted_ids,
                 self.chatrooms_list,
             )
+            row.ensurePolished()
             item.setSizeHint(row.sizeHint())
             self.chatrooms_list.setItemWidget(item, row)
             if room["id"] == self.active_chatroom_id:

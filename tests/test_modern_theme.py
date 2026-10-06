@@ -5,7 +5,11 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtGui import QColor, QFont, QPalette
-from PySide6.QtWidgets import QApplication, QLineEdit, QStyleFactory, QTextBrowser, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QLabel, QLineEdit, QListWidgetItem,
+    QStyle, QStyleFactory, QStyleOptionButton, QTextBrowser, QWidget,
+)
 from test_security import SPRITELINK
 
 
@@ -81,6 +85,7 @@ class ModernThemeTests(unittest.TestCase):
 
     def test_switching_themes_clears_modern_styling(self):
         self.apply()
+        checkbox = QCheckBox("Theme change", self.window)
         self.assertTrue(self.app.property("spritelinkModern"))
         self.assertEqual(self.app.styleSheet(), SPRITELINK.MODERN_STYLESHEET)
         for theme, sheet in (("Glassy", SPRITELINK.GLASSY_STYLESHEET),
@@ -93,6 +98,10 @@ class ModernThemeTests(unittest.TestCase):
         self.apply()
         self.assertFalse(self.app.property("spritelinkGlassy"))
         self.assertFalse(self.app.property("spritelinkWindowsClassic"))
+        option = QStyleOptionButton()
+        checkbox.initStyleOption(option)
+        rect = checkbox.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, option, checkbox)
+        self.assertEqual((rect.width(), rect.height()), (20, 20))
 
     def test_input_has_a_thin_gray_edge_and_blue_focus_edge(self):
         self.apply()
@@ -122,11 +131,12 @@ class ModernThemeTests(unittest.TestCase):
             self.apply()
         create.assert_called_once_with("Windows11")
 
-    def test_segoe_font_prefers_variable_and_falls_back_without_it(self):
+    def test_segoe_font_prefers_static_faces_and_falls_back_without_it(self):
         family = SPRITELINK.EncryptedChatClient._ui_font_family
         for available, expected in (
-            (["Segoe UI", "Segoe UI Variable"], "Segoe UI Variable"),
+            (["Segoe UI", "Segoe UI Variable"], "Segoe UI"),
             (["Segoe UI"], "Segoe UI"),
+            (["Segoe UI Variable"], "Segoe UI Variable"),
             ([], "Fallback"),
         ):
             with mock.patch.object(SPRITELINK.QFontDatabase, "families", return_value=available):
@@ -135,6 +145,94 @@ class ModernThemeTests(unittest.TestCase):
         self.assertEqual(family(self.client), "Fallback")
         self.theme = "Classic"
         self.assertEqual(family(self.client), "Tahoma")
+
+    def test_ui_fonts_keep_their_family_and_message_fonts_stay_validated(self):
+        client = SimpleNamespace(
+            _font_style_strategy=lambda: QFont.StyleStrategy.PreferDefault,
+            _resolved_font_family=lambda name: name if name in SPRITELINK.SUPPORTED_MESSAGE_FONTS
+                else SPRITELINK.DEFAULT_MESSAGE_FONT,
+            _is_windows_classic_theme=lambda: False,
+            _message_font_cache={},
+        )
+        client._make_font = lambda *args, **kwargs: SPRITELINK.EncryptedChatClient._make_font(
+            client, *args, **kwargs
+        )
+        for family in ("Segoe UI", "Segoe UI Variable", "Tahoma"):
+            for bold in (False, True):
+                font = client._make_font(family, 10, bold=bold)
+                self.assertEqual(font.family(), family)
+                self.assertEqual(font.bold(), bold)
+        message_font = SPRITELINK.EncryptedChatClient._make_message_font(client, "Invalid font")
+        self.assertEqual(message_font.family(), SPRITELINK.DEFAULT_MESSAGE_FONT)
+
+    def test_checkbox_is_twenty_pixels_and_preserves_all_glyph_states(self):
+        self.apply()
+        checkbox = QCheckBox("Notifications", self.window)
+        checkbox.setGeometry(10, 10, 200, 32)
+        checkbox.setTristate(True)
+        self.window.resize(240, 60)
+        self.window.show()
+        self.app.processEvents()
+        for enabled in (True, False):
+            checkbox.setEnabled(enabled)
+            images = []
+            for state in (Qt.CheckState.Unchecked, Qt.CheckState.Checked,
+                          Qt.CheckState.PartiallyChecked):
+                checkbox.setCheckState(state)
+                self.app.processEvents()
+                option = QStyleOptionButton()
+                checkbox.initStyleOption(option)
+                rect = checkbox.style().subElementRect(
+                    QStyle.SubElement.SE_CheckBoxIndicator, option, checkbox
+                )
+                self.assertEqual((rect.width(), rect.height()), (20, 20))
+                self.assertGreaterEqual(checkbox.height(), rect.height())
+                images.append(checkbox.grab().toImage())
+            self.assertNotEqual(images[0], images[1])
+            self.assertNotEqual(images[1], images[2])
+
+    def test_disabled_checkbox_text_has_no_etching_or_extra_shadow(self):
+        self.apply()
+        checkbox = QCheckBox("Disabled notifications", self.window)
+        checkbox.setEnabled(False)
+        checkbox.setGeometry(10, 10, 220, 32)
+        self.window.resize(250, 60)
+        self.window.show()
+        self.app.processEvents()
+        for hint in (QStyle.StyleHint.SH_EtchDisabledText, QStyle.StyleHint.SH_DitherDisabledText):
+            self.assertEqual(checkbox.style().styleHint(hint, None, checkbox), 0)
+        images = []
+        for shadows in (False, True):
+            self.app.setProperty("spritelinkTextShadows", shadows)
+            checkbox.update()
+            self.app.processEvents()
+            images.append(checkbox.grab().toImage())
+        self.assertEqual(images[0], images[1])
+
+    def test_custom_chatroom_rows_fit_descenders_after_font_changes(self):
+        self.apply()
+        rooms = SPRITELINK.ChatroomListWidget(self.window)
+        rooms.setGeometry(0, 0, 175, 180)
+        rows = []
+        for name, unread in (("gypsy pq_j", 0), ("Project glyphs", 12)):
+            item = QListWidgetItem(rooms)
+            row = SPRITELINK.ChatroomListRow(name, unread, False, rooms)
+            row.ensurePolished()
+            item.setSizeHint(row.sizeHint())
+            rooms.setItemWidget(item, row)
+            rows.append(row)
+        self.window.resize(175, 180)
+        self.window.show()
+        for size in (9, 13, 10):
+            rooms.setFont(QFont(self.app.font().family(), size))
+            self.app.processEvents()
+            rooms.refresh_row_sizes()
+            self.app.processEvents()
+            for row in rows:
+                self.assertGreaterEqual(row.height(), row.sizeHint().height())
+                for label in row.findChildren(QLabel):
+                    if label.isVisible():
+                        self.assertGreaterEqual(label.height(), label.sizeHint().height())
 
 
 if __name__ == "__main__":
