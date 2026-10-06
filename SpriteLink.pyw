@@ -781,6 +781,91 @@ QFrame[frameShape="4"], QFrame[frameShape="5"] {
 }
 """
 
+# Keep the chat viewport on its original Base palette color. Modern's extra
+# contrast belongs to the surrounding controls, not the message backdrop.
+MODERN_STYLESHEET = """
+QMainWindow, QDialog, QWidget#glassRoot, QWidget#chatTab {
+    background: #f3f3f3;
+    color: #1b1b1b;
+}
+QWidget#chatroomsPanel {
+    background: #eaeaea;
+    border-right: 1px solid #c4c4c4;
+}
+QLabel { background: transparent; }
+QFrame[frameShape="6"] {
+    background: #fbfbfb; border: 1px solid #b8b8b8; border-radius: 8px;
+}
+QPushButton {
+    background: #fbfbfb;
+    color: #1b1b1b;
+    border: 1px solid #b8b8b8;
+    border-bottom-color: #999999;
+    border-radius: 4px;
+    padding: 4px 10px;
+    min-height: 18px;
+}
+QPushButton:hover { background: #ffffff; border-color: #969696; }
+QPushButton:pressed { background: #e5e5e5; border-color: #a4a4a4; }
+QPushButton:checked { background: #e6eff8; border-color: #7c9fbe; }
+QPushButton:focus { border-color: #0067c0; }
+QPushButton:default { background: #0067c0; color: #ffffff; border-color: #005ba9; }
+QPushButton:default:hover { background: #1975c5; }
+QPushButton:default:pressed { background: #005ba9; }
+QPushButton:disabled {
+    background: #f0f0f0; color: #777777; border-color: #cccccc;
+}
+QLineEdit, QPlainTextEdit, QComboBox {
+    background: #ffffff;
+    color: #1b1b1b;
+    border: 1px solid #b8b8b8;
+    border-bottom-color: #858585;
+    border-radius: 4px;
+    selection-background-color: #0067c0;
+    selection-color: #ffffff;
+}
+QLineEdit { padding: 3px 6px; }
+QPlainTextEdit { padding: 3px; }
+QComboBox { padding: 3px 26px 3px 8px; min-height: 18px; }
+QLineEdit:hover, QPlainTextEdit:hover, QComboBox:hover { border-color: #959595; }
+QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus { border-bottom-color: #0067c0; }
+QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {
+    background: #f0f0f0; color: #777777; border-color: #cccccc;
+}
+QComboBox::drop-down { border: none; width: 24px; }
+QComboBox::down-arrow { image: none; }
+QFrame#comboPopup {
+    background: #fbfbfb; border: 1px solid #b8b8b8; border-radius: 4px;
+}
+QComboBox QAbstractItemView, QListWidget {
+    background: #ffffff; color: #1b1b1b;
+    border: 1px solid #b8b8b8; border-radius: 4px;
+    selection-background-color: #e2edf8; selection-color: #1b1b1b;
+    outline: none;
+}
+QListWidget::item { padding: 3px 4px; }
+QListWidget::item:hover { background: #eff3f7; }
+QListWidget::item:selected { background: #e2edf8; color: #1b1b1b; }
+QTextBrowser#chatViewport {
+    background: palette(base); border: 1px solid #b8b8b8; border-radius: 4px;
+}
+QScrollArea { background: transparent; border: none; }
+QCheckBox { spacing: 6px; }
+QMenu {
+    background: #fbfbfb; color: #1b1b1b;
+    border: 1px solid #b8b8b8; border-radius: 8px; padding: 4px;
+}
+QMenu::item { padding: 5px 24px; border-radius: 4px; }
+QMenu::item:selected { background: #e2edf8; }
+QMenu::item:disabled { color: #777777; }
+QMenu::separator { height: 1px; background: #d2d2d2; margin: 4px 6px; }
+QToolTip {
+    background: #fbfbfb; color: #1b1b1b;
+    border: 1px solid #b8b8b8; border-radius: 4px; padding: 4px;
+}
+QFrame[frameShape="4"], QFrame[frameShape="5"] { color: #b8b8b8; }
+"""
+
 GLASSY_STYLESHEET = """
 QMainWindow, QDialog {
     background: rgba(224, 240, 250, 188);
@@ -4804,7 +4889,7 @@ class ThemeSlider(QSlider):
 
 
 class ThemeComboBox(QComboBox):
-    """Config combo box with Classic styling and no wheel changes."""
+    """Config combo box with theme arrows and no wheel changes."""
 
     def showPopup(self) -> None:
         popup = self.view().window()
@@ -4832,11 +4917,24 @@ class ThemeComboBox(QComboBox):
             app.property("spritelinkWindowsClassic")
         )
         glassy = bool(app.property("spritelinkGlassy"))
-        if not windows_classic and not glassy:
+        modern = bool(app.property("spritelinkModern"))
+        if not windows_classic and not glassy and not modern:
             return
 
         center_x = self.width() - 11
         center_y = self.height() // 2
+        if modern:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor("#454545" if self.isEnabled() else "#888888"), 1.2))
+            painter.drawPolyline(QPolygon([
+                QPoint(center_x - 4, center_y - 2),
+                QPoint(center_x, center_y + 2),
+                QPoint(center_x + 4, center_y - 2),
+            ]))
+            painter.end()
+            return
+
         arrow = QPolygon([
             QPoint(center_x - 4, center_y - 2),
             QPoint(center_x + 4, center_y - 2),
@@ -6170,6 +6268,11 @@ class EncryptedChatClient(QObject):
     def _ui_font_family(self) -> str:
         if self._is_windows_classic_theme():
             return "Tahoma"
+        if not self._is_glassy_theme():
+            families = set(QFontDatabase.families())
+            for family in ("Segoe UI Variable", "Segoe UI"):
+                if family in families:
+                    return family
         return self._basic_application_font.family()
 
     def _is_windows_classic_theme(self) -> bool:
@@ -6252,6 +6355,34 @@ class EncryptedChatClient(QObject):
         )
         return palette
 
+    def _modern_palette(self) -> QPalette:
+        palette = QPalette(self._basic_palette)
+        # Deliberately retain Base and AlternateBase, including disabled and
+        # inactive groups, so switching to Modern never darkens the chat log.
+        colors = {
+            QPalette.ColorRole.Window: "#f3f3f3",
+            QPalette.ColorRole.WindowText: "#1b1b1b",
+            QPalette.ColorRole.Text: "#1b1b1b",
+            QPalette.ColorRole.Button: "#fbfbfb",
+            QPalette.ColorRole.ButtonText: "#1b1b1b",
+            QPalette.ColorRole.Light: "#ffffff",
+            QPalette.ColorRole.Midlight: "#e5e5e5",
+            QPalette.ColorRole.Mid: "#b8b8b8",
+            QPalette.ColorRole.Dark: "#858585",
+            QPalette.ColorRole.Shadow: "#666666",
+            QPalette.ColorRole.Highlight: "#0067c0",
+            QPalette.ColorRole.HighlightedText: "#ffffff",
+            QPalette.ColorRole.Link: "#0067c0",
+            QPalette.ColorRole.ToolTipBase: "#fbfbfb",
+            QPalette.ColorRole.ToolTipText: "#1b1b1b",
+        }
+        for role, color in colors.items():
+            palette.setColor(role, QColor(color))
+        for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                     QPalette.ColorRole.ButtonText):
+            palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#777777"))
+        return palette
+
     def _config_panel_stylesheet(self) -> str:
         if self._is_windows_classic_theme():
             return (
@@ -6274,8 +6405,8 @@ class EncryptedChatClient(QObject):
                 " border-radius: 9px; }"
             )
         return (
-            "QFrame#configPanel { background: palette(window); "
-            "border: 1px solid palette(mid); border-radius: 3px; }"
+            "QFrame#configPanel { background: #fbfbfb; "
+            "border: 1px solid #b8b8b8; border-radius: 8px; }"
         )
 
     @staticmethod
@@ -6345,7 +6476,7 @@ class EncryptedChatClient(QObject):
                     ctypes.sizeof(data),
                 ))
 
-            # Keep both themes light, then color the Windows 11 non-client
+            # Keep all themes light, then color the Windows 11 non-client
             # frame where the DWM color attributes are supported.
             set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
             if self._is_windows_classic_theme():
@@ -6361,10 +6492,10 @@ class EncryptedChatClient(QObject):
                 corner_preference = 2  # DWMWCP_ROUND
                 backdrop = 3  # DWMSBT_TRANSIENTWINDOW (acrylic)
             else:
-                border = "#d0d0d0"
-                caption = "#f0f0f0"
-                text = "#000000"
-                corner_preference = 0  # DWMWCP_DEFAULT
+                border = "#bdbdbd"
+                caption = "#f3f3f3"
+                text = "#1b1b1b"
+                corner_preference = 2  # DWMWCP_ROUND
                 backdrop = 1  # DWMSBT_NONE
 
             set_attribute(33, corner_preference)  # DWMWA_WINDOW_CORNER_PREFERENCE
@@ -6752,11 +6883,14 @@ class EncryptedChatClient(QObject):
             app.setPalette(self._glassy_palette())
             app.setStyleSheet(GLASSY_STYLESHEET)
         else:
-            style_name = available_styles.get(
-                self._basic_style_name.casefold()
+            style_name = next(
+                (available_styles[name] for name in (
+                    "windows11", "windowsvista", self._basic_style_name.casefold(), "fusion"
+                ) if name in available_styles),
+                "Fusion",
             )
-            app.setPalette(QPalette(self._basic_palette))
-            app.setStyleSheet(self._basic_application_stylesheet)
+            app.setPalette(self._modern_palette())
+            app.setStyleSheet(MODERN_STYLESHEET)
 
         text_shadows_enabled = bool(self.text_shadows_var.get())
         app.setProperty("spritelinkTextShadows", text_shadows_enabled)
@@ -6769,6 +6903,10 @@ class EncryptedChatClient(QObject):
             self._is_windows_classic_theme(),
         )
         app.setProperty("spritelinkGlassy", self._is_glassy_theme())
+        app.setProperty(
+            "spritelinkModern",
+            not self._is_windows_classic_theme() and not self._is_glassy_theme(),
+        )
         for widget in app.allWidgets():
             if isinstance(widget, ThemeComboBox):
                 widget.update()
@@ -10384,10 +10522,10 @@ class EncryptedChatClient(QObject):
                 "QProgressBar { background-color: #eeeeee; "
                 "border: 1px solid #a8a8a8; color: "
                 + ("#ffffff" if at_or_over_limit else "#202020")
-                + "; text-align: center; } "
+                + "; border-radius: 3px; text-align: center; } "
                 "QProgressBar::chunk { background: "
-                + ("#303030" if at_or_over_limit else "#b8b8b8")
-                + "; }"
+                + ("#303030" if at_or_over_limit else "#aaaaaa")
+                + "; border-radius: 3px; }"
             )
 
         messages_left = self._messages_left_today()
