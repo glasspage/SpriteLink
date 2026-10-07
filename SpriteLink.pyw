@@ -1145,11 +1145,10 @@ QScrollBar:vertical {
         stop:1 #f3f7fa
     );
     width: 14px;
-    margin: 15px 1px;
+    margin: 1px;
     border-radius: 2px;
 }
-QScrollBar::handle:vertical,
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+QScrollBar::handle:vertical {
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,
         stop:0 #ffffff,
@@ -1165,8 +1164,7 @@ QScrollBar::handle:vertical {
     min-height: 24px;
     image: url("SPRITELINK_SCROLLBAR_ASSETS/scrollbar-grip.svg");
 }
-QScrollBar::handle:vertical:hover,
-QScrollBar::add-line:vertical:hover, QScrollBar::sub-line:vertical:hover {
+QScrollBar::handle:vertical:hover {
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,
         stop:0 #ffffff,
@@ -1177,8 +1175,7 @@ QScrollBar::add-line:vertical:hover, QScrollBar::sub-line:vertical:hover {
     border-color: #4d8caf;
     border-top-color: #9ccbe4;
 }
-QScrollBar::handle:vertical:pressed,
-QScrollBar::add-line:vertical:pressed, QScrollBar::sub-line:vertical:pressed {
+QScrollBar::handle:vertical:pressed {
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,
         stop:0 #c7e7f6,
@@ -1188,30 +1185,14 @@ QScrollBar::add-line:vertical:pressed, QScrollBar::sub-line:vertical:pressed {
     );
     border-color: #397b9f;
 }
-QScrollBar::handle:vertical:disabled,
-QScrollBar::add-line:vertical:disabled, QScrollBar::sub-line:vertical:disabled {
+QScrollBar::handle:vertical:disabled {
     background: #e8eef2;
     border-color: #b4c1ca;
 }
-QScrollBar::sub-line:vertical {
-    height: 12px;
-    subcontrol-origin: margin;
-    subcontrol-position: top;
-}
-QScrollBar::add-line:vertical {
-    height: 12px;
-    subcontrol-origin: margin;
-    subcontrol-position: bottom;
-}
-QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
-    width: 6px;
-    height: 4px;
-}
-QScrollBar::up-arrow:vertical {
-    image: url("SPRITELINK_SCROLLBAR_ASSETS/scrollbar-up.svg");
-}
-QScrollBar::down-arrow:vertical {
-    image: url("SPRITELINK_SCROLLBAR_ASSETS/scrollbar-down.svg");
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    background: transparent;
+    border: none;
+    height: 0px;
 }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
     background: transparent;
@@ -3898,6 +3879,12 @@ messagebox = MessageBoxes()
 class ComposeTextEdit(QPlainTextEdit):
     send_requested = Signal()
     formatting_shortcut_requested = Signal(str)
+    width_changed = Signal()
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self.width_changed.emit()
 
     def to_message_text(self) -> str:
         segments: list[tuple[str, bool, bool, bool, bool]] = []
@@ -8986,6 +8973,10 @@ class EncryptedChatClient(QObject):
             QSizePolicy.Policy.Fixed,
         )
         self.message_entry.textChanged.connect(self._schedule_composer_update)
+        self.message_entry.document().documentLayout().documentSizeChanged.connect(
+            lambda _size: self.message_resize_timer.start(0)
+        )
+        self.message_entry.width_changed.connect(lambda: self.message_resize_timer.start(0))
         self.message_entry.cursorPositionChanged.connect(
             self._sync_formatting_buttons
         )
@@ -10815,6 +10806,8 @@ class EncryptedChatClient(QObject):
         self._draw_message_size_bar()
 
     def _resize_message_entry(self) -> None:
+        # Apply stylesheet padding before measuring, including at startup.
+        self.message_entry.ensurePolished()
         document = self.message_entry.document()
         document.setTextWidth(max(1, self.message_entry.viewport().width()))
         line_height = max(
@@ -10824,23 +10817,34 @@ class EncryptedChatClient(QObject):
         document_margins = int(document.documentMargin() * 2)
         document.size()  # Force wrapped line layouts to update.
         display_lines = 0
+        line_heights: list[float] = []
         block = document.begin()
         while block.isValid():
-            display_lines += max(1, block.layout().lineCount())
+            document.documentLayout().blockBoundingRect(block)
+            layout = block.layout()
+            lines = max(1, layout.lineCount())
+            display_lines += lines
+            for index in range(min(lines, MESSAGE_ENTRY_MAX_LINES - len(line_heights))):
+                line = layout.lineAt(index) if index < layout.lineCount() else None
+                line_heights.append(line.height() if line is not None and line.isValid() else line_height)
             block = block.next()
         display_lines = max(1, display_lines)
         visible_lines = max(
             MESSAGE_ENTRY_MIN_LINES,
             min(MESSAGE_ENTRY_MAX_LINES, display_lines),
         )
-        margins = (
-            self.message_entry.frameWidth() * 2
-            + document_margins
-            + 2
+        # frameWidth() includes horizontal stylesheet padding and made Glassy
+        # taller than Modern. Only vertical padding belongs in this height.
+        contents_margins = self.message_entry.contentsMargins()
+        margins = contents_margins.top() + contents_margins.bottom() + document_margins + 2
+        content_height = math.ceil(sum(line_heights[:visible_lines]))
+        height = content_height + margins
+        self.message_entry.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if display_lines > MESSAGE_ENTRY_MAX_LINES
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.message_entry.setFixedHeight(
-            visible_lines * line_height + margins
-        )
+        if self.message_entry.height() != height:
+            self.message_entry.setFixedHeight(height)
 
         if display_lines > MESSAGE_ENTRY_MAX_LINES:
             self.message_entry.ensureCursorVisible()
