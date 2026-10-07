@@ -286,10 +286,60 @@ class UiSizePresetTests(unittest.TestCase):
         margins = self.client.config_overlay.layout().contentsMargins()
         self.assertEqual(margins.left(), 24)
         self.assertEqual(margins.right(), 24)
+        self.assertEqual(
+            self.client.config_panel.maximumWidth(),
+            S.CONFIG_PANEL_MAX_WIDTH,
+        )
+        self.assertGreater(
+            S.CONFIG_PANEL_MAX_WIDTH,
+            S.CONFIG_POPUP_MAX_WIDTH,
+        )
 
         panel_row = self.client.config_overlay.layout().itemAt(0).layout()
         self.assertIsNotNone(panel_row)
         self.assertEqual(panel_row.stretch(1), 10)
+
+    def test_tiny_condenses_identity_choose_buttons_only(self):
+        self.assertEqual(self.client.identity_color_button.text(), "Choose...")
+        self.assertEqual(self.client.profile_icon_button.text(), "Browse...")
+
+        self._select_size("Tiny")
+        self.assertEqual(self.client.identity_color_button.text(), "...")
+        self.assertEqual(self.client.profile_icon_button.text(), "...")
+
+        self._select_size("Small (Default)")
+        self.assertEqual(self.client.identity_color_button.text(), "Choose...")
+        self.assertEqual(self.client.profile_icon_button.text(), "Browse...")
+
+    def test_unread_attention_does_not_resize_chatroom_toggle(self):
+        base_size = self.client.chatrooms_toggle.size()
+        self.client.config_data["unread_counts"] = {
+            "unread-room": 1,
+        }
+        self.client.config_data["chatrooms"] = [{
+            "id": "unread-room",
+            "nickname": "Unread Room",
+            "key": "unread-key",
+        }]
+        self.client._update_chatrooms_toggle_unread_style()
+        QTest.qWait(10)
+
+        self.assertEqual(
+            self.client.chatrooms_toggle.width(),
+            base_size.width(),
+        )
+        self.assertEqual(
+            self.client.chatrooms_toggle.height(),
+            base_size.height(),
+        )
+
+        self.client.config_data["unread_counts"] = {}
+        self.client._update_chatrooms_toggle_unread_style()
+        QTest.qWait(10)
+        self.assertEqual(
+            self.client.chatrooms_toggle.size(),
+            base_size,
+        )
 
     def test_invalid_ui_size_normalizes_to_small(self):
         self.assertEqual(S.normalize_ui_size("Huge"), "Small (Default)")
