@@ -1,4 +1,5 @@
 import ctypes
+import math
 import os
 import unittest
 from types import MethodType, SimpleNamespace
@@ -155,14 +156,67 @@ class ThemeColorTests(unittest.TestCase):
         self.client._rerender_preserving_scroll.assert_not_called()
         self.assertIsNone(slider.property("spritelinkPreviewHue"))
 
-    def test_hue_rotation_preserves_alpha_saturation_and_lightness(self):
-        color = QColor(153, 201, 230, 72)
-        shifted = S.shift_theme_color(color, 143)
-        self.assertEqual(color.alpha(), shifted.alpha())
-        self.assertAlmostEqual(color.hslSaturationF(), shifted.hslSaturationF(), places=3)
-        self.assertAlmostEqual(color.lightnessF(), shifted.lightnessF(), places=3)
-        self.assertEqual(S.shift_theme_color(color, 0), color)
-        self.assertEqual(S.shift_theme_color("#eeeeee", 143), QColor("#eeeeee"))
+    @staticmethod
+    def perceptual_coordinates(color):
+        # Independent sRGB -> XYZ -> Oklab reference, including sRGB decoding.
+        rgb = [value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+               for value in (color.redF(), color.greenF(), color.blueF())]
+        red, green, blue = rgb
+        x = 0.4124564 * red + 0.3575761 * green + 0.1804375 * blue
+        y = 0.2126729 * red + 0.7151522 * green + 0.0721750 * blue
+        z = 0.0193339 * red + 0.1191920 * green + 0.9503041 * blue
+        light = (0.8189330101 * x + 0.3618667424 * y - 0.1288597137 * z) ** (1 / 3)
+        medium = (0.0329845436 * x + 0.9293118715 * y + 0.0361456387 * z) ** (1 / 3)
+        short = (0.0482003018 * x + 0.2643662691 * y + 0.6338517070 * z) ** (1 / 3)
+        return (0.2104542553 * light + 0.7936177850 * medium - 0.0040720468 * short,
+                1.9779984951 * light - 2.4285922050 * medium + 0.4505937099 * short,
+                0.0259040371 * light + 0.7827717662 * medium - 0.8086757660 * short,
+                y)
+
+    def test_hue_rotation_preserves_alpha_and_perceived_lightness(self):
+        for source in ("#0067c0", "#246a92", "#24485f", "#99c5e1", "#e0f0fa", "#50d7e7f2"):
+            color = QColor(source)
+            lightness, a, b, _ = self.perceptual_coordinates(color)
+            chroma = math.hypot(a, b)
+            for degrees in range(0, 360, 5):
+                shifted = S.shift_theme_color(color, degrees)
+                shifted_lightness, shifted_a, shifted_b, _ = self.perceptual_coordinates(shifted)
+                self.assertEqual(color.alphaF(), shifted.alphaF())
+                self.assertAlmostEqual(lightness, shifted_lightness, delta=0.0002)
+                rendered = QColor(shifted.name(QColor.NameFormat.HexArgb))
+                self.assertAlmostEqual(lightness, self.perceptual_coordinates(rendered)[0], delta=0.002)
+                self.assertLessEqual(math.hypot(shifted_a, shifted_b), chroma + 0.0002)
+                delta_hue = math.degrees(math.atan2(shifted_b, shifted_a) - math.atan2(b, a))
+                # The independent XYZ reference differs slightly from the
+                # updated direct-sRGB matrices, especially for pale colors.
+                self.assertLess(abs((delta_hue - degrees + 180) % 360 - 180), 0.5)
+            self.assertEqual(S.shift_theme_color(color, 0), color)
+            self.assertEqual(S.shift_theme_color(color, 360), color)
+        for source in ("#000000", "#eeeeee", "#ffffff", "#80ffffff"):
+            self.assertEqual(S.shift_theme_color(source, 143), QColor(source))
+
+    def test_purple_and_green_keep_text_contrast_close_to_original_blue(self):
+        accent = QColor("#0067c0")
+        reference = self.perceptual_coordinates(accent)[3]
+        contrast = 1.05 / (reference + 0.05)
+        for degrees in range(0, 360, 5):
+            shifted = QColor(S.shift_theme_color(accent, degrees).name())
+            luminance = self.perceptual_coordinates(shifted)[3]
+            self.assertAlmostEqual(1.05 / (luminance + 0.05), contrast, delta=contrast * 0.2)
+        for degrees in (45, 240):
+            hue, saturation, lightness, alpha = accent.getHslF()
+            old = QColor.fromHslF((hue + degrees / 360) % 1, saturation, lightness, alpha)
+            shifted = S.shift_theme_color(accent, degrees)
+            self.assertLess(abs(self.perceptual_coordinates(shifted)[0] - self.perceptual_coordinates(accent)[0]),
+                            abs(self.perceptual_coordinates(old)[0] - self.perceptual_coordinates(accent)[0]))
+
+    def test_perceptual_color_cache_does_not_share_mutable_colors(self):
+        S._perceptual_theme_rgb.cache_clear()
+        first = S.shift_theme_color("#0067c0", 45)
+        expected = first.name()
+        first.setRed(255)
+        self.assertEqual(S.shift_theme_color("#0067c0", 45).name(), expected)
+        self.assertEqual(S._perceptual_theme_rgb.cache_info().hits, 1)
 
     def test_warning_colors_and_visited_links_do_not_rotate(self):
         sheet = "color:#0067c0; background:#ffb9b9; border-color:#d97706; color:#5e4b9e; background:#ffffff;"
