@@ -6469,7 +6469,8 @@ class EncryptedChatClient(QObject):
         self._apply_theme()
         self._apply_application_font_strategy()
         self._build_ui()
-        self._apply_text_sizes()
+        if self.config_data["text_sizes"] != DEFAULT_TEXT_SIZES:
+            self._apply_text_sizes()
         self._build_tray_icon()
         self._schedule_utc_midnight_reset()
         self._apply_server_preset_state()
