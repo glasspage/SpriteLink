@@ -121,7 +121,7 @@ class GlassyControlRenderingTests(unittest.TestCase):
         self.app.setPalette(self.previous_palette)
         self.app.setStyleSheet(self.previous_sheet)
 
-    def test_pressed_buttons_invert_gloss_without_changing_rounded_bounds(self):
+    def test_pressed_buttons_inset_bevel_without_changing_rounded_bounds(self):
         from PySide6.QtCore import QPoint
         from PySide6.QtGui import QColor
         from PySide6.QtTest import QTest
@@ -144,6 +144,9 @@ class GlassyControlRenderingTests(unittest.TestCase):
             top, bottom = normal.height() // 4, 3 * normal.height() // 4
             self.assertGreater(normal.pixelColor(x, top).lightnessF(),
                                normal.pixelColor(x, bottom).lightnessF())
+            edge = max(1, round(ratio))
+            self.assertGreater(normal.pixelColor(x, edge).lightnessF(),
+                               normal.pixelColor(x, normal.height() - 1 - edge).lightnessF())
             geometry, hint = button.geometry(), button.sizeHint()
             for checked in (False, True):
                 with self.subTest(size=(width, height), checked=checked):
@@ -151,8 +154,12 @@ class GlassyControlRenderingTests(unittest.TestCase):
                     button.setDown(not checked)
                     self.app.processEvents()
                     pressed = button.grab().toImage()
-                    self.assertLess(pressed.pixelColor(x, top).lightnessF(),
-                                    pressed.pixelColor(x, bottom).lightnessF())
+                    # The face retains overhead lighting; only the narrow
+                    # bevel reverses into a shadow above and highlight below.
+                    self.assertGreater(pressed.pixelColor(x, top).lightnessF(),
+                                       pressed.pixelColor(x, bottom).lightnessF())
+                    self.assertLess(pressed.pixelColor(x, edge).lightnessF(),
+                                    pressed.pixelColor(x, pressed.height() - 1 - edge).lightnessF())
                     self.assertEqual(button.geometry(), geometry)
                     self.assertEqual(button.sizeHint(), hint)
                     # A single rounded outline keeps all four corners inside

@@ -1113,13 +1113,11 @@ QPushButton:hover {
 }
 QPushButton:pressed, QPushButton:checked {
     background: qlineargradient(
-        x1:0, y1:1, x2:0, y2:0,
-        stop:0 rgba(187, 216, 235, 248),
-        stop:0.06 rgba(173, 207, 230, 248),
-        stop:0.46 rgba(170, 204, 228, 246),
-        stop:0.50 rgba(157, 194, 220, 246),
-        stop:0.94 rgba(164, 200, 225, 248),
-        stop:1 rgba(146, 184, 211, 248)
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(136, 175, 203, 248),
+        stop:0.06 rgba(181, 210, 231, 248),
+        stop:0.94 rgba(169, 202, 227, 248),
+        stop:1 rgba(205, 226, 241, 248)
     );
     border-color: #376d8d;
     padding-top: 5px;
