@@ -118,6 +118,7 @@ try:
         QPushButton,
         QScrollArea,
         QSlider,
+        QSpinBox,
         QSizePolicy,
         QStyle,
         QStyleFactory,
@@ -753,8 +754,40 @@ def message_row_backgrounds() -> tuple[str, str]:
     return MESSAGE_ROW_BACKGROUNDS
 
 
-MESSAGE_LINE_HEIGHT_PX = 24
-SPOILER_DISPLAY_HEIGHT_PX = 22
+DEFAULT_MESSAGE_LINE_HEIGHT_PX = 24
+CHAT_LINE_VERTICAL_PADDING_PX = 3
+SPOILER_VERTICAL_INSET_PX = 1.0
+TEXT_SIZE_MIN_PT = 7
+TEXT_SIZE_MAX_PT = 24
+DEFAULT_TEXT_SIZES = {
+    "chat_log": 13,
+    "message_input": 13,
+    "chatrooms": 9,
+    "status": 9,
+    "other_ui": 9,
+}
+TEXT_SIZE_CONTROLS = (
+    ("chat_log", "Chat Log"),
+    ("message_input", "Message Input"),
+    ("chatrooms", "Chatrooms"),
+    ("status", "Status"),
+    ("other_ui", "Other UI"),
+)
+
+
+def normalize_text_sizes(value: Any) -> dict[str, int]:
+    raw = value if isinstance(value, dict) else {}
+    normalized: dict[str, int] = {}
+    for key, default in DEFAULT_TEXT_SIZES.items():
+        try:
+            point_size = int(raw.get(key, default))
+        except (TypeError, ValueError):
+            point_size = default
+        normalized[key] = max(
+            TEXT_SIZE_MIN_PT,
+            min(TEXT_SIZE_MAX_PT, point_size),
+        )
+    return normalized
 COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
 RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
 RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
@@ -3144,6 +3177,7 @@ def default_config() -> dict[str, Any]:
         "theme": DEFAULT_THEME,
         "theme_colors": normalize_theme_colors(None),
         "text_shadows": True,
+        "text_sizes": normalize_text_sizes(None),
         "message_sound": DEFAULT_MESSAGE_SOUND,
         "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
         "custom_message_sound_path": "",
@@ -3220,6 +3254,7 @@ def load_config() -> dict[str, Any]:
         else ""
     )
     config["text_shadows"] = bool(config.get("text_shadows", True))
+    config["text_sizes"] = normalize_text_sizes(config.get("text_sizes"))
     config["desktop_notifications"] = bool(
         config.get("desktop_notifications", False)
     )
@@ -5679,7 +5714,11 @@ class MessageLogBrowser(QTextBrowser):
                         start_x = line.cursorToX(start)[0]
                         end_x = line.cursorToX(end)[0]
                         spoiler_height = min(
-                            float(SPOILER_DISPLAY_HEIGHT_PX),
+                            max(
+                                1.0,
+                                line.height()
+                                - (SPOILER_VERTICAL_INSET_PX * 2.0),
+                            ),
                             line.height(),
                         )
                         spoiler_rect = QRectF(
@@ -6223,7 +6262,10 @@ class EncryptedChatClient(QObject):
         self._pending_tooltip_message_id: str | None = None
         self._pending_tooltip_global_position = QPoint()
         self._config_snapshot_at_open: tuple[Any, ...] | None = None
-        self._message_font_cache: dict[tuple[str, bool, bool], QFont] = {}
+        self._message_font_cache: dict[
+            tuple[str, bool, bool, str, int],
+            QFont,
+        ] = {}
         self._loading_profile_controls = False
         self._connection_error_visible = False
         self.active_chatroom_id = str(
@@ -6284,6 +6326,9 @@ class EncryptedChatClient(QObject):
         self.theme_color_save_timer.timeout.connect(self._save_theme_colors)
         self.text_shadows_var = ValueModel(
             bool(self.config_data.get("text_shadows", True))
+        )
+        self.config_data["text_sizes"] = normalize_text_sizes(
+            self.config_data.get("text_sizes")
         )
         self.message_sound_var = ValueModel(
             str(self.config_data["message_sound"])
@@ -6424,6 +6469,7 @@ class EncryptedChatClient(QObject):
         self._apply_theme()
         self._apply_application_font_strategy()
         self._build_ui()
+        self._apply_text_sizes()
         self._build_tray_icon()
         self._schedule_utc_midnight_reset()
         self._apply_server_preset_state()
@@ -6471,20 +6517,39 @@ class EncryptedChatClient(QObject):
         font.setStyleStrategy(self._font_style_strategy())
         return font
 
+    def _text_size(self, key: str) -> int:
+        sizes = normalize_text_sizes(self.config_data.get("text_sizes"))
+        self.config_data["text_sizes"] = sizes
+        return sizes[key]
+
     def _make_message_font(
         self,
         font_name: str,
         *,
         bold: bool = False,
+        role: str = "message_input",
     ) -> QFont:
+        if role not in {"chat_log", "message_input"}:
+            role = "message_input"
+        base_point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
+        point_size = max(
+            TEXT_SIZE_MIN_PT,
+            min(
+                TEXT_SIZE_MAX_PT,
+                base_point_size
+                + self._text_size(role)
+                - DEFAULT_TEXT_SIZES[role],
+            ),
+        )
         cache_key = (
             font_name,
             bool(bold),
             self._is_windows_classic_theme(),
+            role,
+            point_size,
         )
         cached = self._message_font_cache.get(cache_key)
         if cached is None:
-            point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
             cached = self._make_font(
                 self._resolved_font_family(font_name),
                 point_size,
@@ -6493,15 +6558,152 @@ class EncryptedChatClient(QObject):
             self._message_font_cache[cache_key] = cached
         return cached
 
-    def _make_ui_font(self, *, bold: bool = False) -> QFont:
+    def _make_ui_font(
+        self,
+        *,
+        bold: bool = False,
+        point_size: int | None = None,
+    ) -> QFont:
         app = QApplication.instance()
         font = QFont(
             app.font() if app is not None else self._basic_application_font
         )
         font.setFamily(self._ui_font_family())
+        if point_size is not None:
+            font.setPointSize(max(TEXT_SIZE_MIN_PT, int(point_size)))
         font.setBold(bold)
         font.setStyleStrategy(self._font_style_strategy())
         return font
+
+    @staticmethod
+    def _widget_base_point_size(widget: QWidget) -> int:
+        stored = widget.property("spritelinkBasePointSize")
+        try:
+            stored_size = int(stored)
+        except (TypeError, ValueError):
+            stored_size = 0
+        if stored_size > 0:
+            return stored_size
+        current_size = widget.font().pointSize()
+        if current_size <= 0:
+            app = QApplication.instance()
+            current_size = (
+                app.font().pointSize()
+                if app is not None and app.font().pointSize() > 0
+                else DEFAULT_TEXT_SIZES["other_ui"]
+            )
+        widget.setProperty("spritelinkBasePointSize", current_size)
+        return current_size
+
+    def _set_widget_text_size(
+        self,
+        widget: QWidget,
+        role: str,
+    ) -> None:
+        base_size = self._widget_base_point_size(widget)
+        point_size = max(
+            TEXT_SIZE_MIN_PT,
+            min(
+                TEXT_SIZE_MAX_PT,
+                base_size
+                + self._text_size(role)
+                - DEFAULT_TEXT_SIZES[role],
+            ),
+        )
+        font = QFont(widget.font())
+        if font.pointSize() != point_size:
+            font.setPointSize(point_size)
+            widget.setFont(font)
+
+    @staticmethod
+    def _is_widget_within(
+        widget: QWidget,
+        ancestor: QWidget | None,
+    ) -> bool:
+        if ancestor is None:
+            return False
+        current: QWidget | None = widget
+        while current is not None:
+            if current is ancestor:
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _apply_text_sizes_to_widget_tree(self, root_widget: QWidget) -> None:
+        chat_display = getattr(self, "chat_display", None)
+        message_entry = getattr(self, "message_entry", None)
+        status_label = getattr(self, "status_label", None)
+        chatrooms_panel = getattr(self, "chatrooms_panel", None)
+        widgets = [root_widget, *root_widget.findChildren(QWidget)]
+        for widget in widgets:
+            if widget in {chat_display, message_entry, status_label}:
+                continue
+            if self._is_widget_within(widget, chatrooms_panel):
+                continue
+            self._set_widget_text_size(widget, "other_ui")
+
+        if chatrooms_panel is not None:
+            for widget in [
+                chatrooms_panel,
+                *chatrooms_panel.findChildren(QWidget),
+            ]:
+                self._set_widget_text_size(widget, "chatrooms")
+
+        if status_label is not None:
+            self._set_widget_text_size(status_label, "status")
+
+    def _apply_text_sizes(self) -> None:
+        self.config_data["text_sizes"] = normalize_text_sizes(
+            self.config_data.get("text_sizes")
+        )
+        self._message_font_cache.clear()
+        if hasattr(self, "root"):
+            self._apply_text_sizes_to_widget_tree(self.root)
+        if hasattr(self, "chat_display"):
+            self.chat_display.setFont(
+                self._make_message_font(
+                    DEFAULT_MESSAGE_FONT,
+                    role="chat_log",
+                )
+            )
+        if hasattr(self, "message_font_combo"):
+            self._refresh_message_font_combo_fonts()
+        if hasattr(self, "message_entry"):
+            self._apply_active_composer_style()
+            self._schedule_message_entry_resize()
+        if hasattr(self, "chatrooms_list"):
+            self.chatrooms_list.refresh_row_sizes()
+
+    def _chat_icons_visible(self) -> bool:
+        return (
+            self._text_size("chat_log")
+            >= DEFAULT_TEXT_SIZES["chat_log"]
+        )
+
+    def _chat_line_height(
+        self,
+        font_name: str,
+        *,
+        ui_font: bool = False,
+    ) -> int:
+        font = (
+            self._make_ui_font(
+                point_size=self._text_size("chat_log")
+            )
+            if ui_font
+            else self._make_message_font(
+                font_name,
+                role="chat_log",
+            )
+        )
+        text_height = max(1, QFontMetrics(font).height())
+        line_height = text_height + CHAT_LINE_VERTICAL_PADDING_PX
+        if self._chat_icons_visible():
+            line_height = max(
+                DEFAULT_MESSAGE_LINE_HEIGHT_PX,
+                line_height,
+            )
+        return line_height
 
     def _make_link_warning_url_font(self) -> QFont:
         available_families = {
@@ -10158,6 +10360,45 @@ class EncryptedChatClient(QObject):
         advanced_row = 0
 
         advanced_layout.addWidget(
+            self._heading("Text Sizes (Development)"),
+            advanced_row,
+            0,
+            1,
+            3,
+        )
+        advanced_row += 1
+        self.text_size_spinboxes: dict[str, QSpinBox] = {}
+        for key, label in TEXT_SIZE_CONTROLS:
+            advanced_layout.addWidget(QLabel(label), advanced_row, 0)
+            spinbox = QSpinBox()
+            spinbox.setRange(TEXT_SIZE_MIN_PT, TEXT_SIZE_MAX_PT)
+            spinbox.setSuffix(" pt")
+            spinbox.setValue(self._text_size(key))
+            spinbox.valueChanged.connect(
+                lambda value, key=key: self._on_text_size_changed(
+                    key,
+                    value,
+                )
+            )
+            self.text_size_spinboxes[key] = spinbox
+            advanced_layout.addWidget(
+                spinbox,
+                advanced_row,
+                1,
+                1,
+                2,
+            )
+            advanced_row += 1
+
+        advanced_layout.addWidget(
+            self._separator(),
+            advanced_row,
+            0,
+            1,
+            3,
+        )
+        advanced_row += 1
+        advanced_layout.addWidget(
             self._heading("Server"),
             advanced_row,
             0,
@@ -10223,6 +10464,22 @@ class EncryptedChatClient(QObject):
             "Advanced ▼" if expanded else "Advanced ▶"
         )
         self.advanced_config_content.setVisible(expanded)
+
+    def _on_text_size_changed(self, key: str, value: int) -> None:
+        if key not in DEFAULT_TEXT_SIZES:
+            return
+        sizes = normalize_text_sizes(self.config_data.get("text_sizes"))
+        point_size = max(
+            TEXT_SIZE_MIN_PT,
+            min(TEXT_SIZE_MAX_PT, int(value)),
+        )
+        if sizes[key] == point_size:
+            return
+        sizes[key] = point_size
+        self.config_data["text_sizes"] = sizes
+        self._apply_text_sizes()
+        if key == "chat_log" and hasattr(self, "chat_display"):
+            self._rerender_preserving_scroll()
 
     def _on_message_sound_selected(self, value: str) -> None:
         selected_sound = str(value)
@@ -10445,6 +10702,10 @@ class EncryptedChatClient(QObject):
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
             bool(self.text_shadows_var.get()),
+            tuple(
+                self._text_size(key)
+                for key, _label in TEXT_SIZE_CONTROLS
+            ),
             str(self.message_sound_var.get()),
             int(self.message_sound_volume_var.get()),
             str(self.custom_message_sound_path_var.get()),
@@ -10704,6 +10965,9 @@ class EncryptedChatClient(QObject):
         )
         self.config_data["text_shadows"] = bool(
             self.text_shadows_var.get()
+        )
+        self.config_data["text_sizes"] = normalize_text_sizes(
+            self.config_data.get("text_sizes")
         )
         message_sound = str(self.message_sound_var.get())
         self.config_data["message_sound"] = (
@@ -13670,6 +13934,7 @@ class EncryptedChatClient(QObject):
             )
         ):
             self._apply_dialog_window_theme(watched)
+            self._apply_text_sizes_to_widget_tree(watched)
 
         if (
             watched is self.root
@@ -13985,6 +14250,7 @@ class EncryptedChatClient(QObject):
         *,
         align_top: bool = False,
         opacity: float = 1.0,
+        line_height_px: int = DEFAULT_MESSAGE_LINE_HEIGHT_PX,
     ) -> bool:
         if not encoded_icon:
             return False
@@ -14013,7 +14279,15 @@ class EncryptedChatClient(QObject):
                 - PROFILE_ICON_VERTICAL_OFFSET_PX,
             )
             if align_top
-            else PROFILE_ICON_VERTICAL_OFFSET_PX
+            else max(
+                0,
+                round(
+                    (max(PROFILE_ICON_SIZE, line_height_px)
+                     - PROFILE_ICON_SIZE)
+                    / 2.0
+                    - PROFILE_ICON_VERTICAL_OFFSET_PX
+                ),
+            )
         )
         bottom_padding = (
             0
@@ -14069,12 +14343,9 @@ class EncryptedChatClient(QObject):
         image_format.setHeight(displayed_image.height())
         image_format.setAnchor(True)
         image_format.setAnchorHref(f"spritelink:{message_id}")
-        # Inline images participate in Qt's automatic line-height calculation,
-        # so a short text line expands to the icon's native 16-pixel height.
-        # A normal 16 px icon belongs at y=2 in the fixed 24 px row:
-        # centered at y=4, then shifted upward by exactly 2 px. Aligning the
-        # padded 20 px canvas to the row top avoids AlignMiddle's half-pixel
-        # rounding, which previously reduced the visible shift to one pixel.
+        # Keep the icon vertically centered in the current text row while
+        # retaining the slight upward optical offset used by the default
+        # 24-pixel layout. AlignTop avoids AlignMiddle half-pixel rounding.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
         )
@@ -14177,9 +14448,16 @@ class EncryptedChatClient(QObject):
         formatting = QTextCharFormat()
         formatting.setForeground(QColor(color))
         formatting.setFont(
-            self._make_ui_font(bold=bold)
+            self._make_ui_font(
+                bold=bold,
+                point_size=self._text_size("chat_log"),
+            )
             if ui_font
-            else self._make_message_font(font_name, bold=bold)
+            else self._make_message_font(
+                font_name,
+                bold=bold,
+                role="chat_log",
+            )
         )
         formatting.setFontItalic(italic)
         formatting.setFontUnderline(underline)
@@ -15401,12 +15679,19 @@ class EncryptedChatClient(QObject):
                 )
         align_message_top = top_align_height > 0
 
-        has_profile_icon = self._insert_profile_icon(
-            cursor,
-            "" if is_muted else profile_icon,
-            message_id,
-            align_top=align_message_top,
+        message_line_height = self._chat_line_height(
+            font_name,
+            ui_font=is_muted,
         )
+        has_profile_icon = False
+        if self._chat_icons_visible():
+            has_profile_icon = self._insert_profile_icon(
+                cursor,
+                "" if is_muted else profile_icon,
+                message_id,
+                align_top=align_message_top,
+                line_height_px=message_line_height,
+            )
         if has_profile_icon:
             cursor.insertText(
                 " ",
@@ -15523,7 +15808,7 @@ class EncryptedChatClient(QObject):
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
             # Only date/hour separators may contribute vertical margins.
-            # Ordinary message blocks always occupy fixed 24-pixel lines.
+            # Ordinary message blocks follow the active chat font metrics.
             block_format.setTopMargin(0.0)
             block_format.setBottomMargin(0.0)
             # The custom full-width painter owns the entire normal stripe.
@@ -15534,7 +15819,7 @@ class EncryptedChatClient(QObject):
             )
             if block.blockNumber() not in embedded_media_block_numbers:
                 block_format.setLineHeight(
-                    float(MESSAGE_LINE_HEIGHT_PX),
+                    float(message_line_height),
                     int(QTextBlockFormat.LineHeightTypes.FixedHeight.value),
                 )
             block_cursor.setBlockFormat(block_format)
