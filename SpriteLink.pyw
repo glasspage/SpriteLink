@@ -6544,6 +6544,8 @@ class EncryptedChatClient(QObject):
         self._refresh_message_font_combo_fonts()
         if hasattr(self, "chatrooms_list"):
             self.chatrooms_list.refresh_row_sizes()
+        if hasattr(self, "theme_color_slider"):
+            self._sync_theme_color_slider()
 
     def _ui_font_family(self) -> str:
         if self._is_windows_classic_theme():
@@ -9908,13 +9910,13 @@ class EncryptedChatClient(QObject):
         color_layout = QHBoxLayout(color_control)
         color_layout.setContentsMargins(0, 0, 0, 0)
         color_layout.setSpacing(6)
-        color_layout.addWidget(QLabel("Color"))
+        self.theme_color_label = QLabel("Color")
+        color_layout.addWidget(self.theme_color_label)
         self.theme_color_slider = ThemeSlider(Qt.Orientation.Horizontal)
         self.theme_color_slider.setAccessibleName("Theme color")
         self.theme_color_slider.setMinimumWidth(64)
         self.theme_color_slider.setMaximumWidth(112)
         self.theme_color_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._sync_theme_color_slider()
         self.theme_color_slider.valueChanged.connect(self._on_theme_color_changed)
         self.theme_color_slider.sliderReleased.connect(self._finish_theme_color_change)
         color_layout.addWidget(self.theme_color_slider, 1)
@@ -10009,6 +10011,7 @@ class EncryptedChatClient(QObject):
             1,
         )
         layout.addWidget(message_sound_volume_control, row, 2)
+        self._sync_theme_color_slider()
         row += 1
 
         self.desktop_notifications_checkbox = QCheckBox(
@@ -10518,6 +10521,18 @@ class EncryptedChatClient(QObject):
         slider = self.theme_color_slider
         theme = str(self.theme_var.get())
         classic = theme == "Classic"
+        compact_width = max(40, self.message_sound_volume_slider.sizeHint().width())
+        slider.setMinimumWidth(compact_width if classic else 64)
+        slider.setMaximumWidth(compact_width if classic else 112)
+        self.message_sound_volume_slider.setMaximumWidth(compact_width if classic else 16777215)
+        # Reserve the longest label so dragging between schemes keeps the
+        # controls stationary. Both Classic sliders share the compact width.
+        labels = [f"Color: {scheme['name']}" for scheme in CLASSIC_COLOR_SCHEMES]
+        labels.append("Volume: 100%")
+        self.theme_color_label.setMinimumWidth(
+            max(self.theme_color_label.fontMetrics().horizontalAdvance(label) for label in labels)
+            if classic else 0
+        )
         was_blocked = slider.blockSignals(True)
         try:
             slider.setRange(0, len(CLASSIC_COLOR_SCHEMES) - 1 if classic else 359)
@@ -10530,6 +10545,9 @@ class EncryptedChatClient(QObject):
             slider.setProperty("spritelinkPreviewHue", None)
             slider.setProperty("spritelinkPreviewClassicColor", position if classic else None)
             slider.setToolTip(CLASSIC_COLOR_SCHEMES[position]["name"] if classic else "")
+            self.theme_color_label.setText(
+                f"Color: {CLASSIC_COLOR_SCHEMES[position]['name']}" if classic else "Color"
+            )
         finally:
             slider.blockSignals(was_blocked)
 
@@ -10539,7 +10557,9 @@ class EncryptedChatClient(QObject):
         colors[theme] = value
         self.config_data["theme_colors"] = normalize_theme_colors(colors)
         if theme == "Classic":
-            self.theme_color_slider.setToolTip(CLASSIC_COLOR_SCHEMES[colors[theme]]["name"])
+            scheme_name = CLASSIC_COLOR_SCHEMES[colors[theme]]["name"]
+            self.theme_color_slider.setToolTip(scheme_name)
+            self.theme_color_label.setText(f"Color: {scheme_name}")
         self.theme_color_slider.setProperty("spritelinkPreviewHue", None if theme == "Classic" else value)
         self.theme_color_slider.setProperty("spritelinkPreviewClassicColor", value if theme == "Classic" else None)
         self.theme_color_slider.update()

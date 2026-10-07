@@ -47,6 +47,8 @@ class ThemeColorTests(unittest.TestCase):
         ):
             setattr(self.client, name, MethodType(getattr(S.EncryptedChatClient, name), self.client))
         self.client.theme_color_slider = S.ThemeSlider(Qt.Orientation.Horizontal, self.window)
+        self.client.theme_color_label = QLabel("Color", self.window)
+        self.client.message_sound_volume_slider = S.ThemeSlider(Qt.Orientation.Horizontal, self.window)
         self.client.theme_color_slider.setGeometry(10, 10, 112, 24)
         self.client.theme_color_save_timer = QTimer(self.window)
         self.client.theme_color_save_timer.setSingleShot(True)
@@ -108,6 +110,7 @@ class ThemeColorTests(unittest.TestCase):
             self.assertEqual(slider.pageStep(), 1 if theme == "Classic" else 15)
             self.assertEqual(slider.tickPosition(), S.QSlider.TickPosition.TicksBelow
                              if theme == "Classic" else S.QSlider.TickPosition.NoTicks)
+            self.assertEqual(self.client.theme_color_label.text(), "Color: Slate" if theme == "Classic" else "Color")
         self.assertEqual(spy.count(), 0)
         self.assertEqual(self.client.config_data["theme_colors"], {"Classic": 3, "Glassy": 94, "Modern": 218})
 
@@ -203,6 +206,7 @@ class ThemeColorTests(unittest.TestCase):
         for position, scheme in enumerate(S.CLASSIC_COLOR_SCHEMES):
             slider.setValue(position)
             self.app.processEvents()
+            self.assertEqual(self.client.theme_color_label.text(), f"Color: {scheme['name']}")
             option = QStyleOptionSlider()
             slider.initStyleOption(option)
             handle = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
