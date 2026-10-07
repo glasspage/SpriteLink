@@ -1114,11 +1114,14 @@ QPushButton:hover {
 QPushButton:pressed, QPushButton:checked {
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,
-        stop:0 rgba(105, 168, 207, 242),
-        stop:0.52 rgba(164, 209, 235, 242),
-        stop:1 rgba(222, 244, 254, 244)
+        stop:0 rgba(181, 220, 243, 248),
+        stop:0.08 rgba(220, 242, 255, 248),
+        stop:0.46 rgba(189, 224, 246, 246),
+        stop:0.50 rgba(119, 184, 225, 246),
+        stop:1 rgba(159, 209, 240, 248)
     );
     border-color: #376d8d;
+    border-bottom-color: #84aac3;
     padding-top: 5px;
     padding-bottom: 3px;
 }
@@ -1229,7 +1232,18 @@ QScrollBar:vertical {
     margin: 1px;
     border-radius: 2px;
 }
-QScrollBar::handle:vertical {
+QScrollBar:horizontal {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #d5e0e8,
+        stop:0.25 #e6edf2,
+        stop:1 #f3f7fa
+    );
+    height: 14px;
+    margin: 1px;
+    border-radius: 2px;
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,
         stop:0 #ffffff,
@@ -1245,7 +1259,11 @@ QScrollBar::handle:vertical {
     min-height: 24px;
     image: url("SPRITELINK_SCROLLBAR_ASSETS/scrollbar-grip.svg");
 }
-QScrollBar::handle:vertical:hover {
+QScrollBar::handle:horizontal {
+    min-width: 24px;
+    image: url("SPRITELINK_SCROLLBAR_ASSETS/scrollbar-grip-horizontal.svg");
+}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,
         stop:0 #ffffff,
@@ -1256,7 +1274,7 @@ QScrollBar::handle:vertical:hover {
     border-color: #4d8caf;
     border-top-color: #9ccbe4;
 }
-QScrollBar::handle:vertical:pressed {
+QScrollBar::handle:vertical:pressed, QScrollBar::handle:horizontal:pressed {
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,
         stop:0 #c7e7f6,
@@ -1266,7 +1284,7 @@ QScrollBar::handle:vertical:pressed {
     );
     border-color: #397b9f;
 }
-QScrollBar::handle:vertical:disabled {
+QScrollBar::handle:vertical:disabled, QScrollBar::handle:horizontal:disabled {
     background: #e8eef2;
     border-color: #b4c1ca;
 }
@@ -1275,7 +1293,13 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     border: none;
     height: 0px;
 }
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    background: transparent;
+    border: none;
+    width: 0px;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical,
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: transparent;
 }
 QSlider:horizontal {
