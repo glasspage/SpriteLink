@@ -760,14 +760,14 @@ CHAT_LINE_VERTICAL_PADDING_PX = 3
 SPOILER_VERTICAL_INSET_PX = 1.0
 TEXT_SIZE_MIN_PT = 7
 TEXT_SIZE_MAX_PT = 24
-DEFAULT_UI_SIZE = "Small"
+DEFAULT_UI_SIZE = "Small (Default)"
 UI_SIZE_PRESETS = {
     "Large": {
         "chat_log": 15,
         "message_input": 15,
         "other_ui": 11,
     },
-    "Small": {
+    "Small (Default)": {
         "chat_log": 13,
         "message_input": 13,
         "other_ui": 9,
@@ -789,6 +789,8 @@ DEFAULT_TEXT_SIZES = {
 
 def normalize_ui_size(value: Any) -> str:
     size = str(value)
+    if size == "Small":
+        return DEFAULT_UI_SIZE
     return size if size in UI_SIZE_PRESETS else DEFAULT_UI_SIZE
 
 
@@ -6872,6 +6874,8 @@ class EncryptedChatClient(QObject):
             self.chatrooms_list.refresh_row_sizes()
         if hasattr(self, "theme_color_slider"):
             self._sync_theme_color_slider()
+        if hasattr(self, "chat_tab"):
+            self._apply_ui_size()
 
     def _ui_font_family(self) -> str:
         if self._is_windows_classic_theme():
@@ -8079,6 +8083,8 @@ QComboBox::drop-down {
                 room["id"] in muted_ids,
                 self.chatrooms_list,
             )
+            for widget in [row, *row.findChildren(QWidget)]:
+                self._set_widget_text_size(widget, "chatrooms")
             row.ensurePolished()
             item.setSizeHint(row.sizeHint())
             self.chatrooms_list.setItemWidget(item, row)
@@ -9694,9 +9700,13 @@ QComboBox::drop-down {
         if not hasattr(self, "message_entry"):
             return
         profile = self._active_room_profile()
-        self.message_entry.setFont(
-            self._make_message_font(profile["font"])
+        composer_font = self._make_message_font(
+            profile["font"],
+            role="message_input",
         )
+        self.message_entry.setFont(composer_font)
+        self.message_entry.document().setDefaultFont(composer_font)
+        self.message_entry.viewport().setFont(composer_font)
         self.message_entry.setStyleSheet(
             f"color: {profile['text_color']};"
         )
@@ -9859,7 +9869,7 @@ QComboBox::drop-down {
         self.config_overlay.dismissed.connect(self._dismiss_config_popup)
 
         overlay_layout = QVBoxLayout(self.config_overlay)
-        overlay_layout.setContentsMargins(36, 24, 36, 24)
+        overlay_layout.setContentsMargins(24, 24, 24, 24)
 
         panel_row = QHBoxLayout()
         panel_row.addStretch(1)
@@ -9872,7 +9882,7 @@ QComboBox::drop-down {
             QSizePolicy.Policy.Expanding,
         )
         self.config_panel.setStyleSheet(self._config_panel_stylesheet())
-        panel_row.addWidget(self.config_panel, 8)
+        panel_row.addWidget(self.config_panel, 10)
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row, 1)
         self.config_overlay.panel = self.config_panel
