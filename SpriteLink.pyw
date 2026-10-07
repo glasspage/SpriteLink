@@ -6670,7 +6670,6 @@ class EncryptedChatClient(QObject):
             self._refresh_message_font_combo_fonts()
         if hasattr(self, "message_entry"):
             self._apply_active_composer_style()
-            self._schedule_message_entry_resize()
         if hasattr(self, "chatrooms_list"):
             self.chatrooms_list.refresh_row_sizes()
 
