@@ -6791,9 +6791,13 @@ class EncryptedChatClient(QObject):
             self._refresh_message_font_combo_fonts()
         if hasattr(self, "message_entry"):
             profile = self._active_room_profile()
-            self.message_entry.setFont(
-                self._make_message_font(profile["font"])
+            composer_font = self._make_message_font(
+                profile["font"],
+                role="message_input",
             )
+            self.message_entry.setFont(composer_font)
+            self.message_entry.document().setDefaultFont(composer_font)
+            self.message_entry.viewport().setFont(composer_font)
             self.message_resize_timer.start(0)
         if hasattr(self, "chatrooms_list"):
             self.chatrooms_list.refresh_row_sizes()
