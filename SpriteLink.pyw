@@ -421,67 +421,15 @@ def client_theme_color(client: Any, theme: str) -> int:
     return normalize_theme_colors(config.get("theme_colors") if isinstance(config, dict) else None)[theme]
 
 
-def _linear_rgb_to_oklab(red: float, green: float, blue: float) -> tuple[float, float, float]:
-    # Bjorn Ottosson's public-domain Oklab matrices:
-    # https://bottosson.github.io/posts/oklab/
-    light = (0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue) ** (1.0 / 3.0)
-    medium = (0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue) ** (1.0 / 3.0)
-    short = (0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue) ** (1.0 / 3.0)
-    return (
-        0.2104542553 * light + 0.7936177850 * medium - 0.0040720468 * short,
-        1.9779984951 * light - 2.4285922050 * medium + 0.4505937099 * short,
-        0.0259040371 * light + 0.7827717662 * medium - 0.8086757660 * short,
-    )
-
-
-def _oklab_to_linear_rgb(lightness: float, a: float, b: float) -> tuple[float, float, float]:
-    light = (lightness + 0.3963377774 * a + 0.2158037573 * b) ** 3
-    medium = (lightness - 0.1055613458 * a - 0.0638541728 * b) ** 3
-    short = (lightness - 0.0894841775 * a - 1.2914855480 * b) ** 3
-    return (
-        4.0767416621 * light - 3.3077115913 * medium + 0.2309699292 * short,
-        -1.2684380046 * light + 2.6097574011 * medium - 0.3413193965 * short,
-        -0.0041960863 * light - 0.7034186147 * medium + 1.7076147010 * short,
-    )
-
-
-@lru_cache(maxsize=4096)
-def _perceptual_theme_rgb(red: float, green: float, blue: float, degrees: int) -> tuple[float, float, float]:
-    linear = tuple(channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
-                   for channel in (red, green, blue))
-    lightness, a, b = _linear_rgb_to_oklab(*linear)
-    angle = math.radians(degrees)
-    cosine, sine = math.cos(angle), math.sin(angle)
-    a, b = a * cosine - b * sine, a * sine + b * cosine
-    shifted = _oklab_to_linear_rgb(lightness, a, b)
-    if not all(0.0 <= channel <= 1.0 for channel in shifted):
-        # Reduce chroma along the same OKLCH hue/lightness ray rather than
-        # clipping RGB channels, which would distort brightness and hue.
-        lower, upper = 0.0, 1.0
-        for _ in range(18):
-            scale = (lower + upper) / 2.0
-            candidate = _oklab_to_linear_rgb(lightness, a * scale, b * scale)
-            if all(0.0 <= channel <= 1.0 for channel in candidate):
-                lower = scale
-            else:
-                upper = scale
-        shifted = _oklab_to_linear_rgb(lightness, a * lower, b * lower)
-    return tuple(max(0.0, min(1.0, 12.92 * channel if channel <= 0.0031308
-                              else 1.055 * channel ** (1.0 / 2.4) - 0.055))
-                 for channel in shifted)
-
-
 def shift_theme_color(color: Any, degrees: int | None = None) -> QColor:
-    """Rotate OKLCH hue, keeping perceived lightness and alpha stable."""
     original = QColor(color)
     if degrees is None:
         app = QApplication.instance()
         degrees = int(app.property("spritelinkThemeHue") or 0) if app is not None else 0
-    degrees %= 360
-    if degrees == 0 or not original.isValid() or original.hslSaturation() == 0:
+    if degrees % 360 == 0 or original.hslSaturation() == 0:
         return original
-    return QColor.fromRgbF(*_perceptual_theme_rgb(original.redF(), original.greenF(), original.blueF(), degrees),
-                           original.alphaF())
+    hue, saturation, lightness, alpha = original.getHslF()
+    return QColor.fromHslF((hue + degrees / 360.0) % 1.0, saturation, lightness, alpha)
 
 
 def hue_theme_stylesheet(stylesheet: str, degrees: int) -> str:
@@ -5468,14 +5416,14 @@ class MessageLogBrowser(QTextBrowser):
         self,
         block: Any,
     ) -> tuple[int, int]:
-        """Return a row whose bottom is the next row's exact top edge."""
+        """Return shared row edges, assigning top margins to their own row."""
         document_layout = self.document().documentLayout()
         block_rect = document_layout.blockBoundingRect(block)
         next_block = block.next()
         if next_block.isValid():
             bottom_edge = document_layout.blockBoundingRect(
                 next_block
-            ).top()
+            ).top() - next_block.blockFormat().topMargin()
         else:
             bottom_edge = block_rect.top() + block_rect.height()
 
@@ -5483,7 +5431,8 @@ class MessageLogBrowser(QTextBrowser):
         # makes neighboring rows overlap whenever their coordinates are
         # fractional, so the later alternating color steals an edge pixel.
         scroll_y = self.verticalScrollBar().value()
-        painted_top = self._nearest_pixel_edge(block_rect.top()) - scroll_y
+        top_edge = block_rect.top() - block.blockFormat().topMargin()
+        painted_top = self._nearest_pixel_edge(top_edge) - scroll_y
         painted_bottom = self._nearest_pixel_edge(bottom_edge) - scroll_y
         return painted_top, max(painted_top + 1, painted_bottom)
 

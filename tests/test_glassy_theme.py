@@ -121,6 +121,51 @@ class GlassyControlRenderingTests(unittest.TestCase):
         self.app.setPalette(self.previous_palette)
         self.app.setStyleSheet(self.previous_sheet)
 
+    def test_separator_top_padding_matches_translucent_body_and_bottom(self):
+        from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
+        browser = SPRITELINK.MessageLogBrowser(self.window)
+        browser.setObjectName("chatViewport")
+        browser.setGeometry(0, 0, 280, 150)
+        browser.document().setDocumentMargin(0)
+        client = SimpleNamespace(chat_display=browser, _text_format=lambda color: QTextCharFormat())
+        previous_hue = self.app.property("spritelinkThemeHue")
+        try:
+            for hue in (0, 65, 240):
+                self.app.setProperty("spritelinkThemeHue", hue)
+                for shadows in (False, True):
+                    self.app.setProperty("spritelinkTextShadows", shadows)
+                    for stripe in (0, 1):
+                        browser.clear()
+                        browser.row_background_blocks.clear()
+                        browser.row_background_padding_blocks.clear()
+                        colors = SPRITELINK.message_row_backgrounds()
+                        cursor = QTextCursor(browser.document())
+                        cursor.insertText("Older message")
+                        separator = SPRITELINK.EncryptedChatClient._insert_log_separator(
+                            client, cursor, "Nov 15, 2023", colors[stripe], [],
+                        )
+                        cursor.insertText("Newer message")
+                        browser.row_background_blocks.update({
+                            0: QColor(colors[1 - stripe]), separator: QColor(colors[stripe]),
+                            cursor.blockNumber(): QColor(colors[1 - stripe]),
+                        })
+                        browser.show()
+                        self.app.processEvents()
+                        image = browser.viewport().grab().toImage()
+                        ratio = image.devicePixelRatio()
+                        block = browser.document().findBlockByNumber(separator)
+                        top, bottom = browser._block_content_vertical_bounds(block)
+                        x = image.width() - 10
+                        body = image.pixelColor(x, round((top + 4) * ratio))
+                        for y in range(top - 7, top):
+                            self.assertEqual(image.pixelColor(x, round(y * ratio)), body,
+                                             (hue, shadows, stripe, y))
+                        for y in range(bottom, bottom + 7):
+                            self.assertEqual(image.pixelColor(x, round(y * ratio)), body,
+                                             (hue, shadows, stripe, y))
+        finally:
+            self.app.setProperty("spritelinkThemeHue", previous_hue)
+
     def test_checkbox_outline_and_checked_glyph_survive_without_text_shadows(self):
         from PySide6.QtWidgets import QCheckBox, QStyle, QStyleOptionButton
         checkbox = QCheckBox("Check", self.window)

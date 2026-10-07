@@ -1700,6 +1700,8 @@ class RuntimeOptimizationTests(unittest.TestCase):
         next_block = mock.Mock()
         block.next.return_value = next_block
         next_block.isValid.return_value = True
+        block.blockFormat.return_value = SPRITELINK.QTextBlockFormat()
+        next_block.blockFormat.return_value = SPRITELINK.QTextBlockFormat()
         document_layout = (
             browser.document.return_value.documentLayout.return_value
         )
