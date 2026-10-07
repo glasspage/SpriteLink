@@ -1145,7 +1145,7 @@ QScrollBar:vertical {
 }
 QScrollBar::handle:vertical {
     background: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0,
+        x1:0, y1:0, x2:0, y2:1,
         stop:0 rgba(255, 255, 255, 235),
         stop:0.45 rgba(165, 207, 232, 232),
         stop:1 rgba(102, 167, 207, 232)
