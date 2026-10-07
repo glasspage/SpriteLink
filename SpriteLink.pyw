@@ -1138,29 +1138,83 @@ QScrollArea, QScrollArea > QWidget > QWidget {
     border: none;
 }
 QScrollBar:vertical {
-    background: rgba(220, 238, 248, 155);
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #d5e0e8,
+        stop:0.25 #e6edf2,
+        stop:1 #f3f7fa
+    );
     width: 14px;
-    margin: 1px;
-    border-radius: 6px;
+    margin: 15px 1px;
+    border-radius: 2px;
 }
-QScrollBar::handle:vertical {
+QScrollBar::handle:vertical,
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     background: qlineargradient(
         x1:0, y1:0, x2:0, y2:1,
-        stop:0 rgba(255, 255, 255, 235),
-        stop:0.45 rgba(165, 207, 232, 232),
-        stop:1 rgba(102, 167, 207, 232)
+        stop:0 #ffffff,
+        stop:0.46 #edf5fa,
+        stop:0.50 #ccdce8,
+        stop:1 #e1edf5
     );
-    border: 1px solid #648fa9;
-    border-radius: 5px;
+    border: 1px solid #829eaf;
+    border-top-color: #b2c5d1;
+    border-radius: 2px;
+}
+QScrollBar::handle:vertical {
     min-height: 24px;
+    image: url("SPRITELINK_SCROLLBAR_ASSETS/scrollbar-grip.svg");
 }
-QScrollBar::handle:vertical:hover {
-    background: rgba(115, 190, 229, 240);
+QScrollBar::handle:vertical:hover,
+QScrollBar::add-line:vertical:hover, QScrollBar::sub-line:vertical:hover {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #ffffff,
+        stop:0.46 #e4f5fd,
+        stop:0.50 #afd9f0,
+        stop:1 #c6e8f8
+    );
+    border-color: #4d8caf;
+    border-top-color: #9ccbe4;
 }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::handle:vertical:pressed,
+QScrollBar::add-line:vertical:pressed, QScrollBar::sub-line:vertical:pressed {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #c7e7f6,
+        stop:0.46 #b5dcf0,
+        stop:0.50 #82bbdd,
+        stop:1 #a8d6ef
+    );
+    border-color: #397b9f;
+}
+QScrollBar::handle:vertical:disabled,
+QScrollBar::add-line:vertical:disabled, QScrollBar::sub-line:vertical:disabled {
+    background: #e8eef2;
+    border-color: #b4c1ca;
+}
+QScrollBar::sub-line:vertical {
+    height: 12px;
+    subcontrol-origin: margin;
+    subcontrol-position: top;
+}
+QScrollBar::add-line:vertical {
+    height: 12px;
+    subcontrol-origin: margin;
+    subcontrol-position: bottom;
+}
+QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
+    width: 6px;
+    height: 4px;
+}
+QScrollBar::up-arrow:vertical {
+    image: url("SPRITELINK_SCROLLBAR_ASSETS/scrollbar-up.svg");
+}
+QScrollBar::down-arrow:vertical {
+    image: url("SPRITELINK_SCROLLBAR_ASSETS/scrollbar-down.svg");
+}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
     background: transparent;
-    height: 0px;
 }
 QSlider:horizontal {
     min-height: 21px;
@@ -1207,7 +1261,7 @@ QToolTip {
 QFrame[frameShape="4"], QFrame[frameShape="5"] {
     color: rgba(73, 115, 140, 190);
 }
-"""
+""".replace("SPRITELINK_SCROLLBAR_ASSETS", (Path(__file__).resolve().parent / "assets").as_posix())
 
 # Dark, moderately saturated colors that remain readable against the standard
 # light chat background. A color is selected only when a new local
