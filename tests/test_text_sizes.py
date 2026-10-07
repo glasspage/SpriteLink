@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QApplication, QStyleFactory
 from test_security import SPRITELINK as S
 
 
-class TextSizeDevelopmentTests(unittest.TestCase):
+class UiSizePresetTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -27,6 +27,7 @@ class TextSizeDevelopmentTests(unittest.TestCase):
                 "spritelinkTextShadows",
                 "spritelinkThemeHue",
                 "spritelinkClassicColor",
+                "spritelinkTinyUI",
             )
         }
         config = S.default_config()
@@ -77,14 +78,40 @@ class TextSizeDevelopmentTests(unittest.TestCase):
         self.app.setStyleSheet(self.sheet)
         self.app.setFont(self.font)
 
-    def test_development_controls_start_at_existing_sizes(self):
-        for key, _label in S.TEXT_SIZE_CONTROLS:
-            self.assertEqual(
-                self.client.text_size_spinboxes[key].value(),
-                S.DEFAULT_TEXT_SIZES[key],
-            )
+    def _select_size(self, size: str) -> None:
+        self.client.ui_size_combo.setCurrentText(size)
+        QTest.qWait(20)
 
-    def test_compact_chat_hides_icons_and_reduces_line_height(self):
+    def test_small_is_default_and_presets_match_requested_sizes(self):
+        self.assertEqual(S.DEFAULT_UI_SIZE, "Small")
+        self.assertEqual(self.client.ui_size_combo.currentText(), "Small")
+        self.assertEqual(
+            S.ui_size_text_sizes("Large"),
+            {
+                "chat_log": 15,
+                "message_input": 15,
+                "chatrooms": 11,
+                "status": 11,
+                "other_ui": 11,
+            },
+        )
+        self.assertEqual(
+            S.ui_size_text_sizes("Small"),
+            S.DEFAULT_TEXT_SIZES,
+        )
+        self.assertEqual(
+            S.ui_size_text_sizes("Tiny"),
+            {
+                "chat_log": 11,
+                "message_input": 11,
+                "chatrooms": 8,
+                "status": 8,
+                "other_ui": 8,
+            },
+        )
+        self.assertFalse(hasattr(self.client, "text_size_spinboxes"))
+
+    def test_tiny_hides_chat_icons_and_reduces_line_height(self):
         default_height = self.client._chat_line_height("Arial")
         self.assertTrue(self.client._chat_icons_visible())
         self.assertGreaterEqual(
@@ -92,95 +119,102 @@ class TextSizeDevelopmentTests(unittest.TestCase):
             S.DEFAULT_MESSAGE_LINE_HEIGHT_PX,
         )
 
-        self.client.text_size_spinboxes["chat_log"].setValue(10)
-        QTest.qWait(10)
+        self._select_size("Tiny")
 
-        compact_height = self.client._chat_line_height("Arial")
-        compact_font = self.client._make_message_font(
+        tiny_height = self.client._chat_line_height("Arial")
+        tiny_font = self.client._make_message_font(
             "Arial",
             role="chat_log",
         )
         self.assertFalse(self.client._chat_icons_visible())
-        self.assertLess(compact_height, default_height)
+        self.assertLess(tiny_height, default_height)
         self.assertGreaterEqual(
-            compact_height,
-            QFontMetrics(compact_font).height(),
+            tiny_height,
+            QFontMetrics(tiny_font).height(),
         )
 
-    def test_large_chat_text_expands_line_height(self):
-        default_height = self.client._chat_line_height("Arial")
-        self.client.text_size_spinboxes["chat_log"].setValue(18)
-        QTest.qWait(10)
-        self.assertGreater(
-            self.client._chat_line_height("Arial"),
-            default_height,
-        )
-
-    def test_message_input_and_other_ui_sizes_are_independent(self):
-        initial_chat_size = self.client._make_message_font(
+    def test_large_increases_chat_input_and_other_ui_together(self):
+        small_chat = self.client._make_message_font(
             "Arial",
             role="chat_log",
         ).pointSize()
-        initial_input_size = self.client._make_message_font(
+        small_input = self.client._make_message_font(
             "Arial",
             role="message_input",
         ).pointSize()
-        initial_button_size = self.client.config_toggle.font().pointSize()
+        small_button = self.client.config_toggle.font().pointSize()
 
-        self.client.text_size_spinboxes["other_ui"].setValue(12)
-        QTest.qWait(10)
+        self._select_size("Large")
 
         self.assertEqual(
             self.client._make_message_font(
                 "Arial",
                 role="chat_log",
             ).pointSize(),
-            initial_chat_size,
-        )
-        self.assertEqual(
-            self.client._make_message_font(
-                "Arial",
-                role="message_input",
-            ).pointSize(),
-            initial_input_size,
-        )
-        self.assertEqual(
-            self.client.config_toggle.font().pointSize(),
-            initial_button_size + 3,
-        )
-
-        self.client.text_size_spinboxes["message_input"].setValue(10)
-        QTest.qWait(10)
-        self.assertEqual(
-            self.client._make_message_font(
-                "Arial",
-                role="chat_log",
-            ).pointSize(),
-            initial_chat_size,
+            small_chat + 2,
         )
         self.assertEqual(
             self.client.message_entry.font().pointSize(),
-            initial_input_size - 3,
+            small_input + 2,
+        )
+        self.assertEqual(
+            self.client.config_toggle.font().pointSize(),
+            small_button + 2,
         )
 
-    def test_text_size_config_is_normalized_and_clamped(self):
-        normalized = S.normalize_text_sizes({
-            "chat_log": 2,
-            "message_input": 99,
-            "chatrooms": "11",
-            "status": "bad",
-        })
-        self.assertEqual(normalized["chat_log"], S.TEXT_SIZE_MIN_PT)
-        self.assertEqual(normalized["message_input"], S.TEXT_SIZE_MAX_PT)
-        self.assertEqual(normalized["chatrooms"], 11)
+    def test_tiny_uses_exact_compact_minimum_and_small_restores_normal_minimum(self):
         self.assertEqual(
-            normalized["status"],
-            S.DEFAULT_TEXT_SIZES["status"],
+            (self.root.minimumWidth(), self.root.minimumHeight()),
+            (S.MINIMUM_WINDOW_WIDTH, S.MINIMUM_WINDOW_HEIGHT),
+        )
+
+        self._select_size("Tiny")
+
+        self.assertEqual(
+            (self.root.minimumWidth(), self.root.minimumHeight()),
+            (470, 250),
         )
         self.assertEqual(
-            normalized["other_ui"],
-            S.DEFAULT_TEXT_SIZES["other_ui"],
+            S.minimum_window_size("Tiny"),
+            (470, 250),
         )
+        self.assertEqual(
+            S.normalize_window_size(100, 100, "Tiny"),
+            (470, 250),
+        )
+
+        self._select_size("Small")
+
+        self.assertEqual(
+            (self.root.minimumWidth(), self.root.minimumHeight()),
+            (S.MINIMUM_WINDOW_WIDTH, S.MINIMUM_WINDOW_HEIGHT),
+        )
+
+    def test_tiny_reduces_modern_spacing_and_control_chrome(self):
+        small_spacing = self.client.config_tab.layout().verticalSpacing()
+        small_button_height = self.client.config_toggle.sizeHint().height()
+        small_combo_height = self.client.theme_combo.sizeHint().height()
+        self.assertEqual(small_spacing, 12)
+
+        self._select_size("Tiny")
+
+        self.assertEqual(
+            self.client.config_tab.layout().verticalSpacing(),
+            5,
+        )
+        self.assertLess(
+            self.client.config_toggle.sizeHint().height(),
+            small_button_height,
+        )
+        self.assertLess(
+            self.client.theme_combo.sizeHint().height(),
+            small_combo_height,
+        )
+        self.assertTrue(bool(self.app.property("spritelinkTinyUI")))
+
+    def test_invalid_ui_size_normalizes_to_small(self):
+        self.assertEqual(S.normalize_ui_size("Huge"), "Small")
+        self.assertEqual(S.normalize_ui_size(None), "Small")
 
 
 if __name__ == "__main__":
