@@ -321,6 +321,7 @@ GLOBAL_CHATROOM_NICKNAME = "Global"
 GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
 CHATROOM_SIDEBAR_WIDTH = 180
 CONFIG_POPUP_MAX_WIDTH = 720
+CONFIG_PANEL_MAX_WIDTH = 760
 DEFAULT_MESSAGE_SOUND = "Chime"
 DEFAULT_MESSAGE_SOUND_VOLUME = 100
 MESSAGE_SOUND_OPTIONS = (
@@ -6738,6 +6739,14 @@ class EncryptedChatClient(QObject):
                 3 if tiny else 5,
             )
             panel.layout().setSpacing(4 if tiny else 7)
+        if hasattr(self, "identity_color_button"):
+            self.identity_color_button.setText(
+                "..." if tiny else "Choose..."
+            )
+        if hasattr(self, "profile_icon_button"):
+            self.profile_icon_button.setText(
+                "..." if tiny else "Browse..."
+            )
         if hasattr(self, "config_tab") and self.config_tab.layout() is not None:
             margin = 10 if tiny else 14
             self.config_tab.layout().setContentsMargins(
@@ -6801,6 +6810,8 @@ class EncryptedChatClient(QObject):
             self.message_resize_timer.start(0)
         if hasattr(self, "chatrooms_list"):
             self.chatrooms_list.refresh_row_sizes()
+        if hasattr(self, "chatrooms_toggle"):
+            self._update_chatrooms_toggle_unread_style()
 
     def _chat_icons_visible(self) -> bool:
         return (
@@ -8141,15 +8152,21 @@ QComboBox::drop-down {
             and int(unread_count or 0) > 0
             for room_id, unread_count in self._unread_counts().items()
         )
+        button = self.chatrooms_toggle
+        button.setMinimumHeight(0)
+        button.setMaximumHeight(16777215)
+        button.setStyleSheet("")
+        button.ensurePolished()
+        base_height = button.sizeHint().height()
+
         if has_visible_unread:
-            self.chatrooms_toggle.setStyleSheet(
+            button.setStyleSheet(
                 notification_button_stylesheet(
                     self._is_windows_classic_theme(),
                     self._is_glassy_theme(),
                 )
             )
-        else:
-            self.chatrooms_toggle.setStyleSheet("")
+        button.setFixedHeight(base_height)
 
     def _update_config_toggle_update_style(self) -> None:
         if not hasattr(self, "config_toggle"):
@@ -9311,9 +9328,11 @@ QComboBox::drop-down {
         self.identity_color_preview.setFrameShape(QFrame.Shape.Panel)
         self.identity_color_preview.setFrameShadow(QFrame.Shadow.Sunken)
         identity_layout.addWidget(self.identity_color_preview)
-        identity_color_button = QPushButton("Choose...")
-        identity_color_button.clicked.connect(self._choose_identity_color)
-        identity_layout.addWidget(identity_color_button)
+        self.identity_color_button = QPushButton("Choose...")
+        self.identity_color_button.clicked.connect(
+            self._choose_identity_color
+        )
+        identity_layout.addWidget(self.identity_color_button)
         identity_layout.addSpacing(8)
         identity_layout.addWidget(QLabel("Icon (16x16)"))
         self.profile_icon_preview = QLabel()
@@ -9328,9 +9347,11 @@ QComboBox::drop-down {
             self._show_profile_icon_context_menu
         )
         identity_layout.addWidget(self.profile_icon_preview)
-        profile_icon_button = QPushButton("Browse...")
-        profile_icon_button.clicked.connect(self._choose_profile_icon)
-        identity_layout.addWidget(profile_icon_button)
+        self.profile_icon_button = QPushButton("Browse...")
+        self.profile_icon_button.clicked.connect(
+            self._choose_profile_icon
+        )
+        identity_layout.addWidget(self.profile_icon_button)
         self.identity_menu.hide()
         content_layout.addWidget(self.identity_menu)
 
@@ -9880,7 +9901,7 @@ QComboBox::drop-down {
 
         self.config_panel = QFrame()
         self.config_panel.setObjectName("configPanel")
-        self.config_panel.setMaximumWidth(CONFIG_POPUP_MAX_WIDTH)
+        self.config_panel.setMaximumWidth(CONFIG_PANEL_MAX_WIDTH)
         self.config_panel.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
