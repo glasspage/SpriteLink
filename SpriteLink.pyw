@@ -6532,12 +6532,18 @@ class EncryptedChatClient(QObject):
         if role not in {"chat_log", "message_input"}:
             role = "message_input"
         base_point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
+        text_size_getter = getattr(self, "_text_size", None)
+        configured_point_size = (
+            int(text_size_getter(role))
+            if callable(text_size_getter)
+            else DEFAULT_TEXT_SIZES[role]
+        )
         point_size = max(
             TEXT_SIZE_MIN_PT,
             min(
                 TEXT_SIZE_MAX_PT,
                 base_point_size
-                + self._text_size(role)
+                + configured_point_size
                 - DEFAULT_TEXT_SIZES[role],
             ),
         )
@@ -6669,7 +6675,11 @@ class EncryptedChatClient(QObject):
         if hasattr(self, "message_font_combo"):
             self._refresh_message_font_combo_fonts()
         if hasattr(self, "message_entry"):
-            self._apply_active_composer_style()
+            profile = self._active_room_profile()
+            self.message_entry.setFont(
+                self._make_message_font(profile["font"])
+            )
+            self.message_resize_timer.start(0)
         if hasattr(self, "chatrooms_list"):
             self.chatrooms_list.refresh_row_sizes()
 
