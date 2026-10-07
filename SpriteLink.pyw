@@ -6644,7 +6644,11 @@ class EncryptedChatClient(QObject):
         for widget in widgets:
             if widget in {chat_display, message_entry, status_label}:
                 continue
-            if self._is_widget_within(widget, chatrooms_panel):
+            if (
+                self._is_widget_within(widget, chat_display)
+                or self._is_widget_within(widget, message_entry)
+                or self._is_widget_within(widget, chatrooms_panel)
+            ):
                 continue
             self._set_widget_text_size(widget, "other_ui")
 
