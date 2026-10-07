@@ -808,6 +808,19 @@ def minimum_window_size(value: Any) -> tuple[int, int]:
     if normalize_ui_size(value) == "Tiny":
         return TINY_MINIMUM_WINDOW_WIDTH, TINY_MINIMUM_WINDOW_HEIGHT
     return MINIMUM_WINDOW_WIDTH, MINIMUM_WINDOW_HEIGHT
+
+
+def client_ui_size(client: Any) -> str:
+    config = getattr(client, "config_data", None)
+    if isinstance(config, dict):
+        return normalize_ui_size(config.get("ui_size"))
+    return DEFAULT_UI_SIZE
+
+
+def client_is_tiny_ui(client: Any) -> bool:
+    return client_ui_size(client) == "Tiny"
+
+
 COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
 RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
 RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
@@ -6554,7 +6567,7 @@ class EncryptedChatClient(QObject):
         return sizes[key]
 
     def _is_tiny_ui(self) -> bool:
-        return normalize_ui_size(self.config_data.get("ui_size")) == "Tiny"
+        return client_is_tiny_ui(self)
 
     def _make_message_font(
         self,
@@ -6748,7 +6761,7 @@ class EncryptedChatClient(QObject):
         )
         app = QApplication.instance()
         if app is not None:
-            app.setProperty("spritelinkTinyUI", self._is_tiny_ui())
+            app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
         minimum_width, minimum_height = minimum_window_size(
             self.config_data["ui_size"]
         )
@@ -7481,7 +7494,7 @@ class EncryptedChatClient(QObject):
         stylesheet: str,
         theme: str,
     ) -> str:
-        if not self._is_tiny_ui():
+        if not client_is_tiny_ui(self):
             return stylesheet
 
         common = """
@@ -7583,7 +7596,7 @@ QComboBox::drop-down {
         position = client_theme_color(self, theme)
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
-        app.setProperty("spritelinkTinyUI", self._is_tiny_ui())
+        app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
 
         available_styles = {
             name.casefold(): name for name in QStyleFactory.keys()
@@ -7594,14 +7607,14 @@ QComboBox::drop-down {
                 available_styles.get("fusion", "Fusion"),
             )
             app.setPalette(self._windows_classic_palette())
-            app.setStyleSheet(self._ui_density_stylesheet(
+            app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
                 classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position),
                 theme,
             ))
         elif self._is_glassy_theme():
             style_name = available_styles.get("fusion", "Fusion")
             app.setPalette(self._glassy_palette())
-            app.setStyleSheet(self._ui_density_stylesheet(
+            app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
                 hue_theme_stylesheet(GLASSY_STYLESHEET, position),
                 theme,
             ))
@@ -7613,7 +7626,7 @@ QComboBox::drop-down {
                 "Fusion",
             )
             app.setPalette(self._modern_palette())
-            app.setStyleSheet(self._ui_density_stylesheet(
+            app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
                 hue_theme_stylesheet(MODERN_STYLESHEET, position),
                 theme,
             ))
@@ -11042,7 +11055,7 @@ QComboBox::drop-down {
             return False
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
-        app.setProperty("spritelinkTinyUI", self._is_tiny_ui())
+        app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
         if theme == "Classic":
             palette = self._windows_classic_palette()
             stylesheet = classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position)
@@ -11052,7 +11065,7 @@ QComboBox::drop-down {
         else:
             palette = self._modern_palette()
             stylesheet = hue_theme_stylesheet(MODERN_STYLESHEET, position)
-        stylesheet = self._ui_density_stylesheet(stylesheet, theme)
+        stylesheet = EncryptedChatClient._ui_density_stylesheet(self, stylesheet, theme)
         # Repolish can reset explicitly assigned families and NoAntialias.
         # Keep the existing fonts, including Classic headings and user fonts.
         application_font = QFont(app.font())
