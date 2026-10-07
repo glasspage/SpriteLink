@@ -541,6 +541,11 @@ ED25519_PUBLIC_KEY_BYTES = 32
 ED25519_SIGNATURE_BYTES = 64
 VISIBLE_USER_ID_CHARS = 8
 SIGNED_MESSAGE_CONTEXT = "SpriteLink signed message v1"
+TENOR_MEDIA_HOSTS = (
+    "media.tenor.com",
+    "media1.tenor.com",
+    "c.tenor.com",
+)
 TRUSTED_EXTENSIONLESS_IMAGE_HOSTS = (
     "images.unsplash.com",
     "pbs.twimg.com",
@@ -548,6 +553,7 @@ TRUSTED_EXTENSIONLESS_IMAGE_HOSTS = (
     "res.cloudinary.com",
     "images.ctfassets.net",
     "cdn.sanity.io",
+    "media.gettyimages.com",
 )
 TRUSTED_IMAGE_HOST_PATTERNS = (
     "cdn.discordapp.com",
@@ -561,8 +567,7 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "cdn.bsky.app",
     "tenor.com",
     "www.tenor.com",
-    "media.tenor.com",
-    "c.tenor.com",
+    *TENOR_MEDIA_HOSTS,
     "giphy.com",
     "www.giphy.com",
     "media.giphy.com",
@@ -582,6 +587,13 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "cdn.sanity.io",
     "live.staticflickr.com",
     "cdn.pixabay.com",
+    "alamy.com",
+    "*.alamy.com",
+    "shutterstock.com",
+    "*.shutterstock.com",
+    "ak.picdn.net",
+    "ak4.picdn.net",
+    "media.gettyimages.com",
     "static.wikia.nocookie.net",
     "avatars.githubusercontent.com",
     "user-images.githubusercontent.com",
@@ -656,6 +668,9 @@ TRUSTED_LINK_DOMAINS = (
     "unsplash.com",
     "pexels.com",
     "pixabay.com",
+    "alamy.com",
+    "shutterstock.com",
+    "gettyimages.com",
     "flickr.com",
     "cloudinary.com",
     "ctfassets.net",
@@ -670,6 +685,8 @@ TRUSTED_LINK_DOMAINS = (
 TRUSTED_LINK_EXACT_HOSTS = (
     "adriansblinkiecollection.neocities.org",
     "steamuserimages-a.akamaihd.net",
+    "ak.picdn.net",
+    "ak4.picdn.net",
 )
 IMAGE_LINK_EXTENSIONS = (
     ".png",
@@ -680,17 +697,12 @@ IMAGE_LINK_EXTENSIONS = (
     ".bmp",
     ".jfif",
 )
-TENOR_MEDIA_HOSTS = (
-    "media.tenor.com",
-    "c.tenor.com",
-)
 TENOR_VIDEO_EXTENSIONS = (
     ".mp4",
     ".webm",
 )
 LOOPING_VIDEO_HOST_PATTERNS = (
-    "media.tenor.com",
-    "c.tenor.com",
+    *TENOR_MEDIA_HOSTS,
     "*.klipy.com",
     "media.giphy.com",
     "media0.giphy.com",

@@ -2935,6 +2935,37 @@ class ProfileIconTests(unittest.TestCase):
 
 
 class ImageTrustTests(unittest.TestCase):
+    def test_stock_and_tenor_cdns_are_trusted_for_images_and_links(self) -> None:
+        urls = (
+            "https://c8.alamy.com/comp/example/photo.jpg",
+            "https://c7.alamy.com/comp/example/photo.jpg",
+            "https://media1.tenor.com/m/example/tenor.gif",
+            "https://image.shutterstock.com/image-photo/example.jpg",
+            "https://thumb9.shutterstock.com/thumb_small/example.jpg",
+            "https://ak.picdn.net/shutterstock/photos/example/preview.jpg",
+            "https://ak4.picdn.net/shutterstock/videos/example/thumb/1.jpg",
+            "https://media.gettyimages.com/id/example/photo/sample.jpg",
+            "https://media.gettyimages.com/photos/sample-picture-id123?s=170x170",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertTrue(SPRITELINK.is_trusted_image_url(url))
+                self.assertTrue(SPRITELINK.is_embeddable_media_url(url))
+                self.assertTrue(SPRITELINK.analyze_link_url(url).trusted)
+                parsed = SPRITELINK.urlsplit(url)
+                labels = parsed.hostname.split(".")
+                lookalike_host = ".".join(labels[:-2] + [f"evil{labels[-2]}", labels[-1]])
+                for host in (f"{parsed.hostname}.evil.example", lookalike_host):
+                    spoof = f"https://{host}{parsed.path}"
+                    self.assertFalse(SPRITELINK.is_trusted_image_url(spoof))
+                    self.assertFalse(SPRITELINK.analyze_link_url(spoof).trusted)
+                insecure = url.replace("https://", "http://", 1)
+                self.assertFalse(SPRITELINK.is_trusted_image_url(insecure))
+                self.assertFalse(SPRITELINK.analyze_link_url(insecure).trusted)
+                self.assertFalse(SPRITELINK.analyze_link_url(
+                    url.replace("https://", "https://attacker@", 1)
+                ).trusted)
+
     def test_requested_and_common_cdn_hosts_are_trusted(self) -> None:
         trusted_urls = (
             "https://cdn.discordapp.com/attachments/1/2/example.png",
@@ -3348,6 +3379,8 @@ class ImageEmbeddingTests(unittest.TestCase):
     def test_tenor_videos_are_embeddable_looping_media(self) -> None:
         urls = (
             "https://media.tenor.com/example/tenor.mp4",
+            "https://media1.tenor.com/m/example/tenor.mp4",
+            "https://media1.tenor.com/m/example/tenor.webm",
             "https://c.tenor.com/example/tenor.webm",
             "https://media.tenor.com/example/tenor?format=mp4",
             "https://cdn.klipy.com/example.mp4",
