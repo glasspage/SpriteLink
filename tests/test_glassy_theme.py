@@ -121,6 +121,52 @@ class GlassyControlRenderingTests(unittest.TestCase):
         self.app.setPalette(self.previous_palette)
         self.app.setStyleSheet(self.previous_sheet)
 
+    def test_pressed_buttons_invert_gloss_without_changing_rounded_bounds(self):
+        from PySide6.QtCore import QPoint
+        from PySide6.QtGui import QColor
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QPushButton
+        self.window.setObjectName("buttonTestBackground")
+        self.window.setStyleSheet("QWidget#buttonTestBackground { background: #ff00ff; }")
+        background = QColor("#ff00ff")
+        button = QPushButton("", self.window)
+        button.setCheckable(True)
+        for width, height in ((120, 34), (80, 24), (30, 22)):
+            button.setDown(False)
+            button.setChecked(False)
+            button.setGeometry(20, 20, width, height)
+            button.show()
+            QTest.mouseMove(self.window, QPoint(290, 150))
+            self.app.processEvents()
+            normal = button.grab().toImage()
+            ratio = normal.devicePixelRatio()
+            x = normal.width() // 2
+            top, bottom = normal.height() // 4, 3 * normal.height() // 4
+            self.assertGreater(normal.pixelColor(x, top).lightnessF(),
+                               normal.pixelColor(x, bottom).lightnessF())
+            geometry, hint = button.geometry(), button.sizeHint()
+            for checked in (False, True):
+                with self.subTest(size=(width, height), checked=checked):
+                    button.setChecked(checked)
+                    button.setDown(not checked)
+                    self.app.processEvents()
+                    pressed = button.grab().toImage()
+                    self.assertLess(pressed.pixelColor(x, top).lightnessF(),
+                                    pressed.pixelColor(x, bottom).lightnessF())
+                    self.assertEqual(button.geometry(), geometry)
+                    self.assertEqual(button.sizeHint(), hint)
+                    # A single rounded outline keeps all four corners inside
+                    # the normal silhouette, including at fractional scaling.
+                    for y in range(normal.height()):
+                        for px in range(normal.width()):
+                            if normal.pixelColor(px, y) == background:
+                                self.assertEqual(pressed.pixelColor(px, y), background)
+                    inset = max(0, round(ratio / 2) - 1)
+                    self.assertEqual(pressed.pixelColor(inset, pressed.height() // 2),
+                                     pressed.pixelColor(x, pressed.height() - 1 - inset))
+            button.setDown(False)
+            button.setChecked(False)
+
     def test_separator_top_padding_matches_translucent_body_and_bottom(self):
         from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
         browser = SPRITELINK.MessageLogBrowser(self.window)
