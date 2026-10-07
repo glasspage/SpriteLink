@@ -7476,6 +7476,104 @@ class EncryptedChatClient(QObject):
     def _apply_titlebar_theme(self) -> None:
         self._apply_window_titlebar_theme(self.root)
 
+    def _ui_density_stylesheet(
+        self,
+        stylesheet: str,
+        theme: str,
+    ) -> str:
+        if not self._is_tiny_ui():
+            return stylesheet
+
+        common = """
+QMenu::item {
+    padding-top: 2px;
+    padding-bottom: 2px;
+}
+QSlider:horizontal {
+    min-height: 18px;
+}
+"""
+        if theme == "Modern":
+            compact = """
+QPushButton {
+    padding: 2px 7px;
+    min-height: 14px;
+}
+QComboBox {
+    padding: 1px 20px 1px 6px;
+    min-height: 14px;
+}
+QComboBox::drop-down {
+    width: 18px;
+}
+QLineEdit {
+    padding: 1px 5px;
+}
+QPlainTextEdit {
+    padding: 1px;
+}
+QMenu {
+    padding: 2px;
+}
+QMenu::item {
+    padding-left: 18px;
+    padding-right: 18px;
+}
+QMenu::separator {
+    margin: 2px 5px;
+}
+"""
+        elif theme == "Glassy":
+            compact = """
+QPushButton {
+    padding: 2px 7px;
+    min-height: 14px;
+}
+QPushButton:pressed, QPushButton:checked {
+    padding-top: 3px;
+    padding-bottom: 1px;
+}
+QPushButton#identityMenuButton,
+QPushButton#fontMenuButton,
+QPushButton#formattingMenuButton {
+    min-height: 14px;
+    padding-top: 1px;
+    padding-bottom: 1px;
+}
+QLineEdit, QPlainTextEdit {
+    padding-top: 1px;
+    padding-bottom: 1px;
+}
+QComboBox {
+    padding: 1px 20px 1px 5px;
+    min-height: 14px;
+}
+QComboBox::drop-down {
+    width: 18px;
+}
+"""
+        else:
+            compact = """
+QPushButton {
+    padding: 1px 6px;
+    min-height: 14px;
+}
+QPushButton:pressed, QPushButton:checked {
+    padding-top: 2px;
+    padding-left: 7px;
+    padding-right: 5px;
+    padding-bottom: 0px;
+}
+QComboBox {
+    padding: 1px 3px;
+    min-height: 14px;
+}
+QComboBox::drop-down {
+    width: 18px;
+}
+"""
+        return stylesheet + common + compact
+
     def _apply_theme(self) -> None:
         app = QApplication.instance()
         if app is None:
@@ -7485,6 +7583,7 @@ class EncryptedChatClient(QObject):
         position = client_theme_color(self, theme)
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
+        app.setProperty("spritelinkTinyUI", self._is_tiny_ui())
 
         available_styles = {
             name.casefold(): name for name in QStyleFactory.keys()
@@ -7495,11 +7594,17 @@ class EncryptedChatClient(QObject):
                 available_styles.get("fusion", "Fusion"),
             )
             app.setPalette(self._windows_classic_palette())
-            app.setStyleSheet(classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position))
+            app.setStyleSheet(self._ui_density_stylesheet(
+                classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position),
+                theme,
+            ))
         elif self._is_glassy_theme():
             style_name = available_styles.get("fusion", "Fusion")
             app.setPalette(self._glassy_palette())
-            app.setStyleSheet(hue_theme_stylesheet(GLASSY_STYLESHEET, position))
+            app.setStyleSheet(self._ui_density_stylesheet(
+                hue_theme_stylesheet(GLASSY_STYLESHEET, position),
+                theme,
+            ))
         else:
             style_name = next(
                 (available_styles[name] for name in (
@@ -7508,7 +7613,10 @@ class EncryptedChatClient(QObject):
                 "Fusion",
             )
             app.setPalette(self._modern_palette())
-            app.setStyleSheet(hue_theme_stylesheet(MODERN_STYLESHEET, position))
+            app.setStyleSheet(self._ui_density_stylesheet(
+                hue_theme_stylesheet(MODERN_STYLESHEET, position),
+                theme,
+            ))
 
         text_shadows_enabled = bool(self.text_shadows_var.get())
         app.setProperty("spritelinkTextShadows", text_shadows_enabled)
@@ -10934,6 +11042,7 @@ class EncryptedChatClient(QObject):
             return False
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
+        app.setProperty("spritelinkTinyUI", self._is_tiny_ui())
         if theme == "Classic":
             palette = self._windows_classic_palette()
             stylesheet = classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position)
@@ -10943,6 +11052,7 @@ class EncryptedChatClient(QObject):
         else:
             palette = self._modern_palette()
             stylesheet = hue_theme_stylesheet(MODERN_STYLESHEET, position)
+        stylesheet = self._ui_density_stylesheet(stylesheet, theme)
         # Repolish can reset explicitly assigned families and NoAntialias.
         # Keep the existing fonts, including Classic headings and user fonts.
         application_font = QFont(app.font())
