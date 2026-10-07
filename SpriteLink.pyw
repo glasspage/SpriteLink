@@ -6839,7 +6839,7 @@ class EncryptedChatClient(QObject):
     ) -> int:
         font = (
             self._make_ui_font(
-                point_size=self._text_size("chat_log")
+                point_size=self._text_size("other_ui")
             )
             if ui_font
             else self._make_message_font(
@@ -14713,7 +14713,7 @@ QComboBox::drop-down {
         formatting.setFont(
             self._make_ui_font(
                 bold=bold,
-                point_size=self._text_size("chat_log"),
+                point_size=self._text_size("other_ui"),
             )
             if ui_font
             else self._make_message_font(

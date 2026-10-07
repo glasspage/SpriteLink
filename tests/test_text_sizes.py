@@ -162,6 +162,46 @@ class UiSizePresetTests(unittest.TestCase):
             small_button + 2,
         )
 
+    def test_muted_message_rows_use_smaller_fonts_for_each_ui_size(self):
+        item = {
+            "message": {
+                "u": "Muted User", "k": "#336699", "m": "Muted message",
+                "i": "muted-size-test", "c": "muted-user", "t": 1700000000,
+                "f": "Arial",
+            },
+            "is_local": False,
+        }
+        for theme in ("Modern", "Glassy", "Classic"):
+            self.client._on_theme_changed(theme)
+            for size, point_size in (("Small (Default)", 9), ("Large", 11),
+                                     ("Tiny", 8), ("Small (Default)", 9)):
+                with self.subTest(theme=theme, size=size):
+                    self._select_size(size)
+                    document = self.client.chat_display.document()
+                    document.clear()
+                    cursor = S.QTextCursor(document)
+                    self.client._insert_message_item(
+                        cursor, item, muted_ids={"muted-user"}, collapsed_ids=set(),
+                        trusted_user_ids=set(), background_color="#ffffff", row_selections=[],
+                    )
+                    block = document.firstBlock()
+                    self.assertEqual(block.text(), "Muted User (muted): Muted message")
+                    fragments = block.begin()
+                    while not fragments.atEnd():
+                        fragment = fragments.fragment()
+                        if fragment.isValid():
+                            font = fragment.charFormat().font()
+                            self.assertEqual(font.pointSize(), point_size)
+                            self.assertEqual(font.family(), self.client._ui_font_family())
+                            self.assertGreaterEqual(block.blockFormat().lineHeight(),
+                                                    QFontMetrics(font).height())
+                        fragments += 1
+                    self.assertEqual(block.blockFormat().lineHeight(),
+                                     self.client._chat_line_height("Arial", ui_font=True))
+                    self.assertLess(point_size, self.client._make_message_font(
+                        "Arial", role="chat_log"
+                    ).pointSize())
+
     def test_tiny_uses_exact_compact_minimum_and_small_restores_normal_minimum(self):
         self.assertEqual(
             (self.root.minimumWidth(), self.root.minimumHeight()),
