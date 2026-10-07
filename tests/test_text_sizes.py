@@ -83,8 +83,8 @@ class UiSizePresetTests(unittest.TestCase):
         QTest.qWait(20)
 
     def test_small_is_default_and_presets_match_requested_sizes(self):
-        self.assertEqual(S.DEFAULT_UI_SIZE, "Small")
-        self.assertEqual(self.client.ui_size_combo.currentText(), "Small")
+        self.assertEqual(S.DEFAULT_UI_SIZE, "Small (Default)")
+        self.assertEqual(self.client.ui_size_combo.currentText(), "Small (Default)")
         self.assertEqual(
             S.ui_size_text_sizes("Large"),
             {
@@ -96,7 +96,7 @@ class UiSizePresetTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            S.ui_size_text_sizes("Small"),
+            S.ui_size_text_sizes("Small (Default)"),
             S.DEFAULT_TEXT_SIZES,
         )
         self.assertEqual(
@@ -183,7 +183,7 @@ class UiSizePresetTests(unittest.TestCase):
             (470, 250),
         )
 
-        self._select_size("Small")
+        self._select_size("Small (Default)")
 
         self.assertEqual(
             (self.root.minimumWidth(), self.root.minimumHeight()),
@@ -212,9 +212,88 @@ class UiSizePresetTests(unittest.TestCase):
         )
         self.assertTrue(bool(self.app.property("spritelinkTinyUI")))
 
+    def test_placeholder_document_font_tracks_active_ui_size(self):
+        for size in ("Large", "Tiny", "Small (Default)"):
+            self._select_size(size)
+            profile = self.client._active_room_profile()
+            expected = self.client._make_message_font(
+                profile["font"],
+                role="chat_log",
+            ).pointSize()
+            self.assertEqual(
+                self.client.message_entry.document().defaultFont().pointSize(),
+                expected,
+            )
+            self.assertEqual(
+                self.client.message_entry.viewport().font().pointSize(),
+                expected,
+            )
+
+    def test_chatroom_rows_keep_ui_size_after_refresh_and_room_switch(self):
+        self._select_size("Tiny")
+        self.client.config_data["chatrooms"] = [{
+            "id": "test-room",
+            "nickname": "Test Room",
+            "key": "test-key",
+        }]
+        self.client._refresh_chatroom_list()
+
+        expected_size = S.ui_size_text_sizes("Tiny")["chatrooms"]
+        for index in range(self.client.chatrooms_list.count()):
+            item = self.client.chatrooms_list.item(index)
+            row = self.client.chatrooms_list.itemWidget(item)
+            self.assertIsNotNone(row)
+            for label in row.findChildren(S.QLabel):
+                self.assertEqual(label.font().pointSize(), expected_size)
+
+        self.client._activate_chatroom("test-room")
+        QTest.qWait(20)
+        for index in range(self.client.chatrooms_list.count()):
+            item = self.client.chatrooms_list.item(index)
+            row = self.client.chatrooms_list.itemWidget(item)
+            self.assertIsNotNone(row)
+            for label in row.findChildren(S.QLabel):
+                self.assertEqual(label.font().pointSize(), expected_size)
+
+    def test_theme_change_preserves_active_ui_size_fonts(self):
+        self._select_size("Tiny")
+        config_button_size = self.client.config_toggle.font().pointSize()
+        status_size = self.client.status_label.font().pointSize()
+        config_heading = next(
+            label
+            for label in self.client.config_panel.findChildren(S.QLabel)
+            if label.text() == "Config"
+        )
+        heading_size = config_heading.font().pointSize()
+
+        self.client.theme_combo.setCurrentText("Glassy")
+        QTest.qWait(20)
+
+        self.assertEqual(
+            self.client.config_toggle.font().pointSize(),
+            config_button_size,
+        )
+        self.assertEqual(
+            self.client.status_label.font().pointSize(),
+            status_size,
+        )
+        self.assertEqual(
+            config_heading.font().pointSize(),
+            heading_size,
+        )
+
+    def test_config_overlay_uses_more_horizontal_space(self):
+        margins = self.client.config_overlay.layout().contentsMargins()
+        self.assertEqual(margins.left(), 24)
+        self.assertEqual(margins.right(), 24)
+
+        panel_row = self.client.config_overlay.layout().itemAt(0).layout()
+        self.assertIsNotNone(panel_row)
+        self.assertEqual(panel_row.stretch(1), 10)
+
     def test_invalid_ui_size_normalizes_to_small(self):
-        self.assertEqual(S.normalize_ui_size("Huge"), "Small")
-        self.assertEqual(S.normalize_ui_size(None), "Small")
+        self.assertEqual(S.normalize_ui_size("Huge"), "Small (Default)")
+        self.assertEqual(S.normalize_ui_size(None), "Small (Default)")
 
 
 if __name__ == "__main__":
