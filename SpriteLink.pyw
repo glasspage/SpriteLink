@@ -321,6 +321,7 @@ GLOBAL_CHATROOM_NICKNAME = "Global"
 GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
 CHATROOM_SIDEBAR_WIDTH = 180
 CONFIG_POPUP_MAX_WIDTH = 720
+CONFIG_PANEL_MAX_WIDTH = 760
 DEFAULT_MESSAGE_SOUND = "Chime"
 DEFAULT_MESSAGE_SOUND_VOLUME = 100
 MESSAGE_SOUND_OPTIONS = (
@@ -475,6 +476,8 @@ DEFAULT_WINDOW_WIDTH = 840
 DEFAULT_WINDOW_HEIGHT = 650
 MINIMUM_WINDOW_WIDTH = 670
 MINIMUM_WINDOW_HEIGHT = 500
+TINY_MINIMUM_WINDOW_WIDTH = 470
+TINY_MINIMUM_WINDOW_HEIGHT = 250
 
 ON_SCREEN_POLL_INTERVAL_SECONDS = 6.0
 OFF_SCREEN_POLL_INTERVAL_SECONDS = 9.0
@@ -753,8 +756,74 @@ def message_row_backgrounds() -> tuple[str, str]:
     return MESSAGE_ROW_BACKGROUNDS
 
 
-MESSAGE_LINE_HEIGHT_PX = 24
-SPOILER_DISPLAY_HEIGHT_PX = 22
+DEFAULT_MESSAGE_LINE_HEIGHT_PX = 24
+CHAT_LINE_VERTICAL_PADDING_PX = 3
+SPOILER_VERTICAL_INSET_PX = 1.0
+TEXT_SIZE_MIN_PT = 7
+TEXT_SIZE_MAX_PT = 24
+DEFAULT_UI_SIZE = "Small (Default)"
+UI_SIZE_PRESETS = {
+    "Large": {
+        "chat_log": 15,
+        "message_input": 15,
+        "other_ui": 11,
+    },
+    "Small (Default)": {
+        "chat_log": 13,
+        "message_input": 13,
+        "other_ui": 9,
+    },
+    "Tiny": {
+        "chat_log": 11,
+        "message_input": 11,
+        "other_ui": 8,
+    },
+}
+DEFAULT_TEXT_SIZES = {
+    "chat_log": 13,
+    "message_input": 13,
+    "chatrooms": 9,
+    "status": 9,
+    "other_ui": 9,
+}
+
+
+def normalize_ui_size(value: Any) -> str:
+    size = str(value)
+    if size == "Small":
+        return DEFAULT_UI_SIZE
+    return size if size in UI_SIZE_PRESETS else DEFAULT_UI_SIZE
+
+
+def ui_size_text_sizes(value: Any) -> dict[str, int]:
+    preset = UI_SIZE_PRESETS[normalize_ui_size(value)]
+    other = int(preset["other_ui"])
+    return {
+        "chat_log": int(preset["chat_log"]),
+        "message_input": int(preset["message_input"]),
+        "chatrooms": other,
+        "status": other,
+        "other_ui": other,
+    }
+
+
+def minimum_window_size(value: Any) -> tuple[int, int]:
+    if normalize_ui_size(value) == "Tiny":
+        return TINY_MINIMUM_WINDOW_WIDTH, TINY_MINIMUM_WINDOW_HEIGHT
+    return MINIMUM_WINDOW_WIDTH, MINIMUM_WINDOW_HEIGHT
+
+
+def client_ui_size(client: Any) -> str:
+    config = getattr(client, "config_data", None)
+    if isinstance(config, dict):
+        return normalize_ui_size(config.get("ui_size"))
+    return DEFAULT_UI_SIZE
+
+
+def client_is_tiny_ui(client: Any) -> bool:
+    return client_ui_size(client) == "Tiny"
+
+
 COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
 RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
 RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
@@ -3144,6 +3213,7 @@ def default_config() -> dict[str, Any]:
         "theme": DEFAULT_THEME,
         "theme_colors": normalize_theme_colors(None),
         "text_shadows": True,
+        "ui_size": DEFAULT_UI_SIZE,
         "message_sound": DEFAULT_MESSAGE_SOUND,
         "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
         "custom_message_sound_path": "",
@@ -3220,6 +3290,8 @@ def load_config() -> dict[str, Any]:
         else ""
     )
     config["text_shadows"] = bool(config.get("text_shadows", True))
+    config["ui_size"] = normalize_ui_size(config.get("ui_size"))
+    config.pop("text_sizes", None)
     config["desktop_notifications"] = bool(
         config.get("desktop_notifications", False)
     )
@@ -3244,6 +3316,7 @@ def load_config() -> dict[str, Any]:
     window_width, window_height = normalize_window_size(
         config.get("window_width", DEFAULT_WINDOW_WIDTH),
         config.get("window_height", DEFAULT_WINDOW_HEIGHT),
+        config["ui_size"],
     )
     config["window_width"] = window_width
     config["window_height"] = window_height
@@ -3466,7 +3539,11 @@ def save_config(config: dict[str, Any]) -> None:
     )
 
 
-def normalize_window_size(width: Any, height: Any) -> tuple[int, int]:
+def normalize_window_size(
+    width: Any,
+    height: Any,
+    ui_size: Any = DEFAULT_UI_SIZE,
+) -> tuple[int, int]:
     try:
         normalized_width = int(width)
     except (TypeError, ValueError):
@@ -3475,10 +3552,14 @@ def normalize_window_size(width: Any, height: Any) -> tuple[int, int]:
         normalized_height = int(height)
     except (TypeError, ValueError):
         normalized_height = DEFAULT_WINDOW_HEIGHT
+    minimum_width, minimum_height = minimum_window_size(ui_size)
     return (
-        max(MINIMUM_WINDOW_WIDTH, min(DEFAULT_WINDOW_WIDTH, normalized_width)),
         max(
-            MINIMUM_WINDOW_HEIGHT,
+            minimum_width,
+            min(DEFAULT_WINDOW_WIDTH, normalized_width),
+        ),
+        max(
+            minimum_height,
             min(DEFAULT_WINDOW_HEIGHT, normalized_height),
         ),
     )
@@ -4587,7 +4668,9 @@ class ChatroomListRow(QWidget):
 
     def apply_theme(self) -> None:
         app = QApplication.instance()
-        vertical_margin = 3 if app is not None and app.property("spritelinkModern") else 1
+        modern = app is not None and app.property("spritelinkModern")
+        tiny = app is not None and app.property("spritelinkTinyUI")
+        vertical_margin = 1 if tiny else (3 if modern else 1)
         self.layout().setContentsMargins(4, vertical_margin, 4, vertical_margin)
 
 
@@ -5679,7 +5762,11 @@ class MessageLogBrowser(QTextBrowser):
                         start_x = line.cursorToX(start)[0]
                         end_x = line.cursorToX(end)[0]
                         spoiler_height = min(
-                            float(SPOILER_DISPLAY_HEIGHT_PX),
+                            max(
+                                1.0,
+                                line.height()
+                                - (SPOILER_VERTICAL_INSET_PX * 2.0),
+                            ),
                             line.height(),
                         )
                         spoiler_rect = QRectF(
@@ -6100,8 +6187,7 @@ class EncryptedChatClient(QObject):
         self.root.setWindowTitle("SpriteLink")
         self.config_data = load_config()
         self.root.setMinimumSize(
-            MINIMUM_WINDOW_WIDTH,
-            MINIMUM_WINDOW_HEIGHT,
+            *minimum_window_size(self.config_data.get("ui_size"))
         )
         self.root.resize(
             int(self.config_data["window_width"]),
@@ -6223,7 +6309,10 @@ class EncryptedChatClient(QObject):
         self._pending_tooltip_message_id: str | None = None
         self._pending_tooltip_global_position = QPoint()
         self._config_snapshot_at_open: tuple[Any, ...] | None = None
-        self._message_font_cache: dict[tuple[str, bool, bool], QFont] = {}
+        self._message_font_cache: dict[
+            tuple[str, bool, bool, str, int],
+            QFont,
+        ] = {}
         self._loading_profile_controls = False
         self._connection_error_visible = False
         self.active_chatroom_id = str(
@@ -6285,6 +6374,10 @@ class EncryptedChatClient(QObject):
         self.text_shadows_var = ValueModel(
             bool(self.config_data.get("text_shadows", True))
         )
+        self.config_data["ui_size"] = normalize_ui_size(
+            self.config_data.get("ui_size")
+        )
+        self.ui_size_var = ValueModel(self.config_data["ui_size"])
         self.message_sound_var = ValueModel(
             str(self.config_data["message_sound"])
         )
@@ -6424,6 +6517,7 @@ class EncryptedChatClient(QObject):
         self._apply_theme()
         self._apply_application_font_strategy()
         self._build_ui()
+        self._apply_ui_size()
         self._build_tray_icon()
         self._schedule_utc_midnight_reset()
         self._apply_server_preset_state()
@@ -6471,20 +6565,47 @@ class EncryptedChatClient(QObject):
         font.setStyleStrategy(self._font_style_strategy())
         return font
 
+    def _text_size(self, key: str) -> int:
+        sizes = ui_size_text_sizes(self.config_data.get("ui_size"))
+        return sizes[key]
+
+    def _is_tiny_ui(self) -> bool:
+        return client_is_tiny_ui(self)
+
     def _make_message_font(
         self,
         font_name: str,
         *,
         bold: bool = False,
+        role: str = "message_input",
     ) -> QFont:
+        if role not in {"chat_log", "message_input"}:
+            role = "message_input"
+        base_point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
+        text_size_getter = getattr(self, "_text_size", None)
+        configured_point_size = (
+            int(text_size_getter(role))
+            if callable(text_size_getter)
+            else DEFAULT_TEXT_SIZES[role]
+        )
+        point_size = max(
+            TEXT_SIZE_MIN_PT,
+            min(
+                TEXT_SIZE_MAX_PT,
+                base_point_size
+                + configured_point_size
+                - DEFAULT_TEXT_SIZES[role],
+            ),
+        )
         cache_key = (
             font_name,
             bool(bold),
             self._is_windows_classic_theme(),
+            role,
+            point_size,
         )
         cached = self._message_font_cache.get(cache_key)
         if cached is None:
-            point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
             cached = self._make_font(
                 self._resolved_font_family(font_name),
                 point_size,
@@ -6493,15 +6614,237 @@ class EncryptedChatClient(QObject):
             self._message_font_cache[cache_key] = cached
         return cached
 
-    def _make_ui_font(self, *, bold: bool = False) -> QFont:
+    def _make_ui_font(
+        self,
+        *,
+        bold: bool = False,
+        point_size: int | None = None,
+    ) -> QFont:
         app = QApplication.instance()
         font = QFont(
             app.font() if app is not None else self._basic_application_font
         )
         font.setFamily(self._ui_font_family())
+        if point_size is not None:
+            font.setPointSize(max(TEXT_SIZE_MIN_PT, int(point_size)))
         font.setBold(bold)
         font.setStyleStrategy(self._font_style_strategy())
         return font
+
+    @staticmethod
+    def _widget_base_point_size(widget: QWidget) -> int:
+        stored = widget.property("spritelinkBasePointSize")
+        try:
+            stored_size = int(stored)
+        except (TypeError, ValueError):
+            stored_size = 0
+        if stored_size > 0:
+            return stored_size
+        current_size = widget.font().pointSize()
+        if current_size <= 0:
+            app = QApplication.instance()
+            current_size = (
+                app.font().pointSize()
+                if app is not None and app.font().pointSize() > 0
+                else DEFAULT_TEXT_SIZES["other_ui"]
+            )
+        widget.setProperty("spritelinkBasePointSize", current_size)
+        return current_size
+
+    def _set_widget_text_size(
+        self,
+        widget: QWidget,
+        role: str,
+    ) -> None:
+        base_size = self._widget_base_point_size(widget)
+        point_size = max(
+            TEXT_SIZE_MIN_PT,
+            min(
+                TEXT_SIZE_MAX_PT,
+                base_size
+                + self._text_size(role)
+                - DEFAULT_TEXT_SIZES[role],
+            ),
+        )
+        font = QFont(widget.font())
+        if font.pointSize() != point_size:
+            font.setPointSize(point_size)
+            widget.setFont(font)
+
+    @staticmethod
+    def _is_widget_within(
+        widget: QWidget,
+        ancestor: QWidget | None,
+    ) -> bool:
+        if ancestor is None:
+            return False
+        current: QWidget | None = widget
+        while current is not None:
+            if current is ancestor:
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _apply_ui_size_to_widget_tree(self, root_widget: QWidget) -> None:
+        chat_display = getattr(self, "chat_display", None)
+        message_entry = getattr(self, "message_entry", None)
+        status_label = getattr(self, "status_label", None)
+        chatrooms_panel = getattr(self, "chatrooms_panel", None)
+        widgets = [root_widget, *root_widget.findChildren(QWidget)]
+        for widget in widgets:
+            if widget in {chat_display, message_entry, status_label}:
+                continue
+            if (
+                self._is_widget_within(widget, chat_display)
+                or self._is_widget_within(widget, message_entry)
+                or self._is_widget_within(widget, chatrooms_panel)
+            ):
+                continue
+            self._set_widget_text_size(widget, "other_ui")
+
+        if chatrooms_panel is not None:
+            for widget in [
+                chatrooms_panel,
+                *chatrooms_panel.findChildren(QWidget),
+            ]:
+                self._set_widget_text_size(widget, "chatrooms")
+
+        if status_label is not None:
+            self._set_widget_text_size(status_label, "status")
+
+    def _apply_layout_density(self) -> None:
+        tiny = self._is_tiny_ui()
+        if hasattr(self, "chat_tab") and self.chat_tab.layout() is not None:
+            margin = 6 if tiny else 10
+            self.chat_tab.layout().setContentsMargins(
+                margin,
+                margin,
+                margin,
+                margin,
+            )
+            self.chat_tab.layout().setSpacing(4 if tiny else 7)
+        if (
+            hasattr(self, "chat_content")
+            and self.chat_content.layout() is not None
+        ):
+            self.chat_content.layout().setSpacing(4 if tiny else 7)
+        for name in ("identity_menu", "font_menu", "formatting_menu"):
+            panel = getattr(self, name, None)
+            if panel is None or panel.layout() is None:
+                continue
+            panel.layout().setContentsMargins(
+                5 if tiny else 8,
+                3 if tiny else 5,
+                5 if tiny else 8,
+                3 if tiny else 5,
+            )
+            panel.layout().setSpacing(4 if tiny else 7)
+        if hasattr(self, "identity_color_button"):
+            self.identity_color_button.setText(
+                "..." if tiny else "Choose..."
+            )
+        if hasattr(self, "profile_icon_button"):
+            self.profile_icon_button.setText(
+                "..." if tiny else "Browse..."
+            )
+        if hasattr(self, "config_tab") and self.config_tab.layout() is not None:
+            margin = 10 if tiny else 14
+            self.config_tab.layout().setContentsMargins(
+                margin,
+                margin,
+                margin,
+                margin,
+            )
+            self.config_tab.layout().setVerticalSpacing(
+                self._config_row_spacing()
+            )
+        if (
+            hasattr(self, "advanced_config_content")
+            and self.advanced_config_content.layout() is not None
+        ):
+            self.advanced_config_content.layout().setVerticalSpacing(
+                self._config_row_spacing()
+            )
+
+    def _apply_ui_size(self) -> None:
+        self.config_data["ui_size"] = normalize_ui_size(
+            self.config_data.get("ui_size")
+        )
+        app = QApplication.instance()
+        if app is not None:
+            app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
+        minimum_width, minimum_height = minimum_window_size(
+            self.config_data["ui_size"]
+        )
+        self.root.setMinimumSize(minimum_width, minimum_height)
+        if (
+            self.root.width() < minimum_width
+            or self.root.height() < minimum_height
+        ):
+            self.root.resize(
+                max(self.root.width(), minimum_width),
+                max(self.root.height(), minimum_height),
+            )
+        self._message_font_cache.clear()
+        if hasattr(self, "root"):
+            self._apply_ui_size_to_widget_tree(self.root)
+        self._apply_layout_density()
+        if hasattr(self, "chat_display"):
+            self.chat_display.setFont(
+                self._make_message_font(
+                    DEFAULT_MESSAGE_FONT,
+                    role="chat_log",
+                )
+            )
+        if hasattr(self, "message_font_combo"):
+            self._refresh_message_font_combo_fonts()
+        if hasattr(self, "message_entry"):
+            profile = self._active_room_profile()
+            composer_font = self._make_message_font(
+                profile["font"],
+                role="message_input",
+            )
+            self.message_entry.setFont(composer_font)
+            self.message_entry.document().setDefaultFont(composer_font)
+            self.message_entry.viewport().setFont(composer_font)
+            self.message_resize_timer.start(0)
+        if hasattr(self, "chatrooms_list"):
+            self.chatrooms_list.refresh_row_sizes()
+        if hasattr(self, "chatrooms_toggle"):
+            self._update_chatrooms_toggle_unread_style()
+
+    def _chat_icons_visible(self) -> bool:
+        return (
+            self._text_size("chat_log")
+            >= DEFAULT_TEXT_SIZES["chat_log"]
+        )
+
+    def _chat_line_height(
+        self,
+        font_name: str,
+        *,
+        ui_font: bool = False,
+    ) -> int:
+        font = (
+            self._make_ui_font(
+                point_size=self._text_size("chat_log")
+            )
+            if ui_font
+            else self._make_message_font(
+                font_name,
+                role="chat_log",
+            )
+        )
+        text_height = max(1, QFontMetrics(font).height())
+        line_height = text_height + (
+            2 if self._is_tiny_ui() else CHAT_LINE_VERTICAL_PADDING_PX
+        )
+        if self._chat_icons_visible():
+            line_height = max(
+                DEFAULT_MESSAGE_LINE_HEIGHT_PX,
+                line_height,
+            )
+        return line_height
 
     def _make_link_warning_url_font(self) -> QFont:
         available_families = {
@@ -6546,6 +6889,8 @@ class EncryptedChatClient(QObject):
             self.chatrooms_list.refresh_row_sizes()
         if hasattr(self, "theme_color_slider"):
             self._sync_theme_color_slider()
+        if hasattr(self, "chat_tab"):
+            self._apply_ui_size()
 
     def _ui_font_family(self) -> str:
         if self._is_windows_classic_theme():
@@ -7163,6 +7508,104 @@ class EncryptedChatClient(QObject):
     def _apply_titlebar_theme(self) -> None:
         self._apply_window_titlebar_theme(self.root)
 
+    def _ui_density_stylesheet(
+        self,
+        stylesheet: str,
+        theme: str,
+    ) -> str:
+        if not client_is_tiny_ui(self):
+            return stylesheet
+
+        common = """
+QMenu::item {
+    padding-top: 2px;
+    padding-bottom: 2px;
+}
+QSlider:horizontal {
+    min-height: 18px;
+}
+"""
+        if theme == "Modern":
+            compact = """
+QPushButton {
+    padding: 2px 7px;
+    min-height: 14px;
+}
+QComboBox {
+    padding: 1px 20px 1px 6px;
+    min-height: 14px;
+}
+QComboBox::drop-down {
+    width: 18px;
+}
+QLineEdit {
+    padding: 1px 5px;
+}
+QPlainTextEdit {
+    padding: 1px;
+}
+QMenu {
+    padding: 2px;
+}
+QMenu::item {
+    padding-left: 18px;
+    padding-right: 18px;
+}
+QMenu::separator {
+    margin: 2px 5px;
+}
+"""
+        elif theme == "Glassy":
+            compact = """
+QPushButton {
+    padding: 2px 7px;
+    min-height: 14px;
+}
+QPushButton:pressed, QPushButton:checked {
+    padding-top: 3px;
+    padding-bottom: 1px;
+}
+QPushButton#identityMenuButton,
+QPushButton#fontMenuButton,
+QPushButton#formattingMenuButton {
+    min-height: 14px;
+    padding-top: 1px;
+    padding-bottom: 1px;
+}
+QLineEdit, QPlainTextEdit {
+    padding-top: 1px;
+    padding-bottom: 1px;
+}
+QComboBox {
+    padding: 1px 20px 1px 5px;
+    min-height: 14px;
+}
+QComboBox::drop-down {
+    width: 18px;
+}
+"""
+        else:
+            compact = """
+QPushButton {
+    padding: 1px 6px;
+    min-height: 14px;
+}
+QPushButton:pressed, QPushButton:checked {
+    padding-top: 2px;
+    padding-left: 7px;
+    padding-right: 5px;
+    padding-bottom: 0px;
+}
+QComboBox {
+    padding: 1px 3px;
+    min-height: 14px;
+}
+QComboBox::drop-down {
+    width: 18px;
+}
+"""
+        return stylesheet + common + compact
+
     def _apply_theme(self) -> None:
         app = QApplication.instance()
         if app is None:
@@ -7172,6 +7615,7 @@ class EncryptedChatClient(QObject):
         position = client_theme_color(self, theme)
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
+        app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
 
         available_styles = {
             name.casefold(): name for name in QStyleFactory.keys()
@@ -7182,11 +7626,17 @@ class EncryptedChatClient(QObject):
                 available_styles.get("fusion", "Fusion"),
             )
             app.setPalette(self._windows_classic_palette())
-            app.setStyleSheet(classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position))
+            app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
+                classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position),
+                theme,
+            ))
         elif self._is_glassy_theme():
             style_name = available_styles.get("fusion", "Fusion")
             app.setPalette(self._glassy_palette())
-            app.setStyleSheet(hue_theme_stylesheet(GLASSY_STYLESHEET, position))
+            app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
+                hue_theme_stylesheet(GLASSY_STYLESHEET, position),
+                theme,
+            ))
         else:
             style_name = next(
                 (available_styles[name] for name in (
@@ -7195,7 +7645,10 @@ class EncryptedChatClient(QObject):
                 "Fusion",
             )
             app.setPalette(self._modern_palette())
-            app.setStyleSheet(hue_theme_stylesheet(MODERN_STYLESHEET, position))
+            app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
+                hue_theme_stylesheet(MODERN_STYLESHEET, position),
+                theme,
+            ))
 
         text_shadows_enabled = bool(self.text_shadows_var.get())
         app.setProperty("spritelinkTextShadows", text_shadows_enabled)
@@ -7645,6 +8098,8 @@ class EncryptedChatClient(QObject):
                 room["id"] in muted_ids,
                 self.chatrooms_list,
             )
+            for widget in [row, *row.findChildren(QWidget)]:
+                self._set_widget_text_size(widget, "chatrooms")
             row.ensurePolished()
             item.setSizeHint(row.sizeHint())
             self.chatrooms_list.setItemWidget(item, row)
@@ -7697,15 +8152,21 @@ class EncryptedChatClient(QObject):
             and int(unread_count or 0) > 0
             for room_id, unread_count in self._unread_counts().items()
         )
+        button = self.chatrooms_toggle
+        button.setMinimumHeight(0)
+        button.setMaximumHeight(16777215)
+        button.setStyleSheet("")
+        button.ensurePolished()
+        base_height = button.sizeHint().height()
+
         if has_visible_unread:
-            self.chatrooms_toggle.setStyleSheet(
+            button.setStyleSheet(
                 notification_button_stylesheet(
                     self._is_windows_classic_theme(),
                     self._is_glassy_theme(),
                 )
             )
-        else:
-            self.chatrooms_toggle.setStyleSheet("")
+        button.setFixedHeight(base_height)
 
     def _update_config_toggle_update_style(self) -> None:
         if not hasattr(self, "config_toggle"):
@@ -8867,9 +9328,11 @@ class EncryptedChatClient(QObject):
         self.identity_color_preview.setFrameShape(QFrame.Shape.Panel)
         self.identity_color_preview.setFrameShadow(QFrame.Shadow.Sunken)
         identity_layout.addWidget(self.identity_color_preview)
-        identity_color_button = QPushButton("Choose...")
-        identity_color_button.clicked.connect(self._choose_identity_color)
-        identity_layout.addWidget(identity_color_button)
+        self.identity_color_button = QPushButton("Choose...")
+        self.identity_color_button.clicked.connect(
+            self._choose_identity_color
+        )
+        identity_layout.addWidget(self.identity_color_button)
         identity_layout.addSpacing(8)
         identity_layout.addWidget(QLabel("Icon (16x16)"))
         self.profile_icon_preview = QLabel()
@@ -8884,9 +9347,11 @@ class EncryptedChatClient(QObject):
             self._show_profile_icon_context_menu
         )
         identity_layout.addWidget(self.profile_icon_preview)
-        profile_icon_button = QPushButton("Browse...")
-        profile_icon_button.clicked.connect(self._choose_profile_icon)
-        identity_layout.addWidget(profile_icon_button)
+        self.profile_icon_button = QPushButton("Browse...")
+        self.profile_icon_button.clicked.connect(
+            self._choose_profile_icon
+        )
+        identity_layout.addWidget(self.profile_icon_button)
         self.identity_menu.hide()
         content_layout.addWidget(self.identity_menu)
 
@@ -9260,9 +9725,13 @@ class EncryptedChatClient(QObject):
         if not hasattr(self, "message_entry"):
             return
         profile = self._active_room_profile()
-        self.message_entry.setFont(
-            self._make_message_font(profile["font"])
+        composer_font = self._make_message_font(
+            profile["font"],
+            role="message_input",
         )
+        self.message_entry.setFont(composer_font)
+        self.message_entry.document().setDefaultFont(composer_font)
+        self.message_entry.viewport().setFont(composer_font)
         self.message_entry.setStyleSheet(
             f"color: {profile['text_color']};"
         )
@@ -9425,20 +9894,20 @@ class EncryptedChatClient(QObject):
         self.config_overlay.dismissed.connect(self._dismiss_config_popup)
 
         overlay_layout = QVBoxLayout(self.config_overlay)
-        overlay_layout.setContentsMargins(36, 24, 36, 24)
+        overlay_layout.setContentsMargins(24, 24, 24, 24)
 
         panel_row = QHBoxLayout()
         panel_row.addStretch(1)
 
         self.config_panel = QFrame()
         self.config_panel.setObjectName("configPanel")
-        self.config_panel.setMaximumWidth(CONFIG_POPUP_MAX_WIDTH)
+        self.config_panel.setMaximumWidth(CONFIG_PANEL_MAX_WIDTH)
         self.config_panel.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
         self.config_panel.setStyleSheet(self._config_panel_stylesheet())
-        panel_row.addWidget(self.config_panel, 8)
+        panel_row.addWidget(self.config_panel, 10)
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row, 1)
         self.config_overlay.panel = self.config_panel
@@ -9886,7 +10355,13 @@ class EncryptedChatClient(QObject):
             )
 
     def _config_row_spacing(self) -> int:
-        return 5 if self._is_windows_classic_theme() or self._is_glassy_theme() else 12
+        if self._is_tiny_ui():
+            return 5
+        return (
+            5
+            if self._is_windows_classic_theme() or self._is_glassy_theme()
+            else 12
+        )
 
     def _build_config_tab(self) -> None:
         layout = QGridLayout(self.config_tab)
@@ -9921,6 +10396,19 @@ class EncryptedChatClient(QObject):
         self.theme_color_slider.sliderReleased.connect(self._finish_theme_color_change)
         color_layout.addWidget(self.theme_color_slider, 1)
         layout.addWidget(color_control, row, 2)
+        row += 1
+
+        layout.addWidget(QLabel("UI Size"), row, 0)
+        self.ui_size_combo = ThemeComboBox()
+        self.ui_size_combo.addItems(list(UI_SIZE_PRESETS.keys()))
+        self.ui_size_combo.setCurrentText(
+            normalize_ui_size(self.ui_size_var.get())
+        )
+        self.ui_size_combo.currentTextChanged.connect(
+            self._on_ui_size_changed
+        )
+        self.ui_size_var.bind(self.ui_size_combo.setCurrentText)
+        layout.addWidget(self.ui_size_combo, row, 1, 1, 2)
         row += 1
 
         self.text_shadows_checkbox = QCheckBox("Text Shadows")
@@ -10224,6 +10712,26 @@ class EncryptedChatClient(QObject):
         )
         self.advanced_config_content.setVisible(expanded)
 
+    def _on_ui_size_changed(self, value: Any) -> None:
+        ui_size = normalize_ui_size(value)
+        if ui_size == self.config_data.get("ui_size"):
+            return
+        self.ui_size_var.set(ui_size)
+        self.config_data["ui_size"] = ui_size
+        self._apply_theme()
+        self._apply_application_font_strategy()
+        self._apply_ui_size()
+        if hasattr(self, "chat_display"):
+            self._rerender_preserving_scroll()
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not save UI size",
+                str(exc),
+                parent=self.root,
+            )
+
     def _on_message_sound_selected(self, value: str) -> None:
         selected_sound = str(value)
         if selected_sound not in MESSAGE_SOUND_OPTIONS:
@@ -10445,6 +10953,7 @@ class EncryptedChatClient(QObject):
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
             bool(self.text_shadows_var.get()),
+            normalize_ui_size(self.ui_size_var.get()),
             str(self.message_sound_var.get()),
             int(self.message_sound_volume_var.get()),
             str(self.custom_message_sound_path_var.get()),
@@ -10581,6 +11090,7 @@ class EncryptedChatClient(QObject):
             return False
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
+        app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
         if theme == "Classic":
             palette = self._windows_classic_palette()
             stylesheet = classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position)
@@ -10590,6 +11100,7 @@ class EncryptedChatClient(QObject):
         else:
             palette = self._modern_palette()
             stylesheet = hue_theme_stylesheet(MODERN_STYLESHEET, position)
+        stylesheet = EncryptedChatClient._ui_density_stylesheet(self, stylesheet, theme)
         # Repolish can reset explicitly assigned families and NoAntialias.
         # Keep the existing fonts, including Classic headings and user fonts.
         application_font = QFont(app.font())
@@ -10705,6 +11216,9 @@ class EncryptedChatClient(QObject):
         self.config_data["text_shadows"] = bool(
             self.text_shadows_var.get()
         )
+        self.config_data["ui_size"] = normalize_ui_size(
+            self.ui_size_var.get()
+        )
         message_sound = str(self.message_sound_var.get())
         self.config_data["message_sound"] = (
             message_sound
@@ -10735,6 +11249,7 @@ class EncryptedChatClient(QObject):
         window_width, window_height = normalize_window_size(
             self.root.width(),
             self.root.height(),
+            self.config_data["ui_size"],
         )
         self.config_data["window_width"] = window_width
         self.config_data["window_height"] = window_height
@@ -13670,6 +14185,7 @@ class EncryptedChatClient(QObject):
             )
         ):
             self._apply_dialog_window_theme(watched)
+            self._apply_ui_size_to_widget_tree(watched)
 
         if (
             watched is self.root
@@ -13985,6 +14501,7 @@ class EncryptedChatClient(QObject):
         *,
         align_top: bool = False,
         opacity: float = 1.0,
+        line_height_px: int = DEFAULT_MESSAGE_LINE_HEIGHT_PX,
     ) -> bool:
         if not encoded_icon:
             return False
@@ -14013,7 +14530,15 @@ class EncryptedChatClient(QObject):
                 - PROFILE_ICON_VERTICAL_OFFSET_PX,
             )
             if align_top
-            else PROFILE_ICON_VERTICAL_OFFSET_PX
+            else max(
+                0,
+                round(
+                    (max(PROFILE_ICON_SIZE, line_height_px)
+                     - PROFILE_ICON_SIZE)
+                    / 2.0
+                    - PROFILE_ICON_VERTICAL_OFFSET_PX
+                ),
+            )
         )
         bottom_padding = (
             0
@@ -14069,12 +14594,9 @@ class EncryptedChatClient(QObject):
         image_format.setHeight(displayed_image.height())
         image_format.setAnchor(True)
         image_format.setAnchorHref(f"spritelink:{message_id}")
-        # Inline images participate in Qt's automatic line-height calculation,
-        # so a short text line expands to the icon's native 16-pixel height.
-        # A normal 16 px icon belongs at y=2 in the fixed 24 px row:
-        # centered at y=4, then shifted upward by exactly 2 px. Aligning the
-        # padded 20 px canvas to the row top avoids AlignMiddle's half-pixel
-        # rounding, which previously reduced the visible shift to one pixel.
+        # Keep the icon vertically centered in the current text row while
+        # retaining the slight upward optical offset used by the default
+        # 24-pixel layout. AlignTop avoids AlignMiddle half-pixel rounding.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
         )
@@ -14177,9 +14699,16 @@ class EncryptedChatClient(QObject):
         formatting = QTextCharFormat()
         formatting.setForeground(QColor(color))
         formatting.setFont(
-            self._make_ui_font(bold=bold)
+            self._make_ui_font(
+                bold=bold,
+                point_size=self._text_size("chat_log"),
+            )
             if ui_font
-            else self._make_message_font(font_name, bold=bold)
+            else self._make_message_font(
+                font_name,
+                bold=bold,
+                role="chat_log",
+            )
         )
         formatting.setFontItalic(italic)
         formatting.setFontUnderline(underline)
@@ -15401,12 +15930,19 @@ class EncryptedChatClient(QObject):
                 )
         align_message_top = top_align_height > 0
 
-        has_profile_icon = self._insert_profile_icon(
-            cursor,
-            "" if is_muted else profile_icon,
-            message_id,
-            align_top=align_message_top,
+        message_line_height = self._chat_line_height(
+            font_name,
+            ui_font=is_muted,
         )
+        has_profile_icon = False
+        if self._chat_icons_visible():
+            has_profile_icon = self._insert_profile_icon(
+                cursor,
+                "" if is_muted else profile_icon,
+                message_id,
+                align_top=align_message_top,
+                line_height_px=message_line_height,
+            )
         if has_profile_icon:
             cursor.insertText(
                 " ",
@@ -15523,7 +16059,7 @@ class EncryptedChatClient(QObject):
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
             # Only date/hour separators may contribute vertical margins.
-            # Ordinary message blocks always occupy fixed 24-pixel lines.
+            # Ordinary message blocks follow the active chat font metrics.
             block_format.setTopMargin(0.0)
             block_format.setBottomMargin(0.0)
             # The custom full-width painter owns the entire normal stripe.
@@ -15534,7 +16070,7 @@ class EncryptedChatClient(QObject):
             )
             if block.blockNumber() not in embedded_media_block_numbers:
                 block_format.setLineHeight(
-                    float(MESSAGE_LINE_HEIGHT_PX),
+                    float(message_line_height),
                     int(QTextBlockFormat.LineHeightTypes.FixedHeight.value),
                 )
             block_cursor.setBlockFormat(block_format)

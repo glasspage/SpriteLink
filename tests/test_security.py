@@ -1583,12 +1583,12 @@ class RichTextFormattingTests(unittest.TestCase):
         )
         self.assertEqual(SPRITELINK.SPOILER_BLOCK_COLOR, "#404040")
         self.assertEqual(SPRITELINK.REVEALED_SPOILER_BLOCK_ALPHA, 26)
-        self.assertEqual(SPRITELINK.SPOILER_DISPLAY_HEIGHT_PX, 22)
+        self.assertEqual(SPRITELINK.SPOILER_VERTICAL_INSET_PX, 1.0)
         paint_source = inspect.getsource(
             SPRITELINK.MessageLogBrowser._paint_spoilers
         )
         self.assertIn("line.height() - spoiler_height", paint_source)
-        self.assertIn("SPOILER_DISPLAY_HEIGHT_PX", paint_source)
+        self.assertIn("SPOILER_VERTICAL_INSET_PX", paint_source)
         toggle_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._toggle_rendered_spoiler
         )
@@ -4712,14 +4712,15 @@ class Version120ReleaseTests(unittest.TestCase):
             source,
         )
 
-    def test_user_message_lines_are_fixed_at_24_pixels(self) -> None:
-        self.assertEqual(SPRITELINK.MESSAGE_LINE_HEIGHT_PX, 24)
+    def test_user_message_lines_follow_configured_text_size(self) -> None:
+        self.assertEqual(SPRITELINK.DEFAULT_MESSAGE_LINE_HEIGHT_PX, 24)
         source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_message_item
         )
+        self.assertIn("message_line_height = self._chat_line_height(", source)
         self.assertIn("block_format.setLineHeight(", source)
         self.assertIn(
-            "float(MESSAGE_LINE_HEIGHT_PX)",
+            "float(message_line_height)",
             source,
         )
         self.assertIn(
@@ -4727,15 +4728,14 @@ class Version120ReleaseTests(unittest.TestCase):
             source,
         )
         self.assertIn("embedded_media_block_numbers", source)
+        self.assertIn("if self._chat_icons_visible():", source)
 
         icon_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_profile_icon
         )
         self.assertEqual(SPRITELINK.PROFILE_ICON_VERTICAL_OFFSET_PX, 2)
-        self.assertIn(
-            "else PROFILE_ICON_VERTICAL_OFFSET_PX",
-            icon_source,
-        )
+        self.assertIn("line_height_px", icon_source)
+        self.assertIn("PROFILE_ICON_VERTICAL_OFFSET_PX", icon_source)
         self.assertNotIn(
             "VerticalAlignment.AlignMiddle",
             icon_source,
