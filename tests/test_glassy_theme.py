@@ -174,8 +174,13 @@ class GlassyControlRenderingTests(unittest.TestCase):
             button.setDown(False)
             button.setChecked(False)
 
-    def test_separator_top_padding_matches_translucent_body_and_bottom(self):
-        from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
+    def test_separator_background_matches_message_stripe_including_padding(self):
+        for path in ("_insert_log_separator", "_insert_log_separator_before_newer_content"):
+            with self.subTest(path=path):
+                self._check_separator_background(path)
+
+    def _check_separator_background(self, path):
+        from PySide6.QtGui import QColor, QTextBlockFormat, QTextCharFormat, QTextCursor
         browser = SPRITELINK.MessageLogBrowser(self.window)
         browser.setObjectName("chatViewport")
         browser.setGeometry(0, 0, 280, 150)
@@ -194,13 +199,15 @@ class GlassyControlRenderingTests(unittest.TestCase):
                         colors = SPRITELINK.message_row_backgrounds()
                         cursor = QTextCursor(browser.document())
                         cursor.insertText("Older message")
-                        separator = SPRITELINK.EncryptedChatClient._insert_log_separator(
+                        separator = getattr(SPRITELINK.EncryptedChatClient, path)(
                             client, cursor, "Nov 15, 2023", colors[stripe], [],
                         )
+                        if path == "_insert_log_separator_before_newer_content":
+                            cursor.insertBlock(QTextBlockFormat())
                         cursor.insertText("Newer message")
                         browser.row_background_blocks.update({
                             0: QColor(colors[1 - stripe]), separator: QColor(colors[stripe]),
-                            cursor.blockNumber(): QColor(colors[1 - stripe]),
+                            cursor.blockNumber(): QColor(colors[stripe]),
                         })
                         browser.show()
                         self.app.processEvents()
@@ -210,6 +217,9 @@ class GlassyControlRenderingTests(unittest.TestCase):
                         top, bottom = browser._block_content_vertical_bounds(block)
                         x = image.width() - 10
                         body = image.pixelColor(x, round((top + 4) * ratio))
+                        message_top, _ = browser._block_content_vertical_bounds(cursor.block())
+                        self.assertEqual(body, image.pixelColor(x, round((message_top + 4) * ratio)),
+                                         (hue, shadows, stripe, "message stripe"))
                         for y in range(top - 7, top):
                             self.assertEqual(image.pixelColor(x, round(y * ratio)), body,
                                              (hue, shadows, stripe, y))

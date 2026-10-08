@@ -5949,6 +5949,10 @@ class MessageLogBrowser(QTextBrowser):
         for block_number, padding in (
             self.row_background_padding_blocks.items()
         ):
+            # The full-width row painter already includes both margins.
+            # Repainting a translucent band would increase its opacity.
+            if block_number in self.row_background_blocks:
+                continue
             background, top_padding, bottom_padding = padding
             block = self.document().findBlockByNumber(block_number)
             if not block.isValid():
@@ -15303,7 +15307,8 @@ QComboBox::drop-down {
         # background painter covers the complete block, including margins.
         separator_block.setTopMargin(7)
         separator_block.setBottomMargin(7)
-        separator_block.setBackground(QColor(background_color))
+        # The full-width row painter owns separators as well as messages.
+        # A QTextBlock background would blend this stripe a second time.
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
         separator_block_number = cursor.block().blockNumber()
@@ -15745,7 +15750,7 @@ QComboBox::drop-down {
         separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
         separator_block.setTopMargin(7)
         separator_block.setBottomMargin(7)
-        separator_block.setBackground(QColor(background_color))
+        # Match the append path: paint the translucent stripe only once.
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
         separator_block_number = cursor.block().blockNumber()
