@@ -18,6 +18,8 @@ class PresenceTests(unittest.TestCase):
             active_chatroom_id=S.GLOBAL_CHATROOM_ID,
             recently_online_send_attempts={},
             recently_online_poll_attempts={},
+            recently_online_refresh_event=threading.Event(),
+            _minimized_to_tray=False,
             session=mock.Mock(),
             _queue_ui_event=mock.Mock(),
         )
@@ -105,15 +107,42 @@ class PresenceTests(unittest.TestCase):
         self.assertNotIn("pending_token", disk["recently_online_state"][self.server])
         self.client._queue_ui_event.assert_called_once_with(("recently_online_sent", None))
 
-    def test_publishes_in_private_view_but_only_polls_in_global(self):
+    def test_tallies_every_five_minutes_even_in_private_view(self):
         self.client.active_chatroom_id = "private"
         self.assertTrue(self.step(100))
-        self.assertFalse(self.step(106))
-        self.client.session.get.assert_not_called()
-        self.client.active_chatroom_id = S.GLOBAL_CHATROOM_ID
         self.client.session.get.return_value.text = ""
-        self.assertTrue(self.step(112))
+        self.assertTrue(self.step(106))
         self.assertEqual(self.client._queue_ui_event.call_args.args[0], ("recently_online", (self.server, {})))
+        self.assertFalse(self.step(405))
+        self.assertTrue(self.step(406))
+        self.assertEqual(self.client.session.get.call_count, 2)
+
+    def test_tray_pauses_tallies_and_restore_refreshes_before_five_minutes(self):
+        self.step(100)
+        self.client.session.get.return_value.text = ""
+        self.step(106)
+        self.client._minimized_to_tray = True
+        self.assertFalse(self.step(112))
+        self.assertFalse(self.step(406))
+        self.assertEqual(self.client.session.get.call_count, 1)
+        # Resume after a short stay as well as a long one.
+        for resumed_at in (407, 419):
+            self.client._minimized_to_tray = False
+            self.client.recently_online_refresh_event.set()
+            self.assertTrue(self.step(resumed_at))
+            self.assertFalse(self.client.recently_online_refresh_event.is_set())
+            self.assertFalse(self.step(resumed_at + 6))
+            self.client._minimized_to_tray = True
+        self.assertEqual(self.client.session.get.call_count, 3)
+
+    def test_six_hour_publishing_continues_in_tray_without_tallying(self):
+        self.client._minimized_to_tray = True
+        self.assertTrue(self.step(100))
+        self.assertFalse(self.step(400))
+        self.now += S.RECENTLY_ONLINE_INTERVAL_SECONDS
+        self.assertTrue(self.step(500))
+        self.assertEqual(self.client.session.post.call_count, 2)
+        self.client.session.get.assert_not_called()
 
     def test_server_state_is_separate_and_failed_tally_does_not_report_zero(self):
         self.step(100)
@@ -141,7 +170,7 @@ class PresenceTests(unittest.TestCase):
         self.assertEqual(self.client.session.post.call_count, 1)
         self.assertEqual(self.client.config_data["recently_online_state"][self.server], {"sent_at": self.now})
 
-    def test_presence_shares_chat_cadence_without_bursting_or_starving_chat(self):
+    def _loop_requests(self, *, restore_during_wait=False):
         ticks = [0.0]
         requests = []
         self.client.stop_event = mock.Mock()
@@ -156,7 +185,13 @@ class PresenceTests(unittest.TestCase):
         self.client._network_poll = lambda *args, **kwargs: requests.append(("chat", ticks[0]))
         self.client._network_recently_online_step = lambda **kwargs: self.step(kwargs["now"])
         self.client.network_wakeup_event = mock.Mock()
-        self.client.network_wakeup_event.wait.side_effect = lambda seconds: ticks.__setitem__(0, ticks[0] + seconds)
+        def wait(seconds):
+            if restore_during_wait and len(requests) == 1:
+                ticks[0] += 1
+                self.client.recently_online_refresh_event.set()
+            else:
+                ticks[0] += seconds
+        self.client.network_wakeup_event.wait.side_effect = wait
         self.client.session.post.side_effect = lambda *args, **kwargs: (
             requests.append(("ping", ticks[0])) or mock.Mock()
         )
@@ -165,9 +200,22 @@ class PresenceTests(unittest.TestCase):
         )
         with mock.patch.object(S.time, "monotonic", side_effect=lambda: ticks[0]):
             S.EncryptedChatClient._network_loop(self.client)
+        return requests
+
+    def test_presence_shares_chat_cadence_without_bursting_or_starving_chat(self):
+        requests = self._loop_requests()
         interval = S.ON_SCREEN_POLL_INTERVAL_SECONDS
         self.assertEqual(requests, [
             ("chat", 0), ("ping", interval), ("tally", interval * 2), ("chat", interval * 3),
+        ])
+
+    def test_restored_tally_wakes_worker_and_bypasses_chat_poll_wait(self):
+        self.client.config_data["recently_online_state"][self.server] = {"sent_at": self.now}
+        self.client.recently_online_poll_attempts[self.server] = 0
+        requests = self._loop_requests(restore_during_wait=True)
+        interval = S.ON_SCREEN_POLL_INTERVAL_SECONDS
+        self.assertEqual(requests, [
+            ("chat", 0), ("tally", 1), ("chat", 1 + interval), ("chat", 1 + interval * 2),
         ])
 
 

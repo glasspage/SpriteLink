@@ -102,22 +102,43 @@ class UiSizePresetTests(unittest.TestCase):
         self.client._request_network_refresh(poll_immediately=False)
         self.assertFalse(label.isHidden())
 
-    def test_recently_online_ages_out_and_changes_with_server(self):
+    def test_recently_online_keeps_completed_count_until_new_response(self):
         server = S.normalize_server_url(self.client.config_data["server_url"])
         with mock.patch.object(S.time, "time", return_value=30_000):
             self.client.ui_queue.put(("recently_online", (server, {
-                "expired": 30_000 - S.RECENTLY_ONLINE_INTERVAL_SECONDS,
+                "other": 29_998,
                 "recent": 29_999,
             })))
             self.client._process_ui_queue()
-            self.assertEqual(self.client.recently_online_label.text(), "Recently online: 1")
+            self.assertEqual(self.client.recently_online_label.text(), "Recently online: 2")
             self.client.config_data["server_url"] = "https://other.example"
             self.client._update_recently_online_label()
-            self.assertEqual(self.client.recently_online_label.text(), "Recently online: …")
+            self.assertEqual(self.client.recently_online_label.text(), "Recently online: 2")
             self.client.config_data["server_url"] = server
         with mock.patch.object(S.time, "time", return_value=60_000):
             self.client._update_recently_online_label()
+        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 2")
+        self.client.ui_queue.put(("recently_online", (server, {})))
+        self.client._process_ui_queue()
         self.assertEqual(self.client.recently_online_label.text(), "Recently online: 0")
+
+    def test_tray_restore_requests_fresh_tally_and_preserves_visible_count(self):
+        server = S.normalize_server_url(self.client.config_data["server_url"])
+        self.client.ui_queue.put(("recently_online", (server, {"recent": 1})))
+        self.client._process_ui_queue()
+        self.client.network_wakeup_event.clear()
+        self.client._hide_to_tray()
+        self.assertTrue(self.client._minimized_to_tray)
+        self.assertFalse(self.root.isVisible())
+        self.client._restore_from_tray()
+        QTest.qWait(20)
+        self.assertFalse(self.client._minimized_to_tray)
+        self.assertTrue(self.root.isVisible())
+        self.assertTrue(self.client.recently_online_refresh_event.is_set())
+        self.assertTrue(self.client.network_wakeup_event.is_set())
+        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 1")
+        self.client._request_network_refresh(poll_immediately=False)
+        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 1")
 
     def test_recently_online_publish_counts_toward_relay_allowance_only(self):
         before = self.client._messages_left_today()

@@ -6342,6 +6342,8 @@ class EncryptedChatClient(QObject):
         self.recently_online_poll_attempts: dict[str, float] = {}
         self.recently_online_send_attempts: dict[str, float] = {}
         self.recently_online_counts: dict[str, dict[str, int]] = {}
+        self._last_recently_online_count: int | None = None
+        self.recently_online_refresh_event = threading.Event()
 
         self.network_thread: threading.Thread | None = None
         self.subscription_thread: threading.Thread | None = None
@@ -7517,11 +7519,15 @@ class EncryptedChatClient(QObject):
 
     def _restore_from_tray(self) -> None:
         was_suspended = self._tray_ui_suspended
+        was_in_tray = self._minimized_to_tray
         self._minimized_to_tray = False
         self._clear_tray_notification_if_no_unread()
         self.root.showNormal()
         self.root.raise_()
         self.root.activateWindow()
+        if was_in_tray or was_suspended:
+            self.recently_online_refresh_event.set()
+            self.network_wakeup_event.set()
         if was_suspended:
             QTimer.singleShot(0, self._resume_from_tray)
         else:
@@ -9333,12 +9339,6 @@ QComboBox::drop-down {
         self.recently_online_label.setGraphicsEffect(opacity)
         status_layout.addWidget(self.recently_online_label)
         self._update_recently_online_label()
-        self.recently_online_timer = QTimer(self)
-        self.recently_online_timer.setInterval(60_000)
-        self.recently_online_timer.timeout.connect(
-            self._update_recently_online_label
-        )
-        self.recently_online_timer.start()
 
         self.config_toggle = QPushButton("Config")
         self.config_toggle.setCheckable(True)
@@ -12067,13 +12067,21 @@ QComboBox::drop-down {
             )
             room_to_poll: dict[str, str] | None = None
             repay_background_after_poll = False
-            # Presence uses the same request cadence as chat polling. Let an
-            # initial/explicit active-room refresh go first, and consume only
-            # one request slot for a ping or a tally (never both at once).
+            # Normal presence work shares the chat request cadence. Restoring
+            # from tray requests a tally immediately, then resumes that cadence.
+            # A step sends a ping or fetches a tally, never both at once.
             presence_work = (
-                global_poll_due
-                and last_global_poll_at is not None
-                and not force_active_poll
+                (
+                    (
+                        self.recently_online_refresh_event.is_set()
+                        and not self._minimized_to_tray
+                    )
+                    or (
+                        global_poll_due
+                        and last_global_poll_at is not None
+                        and not force_active_poll
+                    )
+                )
                 and self._network_recently_online_step(now=now)
             )
             if presence_work:
@@ -12170,14 +12178,14 @@ QComboBox::drop-down {
         label.setVisible(self.active_chatroom_id == GLOBAL_CHATROOM_ID)
         server = normalize_server_url(self.config_data.get("server_url", ""))
         pings = self.recently_online_counts.get(server)
-        if pings is None:
+        if pings is not None:
+            self._last_recently_online_count = len(pings)
+        if self._last_recently_online_count is None:
             label.setText("Recently online: …")
             return
-        cutoff = time.time() - RECENTLY_ONLINE_INTERVAL_SECONDS
-        expired = [token for token, timestamp in pings.items() if timestamp <= cutoff]
-        for token in expired:
-            pings.pop(token, None)
-        label.setText(f"Recently online: {len(pings)}")
+        # Keep the last completed tally throughout tray suspension, refreshes
+        # and server changes. Only a successful response replaces the value.
+        label.setText(f"Recently online: {self._last_recently_online_count}")
 
     def _network_recently_online_step(self, *, now: float) -> bool:
         server = normalize_server_url(self.config_data.get("server_url", ""))
@@ -12201,9 +12209,16 @@ QComboBox::drop-down {
             or wall_now < sent_at
             or wall_now - sent_at >= RECENTLY_ONLINE_INTERVAL_SECONDS
         )
-        if send_due and now - self.recently_online_send_attempts.get(
-            server, -math.inf
-        ) >= RECENTLY_ONLINE_RETRY_SECONDS:
+        refresh_requested = (
+            self.recently_online_refresh_event.is_set()
+            and not self._minimized_to_tray
+        )
+        if (
+            send_due
+            and not refresh_requested
+            and now - self.recently_online_send_attempts.get(server, -math.inf)
+            >= RECENTLY_ONLINE_RETRY_SECONDS
+        ):
             self.recently_online_send_attempts[server] = now
             try:
                 token = state.get("pending_token")
@@ -12234,12 +12249,15 @@ QComboBox::drop-down {
                 pass
             return True
 
-        if self.active_chatroom_id != GLOBAL_CHATROOM_ID:
+        if self._minimized_to_tray:
             return False
-        if now - self.recently_online_poll_attempts.get(
-            server, -math.inf
-        ) < RECENTLY_ONLINE_POLL_SECONDS:
+        if (
+            not refresh_requested
+            and now - self.recently_online_poll_attempts.get(server, -math.inf)
+            < RECENTLY_ONLINE_POLL_SECONDS
+        ):
             return False
+        self.recently_online_refresh_event.clear()
         self.recently_online_poll_attempts[server] = now
         try:
             topic, _key = recently_online_transport()
@@ -12252,8 +12270,8 @@ QComboBox::drop-down {
             pings = recently_online_pings(parse_ntfy_ndjson(response), now=time.time())
             self._queue_ui_event(("recently_online", (server, pings)))
         except Exception:
-            # Keep a prior count while its entries age out locally. A failed
-            # first fetch remains unknown, rather than suggesting zero users.
+            # Keep the last completed count on failure. A failed first fetch
+            # remains unknown, rather than suggesting zero users.
             self.recently_online_poll_attempts[server] = (
                 now - RECENTLY_ONLINE_POLL_SECONDS + RECENTLY_ONLINE_RETRY_SECONDS
             )
@@ -16761,7 +16779,6 @@ QComboBox::drop-down {
         self._closing = True
         self._minimized_to_tray = False
         self.theme_color_save_timer.stop()
-        self.recently_online_timer.stop()
         QToolTip.hideText()
         self.update_check_timer.stop()
         self.background_history_prune_timer.stop()
