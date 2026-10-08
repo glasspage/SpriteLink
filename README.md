@@ -6,4 +6,6 @@ Ideally, *SpriteLink should be left running* so it can receive and save messages
 
 The Glassy theme uses native Windows blur behind the translucent window, with an opaque fallback where native blur is unavailable. Saved Glassy+ settings migrate to Glassy.
 
+The Global view shows a "Recently online" count beside Config. It estimates participating clients from encrypted anonymous pings in the last six hours. Each client publishes at most one new ping every six hours, including while viewing another chatroom, without publishing usernames or chat identities. The count refreshes every five minutes while Global is active.
+
 DISCLAIMER: The code in this repository was created with assistance from AI tools. I made the architecture, design and implementation decisions; AI was used to write the code based on them.

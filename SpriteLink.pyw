@@ -178,12 +178,13 @@ from spritelink_update import (
 )
 
 try:
-    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import (
         Ed25519PrivateKey,
         Ed25519PublicKey,
     )
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 except ImportError as exc:
     raise SystemExit(
         "Missing dependency: cryptography\n\nInstall it with:\n"
@@ -493,6 +494,9 @@ CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
 IMMEDIATE_CHATROOM_SWITCH_LIMIT = 2
 CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS = 6
 REQUEST_TIMEOUT_SECONDS = 10
+RECENTLY_ONLINE_INTERVAL_SECONDS = 6 * 60 * 60
+RECENTLY_ONLINE_POLL_SECONDS = 5 * 60
+RECENTLY_ONLINE_RETRY_SECONDS = 60
 SERVER_HISTORY_RETENTION_SECONDS = 12 * 60 * 60
 GAP_SEPARATOR_SECONDS = 6 * 60 * 60
 MAX_MESSAGE_CHARS = 4000
@@ -3271,6 +3275,7 @@ def default_config() -> dict[str, Any]:
         "unread_counts": {},
         "unread_after_message_ids": {},
         "room_state": {},
+        "recently_online_state": {},
         "muted_users": {},
         "trusted_link_and_image_users": {},
         "collapsed_messages": {},
@@ -3360,6 +3365,7 @@ def load_config() -> dict[str, Any]:
 
     for dictionary_key in (
         "room_state",
+        "recently_online_state",
         "muted_users",
         "trusted_link_and_image_users",
         "trusted_image_users",
@@ -3676,6 +3682,59 @@ def room_scope_id(server_url: str, passphrase: str) -> str:
     topic = derive_ntfy_topic(passphrase)
     material = (normalize_server_url(server_url) + "\0" + topic).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def recently_online_transport() -> tuple[str, bytes]:
+    # Separate from chat topics, signing identities and message encryption.
+    # A cached key keeps counting many tiny pings inexpensive.
+    passphrase = GLOBAL_CHATROOM_KEY + "\0SpriteLink-recently-online-v1"
+    key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"SpriteLink-recently-online-v1",
+        info=b"anonymous-ping",
+    ).derive(passphrase.encode("utf-8"))
+    return derive_ntfy_topic(passphrase), key
+
+
+def make_recently_online_packet(token: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ValueError("Invalid presence token.")
+    nonce = os.urandom(12)
+    _topic, key = recently_online_transport()
+    ciphertext = ChaCha20Poly1305(key).encrypt(
+        nonce, bytes.fromhex(token), b"SpriteLink-recently-online-v1"
+    )
+    return base64.b64encode(b"\x01" + nonce + ciphertext).decode("ascii")
+
+
+def recently_online_pings(
+    records: list[dict[str, Any]], *, now: float,
+) -> dict[str, int]:
+    pings: dict[str, int] = {}
+    _topic, key = recently_online_transport()
+    for record in records:
+        timestamp = record.get("time")
+        packet = record.get("message")
+        if (
+            type(timestamp) is not int
+            or not now - RECENTLY_ONLINE_INTERVAL_SECONDS < timestamp <= now
+            or not isinstance(packet, str)
+            or len(packet) != 60
+        ):
+            continue
+        try:
+            raw = base64.b64decode(packet, validate=True)
+            if len(raw) != 45 or raw[0] != 1:
+                continue
+            token = ChaCha20Poly1305(key).decrypt(
+                raw[1:13], raw[13:], b"SpriteLink-recently-online-v1"
+            ).hex()
+        except Exception:
+            continue
+        pings[token] = max(timestamp, pings.get(token, timestamp))
+    return pings
 
 
 def derive_message_key(passphrase: str, salt: bytes) -> bytes:
@@ -6280,6 +6339,9 @@ class EncryptedChatClient(QObject):
             str,
             dict[str, Any],
         ] = {}
+        self.recently_online_poll_attempts: dict[str, float] = {}
+        self.recently_online_send_attempts: dict[str, float] = {}
+        self.recently_online_counts: dict[str, dict[str, int]] = {}
 
         self.network_thread: threading.Thread | None = None
         self.subscription_thread: threading.Thread | None = None
@@ -8863,6 +8925,7 @@ QComboBox::drop-down {
         poll_immediately: bool,
         bypass_rate_limits: bool = False,
     ) -> None:
+        self._update_recently_online_label()
         self.network_control_queue.put({
             "room_id": self.active_chatroom_id,
             "poll_immediately": poll_immediately,
@@ -9260,6 +9323,22 @@ QComboBox::drop-down {
         self.status_var.bind(self._on_connection_status_changed)
         status_layout.addWidget(self.status_label)
         status_layout.addStretch(1)
+
+        self.recently_online_label = QLabel("Recently online: …")
+        self.recently_online_label.setFont(
+            self._make_font(self._ui_font_family(), 9)
+        )
+        opacity = QGraphicsOpacityEffect(self.recently_online_label)
+        opacity.setOpacity(0.6)
+        self.recently_online_label.setGraphicsEffect(opacity)
+        status_layout.addWidget(self.recently_online_label)
+        self._update_recently_online_label()
+        self.recently_online_timer = QTimer(self)
+        self.recently_online_timer.setInterval(60_000)
+        self.recently_online_timer.timeout.connect(
+            self._update_recently_online_label
+        )
+        self.recently_online_timer.start()
 
         self.config_toggle = QPushButton("Config")
         self.config_toggle.setCheckable(True)
@@ -11988,7 +12067,18 @@ QComboBox::drop-down {
             )
             room_to_poll: dict[str, str] | None = None
             repay_background_after_poll = False
-            if global_poll_due:
+            # Presence uses the same request cadence as chat polling. Let an
+            # initial/explicit active-room refresh go first, and consume only
+            # one request slot for a ping or a tally (never both at once).
+            presence_work = (
+                global_poll_due
+                and last_global_poll_at is not None
+                and not force_active_poll
+                and self._network_recently_online_step(now=now)
+            )
+            if presence_work:
+                last_global_poll_at = time.monotonic()
+            if global_poll_due and not presence_work:
                 room_id_to_poll = (
                     active_room_id
                     if force_active_poll
@@ -12072,6 +12162,102 @@ QComboBox::drop-down {
                 )
             self.network_wakeup_event.wait(max(0.01, wait_seconds))
             self.network_wakeup_event.clear()
+
+    def _update_recently_online_label(self) -> None:
+        label = getattr(self, "recently_online_label", None)
+        if label is None:
+            return
+        label.setVisible(self.active_chatroom_id == GLOBAL_CHATROOM_ID)
+        server = normalize_server_url(self.config_data.get("server_url", ""))
+        pings = self.recently_online_counts.get(server)
+        if pings is None:
+            label.setText("Recently online: …")
+            return
+        cutoff = time.time() - RECENTLY_ONLINE_INTERVAL_SECONDS
+        expired = [token for token, timestamp in pings.items() if timestamp <= cutoff]
+        for token in expired:
+            pings.pop(token, None)
+        label.setText(f"Recently online: {len(pings)}")
+
+    def _network_recently_online_step(self, *, now: float) -> bool:
+        server = normalize_server_url(self.config_data.get("server_url", ""))
+        if not server:
+            return False
+        states = self.config_data.setdefault("recently_online_state", {})
+        state = states.get(server)
+        if not isinstance(state, dict):
+            state = {}
+            states[server] = state
+        sent_at = state.get("sent_at", 0)
+        if (
+            type(sent_at) not in (int, float)
+            or not 0 <= sent_at <= 253_402_300_799
+            or not math.isfinite(sent_at)
+        ):
+            sent_at = 0
+        wall_now = time.time()
+        send_due = (
+            sent_at <= 0
+            or wall_now < sent_at
+            or wall_now - sent_at >= RECENTLY_ONLINE_INTERVAL_SECONDS
+        )
+        if send_due and now - self.recently_online_send_attempts.get(
+            server, -math.inf
+        ) >= RECENTLY_ONLINE_RETRY_SECONDS:
+            self.recently_online_send_attempts[server] = now
+            try:
+                token = state.get("pending_token")
+                if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+                    token = secrets.token_hex(16)
+                    state["pending_token"] = token
+                # Retrying after a timeout or restart must count as one ping.
+                save_config(self.config_data)
+                topic, _key = recently_online_transport()
+                response = self.session.post(
+                    f"{server}/{topic}",
+                    data=make_recently_online_packet(token).encode("ascii"),
+                    headers={
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "X-Firebase": "no",
+                        "X-Cache": "yes",
+                    },
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                state["sent_at"] = time.time()
+                state.pop("pending_token", None)
+                self._queue_ui_event(("recently_online_sent", None))
+                save_config(self.config_data)
+            except Exception:
+                # Retry quietly with the same token; presence failures never
+                # produce chat messages, unread markers or notifications.
+                pass
+            return True
+
+        if self.active_chatroom_id != GLOBAL_CHATROOM_ID:
+            return False
+        if now - self.recently_online_poll_attempts.get(
+            server, -math.inf
+        ) < RECENTLY_ONLINE_POLL_SECONDS:
+            return False
+        self.recently_online_poll_attempts[server] = now
+        try:
+            topic, _key = recently_online_transport()
+            response = self.session.get(
+                f"{server}/{topic}/json",
+                params={"poll": "1", "since": "6h"},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            pings = recently_online_pings(parse_ntfy_ndjson(response), now=time.time())
+            self._queue_ui_event(("recently_online", (server, pings)))
+        except Exception:
+            # Keep a prior count while its entries age out locally. A failed
+            # first fetch remains unknown, rather than suggesting zero users.
+            self.recently_online_poll_attempts[server] = (
+                now - RECENTLY_ONLINE_POLL_SECONDS + RECENTLY_ONLINE_RETRY_SECONDS
+            )
+        return True
 
     def _network_send(self, outbound: dict[str, Any]) -> None:
         try:
@@ -12415,6 +12601,11 @@ QComboBox::drop-down {
                     if room_id == self.active_chatroom_id:
                         self.status_var.set(status)
 
+                elif event_type == "recently_online":
+                    server, pings = payload
+                    self.recently_online_counts[server] = pings
+                    self._update_recently_online_label()
+
                 elif event_type == "messages":
                     room_id = str(payload.get("room_id", ""))
                     items = payload.get("items", [])
@@ -12452,7 +12643,8 @@ QComboBox::drop-down {
                             added_message_ids
                         )
 
-                elif event_type == "send_succeeded":
+                elif event_type in {"send_succeeded", "recently_online_sent"}:
+                    # Anonymous pings also consume a relay publish request.
                     self._record_successful_send()
 
                 elif event_type == "send_failed":
@@ -16569,6 +16761,7 @@ QComboBox::drop-down {
         self._closing = True
         self._minimized_to_tray = False
         self.theme_color_save_timer.stop()
+        self.recently_online_timer.stop()
         QToolTip.hideText()
         self.update_check_timer.stop()
         self.background_history_prune_timer.stop()

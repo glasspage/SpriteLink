@@ -82,6 +82,52 @@ class UiSizePresetTests(unittest.TestCase):
         self.client.ui_size_combo.setCurrentText(size)
         QTest.qWait(20)
 
+    def test_recently_online_visibility_opacity_and_ui_sizes(self):
+        label = self.client.recently_online_label
+        for theme in S.THEMES:
+            self.client.theme_combo.setCurrentText(theme)
+            for size in S.UI_SIZE_PRESETS:
+                with self.subTest(theme=theme, size=size):
+                    self._select_size(size)
+                    self.assertTrue(label.isVisible())
+                    self.assertEqual(label.graphicsEffect().opacity(), 0.6)
+                    self.assertEqual(label.font().pointSize(), S.ui_size_text_sizes(size)["other_ui"])
+                    self.assertFalse(label.font().bold())
+                    self.assertLessEqual(label.geometry().right(), self.client.config_toggle.geometry().left())
+                    self.assertGreaterEqual(label.width(), QFontMetrics(label.font()).horizontalAdvance(label.text()))
+        self.client.active_chatroom_id = "private-room"
+        self.client._request_network_refresh(poll_immediately=False)
+        self.assertTrue(label.isHidden())
+        self.client.active_chatroom_id = S.GLOBAL_CHATROOM_ID
+        self.client._request_network_refresh(poll_immediately=False)
+        self.assertFalse(label.isHidden())
+
+    def test_recently_online_ages_out_and_changes_with_server(self):
+        server = S.normalize_server_url(self.client.config_data["server_url"])
+        with mock.patch.object(S.time, "time", return_value=30_000):
+            self.client.ui_queue.put(("recently_online", (server, {
+                "expired": 30_000 - S.RECENTLY_ONLINE_INTERVAL_SECONDS,
+                "recent": 29_999,
+            })))
+            self.client._process_ui_queue()
+            self.assertEqual(self.client.recently_online_label.text(), "Recently online: 1")
+            self.client.config_data["server_url"] = "https://other.example"
+            self.client._update_recently_online_label()
+            self.assertEqual(self.client.recently_online_label.text(), "Recently online: …")
+            self.client.config_data["server_url"] = server
+        with mock.patch.object(S.time, "time", return_value=60_000):
+            self.client._update_recently_online_label()
+        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 0")
+
+    def test_recently_online_publish_counts_toward_relay_allowance_only(self):
+        before = self.client._messages_left_today()
+        with mock.patch.object(self.client, "_add_message_to_log") as append:
+            self.client.ui_queue.put(("recently_online_sent", None))
+            self.client._process_ui_queue()
+        self.assertEqual(self.client._messages_left_today(), before - 1)
+        append.assert_not_called()
+        self.assertEqual(self.client.recently_online_label.text(), "Recently online: …")
+
     def test_small_is_default_and_presets_match_requested_sizes(self):
         self.assertEqual(S.DEFAULT_UI_SIZE, "Small (Default)")
         self.assertEqual(self.client.ui_size_combo.currentText(), "Small (Default)")
