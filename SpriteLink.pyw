@@ -75,6 +75,8 @@ try:
         QLinearGradient,
         QMovie,
         QPainter,
+        QPainterPath,
+        QPen,
         QPalette,
         QPixmap,
         QPixmapCache,
@@ -98,7 +100,9 @@ try:
         QDialog,
         QFrame,
         QFileDialog,
+        QGraphicsBlurEffect,
         QGraphicsOpacityEffect,
+        QGraphicsScene,
         QGridLayout,
         QHBoxLayout,
         QLabel,
@@ -119,6 +123,7 @@ try:
         QStyleFactory,
         QStyledItemDelegate,
         QStyleOptionButton,
+        QStyleOptionSlider,
         QStyleOptionViewItem,
         QSystemTrayIcon,
         QTextBrowser,
@@ -173,12 +178,13 @@ from spritelink_update import (
 )
 
 try:
-    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import (
         Ed25519PrivateKey,
         Ed25519PublicKey,
     )
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 except ImportError as exc:
     raise SystemExit(
         "Missing dependency: cryptography\n\nInstall it with:\n"
@@ -233,6 +239,32 @@ NOTIFICATION_BUTTON_STYLESHEET = (
     "QPushButton:hover { background-color: #f3c78d; }"
     "QPushButton:pressed { background-color: #efb968; }"
 )
+GLASSY_NOTIFICATION_BUTTON_STYLESHEET = (
+    "QPushButton {"
+    " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    " stop:0 rgba(255, 250, 232, 245),"
+    " stop:0.46 rgba(255, 226, 170, 238),"
+    " stop:0.5 rgba(247, 190, 105, 238),"
+    " stop:1 rgba(222, 137, 45, 238));"
+    " color: #633100;"
+    " border: 1px solid #a65c12;"
+    " border-radius: 5px;"
+    " padding: 4px 10px;"
+    "}"
+    "QPushButton:hover {"
+    " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    " stop:0 rgba(255, 255, 244, 250),"
+    " stop:0.46 rgba(255, 235, 191, 245),"
+    " stop:0.5 rgba(255, 205, 124, 245),"
+    " stop:1 rgba(235, 153, 58, 245));"
+    "}"
+    "QPushButton:pressed, QPushButton:checked {"
+    " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    " stop:0 rgba(211, 130, 38, 245),"
+    " stop:1 rgba(255, 220, 157, 245));"
+    " border-color: #834508;"
+    "}"
+)
 WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET = (
     "QPushButton {"
     " background-color: #f8d8ad;"
@@ -260,7 +292,12 @@ WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET = (
 )
 
 
-def notification_button_stylesheet(windows_classic: bool) -> str:
+def notification_button_stylesheet(
+    windows_classic: bool,
+    glassy: bool = False,
+) -> str:
+    if glassy:
+        return GLASSY_NOTIFICATION_BUTTON_STYLESHEET
     return (
         WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET
         if windows_classic
@@ -285,6 +322,7 @@ GLOBAL_CHATROOM_NICKNAME = "Global"
 GLOBAL_CHATROOM_KEY = "Xpkri=AKDzpyRjwi^g6+*GJZ=7CUH-QjdbJA%q"
 CHATROOM_SIDEBAR_WIDTH = 180
 CONFIG_POPUP_MAX_WIDTH = 720
+CONFIG_PANEL_MAX_WIDTH = 760
 DEFAULT_MESSAGE_SOUND = "Chime"
 DEFAULT_MESSAGE_SOUND_VOLUME = 100
 MESSAGE_SOUND_OPTIONS = (
@@ -331,17 +369,116 @@ SERVER_PRESETS: dict[str, str] = {
 DEFAULT_THEME = "Classic"
 THEMES = (
     DEFAULT_THEME,
+    "Glassy",
     "Modern",
 )
 LEGACY_THEME_NAMES = {
+    "Glassy+": "Glassy",
     "Windows Classic": "Classic",
     "Modern (Light)": "Modern",
 }
+
+# Windows Classic/XP scheme RGB values, verified against the archived theme
+# files at https://github.com/zkedem/windows10-classic-themes . The first entry
+# retains SpriteLink's original Classic colors for existing configurations.
+CLASSIC_COLOR_SCHEMES = (
+    dict(name="Default", face="#c0c0c0", shadow="#808080", light="#ffffff",
+         title="#000080", highlight="#007f82", highlight_text="#000000",
+         window="#ffffff", tooltip="#ffffe1"),
+    dict(name="Desert", face="#d5ccbb", shadow="#a28d68", light="#eae6dd",
+         title="#008080", highlight="#008080", highlight_text="#ffffff",
+         window="#ffffff", tooltip="#ffffff"),
+    dict(name="Spruce", face="#a2c8a9", shadow="#599764", light="#d0e3d3",
+         title="#599764", highlight="#599764", highlight_text="#ffffff",
+         window="#ffffff", tooltip="#ffffff"),
+    dict(name="Slate", face="#9db9c8", shadow="#558097", light="#cedce3",
+         title="#558097", highlight="#558097", highlight_text="#ffffff",
+         window="#ffffff", tooltip="#ffffff"),
+    dict(name="Rose", face="#cfafb7", shadow="#9f6070", light="#e7d8dc",
+         title="#9f6070", highlight="#9f6070", highlight_text="#ffffff",
+         window="#ffffff", tooltip="#ffffff"),
+    dict(name="Plum", face="#a89890", shadow="#786058", light="#d8d0c8",
+         title="#484060", highlight="#008080", highlight_text="#d8d0c8",
+         window="#d8d0c8", tooltip="#d5ccc8",
+         chat_backgrounds=("#d8d0c8", "#cec6be")),
+)
+
+
+def normalize_theme_colors(value: Any) -> dict[str, int]:
+    source = value if isinstance(value, dict) else {}
+    result = {}
+    for theme in THEMES:
+        raw = source.get(theme, source.get("Glassy+", 0) if theme == "Glassy" else 0)
+        try:
+            position = int(raw) if not isinstance(raw, bool) else 0
+        except (TypeError, ValueError, OverflowError):
+            position = 0
+        maximum = len(CLASSIC_COLOR_SCHEMES) - 1 if theme == "Classic" else 359
+        result[theme] = max(0, min(maximum, position))
+    return result
+
+
+def client_theme_color(client: Any, theme: str) -> int:
+    config = getattr(client, "config_data", {})
+    return normalize_theme_colors(config.get("theme_colors") if isinstance(config, dict) else None)[theme]
+
+
+def shift_theme_color(color: Any, degrees: int | None = None) -> QColor:
+    original = QColor(color)
+    if degrees is None:
+        app = QApplication.instance()
+        degrees = int(app.property("spritelinkThemeHue") or 0) if app is not None else 0
+    if degrees % 360 == 0 or original.hslSaturation() == 0:
+        return original
+    hue, saturation, lightness, alpha = original.getHslF()
+    return QColor.fromHslF((hue + degrees / 360.0) % 1.0, saturation, lightness, alpha)
+
+
+def hue_theme_stylesheet(stylesheet: str, degrees: int) -> str:
+    if degrees == 0:
+        return stylesheet
+
+    def replace(match: Any) -> str:
+        text = match.group(0)
+        if text.startswith("#"):
+            color = QColor(text)
+        else:
+            channels = [int(part) for part in re.findall(r"\d+", text)]
+            color = QColor(*channels)
+        # Only the original blue/cyan accent family moves. Warning/error
+        # colors, visited links, and neutral whites/grays remain unchanged.
+        if not 0.45 <= color.hslHueF() <= 0.69:
+            return text
+        shifted = shift_theme_color(color, degrees)
+        if text.startswith("#"):
+            return shifted.name()
+        return f"rgba({shifted.red()}, {shifted.green()}, {shifted.blue()}, {color.alpha()})"
+
+    return re.sub(r"#[0-9a-fA-F]{6}\b|\brgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+(?:\s*,\s*\d+)?\s*\)", replace, stylesheet)
+
+
+def classic_theme_stylesheet(stylesheet: str, position: int) -> str:
+    if position == 0:
+        return stylesheet
+    scheme = CLASSIC_COLOR_SCHEMES[position]
+    replacements = {
+        "#c0c0c0": scheme["face"], "#808080": scheme["shadow"],
+        "#ffffff": scheme["light"], "#007f82": scheme["highlight"],
+        "#ffffe1": scheme["tooltip"],
+    }
+    styled = re.sub(r"#[0-9a-fA-F]{6}\b", lambda match: replacements.get(match.group(0).lower(), match.group(0)), stylesheet)
+    styled = styled.replace(f"background-color: {scheme['light']}", f"background-color: {scheme['window']}")
+    styled = styled.replace("selection-color: #000000", f"selection-color: {scheme['highlight_text']}")
+    styled = re.sub(r"(QListWidget::item:selected, QMenu::item:selected\s*\{[^}]*?)color: #000000", lambda match: match.group(1) + f"color: {scheme['highlight_text']}", styled)
+    background = scheme.get("chat_backgrounds", ("#ffffff",))[0]
+    return styled + f"\nQTextBrowser#chatViewport {{ background-color: {background}; }}"
 
 DEFAULT_WINDOW_WIDTH = 840
 DEFAULT_WINDOW_HEIGHT = 650
 MINIMUM_WINDOW_WIDTH = 670
 MINIMUM_WINDOW_HEIGHT = 500
+TINY_MINIMUM_WINDOW_WIDTH = 470
+TINY_MINIMUM_WINDOW_HEIGHT = 250
 
 ON_SCREEN_POLL_INTERVAL_SECONDS = 6.0
 OFF_SCREEN_POLL_INTERVAL_SECONDS = 9.0
@@ -357,6 +494,9 @@ CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
 IMMEDIATE_CHATROOM_SWITCH_LIMIT = 2
 CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS = 6
 REQUEST_TIMEOUT_SECONDS = 10
+RECENTLY_ONLINE_INTERVAL_SECONDS = 6 * 60 * 60
+RECENTLY_ONLINE_POLL_SECONDS = 5 * 60
+RECENTLY_ONLINE_RETRY_SECONDS = 60
 SERVER_HISTORY_RETENTION_SECONDS = 12 * 60 * 60
 GAP_SEPARATOR_SECONDS = 6 * 60 * 60
 MAX_MESSAGE_CHARS = 4000
@@ -405,6 +545,11 @@ ED25519_PUBLIC_KEY_BYTES = 32
 ED25519_SIGNATURE_BYTES = 64
 VISIBLE_USER_ID_CHARS = 8
 SIGNED_MESSAGE_CONTEXT = "SpriteLink signed message v1"
+TENOR_MEDIA_HOSTS = (
+    "media.tenor.com",
+    "media1.tenor.com",
+    "c.tenor.com",
+)
 TRUSTED_EXTENSIONLESS_IMAGE_HOSTS = (
     "images.unsplash.com",
     "pbs.twimg.com",
@@ -412,6 +557,7 @@ TRUSTED_EXTENSIONLESS_IMAGE_HOSTS = (
     "res.cloudinary.com",
     "images.ctfassets.net",
     "cdn.sanity.io",
+    "media.gettyimages.com",
 )
 TRUSTED_IMAGE_HOST_PATTERNS = (
     "cdn.discordapp.com",
@@ -425,8 +571,7 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "cdn.bsky.app",
     "tenor.com",
     "www.tenor.com",
-    "media.tenor.com",
-    "c.tenor.com",
+    *TENOR_MEDIA_HOSTS,
     "giphy.com",
     "www.giphy.com",
     "media.giphy.com",
@@ -446,6 +591,13 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "cdn.sanity.io",
     "live.staticflickr.com",
     "cdn.pixabay.com",
+    "alamy.com",
+    "*.alamy.com",
+    "shutterstock.com",
+    "*.shutterstock.com",
+    "ak.picdn.net",
+    "ak4.picdn.net",
+    "media.gettyimages.com",
     "static.wikia.nocookie.net",
     "avatars.githubusercontent.com",
     "user-images.githubusercontent.com",
@@ -520,6 +672,9 @@ TRUSTED_LINK_DOMAINS = (
     "unsplash.com",
     "pexels.com",
     "pixabay.com",
+    "alamy.com",
+    "shutterstock.com",
+    "gettyimages.com",
     "flickr.com",
     "cloudinary.com",
     "ctfassets.net",
@@ -534,6 +689,8 @@ TRUSTED_LINK_DOMAINS = (
 TRUSTED_LINK_EXACT_HOSTS = (
     "adriansblinkiecollection.neocities.org",
     "steamuserimages-a.akamaihd.net",
+    "ak.picdn.net",
+    "ak4.picdn.net",
 )
 IMAGE_LINK_EXTENSIONS = (
     ".png",
@@ -544,17 +701,12 @@ IMAGE_LINK_EXTENSIONS = (
     ".bmp",
     ".jfif",
 )
-TENOR_MEDIA_HOSTS = (
-    "media.tenor.com",
-    "c.tenor.com",
-)
 TENOR_VIDEO_EXTENSIONS = (
     ".mp4",
     ".webm",
 )
 LOOPING_VIDEO_HOST_PATTERNS = (
-    "media.tenor.com",
-    "c.tenor.com",
+    *TENOR_MEDIA_HOSTS,
     "*.klipy.com",
     "media.giphy.com",
     "media0.giphy.com",
@@ -603,8 +755,91 @@ DEFAULT_MESSAGE_FONT = "Arial"
 DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
-MESSAGE_LINE_HEIGHT_PX = 24
-SPOILER_DISPLAY_HEIGHT_PX = 22
+GLASSY_MESSAGE_ROW_BACKGROUNDS = ("#38ffffff", "#50d7e7f2")
+
+
+def message_row_backgrounds() -> tuple[str, str]:
+    app = QApplication.instance()
+    if app is not None and bool(app.property("spritelinkWindowsClassic")):
+        position = int(app.property("spritelinkClassicColor") or 0)
+        return CLASSIC_COLOR_SCHEMES[position].get("chat_backgrounds", MESSAGE_ROW_BACKGROUNDS)
+    if app is not None and bool(app.property("spritelinkGlassy")):
+        degrees = int(app.property("spritelinkThemeHue") or 0)
+        if degrees:
+            return tuple(shift_theme_color(color, degrees).name(QColor.NameFormat.HexArgb)
+                         for color in GLASSY_MESSAGE_ROW_BACKGROUNDS)
+        return GLASSY_MESSAGE_ROW_BACKGROUNDS
+    return MESSAGE_ROW_BACKGROUNDS
+
+
+DEFAULT_MESSAGE_LINE_HEIGHT_PX = 24
+CHAT_LINE_VERTICAL_PADDING_PX = 3
+SPOILER_VERTICAL_INSET_PX = 1.0
+TEXT_SIZE_MIN_PT = 7
+TEXT_SIZE_MAX_PT = 24
+DEFAULT_UI_SIZE = "Small (Default)"
+UI_SIZE_PRESETS = {
+    "Large": {
+        "chat_log": 15,
+        "message_input": 15,
+        "other_ui": 11,
+    },
+    "Small (Default)": {
+        "chat_log": 13,
+        "message_input": 13,
+        "other_ui": 9,
+    },
+    "Tiny": {
+        "chat_log": 11,
+        "message_input": 11,
+        "other_ui": 8,
+    },
+}
+DEFAULT_TEXT_SIZES = {
+    "chat_log": 13,
+    "message_input": 13,
+    "chatrooms": 9,
+    "status": 9,
+    "other_ui": 9,
+}
+
+
+def normalize_ui_size(value: Any) -> str:
+    size = str(value)
+    if size == "Small":
+        return DEFAULT_UI_SIZE
+    return size if size in UI_SIZE_PRESETS else DEFAULT_UI_SIZE
+
+
+def ui_size_text_sizes(value: Any) -> dict[str, int]:
+    preset = UI_SIZE_PRESETS[normalize_ui_size(value)]
+    other = int(preset["other_ui"])
+    return {
+        "chat_log": int(preset["chat_log"]),
+        "message_input": int(preset["message_input"]),
+        "chatrooms": other,
+        "status": other,
+        "other_ui": other,
+    }
+
+
+def minimum_window_size(value: Any) -> tuple[int, int]:
+    if normalize_ui_size(value) == "Tiny":
+        return TINY_MINIMUM_WINDOW_WIDTH, TINY_MINIMUM_WINDOW_HEIGHT
+    return MINIMUM_WINDOW_WIDTH, MINIMUM_WINDOW_HEIGHT
+
+
+def client_ui_size(client: Any) -> str:
+    config = getattr(client, "config_data", None)
+    if isinstance(config, dict):
+        return normalize_ui_size(config.get("ui_size"))
+    return DEFAULT_UI_SIZE
+
+
+def client_is_tiny_ui(client: Any) -> bool:
+    return client_ui_size(client) == "Tiny"
+
+
 COMPOSER_SPOILER_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
 RENDERED_SPOILER_ID_PROPERTY = int(QTextFormat.Property.UserProperty) + 2
 RENDERED_SPOILER_COLOR_PROPERTY = int(QTextFormat.Property.UserProperty) + 3
@@ -733,6 +968,388 @@ QFrame[frameShape="4"], QFrame[frameShape="5"] {
     color: #808080;
 }
 """
+
+# Keep the chat viewport on its original Base palette color. Modern's extra
+# contrast belongs to the surrounding controls, not the message backdrop.
+MODERN_STYLESHEET = """
+QMainWindow, QDialog, QWidget#glassRoot, QWidget#chatTab {
+    background: #f3f3f3;
+    color: #1b1b1b;
+}
+QWidget#chatroomsPanel {
+    background: #eaeaea;
+    border-right: 1px solid #c4c4c4;
+}
+QLabel { background: transparent; }
+QFrame[frameShape="6"] {
+    background: #fbfbfb; border: 1px solid #b8b8b8; border-radius: 8px;
+}
+QPushButton {
+    background: #fbfbfb;
+    color: #1b1b1b;
+    border: 1px solid #b8b8b8;
+    border-bottom-color: #999999;
+    border-radius: 4px;
+    padding: 4px 10px;
+    min-height: 18px;
+}
+QPushButton:hover { background: #ffffff; border-color: #969696; }
+QPushButton:pressed { background: #e5e5e5; border-color: #a4a4a4; }
+QPushButton:checked { background: #e6eff8; border-color: #7c9fbe; }
+QPushButton:focus { border-color: #0067c0; }
+QPushButton:default { background: #0067c0; color: #ffffff; border-color: #005ba9; }
+QPushButton:default:hover { background: #1975c5; }
+QPushButton:default:pressed { background: #005ba9; }
+QPushButton:disabled {
+    background: #f0f0f0; color: #777777; border-color: #cccccc;
+}
+QLineEdit, QPlainTextEdit, QComboBox {
+    background: #ffffff;
+    color: #1b1b1b;
+    border: 1px solid #b8b8b8;
+    border-bottom-color: #858585;
+    border-radius: 4px;
+    selection-background-color: #0067c0;
+    selection-color: #ffffff;
+}
+QLineEdit { padding: 3px 6px; }
+QPlainTextEdit { padding: 3px; }
+QComboBox { padding: 3px 26px 3px 8px; min-height: 18px; }
+QLineEdit:hover, QPlainTextEdit:hover, QComboBox:hover { border-color: #959595; }
+QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus { border-bottom-color: #0067c0; }
+QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {
+    background: #f0f0f0; color: #777777; border-color: #cccccc;
+}
+QComboBox::drop-down { border: none; width: 24px; }
+QComboBox::down-arrow { image: none; }
+QFrame#comboPopup {
+    background: #fbfbfb; border: 1px solid #b8b8b8; border-radius: 4px;
+}
+QComboBox QAbstractItemView, QListWidget {
+    background: #ffffff; color: #1b1b1b;
+    border: 1px solid #b8b8b8; border-radius: 4px;
+    selection-background-color: #e2edf8; selection-color: #1b1b1b;
+    outline: none;
+}
+QListWidget::item { padding: 3px 4px; }
+QListWidget#chatroomsList::item { padding: 0px; }
+QListWidget::item:hover { background: #eff3f7; }
+QListWidget::item:selected { background: #e2edf8; color: #1b1b1b; }
+QTextBrowser#chatViewport {
+    background: palette(base); border: 1px solid #b8b8b8; border-radius: 4px;
+}
+QScrollArea { background: transparent; border: none; }
+QCheckBox { spacing: 6px; }
+QMenu {
+    background: #fbfbfb; color: #1b1b1b;
+    border: 1px solid #b8b8b8; border-radius: 8px; padding: 4px;
+}
+QMenu::item { padding: 5px 24px; border-radius: 4px; }
+QMenu::item:selected { background: #e2edf8; }
+QMenu::item:disabled { color: #777777; }
+QMenu::separator { height: 1px; background: #d2d2d2; margin: 4px 6px; }
+QToolTip {
+    background: #fbfbfb; color: #1b1b1b;
+    border: 1px solid #b8b8b8; border-radius: 4px; padding: 4px;
+}
+QFrame[frameShape="4"], QFrame[frameShape="5"] { color: #b8b8b8; }
+QSlider:horizontal { min-height: 24px; }
+QSlider::groove:horizontal { height: 4px; background: #c7c7c7; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #0067c0; border-radius: 2px; }
+QSlider::handle:horizontal {
+    width: 18px; margin: -8px 0; background: transparent; border: 1px solid transparent;
+}
+"""
+
+GLASSY_STYLESHEET = """
+QMainWindow, QDialog {
+    background: rgba(224, 240, 250, 188);
+    color: #172532;
+}
+QMainWindow {
+    background: transparent;
+}
+QWidget#glassRoot {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:1,
+        stop:0 rgba(242, 251, 255, 54),
+        stop:0.40 rgba(207, 231, 246, 42),
+        stop:1 rgba(151, 195, 224, 66)
+    );
+}
+QWidget#chatroomsPanel {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(251, 254, 255, 80),
+        stop:1 rgba(172, 207, 230, 64)
+    );
+    border-right: 1px solid rgba(78, 129, 164, 210);
+}
+QWidget#chatTab {
+    background: transparent;
+}
+QLabel {
+    background: transparent;
+}
+QPushButton {
+    color: #142638;
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 246),
+        stop:0.46 rgba(235, 247, 254, 238),
+        stop:0.50 rgba(196, 224, 243, 236),
+        stop:1 rgba(153, 197, 225, 236)
+    );
+    border: 1px solid #496f87;
+    border-radius: 5px;
+    padding: 4px 10px;
+    min-height: 18px;
+}
+QPushButton:hover {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 252),
+        stop:0.46 rgba(236, 252, 255, 246),
+        stop:0.50 rgba(182, 231, 250, 244),
+        stop:1 rgba(102, 184, 226, 242)
+    );
+    border-color: #3c7fa7;
+}
+QPushButton:pressed, QPushButton:checked {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(136, 175, 203, 248),
+        stop:0.06 rgba(181, 210, 231, 248),
+        stop:0.94 rgba(169, 202, 227, 248),
+        stop:1 rgba(205, 226, 241, 248)
+    );
+    border-color: #376d8d;
+    padding-top: 5px;
+    padding-bottom: 3px;
+}
+QPushButton:default {
+    border: 2px solid #4387b2;
+    padding: 3px 9px;
+}
+QPushButton:disabled {
+    color: rgba(49, 68, 82, 125);
+    background: rgba(226, 237, 244, 142);
+    border-color: rgba(99, 132, 151, 110);
+}
+QPushButton#identityMenuButton,
+QPushButton#fontMenuButton,
+QPushButton#formattingMenuButton {
+    min-height: 17px;
+    padding-top: 2px;
+    padding-bottom: 2px;
+}
+QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
+    color: #172532;
+    background-color: rgba(255, 255, 255, 226);
+    border: 1px solid rgba(49, 91, 118, 235);
+    border-radius: 4px;
+    selection-background-color: #5ba7d5;
+    selection-color: #ffffff;
+}
+QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus,
+QListWidget:focus, QComboBox:focus {
+    border: 1px solid #3188bd;
+}
+QLineEdit, QPlainTextEdit {
+    padding: 3px 5px;
+}
+QComboBox {
+    padding: 3px 24px 3px 7px;
+}
+QComboBox::drop-down {
+    width: 22px;
+    border-left: 1px solid rgba(89, 132, 158, 190);
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 230),
+        stop:1 rgba(153, 201, 230, 230)
+    );
+    border-top-right-radius: 4px;
+    border-bottom-right-radius: 4px;
+}
+QComboBox::down-arrow {
+    image: none;
+    width: 0px;
+    height: 0px;
+}
+QTextBrowser#chatViewport {
+    background-color: rgba(255, 255, 255, 72);
+    border: 1px solid #365f78;
+    border-radius: 4px;
+}
+QFrame#comboPopup {
+    background-color: #f7fcff;
+    border: 1px solid #496f87;
+    padding: 0px;
+}
+QComboBox QAbstractItemView {
+    background-color: #f7fcff;
+    border-radius: 0px;
+    padding: 0px;
+}
+QComboBox QAbstractItemView, QMenu {
+    color: #172532;
+    background-color: #f7fcff;
+    border: 1px solid #608aa3;
+    selection-background-color: #62a9d2;
+    selection-color: #ffffff;
+}
+QListWidget::item:selected, QMenu::item:selected {
+    color: #ffffff;
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #3f91c2,
+        stop:1 #80c2e7
+    );
+}
+QMenu::item:disabled {
+    color: rgba(41, 57, 70, 120);
+}
+QFrame[frameShape="6"] {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 192),
+        stop:1 rgba(191, 220, 237, 176)
+    );
+    border: 1px solid rgba(87, 131, 158, 205);
+    border-radius: 6px;
+}
+QScrollArea, QScrollArea > QWidget > QWidget {
+    background: transparent;
+    border: none;
+}
+QScrollBar:vertical {
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #d5e0e8,
+        stop:0.25 #e6edf2,
+        stop:1 #f3f7fa
+    );
+    width: 14px;
+    margin: 1px;
+    border-radius: 2px;
+}
+QScrollBar:horizontal {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #d5e0e8,
+        stop:0.25 #e6edf2,
+        stop:1 #f3f7fa
+    );
+    height: 14px;
+    margin: 1px;
+    border-radius: 2px;
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #ffffff,
+        stop:0.46 #edf5fa,
+        stop:0.50 #ccdce8,
+        stop:1 #e1edf5
+    );
+    border: 1px solid #829eaf;
+    border-top-color: #b2c5d1;
+    border-radius: 2px;
+}
+QScrollBar::handle:vertical {
+    min-height: 24px;
+    image: url("SPRITELINK_SCROLLBAR_ASSETS/scrollbar-grip.svg");
+}
+QScrollBar::handle:horizontal {
+    min-width: 24px;
+    image: url("SPRITELINK_SCROLLBAR_ASSETS/scrollbar-grip-horizontal.svg");
+}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #ffffff,
+        stop:0.46 #e4f5fd,
+        stop:0.50 #afd9f0,
+        stop:1 #c6e8f8
+    );
+    border-color: #4d8caf;
+    border-top-color: #9ccbe4;
+}
+QScrollBar::handle:vertical:pressed, QScrollBar::handle:horizontal:pressed {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #c7e7f6,
+        stop:0.46 #b5dcf0,
+        stop:0.50 #82bbdd,
+        stop:1 #a8d6ef
+    );
+    border-color: #397b9f;
+}
+QScrollBar::handle:vertical:disabled, QScrollBar::handle:horizontal:disabled {
+    background: #e8eef2;
+    border-color: #b4c1ca;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    background: transparent;
+    border: none;
+    height: 0px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    background: transparent;
+    border: none;
+    width: 0px;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical,
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: transparent;
+}
+QSlider:horizontal {
+    min-height: 21px;
+}
+QSlider::groove:horizontal {
+    height: 5px;
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(190, 213, 229, 230),
+        stop:1 rgba(237, 249, 255, 230)
+    );
+    border: 1px solid #648fa9;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    width: 13px;
+    margin: -5px 0;
+    background: transparent;
+    border: 1px solid transparent;
+}
+QProgressBar {
+    color: #172532;
+    background-color: rgba(255, 255, 255, 188);
+    border: 1px solid #6f9bb5;
+    border-radius: 4px;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #c7f5ff,
+        stop:0.48 #72cee9,
+        stop:0.52 #39a8d4,
+        stop:1 #197aa9
+    );
+    border-radius: 3px;
+}
+QToolTip {
+    color: #172532;
+    background-color: rgba(248, 253, 255, 246);
+    border: 1px solid #668da4;
+    padding: 3px;
+}
+QFrame[frameShape="4"], QFrame[frameShape="5"] {
+    color: rgba(73, 115, 140, 190);
+}
+""".replace("SPRITELINK_SCROLLBAR_ASSETS", (Path(__file__).resolve().parent / "assets").as_posix())
 
 # Dark, moderately saturated colors that remain readable against the standard
 # light chat background. A color is selected only when a new local
@@ -2632,7 +3249,9 @@ def default_config() -> dict[str, Any]:
         "server_preset": DEFAULT_SERVER_PRESET,
         "server_url": DEFAULT_SERVER_URL,
         "theme": DEFAULT_THEME,
+        "theme_colors": normalize_theme_colors(None),
         "text_shadows": True,
+        "ui_size": DEFAULT_UI_SIZE,
         "message_sound": DEFAULT_MESSAGE_SOUND,
         "message_sound_volume": DEFAULT_MESSAGE_SOUND_VOLUME,
         "custom_message_sound_path": "",
@@ -2656,6 +3275,7 @@ def default_config() -> dict[str, Any]:
         "unread_counts": {},
         "unread_after_message_ids": {},
         "room_state": {},
+        "recently_online_state": {},
         "muted_users": {},
         "trusted_link_and_image_users": {},
         "collapsed_messages": {},
@@ -2709,6 +3329,8 @@ def load_config() -> dict[str, Any]:
         else ""
     )
     config["text_shadows"] = bool(config.get("text_shadows", True))
+    config["ui_size"] = normalize_ui_size(config.get("ui_size"))
+    config.pop("text_sizes", None)
     config["desktop_notifications"] = bool(
         config.get("desktop_notifications", False)
     )
@@ -2733,6 +3355,7 @@ def load_config() -> dict[str, Any]:
     window_width, window_height = normalize_window_size(
         config.get("window_width", DEFAULT_WINDOW_WIDTH),
         config.get("window_height", DEFAULT_WINDOW_HEIGHT),
+        config["ui_size"],
     )
     config["window_width"] = window_width
     config["window_height"] = window_height
@@ -2742,6 +3365,7 @@ def load_config() -> dict[str, Any]:
 
     for dictionary_key in (
         "room_state",
+        "recently_online_state",
         "muted_users",
         "trusted_link_and_image_users",
         "trusted_image_users",
@@ -2881,6 +3505,7 @@ def load_config() -> dict[str, Any]:
         str(config.get("theme", DEFAULT_THEME)),
     )
     config["theme"] = theme if theme in THEMES else DEFAULT_THEME
+    config["theme_colors"] = normalize_theme_colors(config.get("theme_colors"))
 
     muted_chatrooms = config.get("muted_chatrooms")
     if not isinstance(muted_chatrooms, list):
@@ -2954,7 +3579,11 @@ def save_config(config: dict[str, Any]) -> None:
     )
 
 
-def normalize_window_size(width: Any, height: Any) -> tuple[int, int]:
+def normalize_window_size(
+    width: Any,
+    height: Any,
+    ui_size: Any = DEFAULT_UI_SIZE,
+) -> tuple[int, int]:
     try:
         normalized_width = int(width)
     except (TypeError, ValueError):
@@ -2963,10 +3592,14 @@ def normalize_window_size(width: Any, height: Any) -> tuple[int, int]:
         normalized_height = int(height)
     except (TypeError, ValueError):
         normalized_height = DEFAULT_WINDOW_HEIGHT
+    minimum_width, minimum_height = minimum_window_size(ui_size)
     return (
-        max(MINIMUM_WINDOW_WIDTH, min(DEFAULT_WINDOW_WIDTH, normalized_width)),
         max(
-            MINIMUM_WINDOW_HEIGHT,
+            minimum_width,
+            min(DEFAULT_WINDOW_WIDTH, normalized_width),
+        ),
+        max(
+            minimum_height,
             min(DEFAULT_WINDOW_HEIGHT, normalized_height),
         ),
     )
@@ -3049,6 +3682,59 @@ def room_scope_id(server_url: str, passphrase: str) -> str:
     topic = derive_ntfy_topic(passphrase)
     material = (normalize_server_url(server_url) + "\0" + topic).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def recently_online_transport() -> tuple[str, bytes]:
+    # Separate from chat topics, signing identities and message encryption.
+    # A cached key keeps counting many tiny pings inexpensive.
+    passphrase = GLOBAL_CHATROOM_KEY + "\0SpriteLink-recently-online-v1"
+    key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"SpriteLink-recently-online-v1",
+        info=b"anonymous-ping",
+    ).derive(passphrase.encode("utf-8"))
+    return derive_ntfy_topic(passphrase), key
+
+
+def make_recently_online_packet(token: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ValueError("Invalid presence token.")
+    nonce = os.urandom(12)
+    _topic, key = recently_online_transport()
+    ciphertext = ChaCha20Poly1305(key).encrypt(
+        nonce, bytes.fromhex(token), b"SpriteLink-recently-online-v1"
+    )
+    return base64.b64encode(b"\x01" + nonce + ciphertext).decode("ascii")
+
+
+def recently_online_pings(
+    records: list[dict[str, Any]], *, now: float,
+) -> dict[str, int]:
+    pings: dict[str, int] = {}
+    _topic, key = recently_online_transport()
+    for record in records:
+        timestamp = record.get("time")
+        packet = record.get("message")
+        if (
+            type(timestamp) is not int
+            or not now - RECENTLY_ONLINE_INTERVAL_SECONDS < timestamp <= now
+            or not isinstance(packet, str)
+            or len(packet) != 60
+        ):
+            continue
+        try:
+            raw = base64.b64decode(packet, validate=True)
+            if len(raw) != 45 or raw[0] != 1:
+                continue
+            token = ChaCha20Poly1305(key).decrypt(
+                raw[1:13], raw[13:], b"SpriteLink-recently-online-v1"
+            ).hex()
+        except Exception:
+            continue
+        pings[token] = max(timestamp, pings.get(token, timestamp))
+    return pings
 
 
 def derive_message_key(passphrase: str, salt: bytes) -> bytes:
@@ -3367,6 +4053,12 @@ messagebox = MessageBoxes()
 class ComposeTextEdit(QPlainTextEdit):
     send_requested = Signal()
     formatting_shortcut_requested = Signal(str)
+    width_changed = Signal()
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self.width_changed.emit()
 
     def to_message_text(self) -> str:
         segments: list[tuple[str, bool, bool, bool, bool]] = []
@@ -3584,11 +4276,244 @@ class ConfigOverlay(QWidget):
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.panel: QFrame | None = None
+        self._glassy = False
+        self._blurred_background: QPixmap | None = None
+        self._background_refresh_timer = QTimer(self)
+        self._background_refresh_timer.setSingleShot(True)
+        self._background_refresh_timer.setInterval(0)
+        self._background_refresh_timer.timeout.connect(
+            self._refresh_visible_background
+        )
         self.setObjectName("configOverlay")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(
-            "QWidget#configOverlay { background-color: rgba(0, 0, 0, 105); }"
+        app = QApplication.instance()
+        self.apply_theme(
+            bool(app is not None and app.property("spritelinkGlassy"))
         )
+
+    def apply_theme(self, glassy: bool) -> None:
+        self._glassy = glassy
+        if glassy:
+            self.setStyleSheet(
+                "QWidget#configOverlay {"
+                " background-color: transparent;"
+                "}"
+            )
+            self.schedule_background_refresh()
+        else:
+            self._background_refresh_timer.stop()
+            self._blurred_background = None
+            self.setStyleSheet(
+                "QWidget#configOverlay {"
+                " background-color: rgba(0, 0, 0, 105);"
+                "}"
+            )
+        self.update()
+
+    def schedule_background_refresh(self) -> None:
+        # Capture after stylesheet, composer and layout updates have settled.
+        # Repeated resize events share one pending capture.
+        if self._glassy and self.isVisible():
+            self._background_refresh_timer.start()
+
+    def _refresh_visible_background(self) -> None:
+        if self._glassy and self.isVisible():
+            self._refresh_blurred_background()
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self.schedule_background_refresh()
+
+    @staticmethod
+    def _blur_pixmap(source: QPixmap) -> QPixmap | None:
+        if source.isNull():
+            return None
+
+        # Glassy captures retain the translucent palette/stylesheet alpha.
+        # Flatten before blurring so sharp live controls cannot show through
+        # the blurred composer, even away from the padded window edges.
+        background = shift_theme_color(QColor(224, 240, 250))
+        opaque_source = QPixmap(source.size())
+        opaque_source.setDevicePixelRatio(source.devicePixelRatio())
+        opaque_source.fill(background)
+        painter = QPainter(opaque_source)
+        painter.drawPixmap(QPoint(0, 0), source)
+        painter.end()
+        source = opaque_source
+
+        blur_radius = 11.0
+        padding = int(math.ceil(blur_radius * 2.0))
+        device_ratio = source.devicePixelRatio()
+        source_size = source.deviceIndependentSize()
+        source_width = float(source_size.width())
+        source_height = float(source_size.height())
+        padded = QPixmap(
+            max(
+                1,
+                int(math.ceil(
+                    (source_width + (padding * 2)) * device_ratio
+                )),
+            ),
+            max(
+                1,
+                int(math.ceil(
+                    (source_height + (padding * 2)) * device_ratio
+                )),
+            ),
+        )
+        padded.setDevicePixelRatio(device_ratio)
+        padded.fill(Qt.GlobalColor.transparent)
+
+        # A blur fades toward transparency outside its source. Without a
+        # gutter, the live unblurred controls beneath this overlay show
+        # through along the window edges. Stretch each outermost source row
+        # and column into the gutter so the blur stays opaque everywhere.
+        # QPainter pixmap source rectangles use physical pixels; destination
+        # rectangles and graphics-scene bounds use device-independent units.
+        source_pixel_width = float(source.width())
+        source_pixel_height = float(source.height())
+        source_rect = QRectF(
+            0.0, 0.0, source_pixel_width, source_pixel_height
+        )
+        padded_painter = QPainter(padded)
+        padded_painter.drawPixmap(
+            QRectF(
+                float(padding),
+                float(padding),
+                source_width,
+                source_height,
+            ),
+            source,
+            source_rect,
+        )
+        padded_painter.drawPixmap(
+            QRectF(0.0, float(padding), float(padding), source_height),
+            source,
+            QRectF(0.0, 0.0, 1.0, source_pixel_height),
+        )
+        padded_painter.drawPixmap(
+            QRectF(
+                float(padding) + source_width,
+                float(padding),
+                float(padding),
+                source_height,
+            ),
+            source,
+            QRectF(source_pixel_width - 1.0, 0.0, 1.0, source_pixel_height),
+        )
+        padded_painter.drawPixmap(
+            QRectF(
+                float(padding),
+                0.0,
+                source_width,
+                float(padding),
+            ),
+            source,
+            QRectF(0.0, 0.0, source_pixel_width, 1.0),
+        )
+        padded_painter.drawPixmap(
+            QRectF(
+                float(padding),
+                float(padding) + source_height,
+                source_width,
+                float(padding),
+            ),
+            source,
+            QRectF(0.0, source_pixel_height - 1.0, source_pixel_width, 1.0),
+        )
+        for target_x, target_y, source_x, source_y in (
+            (0.0, 0.0, 0.0, 0.0),
+            (float(padding) + source_width, 0.0, source_pixel_width - 1.0, 0.0),
+            (0.0, float(padding) + source_height, 0.0, source_pixel_height - 1.0),
+            (
+                float(padding) + source_width,
+                float(padding) + source_height,
+                source_pixel_width - 1.0,
+                source_pixel_height - 1.0,
+            ),
+        ):
+            padded_painter.drawPixmap(
+                QRectF(
+                    target_x,
+                    target_y,
+                    float(padding),
+                    float(padding),
+                ),
+                source,
+                QRectF(source_x, source_y, 1.0, 1.0),
+            )
+        padded_painter.end()
+
+        blurred_padded = QPixmap(padded.size())
+        blurred_padded.setDevicePixelRatio(device_ratio)
+        blurred_padded.fill(Qt.GlobalColor.transparent)
+
+        scene = QGraphicsScene()
+        item = scene.addPixmap(padded)
+        effect = QGraphicsBlurEffect()
+        effect.setBlurRadius(blur_radius)
+        effect.setBlurHints(QGraphicsBlurEffect.BlurHint.QualityHint)
+        item.setGraphicsEffect(effect)
+        padded_rect = item.boundingRect()
+        scene.setSceneRect(padded_rect)
+
+        painter = QPainter(blurred_padded)
+        scene.render(painter, padded_rect, padded_rect)
+        painter.end()
+
+        blurred = QPixmap(source.size())
+        blurred.setDevicePixelRatio(device_ratio)
+        # Also cover any rounding/blur-kernel transparency at the crop edge.
+        blurred.fill(background)
+        painter = QPainter(blurred)
+        painter.drawPixmap(
+            QPointF(-float(padding), -float(padding)),
+            blurred_padded,
+        )
+        painter.end()
+        return blurred
+
+    def _refresh_blurred_background(self) -> None:
+        self._background_refresh_timer.stop()
+        if not self._glassy:
+            self._blurred_background = None
+            return
+
+        parent = self.parentWidget()
+        if parent is None:
+            self._blurred_background = None
+            return
+
+        was_visible = self.isVisible()
+        focused_widget = QApplication.focusWidget() if was_visible else None
+        if was_visible:
+            super().hide()
+        try:
+            self._blurred_background = self._blur_pixmap(parent.grab())
+        finally:
+            if was_visible:
+                super().show()
+                self.raise_()
+                if (
+                    focused_widget is not None
+                    and self.isAncestorOf(focused_widget)
+                ):
+                    focused_widget.setFocus()
+        self.update()
+
+    def show(self) -> None:
+        self._refresh_blurred_background()
+        super().show()
+
+    def paintEvent(self, event: Any) -> None:
+        if self._glassy and self._blurred_background is not None:
+            painter = QPainter(self)
+            # Cover the full overlay while a resized capture is queued.
+            painter.drawPixmap(self.rect(), self._blurred_background)
+            painter.fillRect(self.rect(), QColor(20, 54, 76, 82))
+            painter.end()
+            return
+        super().paintEvent(event)
 
     def mousePressEvent(self, event: Any) -> None:
         if (
@@ -3832,6 +4757,14 @@ class ChatroomListRow(QWidget):
             opacity = QGraphicsOpacityEffect(self)
             opacity.setOpacity(0.45)
             self.setGraphicsEffect(opacity)
+        self.apply_theme()
+
+    def apply_theme(self) -> None:
+        app = QApplication.instance()
+        modern = app is not None and app.property("spritelinkModern")
+        tiny = app is not None and app.property("spritelinkTinyUI")
+        vertical_margin = 1 if tiny else (3 if modern else 1)
+        self.layout().setContentsMargins(4, vertical_margin, 4, vertical_margin)
 
 
 class ChatroomListWidget(QListWidget):
@@ -3840,6 +4773,7 @@ class ChatroomListWidget(QListWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("chatroomsList")
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
@@ -3851,6 +4785,22 @@ class ChatroomListWidget(QListWidget):
         self._pressed_room_id: str | None = None
         self._dragged_room_id: str | None = None
         self._dragged_row = -1
+
+    def refresh_row_sizes(self) -> None:
+        # Item widgets own their margins. Recalculate their height after a
+        # theme/font change instead of retaining the old font's size hint.
+        for index in range(self.count()):
+            item = self.item(index)
+            row = self.itemWidget(item)
+            if row is not None:
+                if isinstance(row, ChatroomListRow):
+                    row.apply_theme()
+                row.ensurePolished()
+                if row.layout() is not None:
+                    row.layout().invalidate()
+                    row.layout().activate()
+                item.setSizeHint(row.sizeHint())
+        self.doItemsLayout()
 
     def mousePressEvent(self, event: Any) -> None:
         is_left_press = event.button() == Qt.MouseButton.LeftButton
@@ -4164,7 +5114,88 @@ def subscription_room_ids(
 
 
 class TextShadowProxyStyle(QProxyStyle):
-    """Draw standard Qt widget text with a subtle one-pixel shadow."""
+    """Theme outlines and optional subtle shadows for standard Qt widgets."""
+
+    def pixelMetric(self, metric, option=None, widget=None) -> int:
+        app = QApplication.instance()
+        if (metric in (QStyle.PixelMetric.PM_IndicatorWidth,
+                       QStyle.PixelMetric.PM_IndicatorHeight)
+                and app is not None and bool(app.property("spritelinkModern"))):
+            return 20
+        if (metric == QStyle.PixelMetric.PM_MenuVMargin
+                and isinstance(widget, QComboBox)
+                and app is not None and bool(app.property("spritelinkGlassy"))):
+            return 0
+        return super().pixelMetric(metric, option, widget)
+
+    def styleHint(self, hint, option=None, widget=None, returnData=None) -> int:
+        app = QApplication.instance()
+        if (hint in (QStyle.StyleHint.SH_EtchDisabledText,
+                     QStyle.StyleHint.SH_DitherDisabledText)
+                and app is not None and bool(app.property("spritelinkModern"))):
+            return 0
+        return super().styleHint(hint, option, widget, returnData)
+
+    def drawPrimitive(self, element, option, painter, widget=None) -> None:
+        app = QApplication.instance()
+        if (element == QStyle.PrimitiveElement.PE_IndicatorCheckBox
+                and app is not None and bool(app.property("spritelinkModern"))):
+            enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+            marked = bool(option.state & (QStyle.StateFlag.State_On | QStyle.StateFlag.State_NoChange))
+            hovered = enabled and bool(option.state & QStyle.StateFlag.State_MouseOver)
+            pressed = enabled and bool(option.state & QStyle.StateFlag.State_Sunken)
+            border = QColor("#858585" if enabled else "#b8b8b8")
+            fill = QColor("#ffffff" if enabled else "#f0f0f0")
+            if marked:
+                border = fill = shift_theme_color(
+                    "#b8b8b8" if not enabled else
+                    "#005ba9" if pressed else "#1975c5" if hovered else "#0067c0"
+                )
+            elif hovered:
+                border = shift_theme_color("#0067c0")
+            rect = QRectF(option.rect).adjusted(0.5, 0.5, -0.5, -0.5)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(border, 1.0))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, 3.0, 3.0)
+            if marked:
+                pen = QPen(QColor("#ffffff" if enabled else "#f3f3f3"), 2.0)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                path = QPainterPath()
+                def point(x: float, y: float) -> QPointF:
+                    return QPointF(rect.left() + x * rect.width(), rect.top() + y * rect.height())
+                if option.state & QStyle.StateFlag.State_NoChange:
+                    path.moveTo(point(0.28, 0.50))
+                    path.lineTo(point(0.72, 0.50))
+                else:
+                    path.moveTo(point(0.24, 0.50))
+                    path.lineTo(point(0.43, 0.69))
+                    path.lineTo(point(0.77, 0.31))
+                painter.drawPath(path)
+            painter.restore()
+            return
+        super().drawPrimitive(element, option, painter, widget)
+        if (element != QStyle.PrimitiveElement.PE_IndicatorCheckBox
+                or app is None or not bool(app.property("spritelinkGlassy"))):
+            return
+        # Preserve Fusion's checked/mixed glyph and add a reliable outline
+        # even when the translucent palette makes its native frame faint.
+        enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+        color = shift_theme_color("#496f87" if enabled else "#7391a4")
+        if enabled and option.state & (
+            QStyle.StateFlag.State_MouseOver | QStyle.StateFlag.State_HasFocus
+        ):
+            color = shift_theme_color("#246a92")
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(QPen(color, 1.0))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(option.rect.adjusted(0, 0, -1, -1))
+        painter.restore()
 
     def drawItemText(
         self,
@@ -4181,6 +5212,7 @@ class TextShadowProxyStyle(QProxyStyle):
             text
             and app is not None
             and bool(app.property("spritelinkTextShadows"))
+            and (enabled or not bool(app.property("spritelinkModern")))
         ):
             shadow_color = QColor(0, 0, 0)
             shadow_color.setAlphaF(0.15)
@@ -4220,8 +5252,99 @@ class TextShadowProxyStyle(QProxyStyle):
         )
 
 
+class ThemeSlider(QSlider):
+    """Keep native interaction and paint theme-colored handles."""
+
+    def paintEvent(self, event: Any) -> None:
+        super().paintEvent(event)
+        app = QApplication.instance()
+        if app is None or self.orientation() != Qt.Orientation.Horizontal:
+            return
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        position = self.property("spritelinkPreviewClassicColor")
+        if bool(app.property("spritelinkWindowsClassic")) and position is not None:
+            # Repaint only the native thumb using the selected scheme's bevel
+            # and face colors. The track and application palette stay untouched.
+            scheme = CLASSIC_COLOR_SCHEMES[int(position)]
+            for role, key in (
+                (QPalette.ColorRole.Window, "face"), (QPalette.ColorRole.Button, "face"),
+                (QPalette.ColorRole.Light, "light"), (QPalette.ColorRole.Midlight, "face"),
+                (QPalette.ColorRole.Mid, "shadow"), (QPalette.ColorRole.Dark, "shadow"),
+            ):
+                option.palette.setColor(role, QColor(scheme[key]))
+            option.subControls = QStyle.SubControl.SC_SliderHandle
+            painter = QPainter(self)
+            # Some native styles fill the entire slider background even when
+            # only its handle is requested. Protect the groove/ticks/focus.
+            painter.setClipRect(self.style().subControlRect(
+                QStyle.ComplexControl.CC_Slider, option,
+                QStyle.SubControl.SC_SliderHandle, self,
+            ))
+            self.style().drawComplexControl(QStyle.ComplexControl.CC_Slider, option, painter, self)
+            painter.end()
+            return
+        if not (bool(app.property("spritelinkGlassy")) or bool(app.property("spritelinkModern"))):
+            return
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, option,
+            QStyle.SubControl.SC_SliderHandle, self,
+        )
+        # Snap the outside to physical pixels, then inset the shared fill/stroke
+        # path by half a pen width. This keeps opposite corners symmetrical
+        # at fractional scaling without stacking two rounded stylesheet edges.
+        ratio = self.devicePixelRatioF()
+        rect = QRectF(
+            round(handle.x() * ratio) / ratio,
+            round(handle.y() * ratio) / ratio,
+            round(handle.width() * ratio) / ratio,
+            round(handle.height() * ratio) / ratio,
+        ).adjusted(0.5, 0.5, -0.5, -0.5)
+        enabled = self.isEnabled()
+        highlighted = self.hasFocus() or handle.contains(self.mapFromGlobal(QCursor.pos()))
+        # A Color slider can preview its own thumb without restyling the app.
+        degrees = self.property("spritelinkPreviewHue")
+        if degrees is None:
+            degrees = int(app.property("spritelinkThemeHue") or 0)
+        if bool(app.property("spritelinkModern")):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(QColor("#a0a0a0" if enabled else "#c4c4c4"), 1.0))
+            painter.setBrush(QColor("#ffffff" if enabled else "#f0f0f0"))
+            painter.drawEllipse(rect)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(shift_theme_color("#0067c0", degrees) if enabled else QColor("#b8b8b8"))
+            radius = 3.0 if self.isSliderDown() else 5.0 if highlighted else 4.0
+            painter.drawEllipse(rect.center(), radius, radius)
+            painter.end()
+            return
+        border = shift_theme_color("#496f87" if enabled else "#7391a4", degrees)
+        if enabled and highlighted:
+            border = shift_theme_color("#246a92", degrees)
+        gradient = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        gradient.setColorAt(0, shift_theme_color("#ffffff" if enabled else "#e6eef3", degrees))
+        gradient.setColorAt(1, shift_theme_color("#99c5e1" if enabled else "#dae7ef", degrees))
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(border, 1.0))
+        painter.setBrush(QBrush(gradient))
+        painter.drawRoundedRect(rect, 3.0, 3.0)
+        painter.end()
+
+
 class ThemeComboBox(QComboBox):
-    """Config combo box with Classic styling and no wheel changes."""
+    """Config combo box with theme arrows and no wheel changes."""
+
+    def showPopup(self) -> None:
+        popup = self.view().window()
+        if popup.objectName() != "comboPopup":
+            # The generic translucent QFrame rule must not style the popup's
+            # outside padding. An explicit ID takes precedence over it.
+            popup.setObjectName("comboPopup")
+            popup.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            popup.style().unpolish(popup)
+            popup.style().polish(popup)
+        super().showPopup()
 
     def wheelEvent(self, event: Any) -> None:
         # Let a containing scroll area handle the wheel without changing the
@@ -4231,13 +5354,31 @@ class ThemeComboBox(QComboBox):
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
         app = QApplication.instance()
-        if app is None or not bool(
+        if app is None:
+            return
+
+        windows_classic = bool(
             app.property("spritelinkWindowsClassic")
-        ):
+        )
+        glassy = bool(app.property("spritelinkGlassy"))
+        modern = bool(app.property("spritelinkModern"))
+        if not windows_classic and not glassy and not modern:
             return
 
         center_x = self.width() - 11
         center_y = self.height() // 2
+        if modern:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor("#454545" if self.isEnabled() else "#888888"), 1.2))
+            painter.drawPolyline(QPolygon([
+                QPoint(center_x - 4, center_y - 2),
+                QPoint(center_x, center_y + 2),
+                QPoint(center_x + 4, center_y - 2),
+            ]))
+            painter.end()
+            return
+
         arrow = QPolygon([
             QPoint(center_x - 4, center_y - 2),
             QPoint(center_x + 4, center_y - 2),
@@ -4245,7 +5386,7 @@ class ThemeComboBox(QComboBox):
         ])
         painter = QPainter(self)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#000000"))
+        painter.setBrush(QColor("#000000") if windows_classic else shift_theme_color("#24485f"))
         painter.drawPolygon(arrow)
         painter.end()
 
@@ -4492,14 +5633,14 @@ class MessageLogBrowser(QTextBrowser):
         self,
         block: Any,
     ) -> tuple[int, int]:
-        """Return a row whose bottom is the next row's exact top edge."""
+        """Return shared row edges, assigning top margins to their own row."""
         document_layout = self.document().documentLayout()
         block_rect = document_layout.blockBoundingRect(block)
         next_block = block.next()
         if next_block.isValid():
             bottom_edge = document_layout.blockBoundingRect(
                 next_block
-            ).top()
+            ).top() - next_block.blockFormat().topMargin()
         else:
             bottom_edge = block_rect.top() + block_rect.height()
 
@@ -4507,7 +5648,8 @@ class MessageLogBrowser(QTextBrowser):
         # makes neighboring rows overlap whenever their coordinates are
         # fractional, so the later alternating color steals an edge pixel.
         scroll_y = self.verticalScrollBar().value()
-        painted_top = self._nearest_pixel_edge(block_rect.top()) - scroll_y
+        top_edge = block_rect.top() - block.blockFormat().topMargin()
+        painted_top = self._nearest_pixel_edge(top_edge) - scroll_y
         painted_bottom = self._nearest_pixel_edge(bottom_edge) - scroll_y
         return painted_top, max(painted_top + 1, painted_bottom)
 
@@ -4713,7 +5855,11 @@ class MessageLogBrowser(QTextBrowser):
                         start_x = line.cursorToX(start)[0]
                         end_x = line.cursorToX(end)[0]
                         spoiler_height = min(
-                            float(SPOILER_DISPLAY_HEIGHT_PX),
+                            max(
+                                1.0,
+                                line.height()
+                                - (SPOILER_VERTICAL_INSET_PX * 2.0),
+                            ),
                             line.height(),
                         )
                         spoiler_rect = QRectF(
@@ -4803,6 +5949,10 @@ class MessageLogBrowser(QTextBrowser):
         for block_number, padding in (
             self.row_background_padding_blocks.items()
         ):
+            # The full-width row painter already includes both margins.
+            # Repainting a translucent band would increase its opacity.
+            if block_number in self.row_background_blocks:
+                continue
             background, top_padding, bottom_padding = padding
             block = self.document().findBlockByNumber(block_number)
             if not block.isValid():
@@ -4830,15 +5980,12 @@ class MessageLogBrowser(QTextBrowser):
         painter.end()
 
     def _paint_final_row_background_tail(self, event: Any) -> None:
-        """Extend a final gray message stripe through the viewport bottom."""
+        """Extend the final message stripe through the viewport bottom."""
         if not self.row_background_blocks:
             return
 
         last_block_number = max(self.row_background_blocks)
         background = self.row_background_blocks[last_block_number]
-        if background != QColor(MESSAGE_ROW_BACKGROUNDS[1]):
-            return
-
         block = self.document().findBlockByNumber(last_block_number)
         if not block.isValid():
             return
@@ -4977,7 +6124,26 @@ class MessageLogBrowser(QTextBrowser):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        if os.name == "nt":
+            # Allocate an alpha backing store before the native HWND exists.
+            # Keep the native frame: DWM composites the client area's alpha,
+            # so no layered/frameless window or titlebar replacement is needed.
+            # The format stays fixed when themes are swapped at runtime.
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.close_callback: Any = None
+
+    def paintEvent(self, event: Any) -> None:
+        # Clear every damaged pixel before painting translucent children;
+        # otherwise repeated repaints can accumulate tint over the backdrop.
+        background = self.palette().color(QPalette.ColorRole.Window)
+        background.setAlpha(
+            0 if bool(self.property("spritelinkDesktopBlur")) else 255
+        )
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(event.rect(), background)
+        painter.end()
+        super().paintEvent(event)
 
     def closeEvent(self, event: Any) -> None:
         should_close = True
@@ -5118,8 +6284,7 @@ class EncryptedChatClient(QObject):
         self.root.setWindowTitle("SpriteLink")
         self.config_data = load_config()
         self.root.setMinimumSize(
-            MINIMUM_WINDOW_WIDTH,
-            MINIMUM_WINDOW_HEIGHT,
+            *minimum_window_size(self.config_data.get("ui_size"))
         )
         self.root.resize(
             int(self.config_data["window_width"]),
@@ -5178,6 +6343,11 @@ class EncryptedChatClient(QObject):
             str,
             dict[str, Any],
         ] = {}
+        self.recently_online_poll_attempts: dict[str, float] = {}
+        self.recently_online_send_attempts: dict[str, float] = {}
+        self.recently_online_counts: dict[str, dict[str, int]] = {}
+        self._last_recently_online_count: int | None = None
+        self.recently_online_refresh_event = threading.Event()
 
         self.network_thread: threading.Thread | None = None
         self.subscription_thread: threading.Thread | None = None
@@ -5241,7 +6411,10 @@ class EncryptedChatClient(QObject):
         self._pending_tooltip_message_id: str | None = None
         self._pending_tooltip_global_position = QPoint()
         self._config_snapshot_at_open: tuple[Any, ...] | None = None
-        self._message_font_cache: dict[tuple[str, bool, bool], QFont] = {}
+        self._message_font_cache: dict[
+            tuple[str, bool, bool, str, int],
+            QFont,
+        ] = {}
         self._loading_profile_controls = False
         self._connection_error_visible = False
         self.active_chatroom_id = str(
@@ -5294,9 +6467,19 @@ class EncryptedChatClient(QObject):
         self.theme_var = ValueModel(
             self.config_data.get("theme", DEFAULT_THEME)
         )
+        self.config_data["theme_colors"] = normalize_theme_colors(self.config_data.get("theme_colors"))
+        self._saved_theme_colors = dict(self.config_data["theme_colors"])
+        self.theme_color_save_timer = QTimer(self)
+        self.theme_color_save_timer.setSingleShot(True)
+        self.theme_color_save_timer.setInterval(400)
+        self.theme_color_save_timer.timeout.connect(self._save_theme_colors)
         self.text_shadows_var = ValueModel(
             bool(self.config_data.get("text_shadows", True))
         )
+        self.config_data["ui_size"] = normalize_ui_size(
+            self.config_data.get("ui_size")
+        )
+        self.ui_size_var = ValueModel(self.config_data["ui_size"])
         self.message_sound_var = ValueModel(
             str(self.config_data["message_sound"])
         )
@@ -5436,6 +6619,7 @@ class EncryptedChatClient(QObject):
         self._apply_theme()
         self._apply_application_font_strategy()
         self._build_ui()
+        self._apply_ui_size()
         self._build_tray_icon()
         self._schedule_utc_midnight_reset()
         self._apply_server_preset_state()
@@ -5475,42 +6659,294 @@ class EncryptedChatClient(QObject):
         *,
         bold: bool = False,
     ) -> QFont:
-        font = QFont(self._resolved_font_family(font_name), point_size)
+        # UI families (Segoe UI, Tahoma, etc.) must not pass through the
+        # message-font allowlist, which would silently replace them with Arial.
+        family = self._resolved_font_family(font_name) if font_name == "System" else font_name
+        font = QFont(family, point_size)
         font.setBold(bold)
         font.setStyleStrategy(self._font_style_strategy())
         return font
+
+    def _text_size(self, key: str) -> int:
+        sizes = ui_size_text_sizes(self.config_data.get("ui_size"))
+        return sizes[key]
+
+    def _is_tiny_ui(self) -> bool:
+        return client_is_tiny_ui(self)
 
     def _make_message_font(
         self,
         font_name: str,
         *,
         bold: bool = False,
+        role: str = "message_input",
     ) -> QFont:
+        if role not in {"chat_log", "message_input"}:
+            role = "message_input"
+        base_point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
+        text_size_getter = getattr(self, "_text_size", None)
+        configured_point_size = (
+            int(text_size_getter(role))
+            if callable(text_size_getter)
+            else DEFAULT_TEXT_SIZES[role]
+        )
+        point_size = max(
+            TEXT_SIZE_MIN_PT,
+            min(
+                TEXT_SIZE_MAX_PT,
+                base_point_size
+                + configured_point_size
+                - DEFAULT_TEXT_SIZES[role],
+            ),
+        )
         cache_key = (
             font_name,
             bool(bold),
             self._is_windows_classic_theme(),
+            role,
+            point_size,
         )
         cached = self._message_font_cache.get(cache_key)
         if cached is None:
-            point_size = MESSAGE_FONT_POINT_SIZES.get(font_name, 14)
             cached = self._make_font(
-                font_name,
+                self._resolved_font_family(font_name),
                 point_size,
                 bold=bold,
             )
             self._message_font_cache[cache_key] = cached
         return cached
 
-    def _make_ui_font(self, *, bold: bool = False) -> QFont:
+    def _make_ui_font(
+        self,
+        *,
+        bold: bool = False,
+        point_size: int | None = None,
+    ) -> QFont:
         app = QApplication.instance()
         font = QFont(
             app.font() if app is not None else self._basic_application_font
         )
         font.setFamily(self._ui_font_family())
+        if point_size is not None:
+            font.setPointSize(max(TEXT_SIZE_MIN_PT, int(point_size)))
         font.setBold(bold)
         font.setStyleStrategy(self._font_style_strategy())
         return font
+
+    @staticmethod
+    def _widget_base_point_size(widget: QWidget) -> int:
+        stored = widget.property("spritelinkBasePointSize")
+        try:
+            stored_size = int(stored)
+        except (TypeError, ValueError):
+            stored_size = 0
+        if stored_size > 0:
+            return stored_size
+        current_size = widget.font().pointSize()
+        if current_size <= 0:
+            app = QApplication.instance()
+            current_size = (
+                app.font().pointSize()
+                if app is not None and app.font().pointSize() > 0
+                else DEFAULT_TEXT_SIZES["other_ui"]
+            )
+        widget.setProperty("spritelinkBasePointSize", current_size)
+        return current_size
+
+    def _set_widget_text_size(
+        self,
+        widget: QWidget,
+        role: str,
+    ) -> None:
+        base_size = self._widget_base_point_size(widget)
+        point_size = max(
+            TEXT_SIZE_MIN_PT,
+            min(
+                TEXT_SIZE_MAX_PT,
+                base_size
+                + self._text_size(role)
+                - DEFAULT_TEXT_SIZES[role],
+            ),
+        )
+        font = QFont(widget.font())
+        if font.pointSize() != point_size:
+            font.setPointSize(point_size)
+            widget.setFont(font)
+
+    @staticmethod
+    def _is_widget_within(
+        widget: QWidget,
+        ancestor: QWidget | None,
+    ) -> bool:
+        if ancestor is None:
+            return False
+        current: QWidget | None = widget
+        while current is not None:
+            if current is ancestor:
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _apply_ui_size_to_widget_tree(self, root_widget: QWidget) -> None:
+        chat_display = getattr(self, "chat_display", None)
+        message_entry = getattr(self, "message_entry", None)
+        status_label = getattr(self, "status_label", None)
+        chatrooms_panel = getattr(self, "chatrooms_panel", None)
+        widgets = [root_widget, *root_widget.findChildren(QWidget)]
+        for widget in widgets:
+            if widget in {chat_display, message_entry, status_label}:
+                continue
+            if (
+                self._is_widget_within(widget, chat_display)
+                or self._is_widget_within(widget, message_entry)
+                or self._is_widget_within(widget, chatrooms_panel)
+            ):
+                continue
+            self._set_widget_text_size(widget, "other_ui")
+
+        if chatrooms_panel is not None:
+            for widget in [
+                chatrooms_panel,
+                *chatrooms_panel.findChildren(QWidget),
+            ]:
+                self._set_widget_text_size(widget, "chatrooms")
+
+        if status_label is not None:
+            self._set_widget_text_size(status_label, "status")
+
+    def _apply_layout_density(self) -> None:
+        tiny = self._is_tiny_ui()
+        if hasattr(self, "chat_tab") and self.chat_tab.layout() is not None:
+            margin = 6 if tiny else 10
+            self.chat_tab.layout().setContentsMargins(
+                margin,
+                margin,
+                margin,
+                margin,
+            )
+            self.chat_tab.layout().setSpacing(4 if tiny else 7)
+        if (
+            hasattr(self, "chat_content")
+            and self.chat_content.layout() is not None
+        ):
+            self.chat_content.layout().setSpacing(4 if tiny else 7)
+        for name in ("identity_menu", "font_menu", "formatting_menu"):
+            panel = getattr(self, name, None)
+            if panel is None or panel.layout() is None:
+                continue
+            panel.layout().setContentsMargins(
+                5 if tiny else 8,
+                3 if tiny else 5,
+                5 if tiny else 8,
+                3 if tiny else 5,
+            )
+            panel.layout().setSpacing(4 if tiny else 7)
+        if hasattr(self, "identity_color_button"):
+            self.identity_color_button.setText(
+                "..." if tiny else "Choose..."
+            )
+        if hasattr(self, "profile_icon_button"):
+            self.profile_icon_button.setText(
+                "..." if tiny else "Browse..."
+            )
+        if hasattr(self, "config_tab") and self.config_tab.layout() is not None:
+            margin = 10 if tiny else 14
+            self.config_tab.layout().setContentsMargins(
+                margin,
+                margin,
+                margin,
+                margin,
+            )
+            self.config_tab.layout().setVerticalSpacing(
+                self._config_row_spacing()
+            )
+        if (
+            hasattr(self, "advanced_config_content")
+            and self.advanced_config_content.layout() is not None
+        ):
+            self.advanced_config_content.layout().setVerticalSpacing(
+                self._config_row_spacing()
+            )
+
+    def _apply_ui_size(self) -> None:
+        self.config_data["ui_size"] = normalize_ui_size(
+            self.config_data.get("ui_size")
+        )
+        app = QApplication.instance()
+        if app is not None:
+            app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
+        minimum_width, minimum_height = minimum_window_size(
+            self.config_data["ui_size"]
+        )
+        self.root.setMinimumSize(minimum_width, minimum_height)
+        if (
+            self.root.width() < minimum_width
+            or self.root.height() < minimum_height
+        ):
+            self.root.resize(
+                max(self.root.width(), minimum_width),
+                max(self.root.height(), minimum_height),
+            )
+        self._message_font_cache.clear()
+        if hasattr(self, "root"):
+            self._apply_ui_size_to_widget_tree(self.root)
+        self._apply_layout_density()
+        if hasattr(self, "chat_display"):
+            self.chat_display.setFont(
+                self._make_message_font(
+                    DEFAULT_MESSAGE_FONT,
+                    role="chat_log",
+                )
+            )
+        if hasattr(self, "message_font_combo"):
+            self._refresh_message_font_combo_fonts()
+        if hasattr(self, "message_entry"):
+            profile = self._active_room_profile()
+            composer_font = self._make_message_font(
+                profile["font"],
+                role="message_input",
+            )
+            self.message_entry.setFont(composer_font)
+            self.message_entry.document().setDefaultFont(composer_font)
+            self.message_entry.viewport().setFont(composer_font)
+            self.message_resize_timer.start(0)
+        if hasattr(self, "chatrooms_list"):
+            self.chatrooms_list.refresh_row_sizes()
+        if hasattr(self, "chatrooms_toggle"):
+            self._update_chatrooms_toggle_unread_style()
+
+    def _chat_icons_visible(self) -> bool:
+        return (
+            self._text_size("chat_log")
+            >= DEFAULT_TEXT_SIZES["chat_log"]
+        )
+
+    def _chat_line_height(
+        self,
+        font_name: str,
+        *,
+        ui_font: bool = False,
+    ) -> int:
+        font = (
+            self._make_ui_font(
+                point_size=self._text_size("other_ui")
+            )
+            if ui_font
+            else self._make_message_font(
+                font_name,
+                role="chat_log",
+            )
+        )
+        text_height = max(1, QFontMetrics(font).height())
+        line_height = text_height + (
+            2 if self._is_tiny_ui() else CHAT_LINE_VERTICAL_PADDING_PX
+        )
+        if self._chat_icons_visible():
+            line_height = max(
+                DEFAULT_MESSAGE_LINE_HEIGHT_PX,
+                line_height,
+            )
+        return line_height
 
     def _make_link_warning_url_font(self) -> QFont:
         available_families = {
@@ -5551,14 +6987,29 @@ class EncryptedChatClient(QObject):
             widget.setFont(widget_font)
         self._refresh_special_widget_fonts()
         self._refresh_message_font_combo_fonts()
+        if hasattr(self, "chatrooms_list"):
+            self.chatrooms_list.refresh_row_sizes()
+        if hasattr(self, "theme_color_slider"):
+            self._sync_theme_color_slider()
+        if hasattr(self, "chat_tab"):
+            self._apply_ui_size()
 
     def _ui_font_family(self) -> str:
         if self._is_windows_classic_theme():
             return "Tahoma"
+        if not self._is_glassy_theme():
+            families = set(QFontDatabase.families())
+            # Static Segoe UI provides consistent regular/bold faces in Qt.
+            for family in ("Segoe UI", "Segoe UI Variable"):
+                if family in families:
+                    return family
         return self._basic_application_font.family()
 
     def _is_windows_classic_theme(self) -> bool:
         return self.theme_var.get() == "Classic"
+
+    def _is_glassy_theme(self) -> bool:
+        return self.theme_var.get() == "Glassy"
 
     def _windows_classic_palette(self) -> QPalette:
         palette = QPalette()
@@ -5595,21 +7046,113 @@ class EncryptedChatClient(QObject):
             QPalette.ColorRole.ButtonText,
             QColor("#808080"),
         )
+        position = client_theme_color(self, "Classic")
+        if position:
+            scheme = CLASSIC_COLOR_SCHEMES[position]
+            for role, key in (
+                (QPalette.ColorRole.Window, "face"), (QPalette.ColorRole.Button, "face"),
+                (QPalette.ColorRole.Base, "window"), (QPalette.ColorRole.Light, "light"),
+                (QPalette.ColorRole.Midlight, "face"), (QPalette.ColorRole.Mid, "shadow"),
+                (QPalette.ColorRole.Dark, "shadow"), (QPalette.ColorRole.Highlight, "highlight"),
+                (QPalette.ColorRole.HighlightedText, "highlight_text"),
+                (QPalette.ColorRole.Link, "highlight"), (QPalette.ColorRole.ToolTipBase, "tooltip"),
+            ):
+                palette.setColor(role, QColor(scheme[key]))
+            for role in (QPalette.ColorRole.Text, QPalette.ColorRole.WindowText, QPalette.ColorRole.ButtonText):
+                palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(scheme["shadow"]))
+        return palette
+
+    def _glassy_palette(self) -> QPalette:
+        palette = QPalette(self._basic_palette)
+        colors = {
+            QPalette.ColorRole.Window: QColor(224, 240, 250, 0),
+            QPalette.ColorRole.WindowText: QColor("#172532"),
+            QPalette.ColorRole.Base: QColor(255, 255, 255, 72),
+            QPalette.ColorRole.AlternateBase: QColor(215, 231, 242, 80),
+            QPalette.ColorRole.ToolTipBase: QColor(248, 253, 255, 246),
+            QPalette.ColorRole.ToolTipText: QColor("#172532"),
+            QPalette.ColorRole.Text: QColor("#172532"),
+            QPalette.ColorRole.Button: QColor(191, 221, 239, 226),
+            QPalette.ColorRole.ButtonText: QColor("#142638"),
+            QPalette.ColorRole.BrightText: QColor("#ffffff"),
+            QPalette.ColorRole.Light: QColor("#ffffff"),
+            QPalette.ColorRole.Midlight: QColor("#dceff9"),
+            QPalette.ColorRole.Mid: QColor("#83afc9"),
+            QPalette.ColorRole.Dark: QColor("#527d96"),
+            QPalette.ColorRole.Shadow: QColor("#29485b"),
+            QPalette.ColorRole.Highlight: QColor("#4b9bc9"),
+            QPalette.ColorRole.HighlightedText: QColor("#ffffff"),
+            QPalette.ColorRole.Link: QColor("#006fae"),
+            QPalette.ColorRole.LinkVisited: QColor("#5e4b9e"),
+        }
+        degrees = client_theme_color(self, "Glassy")
+        for role, color in colors.items():
+            palette.setColor(role, color if role == QPalette.ColorRole.LinkVisited else shift_theme_color(color, degrees))
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.Text,
+            shift_theme_color(QColor(49, 68, 82, 125), degrees),
+        )
+        palette.setColor(
+            QPalette.ColorGroup.Disabled,
+            QPalette.ColorRole.ButtonText,
+            shift_theme_color(QColor(49, 68, 82, 125), degrees),
+        )
+        return palette
+
+    def _modern_palette(self) -> QPalette:
+        palette = QPalette(self._basic_palette)
+        # Deliberately retain Base and AlternateBase, including disabled and
+        # inactive groups, so switching to Modern never darkens the chat log.
+        colors = {
+            QPalette.ColorRole.Window: "#f3f3f3",
+            QPalette.ColorRole.WindowText: "#1b1b1b",
+            QPalette.ColorRole.Text: "#1b1b1b",
+            QPalette.ColorRole.Button: "#fbfbfb",
+            QPalette.ColorRole.ButtonText: "#1b1b1b",
+            QPalette.ColorRole.Light: "#ffffff",
+            QPalette.ColorRole.Midlight: "#e5e5e5",
+            QPalette.ColorRole.Mid: "#b8b8b8",
+            QPalette.ColorRole.Dark: "#858585",
+            QPalette.ColorRole.Shadow: "#666666",
+            QPalette.ColorRole.Highlight: "#0067c0",
+            QPalette.ColorRole.HighlightedText: "#ffffff",
+            QPalette.ColorRole.Link: "#0067c0",
+            QPalette.ColorRole.ToolTipBase: "#fbfbfb",
+            QPalette.ColorRole.ToolTipText: "#1b1b1b",
+        }
+        degrees = client_theme_color(self, "Modern")
+        for role, color in colors.items():
+            palette.setColor(role, shift_theme_color(color, degrees))
+        for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                     QPalette.ColorRole.ButtonText):
+            palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#777777"))
         return palette
 
     def _config_panel_stylesheet(self) -> str:
         if self._is_windows_classic_theme():
-            return (
+            return classic_theme_stylesheet((
                 "QFrame#configPanel { background: #c0c0c0;"
                 " border-top: 2px solid #ffffff;"
                 " border-left: 2px solid #ffffff;"
                 " border-right: 2px solid #000000;"
                 " border-bottom: 2px solid #000000;"
                 " border-radius: 0px; }"
-            )
+            ), client_theme_color(self, "Classic"))
+        if self._is_glassy_theme():
+            return hue_theme_stylesheet((
+                "QFrame#configPanel {"
+                " background: qlineargradient("
+                " x1:0, y1:0, x2:1, y2:1,"
+                " stop:0 rgba(255, 255, 255, 232),"
+                " stop:0.42 rgba(225, 242, 252, 220),"
+                " stop:1 rgba(174, 211, 234, 210));"
+                " border: 1px solid rgba(49, 91, 118, 245);"
+                " border-radius: 9px; }"
+            ), client_theme_color(self, "Glassy"))
         return (
-            "QFrame#configPanel { background: palette(window); "
-            "border: 1px solid palette(mid); border-radius: 3px; }"
+            "QFrame#configPanel { background: #fbfbfb; "
+            "border: 1px solid #b8b8b8; border-radius: 8px; }"
         )
 
     @staticmethod
@@ -5621,6 +7164,39 @@ class EncryptedChatClient(QObject):
             | (qt_color.blue() << 16)
         )
 
+    @staticmethod
+    def _set_windows_legacy_blur(hwnd: Any, enabled: bool) -> bool:
+        # Windows 10/early Windows 11 have no DWMWA_SYSTEMBACKDROP_TYPE.
+        # The legacy accent policy provides live blur behind the same alpha
+        # surface. Prefer the supported DWM acrylic API when available.
+        try:
+            class AccentPolicy(ctypes.Structure):
+                _fields_ = [
+                    ("state", ctypes.c_uint),
+                    ("flags", ctypes.c_uint),
+                    ("gradient_color", ctypes.c_uint),
+                    ("animation_id", ctypes.c_uint),
+                ]
+
+            class CompositionData(ctypes.Structure):
+                _fields_ = [
+                    ("attribute", ctypes.c_int),
+                    ("data", ctypes.c_void_p),
+                    ("size", ctypes.c_size_t),
+                ]
+
+            policy = AccentPolicy(3 if enabled else 0, 0, 0, 0)
+            # WCA_ACCENT_POLICY; ACCENT_ENABLE_BLURBEHIND / ACCENT_DISABLED.
+            data = CompositionData(
+                19, ctypes.addressof(policy), ctypes.sizeof(policy)
+            )
+            set_composition = ctypes.windll.user32.SetWindowCompositionAttribute
+            set_composition.argtypes = [wintypes.HWND, ctypes.POINTER(CompositionData)]
+            set_composition.restype = wintypes.BOOL
+            return bool(set_composition(hwnd, ctypes.byref(data)))
+        except (AttributeError, OSError):
+            return False
+
     def _apply_window_titlebar_theme(self, window: QWidget) -> None:
         if os.name != "nt" or not hasattr(ctypes, "windll"):
             return
@@ -5628,37 +7204,98 @@ class EncryptedChatClient(QObject):
         try:
             hwnd = wintypes.HWND(int(window.winId()))
             dwmapi = ctypes.windll.dwmapi
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD
+            ]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+            dwmapi.DwmExtendFrameIntoClientArea.argtypes = [
+                wintypes.HWND, ctypes.c_void_p
+            ]
+            dwmapi.DwmExtendFrameIntoClientArea.restype = ctypes.c_long
 
-            def set_attribute(attribute: int, value: int) -> None:
+            def set_attribute(attribute: int, value: int) -> int:
                 data = ctypes.c_uint(value)
-                dwmapi.DwmSetWindowAttribute(
+                return int(dwmapi.DwmSetWindowAttribute(
                     hwnd,
                     ctypes.c_uint(attribute),
                     ctypes.byref(data),
                     ctypes.sizeof(data),
-                )
+                ))
 
-            # Keep both themes light, then color the Windows 11 non-client
+            # Keep all themes light, then color the Windows 11 non-client
             # frame where the DWM color attributes are supported.
             set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
             if self._is_windows_classic_theme():
                 border = "#000000"
-                caption = "#000080"
+                caption = CLASSIC_COLOR_SCHEMES[client_theme_color(self, "Classic")]["title"]
                 text = "#ffffff"
                 corner_preference = 1  # DWMWCP_DONOTROUND
+                backdrop = 1  # DWMSBT_NONE
+            elif self._is_glassy_theme():
+                degrees = client_theme_color(self, "Glassy")
+                border = shift_theme_color("#6292af", degrees).name()
+                caption = None
+                text = shift_theme_color("#102637", degrees).name()
+                corner_preference = 2  # DWMWCP_ROUND
+                backdrop = 3  # DWMSBT_TRANSIENTWINDOW (acrylic)
             else:
-                border = "#d0d0d0"
-                caption = "#f0f0f0"
-                text = "#000000"
-                corner_preference = 0  # DWMWCP_DEFAULT
+                border = "#bdbdbd"
+                caption = "#f3f3f3"
+                text = "#1b1b1b"
+                corner_preference = 2  # DWMWCP_ROUND
+                backdrop = 1  # DWMSBT_NONE
 
             set_attribute(33, corner_preference)  # DWMWA_WINDOW_CORNER_PREFERENCE
             set_attribute(34, self._windows_colorref(border))
-            set_attribute(35, self._windows_colorref(caption))
+            set_attribute(
+                35,
+                0xFFFFFFFF  # DWMWA_COLOR_DEFAULT keeps acrylic visible.
+                if caption is None
+                else self._windows_colorref(caption),
+            )
             set_attribute(36, self._windows_colorref(text))
+            backdrop_result = set_attribute(38, backdrop)  # DWMWA_SYSTEMBACKDROP_TYPE
+
+            class Margins(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_int),
+                    ("right", ctypes.c_int),
+                    ("top", ctypes.c_int),
+                    ("bottom", ctypes.c_int),
+                ]
+
+            glass_margin = -1 if self._is_glassy_theme() else 0
+            margins = Margins(
+                glass_margin,
+                glass_margin,
+                glass_margin,
+                glass_margin,
+            )
+            frame_result = dwmapi.DwmExtendFrameIntoClientArea(
+                hwnd,
+                ctypes.byref(margins),
+            )
+            if bool(window.property("spritelinkLegacyBlur")):
+                self._set_windows_legacy_blur(hwnd, False)
+                window.setProperty("spritelinkLegacyBlur", False)
+            desktop_blur = (
+                self._is_glassy_theme()
+                and frame_result == 0
+                and backdrop_result == 0
+            )
+            if (
+                self._is_glassy_theme()
+                and frame_result == 0
+                and not desktop_blur
+            ):
+                desktop_blur = self._set_windows_legacy_blur(hwnd, True)
+                window.setProperty("spritelinkLegacyBlur", desktop_blur)
+            window.setProperty("spritelinkDesktopBlur", desktop_blur)
+            window.update()
         except Exception:
             # Older Windows versions do not expose the color attributes.
-            pass
+            window.setProperty("spritelinkDesktopBlur", False)
+            window.update()
 
     def _apply_dialog_window_theme(self, dialog: QDialog) -> None:
         """Apply native theme properties after a dialog window exists."""
@@ -5886,11 +7523,15 @@ class EncryptedChatClient(QObject):
 
     def _restore_from_tray(self) -> None:
         was_suspended = self._tray_ui_suspended
+        was_in_tray = self._minimized_to_tray
         self._minimized_to_tray = False
         self._clear_tray_notification_if_no_unread()
         self.root.showNormal()
         self.root.raise_()
         self.root.activateWindow()
+        if was_in_tray or was_suspended:
+            self.recently_online_refresh_event.set()
+            self.network_wakeup_event.set()
         if was_suspended:
             QTimer.singleShot(0, self._resume_from_tray)
         else:
@@ -5973,10 +7614,114 @@ class EncryptedChatClient(QObject):
     def _apply_titlebar_theme(self) -> None:
         self._apply_window_titlebar_theme(self.root)
 
+    def _ui_density_stylesheet(
+        self,
+        stylesheet: str,
+        theme: str,
+    ) -> str:
+        if not client_is_tiny_ui(self):
+            return stylesheet
+
+        common = """
+QMenu::item {
+    padding-top: 2px;
+    padding-bottom: 2px;
+}
+QSlider:horizontal {
+    min-height: 18px;
+}
+"""
+        if theme == "Modern":
+            compact = """
+QPushButton {
+    padding: 2px 7px;
+    min-height: 14px;
+}
+QComboBox {
+    padding: 1px 20px 1px 6px;
+    min-height: 14px;
+}
+QComboBox::drop-down {
+    width: 18px;
+}
+QLineEdit {
+    padding: 1px 5px;
+}
+QPlainTextEdit {
+    padding: 1px;
+}
+QMenu {
+    padding: 2px;
+}
+QMenu::item {
+    padding-left: 18px;
+    padding-right: 18px;
+}
+QMenu::separator {
+    margin: 2px 5px;
+}
+"""
+        elif theme == "Glassy":
+            compact = """
+QPushButton {
+    padding: 2px 7px;
+    min-height: 14px;
+}
+QPushButton:pressed, QPushButton:checked {
+    padding-top: 3px;
+    padding-bottom: 1px;
+}
+QPushButton#identityMenuButton,
+QPushButton#fontMenuButton,
+QPushButton#formattingMenuButton {
+    min-height: 14px;
+    padding-top: 1px;
+    padding-bottom: 1px;
+}
+QLineEdit, QPlainTextEdit {
+    padding-top: 1px;
+    padding-bottom: 1px;
+}
+QComboBox {
+    padding: 1px 20px 1px 5px;
+    min-height: 14px;
+}
+QComboBox::drop-down {
+    width: 18px;
+}
+"""
+        else:
+            compact = """
+QPushButton {
+    padding: 1px 6px;
+    min-height: 14px;
+}
+QPushButton:pressed, QPushButton:checked {
+    padding-top: 2px;
+    padding-left: 7px;
+    padding-right: 5px;
+    padding-bottom: 0px;
+}
+QComboBox {
+    padding: 1px 3px;
+    min-height: 14px;
+}
+QComboBox::drop-down {
+    width: 18px;
+}
+"""
+        return stylesheet + common + compact
+
     def _apply_theme(self) -> None:
         app = QApplication.instance()
         if app is None:
             return
+
+        theme = "Classic" if self._is_windows_classic_theme() else "Glassy" if self._is_glassy_theme() else "Modern"
+        position = client_theme_color(self, theme)
+        app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
+        app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
+        app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
 
         available_styles = {
             name.casefold(): name for name in QStyleFactory.keys()
@@ -5987,31 +7732,55 @@ class EncryptedChatClient(QObject):
                 available_styles.get("fusion", "Fusion"),
             )
             app.setPalette(self._windows_classic_palette())
-            app.setStyleSheet(WINDOWS_CLASSIC_STYLESHEET)
+            app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
+                classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position),
+                theme,
+            ))
+        elif self._is_glassy_theme():
+            style_name = available_styles.get("fusion", "Fusion")
+            app.setPalette(self._glassy_palette())
+            app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
+                hue_theme_stylesheet(GLASSY_STYLESHEET, position),
+                theme,
+            ))
         else:
-            style_name = available_styles.get(
-                self._basic_style_name.casefold()
+            style_name = next(
+                (available_styles[name] for name in (
+                    "windows11", "windowsvista", self._basic_style_name.casefold(), "fusion"
+                ) if name in available_styles),
+                "Fusion",
             )
-            app.setPalette(QPalette(self._basic_palette))
-            app.setStyleSheet(self._basic_application_stylesheet)
+            app.setPalette(self._modern_palette())
+            app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
+                hue_theme_stylesheet(MODERN_STYLESHEET, position),
+                theme,
+            ))
 
         text_shadows_enabled = bool(self.text_shadows_var.get())
         app.setProperty("spritelinkTextShadows", text_shadows_enabled)
         if style_name is not None:
             base_style = QStyleFactory.create(style_name)
             if base_style is not None:
-                app.setStyle(
-                    TextShadowProxyStyle(base_style)
-                    if text_shadows_enabled
-                    else base_style
-                )
+                app.setStyle(TextShadowProxyStyle(base_style))
         app.setProperty(
             "spritelinkWindowsClassic",
             self._is_windows_classic_theme(),
         )
+        app.setProperty("spritelinkGlassy", self._is_glassy_theme())
+        app.setProperty(
+            "spritelinkModern",
+            not self._is_windows_classic_theme() and not self._is_glassy_theme(),
+        )
+        if hasattr(self, "theme_color_slider"):
+            self._sync_theme_color_slider()
         for widget in app.allWidgets():
             if isinstance(widget, ThemeComboBox):
                 widget.update()
+
+        for name in ("config_tab", "advanced_config_content"):
+            panel = getattr(self, name, None)
+            if panel is not None and isinstance(panel.layout(), QGridLayout):
+                panel.layout().setVerticalSpacing(self._config_row_spacing())
 
         if hasattr(self, "config_panel"):
             self.config_panel.setStyleSheet(
@@ -6029,6 +7798,15 @@ class EncryptedChatClient(QObject):
             self.link_warning_panel.setStyleSheet(
                 self._config_panel_stylesheet()
             )
+        for overlay_name in (
+            "config_overlay",
+            "message_limit_overlay",
+            "image_preview_overlay",
+            "link_warning_overlay",
+        ):
+            overlay = getattr(self, overlay_name, None)
+            if isinstance(overlay, ConfigOverlay):
+                overlay.apply_theme(self._is_glassy_theme())
         if hasattr(self, "message_size_bar"):
             self._draw_message_size_bar()
         if hasattr(self, "chatrooms_toggle"):
@@ -6038,6 +7816,7 @@ class EncryptedChatClient(QObject):
         if hasattr(self, "update_button"):
             self._update_update_button_style()
         self._apply_titlebar_theme()
+        self._applied_theme_color = (theme, position)
 
     def _heading(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -6063,6 +7842,8 @@ class EncryptedChatClient(QObject):
 
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("glassRoot")
+        central.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         central_layout = QHBoxLayout(central)
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.setSpacing(0)
@@ -6070,6 +7851,8 @@ class EncryptedChatClient(QObject):
 
         self._build_chatroom_sidebar(central_layout)
         self.chat_tab = QWidget()
+        self.chat_tab.setObjectName("chatTab")
+        self.chat_tab.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         central_layout.addWidget(self.chat_tab, 1)
 
         self._build_chat_tab()
@@ -6080,6 +7863,11 @@ class EncryptedChatClient(QObject):
 
     def _build_chatroom_sidebar(self, root_layout: QHBoxLayout) -> None:
         self.chatrooms_panel = QWidget()
+        self.chatrooms_panel.setObjectName("chatroomsPanel")
+        self.chatrooms_panel.setAttribute(
+            Qt.WidgetAttribute.WA_StyledBackground,
+            True,
+        )
         self.chatrooms_panel.setFixedWidth(CHATROOM_SIDEBAR_WIDTH)
         panel_layout = QVBoxLayout(self.chatrooms_panel)
         panel_layout.setContentsMargins(6, 10, 8, 10)
@@ -6416,6 +8204,9 @@ class EncryptedChatClient(QObject):
                 room["id"] in muted_ids,
                 self.chatrooms_list,
             )
+            for widget in [row, *row.findChildren(QWidget)]:
+                self._set_widget_text_size(widget, "chatrooms")
+            row.ensurePolished()
             item.setSizeHint(row.sizeHint())
             self.chatrooms_list.setItemWidget(item, row)
             if room["id"] == self.active_chatroom_id:
@@ -6467,14 +8258,21 @@ class EncryptedChatClient(QObject):
             and int(unread_count or 0) > 0
             for room_id, unread_count in self._unread_counts().items()
         )
+        button = self.chatrooms_toggle
+        button.setMinimumHeight(0)
+        button.setMaximumHeight(16777215)
+        button.setStyleSheet("")
+        button.ensurePolished()
+        base_height = button.sizeHint().height()
+
         if has_visible_unread:
-            self.chatrooms_toggle.setStyleSheet(
+            button.setStyleSheet(
                 notification_button_stylesheet(
-                    self._is_windows_classic_theme()
+                    self._is_windows_classic_theme(),
+                    self._is_glassy_theme(),
                 )
             )
-        else:
-            self.chatrooms_toggle.setStyleSheet("")
+        button.setFixedHeight(base_height)
 
     def _update_config_toggle_update_style(self) -> None:
         if not hasattr(self, "config_toggle"):
@@ -6482,7 +8280,8 @@ class EncryptedChatClient(QObject):
         if self.available_update is not None:
             self.config_toggle.setStyleSheet(
                 notification_button_stylesheet(
-                    self._is_windows_classic_theme()
+                    self._is_windows_classic_theme(),
+                    self._is_glassy_theme(),
                 )
             )
             self.config_toggle.setToolTip(
@@ -6501,7 +8300,8 @@ class EncryptedChatClient(QObject):
         ):
             self.update_button.setStyleSheet(
                 notification_button_stylesheet(
-                    self._is_windows_classic_theme()
+                    self._is_windows_classic_theme(),
+                    self._is_glassy_theme(),
                 )
             )
         else:
@@ -7135,6 +8935,7 @@ class EncryptedChatClient(QObject):
         poll_immediately: bool,
         bypass_rate_limits: bool = False,
     ) -> None:
+        self._update_recently_online_label()
         self.network_control_queue.put({
             "room_id": self.active_chatroom_id,
             "poll_immediately": poll_immediately,
@@ -7199,6 +9000,10 @@ class EncryptedChatClient(QObject):
         self.chat_display.setUpdatesEnabled(not suppressed)
         if not suppressed:
             self.chat_display.viewport().update()
+            # Theme swaps rebuild the log in batches. Recapture once the
+            # complete document and its saved scroll anchor are restored.
+            for overlay in self.chat_content.findChildren(ConfigOverlay):
+                overlay.schedule_background_refresh()
 
     def _on_chat_history_scrolled(self, _value: int) -> None:
         self.viewport_media_timer.start(
@@ -7413,7 +9218,7 @@ class EncryptedChatClient(QObject):
                 following_background_name = (
                     following_background.name().casefold()
                 )
-                for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS):
+                for index, color in enumerate(message_row_backgrounds()):
                     if QColor(color).name().casefold() == following_background_name:
                         following_background_index = index
                         break
@@ -7424,15 +9229,15 @@ class EncryptedChatClient(QObject):
         )
         stripe_index = (
             following_background_index - prepended_row_count
-        ) % len(MESSAGE_ROW_BACKGROUNDS)
+        ) % len(message_row_backgrounds())
         for step in render_steps:
-            step["background_color"] = MESSAGE_ROW_BACKGROUNDS[
-                stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+            step["background_color"] = message_row_backgrounds()[
+                stripe_index % len(message_row_backgrounds())
             ]
             stripe_index += 1
             for separator_spec in step["separators_after"]:
-                separator_spec[1] = MESSAGE_ROW_BACKGROUNDS[
-                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                separator_spec[1] = message_row_backgrounds()[
+                    stripe_index % len(message_row_backgrounds())
                 ]
                 stripe_index += 1
 
@@ -7529,6 +9334,16 @@ class EncryptedChatClient(QObject):
         status_layout.addWidget(self.status_label)
         status_layout.addStretch(1)
 
+        self.recently_online_label = QLabel("Recently online: …")
+        self.recently_online_label.setFont(
+            self._make_font(self._ui_font_family(), 9)
+        )
+        opacity = QGraphicsOpacityEffect(self.recently_online_label)
+        opacity.setOpacity(0.6)
+        self.recently_online_label.setGraphicsEffect(opacity)
+        status_layout.addWidget(self.recently_online_label)
+        self._update_recently_online_label()
+
         self.config_toggle = QPushButton("Config")
         self.config_toggle.setCheckable(True)
         self.config_toggle.toggled.connect(self._on_config_toggled)
@@ -7543,6 +9358,7 @@ class EncryptedChatClient(QObject):
         layout.addWidget(self.chat_content, 1)
 
         self.chat_display = MessageLogBrowser()
+        self.chat_display.setObjectName("chatViewport")
         self.chat_display.setReadOnly(True)
         self.chat_display.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.chat_display.setOpenLinks(False)
@@ -7573,18 +9389,21 @@ class EncryptedChatClient(QObject):
         composer_actions.setContentsMargins(0, 0, 0, 0)
         composer_actions.setSpacing(6)
         self.identity_menu_button = QPushButton("Identity")
+        self.identity_menu_button.setObjectName("identityMenuButton")
         self.identity_menu_button.setCheckable(True)
         self.identity_menu_button.toggled.connect(
             self._on_identity_menu_toggled
         )
         composer_actions.addWidget(self.identity_menu_button)
         self.font_menu_button = QPushButton("Font")
+        self.font_menu_button.setObjectName("fontMenuButton")
         self.font_menu_button.setCheckable(True)
         self.font_menu_button.toggled.connect(
             self._on_font_menu_toggled
         )
         composer_actions.addWidget(self.font_menu_button)
         self.formatting_menu_button = QPushButton("Formatting")
+        self.formatting_menu_button.setObjectName("formattingMenuButton")
         self.formatting_menu_button.setCheckable(True)
         self.formatting_menu_button.toggled.connect(
             self._on_formatting_menu_toggled
@@ -7626,9 +9445,11 @@ class EncryptedChatClient(QObject):
         self.identity_color_preview.setFrameShape(QFrame.Shape.Panel)
         self.identity_color_preview.setFrameShadow(QFrame.Shadow.Sunken)
         identity_layout.addWidget(self.identity_color_preview)
-        identity_color_button = QPushButton("Choose...")
-        identity_color_button.clicked.connect(self._choose_identity_color)
-        identity_layout.addWidget(identity_color_button)
+        self.identity_color_button = QPushButton("Choose...")
+        self.identity_color_button.clicked.connect(
+            self._choose_identity_color
+        )
+        identity_layout.addWidget(self.identity_color_button)
         identity_layout.addSpacing(8)
         identity_layout.addWidget(QLabel("Icon (16x16)"))
         self.profile_icon_preview = QLabel()
@@ -7643,9 +9464,11 @@ class EncryptedChatClient(QObject):
             self._show_profile_icon_context_menu
         )
         identity_layout.addWidget(self.profile_icon_preview)
-        profile_icon_button = QPushButton("Browse...")
-        profile_icon_button.clicked.connect(self._choose_profile_icon)
-        identity_layout.addWidget(profile_icon_button)
+        self.profile_icon_button = QPushButton("Browse...")
+        self.profile_icon_button.clicked.connect(
+            self._choose_profile_icon
+        )
+        identity_layout.addWidget(self.profile_icon_button)
         self.identity_menu.hide()
         content_layout.addWidget(self.identity_menu)
 
@@ -7734,6 +9557,10 @@ class EncryptedChatClient(QObject):
             QSizePolicy.Policy.Fixed,
         )
         self.message_entry.textChanged.connect(self._schedule_composer_update)
+        self.message_entry.document().documentLayout().documentSizeChanged.connect(
+            lambda _size: self.message_resize_timer.start(0)
+        )
+        self.message_entry.width_changed.connect(lambda: self.message_resize_timer.start(0))
         self.message_entry.cursorPositionChanged.connect(
             self._sync_formatting_buttons
         )
@@ -8015,9 +9842,13 @@ class EncryptedChatClient(QObject):
         if not hasattr(self, "message_entry"):
             return
         profile = self._active_room_profile()
-        self.message_entry.setFont(
-            self._make_message_font(profile["font"])
+        composer_font = self._make_message_font(
+            profile["font"],
+            role="message_input",
         )
+        self.message_entry.setFont(composer_font)
+        self.message_entry.document().setDefaultFont(composer_font)
+        self.message_entry.viewport().setFont(composer_font)
         self.message_entry.setStyleSheet(
             f"color: {profile['text_color']};"
         )
@@ -8180,20 +10011,20 @@ class EncryptedChatClient(QObject):
         self.config_overlay.dismissed.connect(self._dismiss_config_popup)
 
         overlay_layout = QVBoxLayout(self.config_overlay)
-        overlay_layout.setContentsMargins(36, 24, 36, 24)
+        overlay_layout.setContentsMargins(24, 24, 24, 24)
 
         panel_row = QHBoxLayout()
         panel_row.addStretch(1)
 
         self.config_panel = QFrame()
         self.config_panel.setObjectName("configPanel")
-        self.config_panel.setMaximumWidth(CONFIG_POPUP_MAX_WIDTH)
+        self.config_panel.setMaximumWidth(CONFIG_PANEL_MAX_WIDTH)
         self.config_panel.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
         self.config_panel.setStyleSheet(self._config_panel_stylesheet())
-        panel_row.addWidget(self.config_panel, 8)
+        panel_row.addWidget(self.config_panel, 10)
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row, 1)
         self.config_overlay.panel = self.config_panel
@@ -8640,24 +10471,61 @@ class EncryptedChatClient(QObject):
                 self.current_image_preview_client_id,
             )
 
+    def _config_row_spacing(self) -> int:
+        if self._is_tiny_ui():
+            return 5
+        return (
+            5
+            if self._is_windows_classic_theme() or self._is_glassy_theme()
+            else 12
+        )
+
     def _build_config_tab(self) -> None:
         layout = QGridLayout(self.config_tab)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setHorizontalSpacing(10)
-        layout.setVerticalSpacing(5)
+        layout.setVerticalSpacing(self._config_row_spacing())
         layout.setColumnStretch(1, 1)
         row = 0
 
         layout.addWidget(self._heading("Appearance"), row, 0, 1, 3)
         row += 1
 
-        layout.addWidget(QLabel("Themes"), row, 0)
+        layout.addWidget(QLabel("Theme"), row, 0)
         self.theme_combo = ThemeComboBox()
         self.theme_combo.addItems(list(THEMES))
         self.theme_combo.setCurrentText(str(self.theme_var.get()))
         self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
         self.theme_var.bind(self.theme_combo.setCurrentText)
-        layout.addWidget(self.theme_combo, row, 1, 1, 2)
+        layout.addWidget(self.theme_combo, row, 1)
+        color_control = QWidget()
+        color_layout = QHBoxLayout(color_control)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.setSpacing(6)
+        self.theme_color_label = QLabel("Color")
+        color_layout.addWidget(self.theme_color_label)
+        self.theme_color_slider = ThemeSlider(Qt.Orientation.Horizontal)
+        self.theme_color_slider.setAccessibleName("Theme color")
+        self.theme_color_slider.setMinimumWidth(64)
+        self.theme_color_slider.setMaximumWidth(112)
+        self.theme_color_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.theme_color_slider.valueChanged.connect(self._on_theme_color_changed)
+        self.theme_color_slider.sliderReleased.connect(self._finish_theme_color_change)
+        color_layout.addWidget(self.theme_color_slider, 1)
+        layout.addWidget(color_control, row, 2)
+        row += 1
+
+        layout.addWidget(QLabel("UI Size"), row, 0)
+        self.ui_size_combo = ThemeComboBox()
+        self.ui_size_combo.addItems(list(UI_SIZE_PRESETS.keys()))
+        self.ui_size_combo.setCurrentText(
+            normalize_ui_size(self.ui_size_var.get())
+        )
+        self.ui_size_combo.currentTextChanged.connect(
+            self._on_ui_size_changed
+        )
+        self.ui_size_var.bind(self.ui_size_combo.setCurrentText)
+        layout.addWidget(self.ui_size_combo, row, 1, 1, 2)
         row += 1
 
         self.text_shadows_checkbox = QCheckBox("Text Shadows")
@@ -8715,7 +10583,7 @@ class EncryptedChatClient(QObject):
         message_sound_volume_layout.addWidget(
             self.message_sound_volume_label
         )
-        self.message_sound_volume_slider = QSlider(
+        self.message_sound_volume_slider = ThemeSlider(
             Qt.Orientation.Horizontal
         )
         self.message_sound_volume_slider.setRange(1, 10)
@@ -8748,6 +10616,7 @@ class EncryptedChatClient(QObject):
             1,
         )
         layout.addWidget(message_sound_volume_control, row, 2)
+        self._sync_theme_color_slider()
         row += 1
 
         self.desktop_notifications_checkbox = QCheckBox(
@@ -8889,7 +10758,7 @@ class EncryptedChatClient(QObject):
         advanced_layout = QGridLayout(self.advanced_config_content)
         advanced_layout.setContentsMargins(8, 2, 0, 4)
         advanced_layout.setHorizontalSpacing(10)
-        advanced_layout.setVerticalSpacing(5)
+        advanced_layout.setVerticalSpacing(self._config_row_spacing())
         advanced_layout.setColumnStretch(1, 1)
         advanced_row = 0
 
@@ -8959,6 +10828,26 @@ class EncryptedChatClient(QObject):
             "Advanced ▼" if expanded else "Advanced ▶"
         )
         self.advanced_config_content.setVisible(expanded)
+
+    def _on_ui_size_changed(self, value: Any) -> None:
+        ui_size = normalize_ui_size(value)
+        if ui_size == self.config_data.get("ui_size"):
+            return
+        self.ui_size_var.set(ui_size)
+        self.config_data["ui_size"] = ui_size
+        self._apply_theme()
+        self._apply_application_font_strategy()
+        self._apply_ui_size()
+        if hasattr(self, "chat_display"):
+            self._rerender_preserving_scroll()
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not save UI size",
+                str(exc),
+                parent=self.root,
+            )
 
     def _on_message_sound_selected(self, value: str) -> None:
         selected_sound = str(value)
@@ -9181,6 +11070,7 @@ class EncryptedChatClient(QObject):
             str(self.server_preset_var.get()),
             str(self.server_url_var.get()),
             bool(self.text_shadows_var.get()),
+            normalize_ui_size(self.ui_size_var.get()),
             str(self.message_sound_var.get()),
             int(self.message_sound_volume_var.get()),
             str(self.custom_message_sound_path_var.get()),
@@ -9253,6 +11143,138 @@ class EncryptedChatClient(QObject):
 
         self._apply_server_preset_state()
 
+    def _sync_theme_color_slider(self) -> None:
+        slider = self.theme_color_slider
+        theme = str(self.theme_var.get())
+        classic = theme == "Classic"
+        compact_width = max(40, self.message_sound_volume_slider.sizeHint().width())
+        slider.setMinimumWidth(compact_width if classic else 64)
+        slider.setMaximumWidth(compact_width if classic else 112)
+        self.message_sound_volume_slider.setMaximumWidth(compact_width if classic else 16777215)
+        # Reserve the longest label so dragging between schemes keeps the
+        # controls stationary. Both Classic sliders share the compact width.
+        labels = [f"Color: {scheme['name']}" for scheme in CLASSIC_COLOR_SCHEMES]
+        labels.append("Volume: 100%")
+        self.theme_color_label.setMinimumWidth(
+            max(self.theme_color_label.fontMetrics().horizontalAdvance(label) for label in labels)
+            if classic else 0
+        )
+        was_blocked = slider.blockSignals(True)
+        try:
+            slider.setRange(0, len(CLASSIC_COLOR_SCHEMES) - 1 if classic else 359)
+            slider.setSingleStep(1)
+            slider.setPageStep(1 if classic else 15)
+            slider.setTickPosition(QSlider.TickPosition.TicksBelow if classic else QSlider.TickPosition.NoTicks)
+            slider.setTickInterval(1 if classic else 0)
+            position = client_theme_color(self, theme)
+            slider.setValue(position)
+            slider.setProperty("spritelinkPreviewHue", None)
+            slider.setProperty("spritelinkPreviewClassicColor", position if classic else None)
+            slider.setToolTip(CLASSIC_COLOR_SCHEMES[position]["name"] if classic else "")
+            self.theme_color_label.setText(
+                f"Color: {CLASSIC_COLOR_SCHEMES[position]['name']}" if classic else "Color"
+            )
+        finally:
+            slider.blockSignals(was_blocked)
+
+    def _on_theme_color_changed(self, value: int) -> None:
+        theme = str(self.theme_var.get())
+        colors = normalize_theme_colors(self.config_data.get("theme_colors"))
+        colors[theme] = value
+        self.config_data["theme_colors"] = normalize_theme_colors(colors)
+        if theme == "Classic":
+            scheme_name = CLASSIC_COLOR_SCHEMES[colors[theme]]["name"]
+            self.theme_color_slider.setToolTip(scheme_name)
+            self.theme_color_label.setText(f"Color: {scheme_name}")
+        self.theme_color_slider.setProperty("spritelinkPreviewHue", None if theme == "Classic" else value)
+        self.theme_color_slider.setProperty("spritelinkPreviewClassicColor", value if theme == "Classic" else None)
+        self.theme_color_slider.update()
+        # Stylesheet repolish and log/blur refreshes are deliberately excluded
+        # from dragging, even if the user pauses while holding the thumb.
+        if self.theme_color_slider.isSliderDown():
+            self.theme_color_save_timer.stop()
+        else:
+            self.theme_color_save_timer.start()
+
+    def _apply_theme_colors(self) -> bool:
+        app = QApplication.instance()
+        if app is None:
+            return False
+        theme = str(self.theme_var.get())
+        position = client_theme_color(self, theme)
+        if getattr(self, "_applied_theme_color", None) == (theme, position):
+            self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
+            return False
+        app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
+        app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
+        app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
+        if theme == "Classic":
+            palette = self._windows_classic_palette()
+            stylesheet = classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position)
+        elif theme == "Glassy":
+            palette = self._glassy_palette()
+            stylesheet = hue_theme_stylesheet(GLASSY_STYLESHEET, position)
+        else:
+            palette = self._modern_palette()
+            stylesheet = hue_theme_stylesheet(MODERN_STYLESHEET, position)
+        stylesheet = EncryptedChatClient._ui_density_stylesheet(self, stylesheet, theme)
+        # Repolish can reset explicitly assigned families and NoAntialias.
+        # Keep the existing fonts, including Classic headings and user fonts.
+        application_font = QFont(app.font())
+        fonts = [(widget, QFont(widget.font())) for widget in app.allWidgets()
+                 if widget.testAttribute(Qt.WidgetAttribute.WA_SetFont)]
+        root = getattr(self, "root", None)
+        updates_enabled = root is not None and root.updatesEnabled()
+        if updates_enabled:
+            root.setUpdatesEnabled(False)
+        try:
+            app.setPalette(palette)
+            app.setStyleSheet(stylesheet)
+            panel_stylesheet = self._config_panel_stylesheet()
+            for name in ("config_panel", "message_limit_panel", "image_preview_panel", "link_warning_panel"):
+                panel = getattr(self, name, None)
+                if panel is not None and panel.styleSheet() != panel_stylesheet:
+                    panel.setStyleSheet(panel_stylesheet)
+            if app.font() != application_font:
+                app.setFont(application_font)
+            for widget, font in fonts:
+                if widget.font() != font:
+                    widget.setFont(font)
+            if hasattr(self, "message_size_bar"):
+                self._draw_message_size_bar()
+        finally:
+            if updates_enabled:
+                root.setUpdatesEnabled(True)
+        for name in ("config_overlay", "message_limit_overlay", "image_preview_overlay", "link_warning_overlay"):
+            overlay = getattr(self, name, None)
+            if isinstance(overlay, ConfigOverlay):
+                overlay.apply_theme(theme == "Glassy")
+        self._apply_titlebar_theme()
+        self._applied_theme_color = (theme, position)
+        self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
+        return True
+
+    def _save_theme_colors(self) -> None:
+        if self.theme_color_slider.isSliderDown():
+            return
+        changed = self._apply_theme_colors()
+        # Rebuild changed row brushes once after the committed style update,
+        # keeping history, scroll position, and rendered message fonts intact.
+        if changed and hasattr(self, "chat_display"):
+            self._rerender_preserving_scroll()
+        colors = normalize_theme_colors(self.config_data.get("theme_colors"))
+        if getattr(self, "_saved_theme_colors", None) == colors:
+            return
+        try:
+            save_config(self.config_data)
+            self._saved_theme_colors = dict(colors)
+        except Exception as exc:
+            messagebox.showerror("Could not save theme color", str(exc), parent=self.root)
+
+    def _finish_theme_color_change(self) -> None:
+        self.theme_color_save_timer.stop()
+        self._save_theme_colors()
+
     def _on_theme_changed(self, value: Any) -> None:
         theme = str(value)
         if theme not in THEMES:
@@ -9260,6 +11282,7 @@ class EncryptedChatClient(QObject):
 
         self.theme_var.set(theme)
         self.config_data["theme"] = theme
+        self.theme_color_save_timer.stop()
         self._apply_theme()
         self._apply_application_font_strategy()
         self._apply_active_composer_style()
@@ -9268,6 +11291,7 @@ class EncryptedChatClient(QObject):
 
         try:
             save_config(self.config_data)
+            self._saved_theme_colors = normalize_theme_colors(self.config_data.get("theme_colors"))
         except Exception as exc:
             messagebox.showerror(
                 "Could not save theme",
@@ -9309,6 +11333,9 @@ class EncryptedChatClient(QObject):
         self.config_data["text_shadows"] = bool(
             self.text_shadows_var.get()
         )
+        self.config_data["ui_size"] = normalize_ui_size(
+            self.ui_size_var.get()
+        )
         message_sound = str(self.message_sound_var.get())
         self.config_data["message_sound"] = (
             message_sound
@@ -9339,6 +11366,7 @@ class EncryptedChatClient(QObject):
         window_width, window_height = normalize_window_size(
             self.root.width(),
             self.root.height(),
+            self.config_data["ui_size"],
         )
         self.config_data["window_width"] = window_width
         self.config_data["window_height"] = window_height
@@ -9430,6 +11458,8 @@ class EncryptedChatClient(QObject):
         self._draw_message_size_bar()
 
     def _resize_message_entry(self) -> None:
+        # Apply stylesheet padding before measuring, including at startup.
+        self.message_entry.ensurePolished()
         document = self.message_entry.document()
         document.setTextWidth(max(1, self.message_entry.viewport().width()))
         line_height = max(
@@ -9439,23 +11469,34 @@ class EncryptedChatClient(QObject):
         document_margins = int(document.documentMargin() * 2)
         document.size()  # Force wrapped line layouts to update.
         display_lines = 0
+        line_heights: list[float] = []
         block = document.begin()
         while block.isValid():
-            display_lines += max(1, block.layout().lineCount())
+            document.documentLayout().blockBoundingRect(block)
+            layout = block.layout()
+            lines = max(1, layout.lineCount())
+            display_lines += lines
+            for index in range(min(lines, MESSAGE_ENTRY_MAX_LINES - len(line_heights))):
+                line = layout.lineAt(index) if index < layout.lineCount() else None
+                line_heights.append(line.height() if line is not None and line.isValid() else line_height)
             block = block.next()
         display_lines = max(1, display_lines)
         visible_lines = max(
             MESSAGE_ENTRY_MIN_LINES,
             min(MESSAGE_ENTRY_MAX_LINES, display_lines),
         )
-        margins = (
-            self.message_entry.frameWidth() * 2
-            + document_margins
-            + 2
+        # frameWidth() includes horizontal stylesheet padding and made Glassy
+        # taller than Modern. Only vertical padding belongs in this height.
+        contents_margins = self.message_entry.contentsMargins()
+        margins = contents_margins.top() + contents_margins.bottom() + document_margins + 2
+        content_height = math.ceil(sum(line_heights[:visible_lines]))
+        height = content_height + margins
+        self.message_entry.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if display_lines > MESSAGE_ENTRY_MAX_LINES
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.message_entry.setFixedHeight(
-            visible_lines * line_height + margins
-        )
+        if self.message_entry.height() != height:
+            self.message_entry.setFixedHeight(height)
 
         if display_lines > MESSAGE_ENTRY_MAX_LINES:
             self.message_entry.ensureCursorVisible()
@@ -9571,16 +11612,44 @@ class EncryptedChatClient(QObject):
                 + ("#800000" if at_or_over_limit else "#007f82")
                 + "; }"
             )
+        elif self._is_glassy_theme():
+            self.message_size_bar.setStyleSheet(
+                "QProgressBar { background-color: rgba(255,255,255,188);"
+                " border: 1px solid #6f9bb5; border-radius: 4px; color: "
+                + ("#ffffff" if at_or_over_limit else "#172532")
+                + "; text-align: center; }"
+                " QProgressBar::chunk {"
+                " background: qlineargradient("
+                " x1:0, y1:0, x2:0, y2:1,"
+                + (
+                    " stop:0 #ffb9b9, stop:0.48 #df6262,"
+                    " stop:0.52 #b72f2f, stop:1 #7e1717"
+                    if at_or_over_limit
+                    else
+                    " stop:0 #c7f5ff, stop:0.48 #72cee9,"
+                    " stop:0.52 #39a8d4, stop:1 #197aa9"
+                )
+                + "); border-radius: 3px; }"
+            )
         else:
             self.message_size_bar.setStyleSheet(
                 "QProgressBar { background-color: #eeeeee; "
                 "border: 1px solid #a8a8a8; color: "
                 + ("#ffffff" if at_or_over_limit else "#202020")
-                + "; text-align: center; } "
+                + "; border-radius: 3px; text-align: center; } "
                 "QProgressBar::chunk { background: "
-                + ("#303030" if at_or_over_limit else "#b8b8b8")
-                + "; }"
+                + ("#303030" if at_or_over_limit else "#aaaaaa")
+                + "; border-radius: 3px; }"
             )
+
+        if self._is_windows_classic_theme():
+            self.message_size_bar.setStyleSheet(classic_theme_stylesheet(
+                self.message_size_bar.styleSheet(), client_theme_color(self, "Classic")
+            ))
+        elif self._is_glassy_theme():
+            self.message_size_bar.setStyleSheet(hue_theme_stylesheet(
+                self.message_size_bar.styleSheet(), client_theme_color(self, "Glassy")
+            ))
 
         messages_left = self._messages_left_today()
         message_limit_suffix = (
@@ -10002,7 +12071,26 @@ class EncryptedChatClient(QObject):
             )
             room_to_poll: dict[str, str] | None = None
             repay_background_after_poll = False
-            if global_poll_due:
+            # Normal presence work shares the chat request cadence. Restoring
+            # from tray requests a tally immediately, then resumes that cadence.
+            # A step sends a ping or fetches a tally, never both at once.
+            presence_work = (
+                (
+                    (
+                        self.recently_online_refresh_event.is_set()
+                        and not self._minimized_to_tray
+                    )
+                    or (
+                        global_poll_due
+                        and last_global_poll_at is not None
+                        and not force_active_poll
+                    )
+                )
+                and self._network_recently_online_step(now=now)
+            )
+            if presence_work:
+                last_global_poll_at = time.monotonic()
+            if global_poll_due and not presence_work:
                 room_id_to_poll = (
                     active_room_id
                     if force_active_poll
@@ -10086,6 +12174,112 @@ class EncryptedChatClient(QObject):
                 )
             self.network_wakeup_event.wait(max(0.01, wait_seconds))
             self.network_wakeup_event.clear()
+
+    def _update_recently_online_label(self) -> None:
+        label = getattr(self, "recently_online_label", None)
+        if label is None:
+            return
+        label.setVisible(self.active_chatroom_id == GLOBAL_CHATROOM_ID)
+        server = normalize_server_url(self.config_data.get("server_url", ""))
+        pings = self.recently_online_counts.get(server)
+        if pings is not None:
+            self._last_recently_online_count = len(pings)
+        if self._last_recently_online_count is None:
+            label.setText("Recently online: …")
+            return
+        # Keep the last completed tally throughout tray suspension, refreshes
+        # and server changes. Only a successful response replaces the value.
+        label.setText(f"Recently online: {self._last_recently_online_count}")
+
+    def _network_recently_online_step(self, *, now: float) -> bool:
+        server = normalize_server_url(self.config_data.get("server_url", ""))
+        if not server:
+            return False
+        states = self.config_data.setdefault("recently_online_state", {})
+        state = states.get(server)
+        if not isinstance(state, dict):
+            state = {}
+            states[server] = state
+        sent_at = state.get("sent_at", 0)
+        if (
+            type(sent_at) not in (int, float)
+            or not 0 <= sent_at <= 253_402_300_799
+            or not math.isfinite(sent_at)
+        ):
+            sent_at = 0
+        wall_now = time.time()
+        send_due = (
+            sent_at <= 0
+            or wall_now < sent_at
+            or wall_now - sent_at >= RECENTLY_ONLINE_INTERVAL_SECONDS
+        )
+        refresh_requested = (
+            self.recently_online_refresh_event.is_set()
+            and not self._minimized_to_tray
+        )
+        if (
+            send_due
+            and not refresh_requested
+            and now - self.recently_online_send_attempts.get(server, -math.inf)
+            >= RECENTLY_ONLINE_RETRY_SECONDS
+        ):
+            self.recently_online_send_attempts[server] = now
+            try:
+                token = state.get("pending_token")
+                if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+                    token = secrets.token_hex(16)
+                    state["pending_token"] = token
+                # Retrying after a timeout or restart must count as one ping.
+                save_config(self.config_data)
+                topic, _key = recently_online_transport()
+                response = self.session.post(
+                    f"{server}/{topic}",
+                    data=make_recently_online_packet(token).encode("ascii"),
+                    headers={
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "X-Firebase": "no",
+                        "X-Cache": "yes",
+                    },
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                state["sent_at"] = time.time()
+                state.pop("pending_token", None)
+                self._queue_ui_event(("recently_online_sent", None))
+                save_config(self.config_data)
+            except Exception:
+                # Retry quietly with the same token; presence failures never
+                # produce chat messages, unread markers or notifications.
+                pass
+            return True
+
+        if self._minimized_to_tray:
+            return False
+        if (
+            not refresh_requested
+            and now - self.recently_online_poll_attempts.get(server, -math.inf)
+            < RECENTLY_ONLINE_POLL_SECONDS
+        ):
+            return False
+        self.recently_online_refresh_event.clear()
+        self.recently_online_poll_attempts[server] = now
+        try:
+            topic, _key = recently_online_transport()
+            response = self.session.get(
+                f"{server}/{topic}/json",
+                params={"poll": "1", "since": "6h"},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            pings = recently_online_pings(parse_ntfy_ndjson(response), now=time.time())
+            self._queue_ui_event(("recently_online", (server, pings)))
+        except Exception:
+            # Keep the last completed count on failure. A failed first fetch
+            # remains unknown, rather than suggesting zero users.
+            self.recently_online_poll_attempts[server] = (
+                now - RECENTLY_ONLINE_POLL_SECONDS + RECENTLY_ONLINE_RETRY_SECONDS
+            )
+        return True
 
     def _network_send(self, outbound: dict[str, Any]) -> None:
         try:
@@ -10429,6 +12623,11 @@ class EncryptedChatClient(QObject):
                     if room_id == self.active_chatroom_id:
                         self.status_var.set(status)
 
+                elif event_type == "recently_online":
+                    server, pings = payload
+                    self.recently_online_counts[server] = pings
+                    self._update_recently_online_label()
+
                 elif event_type == "messages":
                     room_id = str(payload.get("room_id", ""))
                     items = payload.get("items", [])
@@ -10466,7 +12665,8 @@ class EncryptedChatClient(QObject):
                             added_message_ids
                         )
 
-                elif event_type == "send_succeeded":
+                elif event_type in {"send_succeeded", "recently_online_sent"}:
+                    # Anonymous pings also consume a relay publish request.
                     self._record_successful_send()
 
                 elif event_type == "send_failed":
@@ -11009,7 +13209,7 @@ class EncryptedChatClient(QObject):
 
         background_indices = {
             QColor(color).name().casefold(): index
-            for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS)
+            for index, color in enumerate(message_row_backgrounds())
         }
         stripe_index = 0
         previous_timestamp: int | None = None
@@ -11034,7 +13234,7 @@ class EncryptedChatClient(QObject):
                         -1,
                     )
                     + 1
-                ) % len(MESSAGE_ROW_BACKGROUNDS)
+                ) % len(message_row_backgrounds())
 
         self._hide_chat_tooltip()
         cursor = self.chat_display.textCursor()
@@ -11057,8 +13257,8 @@ class EncryptedChatClient(QObject):
                 last_separator_block_number = self._insert_log_separator(
                     cursor,
                     separator_text,
-                    MESSAGE_ROW_BACKGROUNDS[
-                        stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                    message_row_backgrounds()[
+                        stripe_index % len(message_row_backgrounds())
                     ],
                     row_selections,
                 )
@@ -11080,8 +13280,8 @@ class EncryptedChatClient(QObject):
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
                 trusted_user_ids=trusted_user_ids,
-                background_color=MESSAGE_ROW_BACKGROUNDS[
-                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                background_color=message_row_backgrounds()[
+                    stripe_index % len(message_row_backgrounds())
                 ],
                 row_selections=row_selections,
             )
@@ -12233,6 +14433,7 @@ class EncryptedChatClient(QObject):
             )
         ):
             self._apply_dialog_window_theme(watched)
+            self._apply_ui_size_to_widget_tree(watched)
 
         if (
             watched is self.root
@@ -12548,6 +14749,7 @@ class EncryptedChatClient(QObject):
         *,
         align_top: bool = False,
         opacity: float = 1.0,
+        line_height_px: int = DEFAULT_MESSAGE_LINE_HEIGHT_PX,
     ) -> bool:
         if not encoded_icon:
             return False
@@ -12576,7 +14778,15 @@ class EncryptedChatClient(QObject):
                 - PROFILE_ICON_VERTICAL_OFFSET_PX,
             )
             if align_top
-            else PROFILE_ICON_VERTICAL_OFFSET_PX
+            else max(
+                0,
+                round(
+                    (max(PROFILE_ICON_SIZE, line_height_px)
+                     - PROFILE_ICON_SIZE)
+                    / 2.0
+                    - PROFILE_ICON_VERTICAL_OFFSET_PX
+                ),
+            )
         )
         bottom_padding = (
             0
@@ -12632,12 +14842,9 @@ class EncryptedChatClient(QObject):
         image_format.setHeight(displayed_image.height())
         image_format.setAnchor(True)
         image_format.setAnchorHref(f"spritelink:{message_id}")
-        # Inline images participate in Qt's automatic line-height calculation,
-        # so a short text line expands to the icon's native 16-pixel height.
-        # A normal 16 px icon belongs at y=2 in the fixed 24 px row:
-        # centered at y=4, then shifted upward by exactly 2 px. Aligning the
-        # padded 20 px canvas to the row top avoids AlignMiddle's half-pixel
-        # rounding, which previously reduced the visible shift to one pixel.
+        # Keep the icon vertically centered in the current text row while
+        # retaining the slight upward optical offset used by the default
+        # 24-pixel layout. AlignTop avoids AlignMiddle half-pixel rounding.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
         )
@@ -12740,9 +14947,16 @@ class EncryptedChatClient(QObject):
         formatting = QTextCharFormat()
         formatting.setForeground(QColor(color))
         formatting.setFont(
-            self._make_ui_font(bold=bold)
+            self._make_ui_font(
+                bold=bold,
+                point_size=self._text_size("other_ui"),
+            )
             if ui_font
-            else self._make_message_font(font_name, bold=bold)
+            else self._make_message_font(
+                font_name,
+                bold=bold,
+                role="chat_log",
+            )
         )
         formatting.setFontItalic(italic)
         formatting.setFontUnderline(underline)
@@ -13093,7 +15307,8 @@ class EncryptedChatClient(QObject):
         # background painter covers the complete block, including margins.
         separator_block.setTopMargin(7)
         separator_block.setBottomMargin(7)
-        separator_block.setBackground(QColor(background_color))
+        # The full-width row painter owns separators as well as messages.
+        # A QTextBlock background would blend this stripe a second time.
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
         separator_block_number = cursor.block().blockNumber()
@@ -13282,8 +15497,8 @@ class EncryptedChatClient(QObject):
                 ):
                     separator_specs.append((
                         separator_text,
-                        MESSAGE_ROW_BACKGROUNDS[
-                            stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                        message_row_backgrounds()[
+                            stripe_index % len(message_row_backgrounds())
                         ],
                     ))
                     stripe_index += 1
@@ -13291,8 +15506,8 @@ class EncryptedChatClient(QObject):
                 render_steps[-1]["separators_after"] = separator_specs
             render_steps.append({
                 "group": group,
-                "background_color": MESSAGE_ROW_BACKGROUNDS[
-                    stripe_index % len(MESSAGE_ROW_BACKGROUNDS)
+                "background_color": message_row_backgrounds()[
+                    stripe_index % len(message_row_backgrounds())
                 ],
                 "separators_after": [],
             })
@@ -13304,7 +15519,7 @@ class EncryptedChatClient(QObject):
         # already rendered so existing white/gray stripes never swap places.
         background_indices = {
             QColor(color).name().casefold(): index
-            for index, color in enumerate(MESSAGE_ROW_BACKGROUNDS)
+            for index, color in enumerate(message_row_backgrounds())
         }
         stripe_shift = 0
         for step in render_steps:
@@ -13323,7 +15538,7 @@ class EncryptedChatClient(QObject):
                     continue
                 stripe_shift = (
                     previous_index - planned_index
-                ) % len(MESSAGE_ROW_BACKGROUNDS)
+                ) % len(message_row_backgrounds())
                 break
             else:
                 continue
@@ -13334,14 +15549,14 @@ class EncryptedChatClient(QObject):
                 planned_index = background_indices[
                     QColor(str(step["background_color"])).name().casefold()
                 ]
-                step["background_color"] = MESSAGE_ROW_BACKGROUNDS[
+                step["background_color"] = message_row_backgrounds()[
                     (planned_index + stripe_shift)
-                    % len(MESSAGE_ROW_BACKGROUNDS)
+                    % len(message_row_backgrounds())
                 ]
                 step["separators_after"] = [
                     (
                         separator_text,
-                        MESSAGE_ROW_BACKGROUNDS[
+                        message_row_backgrounds()[
                             (
                                 background_indices[
                                     QColor(background_color)
@@ -13350,7 +15565,7 @@ class EncryptedChatClient(QObject):
                                 ]
                                 + stripe_shift
                             )
-                            % len(MESSAGE_ROW_BACKGROUNDS)
+                            % len(message_row_backgrounds())
                         ],
                     )
                     for separator_text, background_color
@@ -13432,9 +15647,9 @@ class EncryptedChatClient(QObject):
                 last_separator_block_number = self._insert_log_separator(
                     cursor,
                     separator_text,
-                    MESSAGE_ROW_BACKGROUNDS[
+                    message_row_backgrounds()[
                         (stripe_index + stripe_shift)
-                        % len(MESSAGE_ROW_BACKGROUNDS)
+                        % len(message_row_backgrounds())
                     ],
                     row_selections,
                 )
@@ -13456,9 +15671,9 @@ class EncryptedChatClient(QObject):
                 muted_ids=muted_ids,
                 collapsed_ids=collapsed_ids,
                 trusted_user_ids=trusted_user_ids,
-                background_color=MESSAGE_ROW_BACKGROUNDS[
+                background_color=message_row_backgrounds()[
                     (stripe_index + stripe_shift)
-                    % len(MESSAGE_ROW_BACKGROUNDS)
+                    % len(message_row_backgrounds())
                 ],
                 row_selections=row_selections,
             )
@@ -13490,6 +15705,11 @@ class EncryptedChatClient(QObject):
             for selection in row_selections
             if selection.cursor.block().isValid()
         }
+        # Forward rendering is used when a theme/style replacement rebuilds
+        # the log while preserving its anchor. Short documents have no
+        # scrollbar position to restore, so reapply their root-frame margin
+        # explicitly instead of letting the messages snap to the top.
+        self._bottom_align_short_message_log()
         self.chat_display.setExtraSelections([])
         self._message_render_job = None
         self._rendering_message_log = False
@@ -13530,7 +15750,7 @@ class EncryptedChatClient(QObject):
         separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
         separator_block.setTopMargin(7)
         separator_block.setBottomMargin(7)
-        separator_block.setBackground(QColor(background_color))
+        # Match the append path: paint the translucent stripe only once.
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
         separator_block_number = cursor.block().blockNumber()
@@ -13959,12 +16179,19 @@ class EncryptedChatClient(QObject):
                 )
         align_message_top = top_align_height > 0
 
-        has_profile_icon = self._insert_profile_icon(
-            cursor,
-            "" if is_muted else profile_icon,
-            message_id,
-            align_top=align_message_top,
+        message_line_height = self._chat_line_height(
+            font_name,
+            ui_font=is_muted,
         )
+        has_profile_icon = False
+        if self._chat_icons_visible():
+            has_profile_icon = self._insert_profile_icon(
+                cursor,
+                "" if is_muted else profile_icon,
+                message_id,
+                align_top=align_message_top,
+                line_height_px=message_line_height,
+            )
         if has_profile_icon:
             cursor.insertText(
                 " ",
@@ -14081,7 +16308,7 @@ class EncryptedChatClient(QObject):
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
             # Only date/hour separators may contribute vertical margins.
-            # Ordinary message blocks always occupy fixed 24-pixel lines.
+            # Ordinary message blocks follow the active chat font metrics.
             block_format.setTopMargin(0.0)
             block_format.setBottomMargin(0.0)
             # The custom full-width painter owns the entire normal stripe.
@@ -14092,7 +16319,7 @@ class EncryptedChatClient(QObject):
             )
             if block.blockNumber() not in embedded_media_block_numbers:
                 block_format.setLineHeight(
-                    float(MESSAGE_LINE_HEIGHT_PX),
+                    float(message_line_height),
                     int(QTextBlockFormat.LineHeightTypes.FixedHeight.value),
                 )
             block_cursor.setBlockFormat(block_format)
@@ -14556,6 +16783,7 @@ class EncryptedChatClient(QObject):
 
         self._closing = True
         self._minimized_to_tray = False
+        self.theme_color_save_timer.stop()
         QToolTip.hideText()
         self.update_check_timer.stop()
         self.background_history_prune_timer.stop()

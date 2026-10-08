@@ -25,8 +25,9 @@ a = Analysis(
     datas=[
         ("SL.ico", "."),
         ("sounds", "sounds"),
+        ("assets", "assets"),
     ],
-    hiddenimports=generated_hidden_imports,
+    hiddenimports=generated_hidden_imports + ["PySide6.QtSvg"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
