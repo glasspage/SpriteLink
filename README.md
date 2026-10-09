@@ -8,6 +8,6 @@ Video links from YouTube, Vimeo, Dailymotion, and Streamable appear as click-to-
 
 YouTube, Vimeo, and direct videos use SpriteLink's themed playback controls. Other providers retain their embedded controls. YouTube chooses playback quality automatically; its API no longer supports requesting a target resolution. Provider restrictions, unavailable codecs, or embedding failures can be handled with **Open in Browser**. Existing GIF-style looping videos remain silent and autoplay inline.
 
-When the chat window cannot fit YouTube's minimum player height, playback opens in a larger, resizable pop-up. Fullscreen uses the same SpriteLink controls.
+Videos open inside the main SpriteLink window at any window size. **Pop-out** moves playback into a separate nonmodal window and removes the main-window overlay. **Mini player** keeps a compact player at the top right of the chat log. Mode changes preserve playback, and fullscreen uses the same SpriteLink controls.
 
 DISCLAIMER: The code in this repository was created with assistance from AI tools. I made the architecture, design and implementation decisions; AI was used to write the code based on them.

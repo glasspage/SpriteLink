@@ -1,14 +1,17 @@
 import io
+from contextlib import ExitStack
 import json
 import shutil
 import subprocess
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from PIL import Image
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QImage
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 
 from test_security import SPRITELINK as S
@@ -168,6 +171,54 @@ class VideoControlsTests(unittest.TestCase):
         player.web = None
         player.stop()
 
+    def test_serialized_paused_state_enables_controls_and_preserves_duration(self):
+        player = V.VideoPlayer()
+        player.info = V.VideoInfo(V.VideoLink("youtube", "M7lc1UVf-VE", ""), "youtube.com")
+        player.web = mock.Mock()
+        player.web.page().runJavaScript.side_effect = lambda script, callback: callback(json.dumps({
+            "ready": True, "playerState": 2, "playing": False, "duration": 245,
+            "position": 0, "volume": 80, "muted": False,
+        }))
+        player._poll()
+        self.assertIn("JSON.stringify", player.web.page().runJavaScript.call_args.args[0])
+        self.assertTrue(player.play_button.isEnabled())
+        self.assertTrue(player.seek.isEnabled())
+        self.assertEqual(player.time_label.text(), "0:00 / 4:05")
+        player._update_state(json.dumps({"ready": False, "playerState": 2, "duration": 0}))
+        self.assertTrue(player._ready)
+        self.assertEqual(player._duration, 245)
+        with mock.patch.object(player, "_error") as error:
+            player._check_ready(player._generation)
+            error.assert_not_called()
+        player.web = None
+        player.stop()
+
+    def test_connecting_bridge_never_destroys_a_loaded_iframe_on_timeout(self):
+        player = V.VideoPlayer()
+        player.info = V.VideoInfo(V.VideoLink("youtube", "M7lc1UVf-VE", ""), "youtube.com")
+        player.web = mock.Mock()
+        player._check_ready(player._generation)
+        player.web.setUrl.assert_not_called()
+        player.web.stop.assert_not_called()
+        self.assertTrue(player._poll_pending)
+        # A stale callback from a dismissed player cannot resurrect controls.
+        callback = player.web.page().runJavaScript.call_args.args[1]
+        player.web = None
+        player.stop()
+        callback(json.dumps({"ready": True, "duration": 180}))
+        self.assertFalse(player._ready)
+
+    def test_missing_or_malformed_poll_keeps_initialized_player_ready(self):
+        player = V.VideoPlayer()
+        player._update_state({"ready": True, "duration": 180})
+        for state in (None, "", "null", "not JSON", {"duration": None},
+                      {"ready": False, "playerState": 3, "duration": float("nan")}):
+            player._update_state(state)
+            self.assertTrue(player.play_button.isEnabled())
+            self.assertTrue(player.seek.isEnabled())
+            self.assertEqual(player._duration, 180)
+        player.stop()
+
     def test_fullscreen_restores_parent_size_and_stop_invalidates_callbacks(self):
         parent = QWidget()
         layout = QVBoxLayout(parent)
@@ -241,7 +292,8 @@ c.YT={Player:function(id,o){options=o; return {
   playVideo:()=>calls.push(['play']), pauseVideo:()=>calls.push(['pause']),
   seekTo:(v)=>calls.push(['seek',v]), setVolume:v=>calls.push(['volume',v]),
   mute:()=>calls.push(['mute']), unMute:()=>calls.push(['unmute']),
-  getCurrentTime:()=>12,getDuration:()=>120,getVolume:()=>60,isMuted:()=>false
+  getCurrentTime:()=>12,getDuration:()=>120,getVolume:()=>60,isMuted:()=>false,
+  getPlayerState:()=>1
 };}};
 vm.createContext(c);
 for(const match of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)) vm.runInContext(match[1],c);
@@ -263,6 +315,33 @@ process.stdout.write(JSON.stringify({options,calls,state:c.window.spriteState()}
         self.assertEqual(output["state"]["duration"], 120)
         self.assertTrue(output["state"]["playing"])
 
+    @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the provider bridge")
+    def test_youtube_duration_and_readiness_are_read_while_paused_without_js_timer(self):
+        info = V.VideoInfo(V.VideoLink("youtube", "M7lc1UVf-VE", ""), "youtube.com", duration=90)
+        runner = r"""
+const fs=require('fs'),vm=require('vm');
+const html=fs.readFileSync(0,'utf8'); let options, duration=120;
+const c={window:{}, location:{origin:'https://github.com'}};
+c.YT={Player:function(id,o){options=o;return {
+  playVideo:()=>{}, getPlayerState:()=>2, getCurrentTime:()=>0,
+  getDuration:()=>duration, getVolume:()=>100,isMuted:()=>false
+};}};
+vm.createContext(c);
+for(const match of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)) vm.runInContext(match[1],c);
+c.onYouTubeIframeAPIReady();
+const initialized={...c.window.spriteState()};
+duration=0;
+const paused=c.window.spriteState();
+process.stdout.write(JSON.stringify({initialized,paused}));
+"""
+        result = subprocess.run([shutil.which("node"), "-e", runner],
+                                input=V.provider_player_html(info), text=True,
+                                capture_output=True, check=True)
+        output = json.loads(result.stdout)
+        self.assertTrue(output["initialized"]["ready"])
+        self.assertFalse(output["paused"]["playing"])
+        self.assertEqual(output["paused"]["duration"], 120)
+
     def test_vimeo_unlisted_hash_and_provider_content_are_safe(self):
         info = V.VideoInfo(V.video_link("https://vimeo.com/123456/abc123", trusted),
                            "vimeo.com", "</script><script>evil()</script>")
@@ -270,6 +349,138 @@ process.stdout.write(JSON.stringify({options,calls,state:c.window.spriteState()}
         self.assertIn("controls=0", page)
         self.assertIn("h=abc123", page)
         self.assertNotIn("evil()", page)
+
+
+class VideoModeIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.stack = ExitStack()
+        self.stack.enter_context(mock.patch.object(S, "load_config", side_effect=S.default_config))
+        self.stack.enter_context(mock.patch.object(S, "save_config"))
+        for method in ("_start_network_thread", "_load_saved_history_for_current_room",
+                       "_check_for_updates", "_consume_notification_activation"):
+            self.stack.enter_context(mock.patch.object(S.EncryptedChatClient, method))
+        self.stack.enter_context(mock.patch.object(V.VideoPlayer, "_load_provider"))
+        self.root = S.MainWindow()
+        self.client = S.EncryptedChatClient(self.root)
+        self.client.config_data["ui_size"] = "Tiny"
+        self.client._apply_theme()
+        self.client._apply_ui_size()
+        self.root.resize(470, 250)
+        self.root.show()
+        QTest.qWait(20)
+        self.url = "https://youtu.be/M7lc1UVf-VE"
+        info = V.VideoInfo(V.video_link(self.url, trusted), "youtu.be", duration=245)
+        self.client.image_preview_cache[self.url] = S.RemoteMediaPreview(self.url, b"", "video", None, info)
+        self.client._show_image_preview_popup(self.url)
+        self.player = self.client.video_player
+        self.player._update_state(json.dumps({"ready": True, "playerState": 2, "duration": 245, "position": 35}))
+        QTest.qWait(20)
+
+    def tearDown(self):
+        self.client._closing = True
+        self.player.stop()
+        for timer in self.root.findChildren(QTimer):
+            timer.stop()
+        self.root.close_callback = None
+        self.app.removeEventFilter(self.client)
+        self.root.close()
+        self.root.deleteLater()
+        QTest.qWait(20)
+        self.stack.close()
+
+    def test_tiny_window_keeps_youtube_inside_main_window(self):
+        self.assertEqual(self.root.width(), 470)
+        self.assertEqual(self.root.height(), 250)
+        self.assertEqual(self.player._mode, "main")
+        self.assertIsNone(self.player._fullscreen)
+        self.assertTrue(self.client.image_preview_overlay.isVisible())
+        self.assertIs(self.player.parentWidget(), self.client.image_preview_panel)
+        self.assertTrue(self.player.play_button.isEnabled())
+        self.assertEqual(self.player.time_label.text(), "0:35 / 4:05")
+
+    def test_mode_buttons_preserve_playback_remove_overlay_and_anchor_mini(self):
+        info, generation, position = self.player.info, self.player._generation, self.player.seek.value()
+        self.player.popout_button.click()
+        dialog = self.player._fullscreen
+        self.assertIsNotNone(dialog)
+        self.assertEqual(dialog.windowModality(), Qt.WindowModality.NonModal)
+        self.assertFalse(self.client.image_preview_overlay.isVisible())
+        self.player.mini_button.click()
+        panel = self.client.video_mini_panel
+        self.assertIsNone(self.player._fullscreen)
+        self.assertTrue(panel.isVisible())
+        self.assertIs(panel.parentWidget(), self.client.chat_display.parentWidget())
+        self.assertIs(self.player.parentWidget(), panel)
+        self.assertFalse(self.client.image_preview_overlay.isVisible())
+        self.assertTrue(self.player.volume.isHidden())
+        self.assertTrue(self.player.play_button.isEnabled())
+        self.root.resize(630, 360)
+        QTest.qWait(30)
+        rect = self.client.chat_display.viewport().rect()
+        panel_position = self.client.chat_display.viewport().mapFromGlobal(
+            panel.mapToGlobal(panel.rect().topLeft()))
+        self.assertEqual(rect.width() - panel_position.x() - panel.width(), 6)
+        self.assertEqual(panel_position.y(), 6)
+        self.assertIs(self.player.info, info)
+        self.assertEqual(self.player._generation, generation)
+        self.assertEqual(self.player.seek.value(), position)
+        self.player.mini_button.click()
+        self.assertEqual(self.player._mode, "main")
+        self.assertTrue(self.client.image_preview_overlay.isVisible())
+        self.assertFalse(panel.isVisible())
+        self.assertEqual(self.client.current_image_preview_url, self.url)
+
+    def test_mini_fullscreen_restores_mini_and_popout_close_stops(self):
+        self.player.mini_button.click()
+        self.player.toggle_fullscreen()
+        self.assertFalse(self.client.video_mini_panel.isVisible())
+        self.player.toggle_fullscreen()
+        self.assertEqual(self.player._mode, "mini")
+        self.assertTrue(self.client.video_mini_panel.isVisible())
+        self.assertFalse(self.client.image_preview_overlay.isVisible())
+        self.player.popout_button.click()
+        self.player._fullscreen.close()
+        self.assertIsNone(self.player.info)
+        self.assertIsNone(self.client.current_image_preview_url)
+        self.assertFalse(self.client.image_preview_overlay.isVisible())
+
+    def test_tray_suspension_stops_mini_when_main_overlay_is_hidden(self):
+        self.player.mini_button.click()
+        self.client._suspend_for_tray()
+        self.assertIsNone(self.player.info)
+        self.assertIsNone(self.client.current_image_preview_url)
+        self.assertFalse(self.client.video_mini_panel.isVisible())
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is needed to create a native playback fixture")
+    def test_native_video_survives_mini_popout_and_window_cleanup(self):
+        with TemporaryDirectory() as folder:
+            filename = folder + "/clip.avi"
+            subprocess.run([shutil.which("ffmpeg"), "-loglevel", "error", "-f", "lavfi",
+                            "-i", "color=c=blue:s=64x36:d=2:r=10", "-c:v", "mpeg4", filename],
+                           capture_output=True, check=True)
+            info = V.VideoInfo(V.VideoLink("direct", "", QUrl.fromLocalFile(filename).toString()), "local")
+            self.player.load(info)
+            for _ in range(40):
+                QTest.qWait(25)
+                if self.player._ready and self.player.video_widget.videoSink().videoFrame().isValid():
+                    break
+            self.assertTrue(self.player._ready)
+            self.assertTrue(self.player.video_widget.videoSink().videoFrame().isValid())
+            backend, generation = self.player.media_player, self.player._generation
+            backend.pause()
+            position = backend.position()
+            for mode in ("mini", "popout", "main"):
+                self.client._set_video_player_mode(mode)
+                QTest.qWait(25)
+                self.assertIs(self.player.media_player, backend)
+                self.assertEqual(self.player._generation, generation)
+                self.assertEqual(backend.position(), position)
+            self.player.stop()
+            QTest.qWait(25)
 
 
 if __name__ == "__main__":

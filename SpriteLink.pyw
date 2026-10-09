@@ -7510,7 +7510,7 @@ class EncryptedChatClient(QObject):
         self._hide_chat_tooltip()
         if self.link_warning_overlay.isVisible():
             self._hide_link_warning_popup()
-        if self.image_preview_overlay.isVisible():
+        if self.image_preview_overlay.isVisible() or self.current_image_preview_url:
             self._hide_image_preview_popup()
         self._pause_animated_media()
         self._release_message_sound_resources()
@@ -10185,6 +10185,15 @@ QComboBox::drop-down {
         self.image_preview_label.setMinimumHeight(96)
         panel_layout.addWidget(self.image_preview_label, 1)
         self.video_player: VideoPlayer | None = None
+        # Keep native video surfaces outside QAbstractScrollArea's internal
+        # viewport ownership; the panel still tracks the visible log rectangle.
+        self.video_mini_panel = QFrame(self.chat_display.parentWidget())
+        self.video_mini_panel.setObjectName("configPanel")
+        self.video_mini_panel.setStyleSheet(self._config_panel_stylesheet())
+        mini_layout = QVBoxLayout(self.video_mini_panel)
+        mini_layout.setContentsMargins(4, 4, 4, 4)
+        mini_layout.setSpacing(0)
+        self.video_mini_panel.hide()
 
         button_row = QHBoxLayout()
         self.image_preview_button_row = button_row
@@ -10488,6 +10497,8 @@ QComboBox::drop-down {
                 self.video_player.duration_available.connect(self._on_video_duration_available)
                 self.video_player.popup_closed.connect(self._hide_image_preview_popup)
                 self.video_player.open_in_browser.connect(self._open_current_image_in_browser)
+                self.video_player.mode_requested.connect(self._set_video_player_mode)
+                self.video_player.mode_changed.connect(self._on_video_player_mode_changed)
                 self.image_preview_panel.layout().insertWidget(0, self.video_player, 1)
             self.image_preview_label.hide()
             self.video_player.show()
@@ -10509,7 +10520,6 @@ QComboBox::drop-down {
         self._ensure_animated_media_controller(url or "", media)
         if (
             media.kind == "video" and self.video_player is not None
-            and self.video_player._fullscreen is None
         ):
             margins = self.image_preview_overlay.layout().contentsMargins()
             self.video_player.fit_viewport(
@@ -10517,12 +10527,6 @@ QComboBox::drop-down {
                     - self.image_preview_button_row.sizeHint().height() - 44),
                 self.video_player.width(),
             )
-            if (
-                media.video_info is not None
-                and media.video_info.link.provider == "youtube"
-                and self.video_player.maximumHeight() - self.video_player.controls.sizeHint().height() - 4 < 200
-            ):
-                self.video_player.pop_out()
         elif isinstance(media.frame, QImage) and not media.frame.isNull():
             self._set_large_image_preview_frame(media.frame)
         else:
@@ -10558,7 +10562,47 @@ QComboBox::drop-down {
             self.last_inline_animation_frame_at.pop(url, None)
         self.message_entry.setFocus()
 
+    def _set_video_player_mode(self, mode: str) -> None:
+        player = self.video_player
+        if player is None or not self.current_image_preview_url:
+            return
+        player.set_mode(mode, self.video_mini_panel)
+
+    def _on_video_player_mode_changed(self, mode: str) -> None:
+        if mode == "main":
+            self.video_mini_panel.hide()
+            self._sync_image_preview_overlay_geometry()
+            self.image_preview_overlay.show()
+            self.image_preview_overlay.raise_()
+            self._update_image_preview_popup()
+        else:
+            # Keep the live backend while removing the blocking chat overlay.
+            self.image_preview_overlay.hide()
+            if mode == "mini":
+                self._sync_video_mini_geometry()
+                self.video_mini_panel.show()
+                self.video_mini_panel.raise_()
+            else:
+                self.video_mini_panel.hide()
+        self._apply_video_player_theme()
+
+    def _sync_video_mini_geometry(self) -> None:
+        panel = getattr(self, "video_mini_panel", None)
+        if panel is None:
+            return
+        rect = self.chat_display.viewport().rect()
+        margin = 6
+        width = max(1, min(280, rect.width() - margin * 2))
+        height = max(1, min(184, rect.height() - margin * 2))
+        position = self.chat_display.viewport().mapTo(
+            panel.parentWidget(), QPoint(max(0, rect.width() - width - margin), margin)
+        )
+        panel.setGeometry(position.x(), position.y(), width, height)
+
     def _apply_video_player_theme(self) -> None:
+        mini_panel = getattr(self, "video_mini_panel", None)
+        if mini_panel is not None:
+            mini_panel.setStyleSheet(self._config_panel_stylesheet())
         player = getattr(self, "video_player", None)
         if player is None:
             return
@@ -10570,6 +10614,9 @@ QComboBox::drop-down {
             else (lambda text: hue_theme_stylesheet(text, position))
         )
         player.set_theme(theme, transform, self._is_tiny_ui())
+        # Reparented controls retain the current other-UI font in every mode.
+        for widget in (player, *player.findChildren(QWidget)):
+            self._set_widget_text_size(widget, "other_ui")
 
     def _on_video_duration_available(self, duration: int) -> None:
         media = self.image_preview_cache.get(self.current_image_preview_url or "")
@@ -14614,6 +14661,7 @@ QComboBox::drop-down {
             and watched is self.chat_display.viewport()
         ):
             if event.type() == QEvent.Type.Resize:
+                self._sync_video_mini_geometry()
                 self.viewport_media_timer.start(
                     VIEWPORT_MEDIA_UPDATE_DELAY_MS
                 )
@@ -16532,7 +16580,7 @@ QComboBox::drop-down {
         self._hide_chat_tooltip()
         if self.link_warning_overlay.isVisible():
             self._hide_link_warning_popup()
-        if self.image_preview_overlay.isVisible():
+        if self.image_preview_overlay.isVisible() or self.current_image_preview_url:
             self._hide_image_preview_popup()
         self.seen_client_message_ids.clear()
         self.seen_ntfy_message_ids.clear()

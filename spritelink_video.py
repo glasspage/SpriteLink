@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from html import escape
 import io
 import json
+import math
 import re
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
@@ -247,8 +248,14 @@ function onYouTubeIframeAPIReady() {
     host:'https://www.youtube-nocookie.com',
     playerVars:{controls:0, disablekb:1, fs:0, playsinline:1, rel:0,
                 origin:location.origin, start:START_SECONDS},
-    events:{onReady:() => { state.ready=true; player.playVideo(); },
-      onStateChange:e => { state.playing=e.data===1; state.ended=e.data===0; },
+    events:{onReady:() => { state.ready=true; readYouTubeState(); player.playVideo(); },
+      onStateChange:e => {
+        state.playerState=e.data;
+        if ([0,1,2,3,5].includes(e.data)) state.ready=true;
+        if (e.data!==3) state.playing=e.data===1;
+        state.ended=e.data===0;
+        readYouTubeState();
+      },
       onAutoplayBlocked:() => { state.playing=false; },
       onError:e => { state.error='YouTube playback unavailable ('+e.data+')'; }}
   });
@@ -261,11 +268,24 @@ window.spriteCommand = (command, value) => {
   if(command==='volume') player.setVolume(value);
   if(command==='mute') value ? player.mute() : player.unMute();
 };
-setInterval(() => {
-  if (!state.ready) return;
-  state.position=player.getCurrentTime(); state.duration=player.getDuration();
-  state.volume=player.getVolume(); state.muted=player.isMuted();
-}, 250);
+function readYouTubeState() {
+  if (!player) return state;
+  try {
+    const status=player.getPlayerState();
+    state.playerState=status;
+    if ([0,1,2,3,5].includes(status)) state.ready=true;
+    if (status!==3) state.playing=status===1;
+    state.ended=status===0;
+    if (state.ready) {
+      state.position=player.getCurrentTime();
+      const duration=player.getDuration();
+      if (Number.isFinite(duration) && duration>0) state.duration=duration;
+      state.volume=player.getVolume(); state.muted=player.isMuted();
+    }
+  } catch (_) { /* The iframe may be between initialization messages. */ }
+  return state;
+}
+window.spriteState=readYouTubeState;
 """
         loader = '<script async src="https://www.youtube.com/iframe_api"></script>'
         content = '<div id="player"></div>'
@@ -318,7 +338,7 @@ window.spriteCommand = (command, value) => {
             "<style>html,body{margin:0;width:100%;height:100%;background:#000;overflow:hidden}"
             "#player{display:block;width:100%;height:100%;border:0}</style></head><body>"
             + content + "<script>const state={ready:false,playing:false,ended:false,"
-            "position:0,duration:0,volume:100,muted:false,error:''};"
+            "position:0,duration:" + str(max(0, int(info.duration))) + ",volume:100,muted:false,error:''};"
             "window.spriteState=()=>state;</script>" + loader + "<script>" + script
             + "</script></body></html>")
 
@@ -377,6 +397,8 @@ class VideoPlayer(QWidget):
     duration_available = Signal(int)
     popup_closed = Signal()
     open_in_browser = Signal()
+    mode_requested = Signal(str)
+    mode_changed = Signal(str)
 
     def __init__(self, parent=None, slider_factory=QSlider):
         super().__init__(parent)
@@ -395,6 +417,15 @@ class VideoPlayer(QWidget):
         self._fullscreen = None
         self._popout_mode = False
         self._embedded_parent = parent
+        self._embedded_index = 0
+        self._embedded_minimum_height = 0
+        self._embedded_maximum_height = 16777215
+        self._mini_host = None
+        self._mode = "main"
+        self._fullscreen_restore_mode = None
+        self._tiny = False
+        self._theme = "Modern"
+        self._theme_transform = lambda text: text
         self.setMinimumWidth(0)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -443,6 +474,25 @@ class VideoPlayer(QWidget):
             button.setMinimumWidth(0)
             button.setFixedWidth(32)
         layout.addWidget(self.controls)
+        self.mode_controls = QWidget()
+        modes = QHBoxLayout(self.mode_controls)
+        modes.setContentsMargins(0, 0, 0, 0)
+        modes.setSpacing(5)
+        modes.addStretch(1)
+        self.popout_button = QPushButton("Pop-out")
+        self.popout_button.clicked.connect(lambda: self.mode_requested.emit(
+            "main" if self._mode == "popout" else "popout"))
+        self.mini_button = QPushButton("Mini player")
+        self.mini_button.clicked.connect(lambda: self.mode_requested.emit(
+            "main" if self._mode == "mini" else "mini"))
+        self.mini_close = QPushButton("×")
+        self.mini_close.setAccessibleName("Close video")
+        self.mini_close.setFixedWidth(24)
+        self.mini_close.clicked.connect(self.popup_closed.emit)
+        self.mini_close.hide()
+        for button in (self.popout_button, self.mini_button, self.mini_close):
+            modes.addWidget(button)
+        layout.addWidget(self.mode_controls)
         self.timer = QTimer(self)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self._poll)
@@ -485,6 +535,9 @@ class VideoPlayer(QWidget):
             button.setIcon(QIcon(image))
 
     def set_theme(self, theme: str, transform=lambda text: text, tiny=False) -> None:
+        self._theme, self._theme_transform, self._tiny = theme, transform, tiny
+        mini = self._mode == "mini" and self._fullscreen_restore_mode is None
+        compact = tiny or mini
         styles = {
             "Classic": "QFrame#videoControls {background:#c0c0c0; border-top:2px solid #808080;"
                        "border-left:2px solid #808080; border-bottom:2px solid #ffffff;"
@@ -498,13 +551,16 @@ class VideoPlayer(QWidget):
         }
         # Buttons and sliders inherit the app's separate Classic, Glassy and
         # Modern styles, including bevel painting, color variants and density.
-        self.controls.setStyleSheet(transform(styles.get(theme, styles["Modern"])))
-        self.controls.layout().setContentsMargins(4 if tiny else 6, 3 if tiny else 4,
-                                                  4 if tiny else 6, 3 if tiny else 4)
-        self.controls.layout().setSpacing(3 if tiny else 5)
-        self.volume.setFixedWidth(40 if tiny else 55)
+        stylesheet = styles.get(theme, styles["Modern"])
+        if mini:
+            stylesheet += "QFrame#videoControls QPushButton {padding:2px; min-height:14px;}"
+        self.controls.setStyleSheet(transform(stylesheet))
+        self.controls.layout().setContentsMargins(4 if compact else 6, 3 if compact else 4,
+                                                  4 if compact else 6, 3 if compact else 4)
+        self.controls.layout().setSpacing(3 if compact else 5)
+        self.volume.setFixedWidth(40 if compact else 55)
         for button in (self.play_button, self.mute_button, self.fullscreen_button):
-            button.setFixedWidth(26 if tiny else 32)
+            button.setFixedWidth(26 if compact else 32)
         self._refresh_icons()
 
     def _set_enabled(self, ready: bool) -> None:
@@ -516,7 +572,7 @@ class VideoPlayer(QWidget):
         self.stop()
         self.info = info
         self._ready = self._playing = self._muted = self._ended = False
-        self._duration = 0
+        self._duration = max(0, info.duration)
         self._set_enabled(False)
         self.seek.setValue(0)
         self._refresh_icons()
@@ -589,7 +645,10 @@ class VideoPlayer(QWidget):
 
     def _check_ready(self, generation: int) -> None:
         if generation == self._generation and self.info and not self._ready:
-            self._error("Video player did not load. Open in Browser to watch.")
+            # A slow control bridge is not proof that the video failed. Never
+            # destroy an iframe on a readiness timer; real SDK/page errors are
+            # reported separately, and polling can recover without a reload.
+            self._poll()
 
     def _direct_error(self, error, message: str) -> None:
         self._error("Video playback unavailable. Open in Browser to watch.")
@@ -627,24 +686,41 @@ class VideoPlayer(QWidget):
                     return
                 self._poll_pending = False
                 self._update_state(state)
-            self.web.page().runJavaScript("window.spriteState ? window.spriteState() : null", result)
+            # Explicit JSON avoids QVariant/JS-object conversion differences
+            # between PySide versions. Read live SDK state even while paused.
+            self.web.page().runJavaScript(
+                "JSON.stringify(window.spriteState ? window.spriteState() : null)", result)
 
     def _update_state(self, state) -> None:
+        if isinstance(state, str):
+            try:
+                state = json.loads(state)
+            except (ValueError, TypeError):
+                return
         if not isinstance(state, dict):
             return
         if state.get("error"):
             self._error(str(state["error"]))
             return
-        self._ready = bool(state.get("ready"))
+        self._ready = (self._ready or bool(state.get("ready"))
+                       or state.get("playerState") in (0, 1, 2, 3, 5))
         icons_changed = self._playing != bool(state.get("playing")) or self._muted != bool(state.get("muted"))
         self._playing = bool(state.get("playing"))
         self._muted = bool(state.get("muted"))
         self._ended = bool(state.get("ended"))
-        duration = max(0, float(state.get("duration", 0)))
+        def number(key, fallback=0):
+            try:
+                raw = state.get(key)
+                value = float(raw) if raw is not None else fallback
+                return max(0, value) if math.isfinite(value) else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        duration = number("duration", self._duration) or self._duration
         if duration > 0 and int(duration) != int(self._duration):
             self.duration_available.emit(int(duration))
         self._duration = duration
-        position = max(0, float(state.get("position", 0)))
+        position = number("position")
         self.play_button.setAccessibleName("Pause" if self._playing else "Play")
         self.mute_button.setAccessibleName("Unmute" if self._muted else "Mute")
         if icons_changed:
@@ -657,7 +733,7 @@ class VideoPlayer(QWidget):
             self.seek.blockSignals(False)
         if not self.volume.isSliderDown():
             self.volume.blockSignals(True)
-            self.volume.setValue(round(float(state.get("volume", 100))))
+            self.volume.setValue(round(number("volume", self.volume.value())))
             self.volume.blockSignals(False)
 
     def _command(self, command: str, value=0) -> None:
@@ -693,7 +769,7 @@ class VideoPlayer(QWidget):
 
     def toggle_fullscreen(self) -> None:
         if self._fullscreen is not None:
-            if self._popout_mode:
+            if self._mode == "popout":
                 if self._fullscreen.isFullScreen():
                     self._fullscreen.showNormal()
                 else:
@@ -701,33 +777,92 @@ class VideoPlayer(QWidget):
             else:
                 self._fullscreen.close()
             return
-        self._enter_window(fullscreen=True)
+        self._remember_embedded_geometry()
+        self._fullscreen_restore_mode = self._mode
+        self._create_window(fullscreen=True)
+        self._update_mode_controls()
+        self.mode_changed.emit("fullscreen")
 
     def pop_out(self) -> None:
-        if self._fullscreen is None:
-            self._enter_window(fullscreen=False)
+        self.set_mode("popout")
 
-    def _enter_window(self, *, fullscreen: bool) -> None:
-        parent = self.parentWidget()
-        self._embedded_parent = parent
-        self._embedded_layout = parent.layout()
-        self._embedded_index = self._embedded_layout.indexOf(self)
-        self._embedded_maximum_height = self.maximumHeight()
-        self._embedded_minimum_height = self.minimumHeight()
+    def _remember_embedded_geometry(self) -> None:
+        if self._mode == "main" and self._fullscreen is None:
+            parent = self.parentWidget()
+            if parent is not None and parent.layout() is not None:
+                self._embedded_parent = parent
+                self._embedded_index = parent.layout().indexOf(self)
+                self._embedded_maximum_height = self.maximumHeight()
+                self._embedded_minimum_height = self.minimumHeight()
+
+    def _move_to_host(self, host: QWidget) -> None:
         self.setMinimumHeight(0)
         self.setMaximumHeight(16777215)
-        dialog = QDialog(self.window())
+        self.setParent(host)
+        if host is self._embedded_parent:
+            host.layout().insertWidget(self._embedded_index, self, 1)
+            self.setMinimumHeight(self._embedded_minimum_height)
+            self.setMaximumHeight(self._embedded_maximum_height)
+        else:
+            host.layout().addWidget(self, 1)
+        self.show()
+
+    def _remove_window(self) -> None:
+        dialog = self._fullscreen
+        self._fullscreen = None
+        self._fullscreen_restore_mode = None
+        if dialog is not None:
+            # Move the live backend out before destroying its old container.
+            self.setParent(self._embedded_parent)
+            dialog.blockSignals(True)
+            dialog.close()
+            dialog.deleteLater()
+
+    def set_mode(self, mode: str, mini_host: QWidget | None = None) -> None:
+        if mode not in ("main", "mini", "popout"):
+            return
+        if mini_host is not None:
+            self._mini_host = mini_host
+        if mode == "mini" and self._mini_host is None:
+            return
+        self._remember_embedded_geometry()
+        self._remove_window()
+        if self._mini_host is not None:
+            self._mini_host.hide()
+        self._mode = mode
+        self._popout_mode = mode == "popout"
+        if mode == "popout":
+            self._create_window(fullscreen=False)
+        elif mode == "mini":
+            self._move_to_host(self._mini_host)
+            self._mini_host.show()
+            self._mini_host.raise_()
+        elif self._embedded_parent is not None:
+            self._move_to_host(self._embedded_parent)
+        self._update_mode_controls()
+        self.mode_changed.emit(mode)
+
+    def _update_mode_controls(self) -> None:
+        mini = self._mode == "mini" and self._fullscreen_restore_mode is None
+        self.popout_button.setText("Main window" if self._mode == "popout" else "Pop-out")
+        self.mini_button.setText("Restore" if self._mode == "mini" else "Mini player")
+        self.mini_close.setVisible(mini)
+        supported = self.info is None or self.info.link.provider in ("direct", "youtube", "vimeo")
+        self.volume.setVisible(supported and not mini)
+        self.set_theme(self._theme, self._theme_transform, self._tiny)
+
+    def _create_window(self, *, fullscreen: bool) -> None:
+        # Parent to the chat's window, not the previous detached window.
+        owner = self._embedded_parent.window() if self._embedded_parent else None
+        dialog = QDialog(owner)
         dialog.setWindowTitle(self.info.title if self.info and self.info.title else "SpriteLink Video")
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self, 1)
-        self._popout_mode = not fullscreen
+        self._move_to_host(dialog)
         if not fullscreen:
-            # Tiny windows cannot fit YouTube's minimum 200x200 player.
-            # A resizable pop-up retains usable playback without resizing chat.
             dialog.setMinimumSize(480, 360)
             dialog.resize(640, 420)
-            dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
             footer = QHBoxLayout()
             footer.setContentsMargins(8, 4, 8, 8)
             footer.addStretch(1)
@@ -739,36 +874,51 @@ class VideoPlayer(QWidget):
             footer.addWidget(dismiss)
             layout.addLayout(footer)
         self._fullscreen = dialog
-        dialog.finished.connect(self._leave_fullscreen)
+        dialog.finished.connect(lambda: self._leave_fullscreen(dialog))
         dialog.showFullScreen() if fullscreen else dialog.show()
 
-    def _leave_fullscreen(self, *args) -> None:
-        dialog = self._fullscreen
+    def _leave_fullscreen(self, dialog) -> None:
+        if dialog is not self._fullscreen:
+            return
         self._fullscreen = None
-        was_popout = self._popout_mode
+        restore_mode = self._fullscreen_restore_mode
+        self._fullscreen_restore_mode = None
+        was_popout = self._mode == "popout"
         self._popout_mode = False
-        if self._embedded_parent is not None:
-            self.setParent(self._embedded_parent)
-            self._embedded_layout.insertWidget(self._embedded_index, self, 1)
-            self.setMinimumHeight(self._embedded_minimum_height)
-            self.setMaximumHeight(self._embedded_maximum_height)
-            self.show()
-        if dialog is not None:
-            dialog.deleteLater()
+        self.setParent(self._embedded_parent)
+        dialog.deleteLater()
         if was_popout:
+            # Closing a pop-out dismisses playback without reopening the chat
+            # overlay. Explicit mode buttons restore the in-window player.
+            self._mode = "main"
+            if self._embedded_parent is not None:
+                self._move_to_host(self._embedded_parent)
+            self.hide()
+            self._update_mode_controls()
             self.popup_closed.emit()
+        else:
+            if restore_mode == "main" and self._embedded_parent is not None:
+                self._move_to_host(self._embedded_parent)
+            self.set_mode(restore_mode or "main")
 
     def fit_viewport(self, maximum_height: int, width: int) -> None:
-        if self._fullscreen is not None:
+        if self._fullscreen is not None or self._mode != "main":
             return
         bar_height = self.controls.sizeHint().height() if self.controls.isVisible() else 0
-        height = max(1, min(maximum_height, round(width * 9 / 16) + bar_height + 4))
+        modes_height = self.mode_controls.sizeHint().height()
+        height = max(1, min(maximum_height, round(width * 9 / 16) + bar_height + modes_height + 8))
         self.setMinimumHeight(height)
         self.setMaximumHeight(height)
 
     def stop(self) -> None:
-        if self._fullscreen is not None:
-            self._fullscreen.close()
+        self._remember_embedded_geometry()
+        self._remove_window()
+        if self._mini_host is not None:
+            self._mini_host.hide()
+        self._mode = "main"
+        self._popout_mode = False
+        if self._embedded_parent is not None and self._embedded_parent.layout() is not None:
+            self._move_to_host(self._embedded_parent)
         self._generation += 1
         self._poll_pending = False
         self.timer.stop()
@@ -796,3 +946,6 @@ class VideoPlayer(QWidget):
             profile.deleteLater()
             self.profile = None
         self.surface.setCurrentWidget(self.status)
+        self._ready = self._playing = False
+        self._set_enabled(False)
+        self._update_mode_controls()
