@@ -18,7 +18,7 @@ from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, QUrl, Sign
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF
 from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QSlider,
+    QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QSlider,
     QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
@@ -540,6 +540,69 @@ class BrowserFrameView(VideoFrameView):
         self._frame_timer.setInterval(16 if playing else 100)
 
 
+class InteractiveVideoFrame(VideoFrameView):
+    """Forward native provider input without hosting Chromium in chat."""
+    def __init__(self, send_input):
+        super().__init__()
+        self._send_input = send_input
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _mouse(self, event, kind):
+        if self.frame.isNull():
+            return
+        size = self.frame.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        left, top = (self.width() - size.width()) / 2, (self.height() - size.height()) / 2
+        self._send_input({"kind": kind, "x": (event.position().x() - left) / max(1, size.width()),
+                          "y": (event.position().y() - top) / max(1, size.height()),
+                          "button": event.button().value, "buttons": event.buttons().value,
+                          "modifiers": event.modifiers().value})
+        event.accept()
+
+    def wheelEvent(self, event):
+        if self.frame.isNull():
+            return
+        size = self.frame.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._send_input({"kind": "wheel",
+                          "x": (event.position().x() - (self.width() - size.width()) / 2) / max(1, size.width()),
+                          "y": (event.position().y() - (self.height() - size.height()) / 2) / max(1, size.height()),
+                          "pixel": [event.pixelDelta().x(), event.pixelDelta().y()],
+                          "angle": [event.angleDelta().x(), event.angleDelta().y()],
+                          "buttons": event.buttons().value, "modifiers": event.modifiers().value,
+                          "phase": event.phase().value, "inverted": event.inverted()})
+        event.accept()
+
+    def mousePressEvent(self, event):
+        self.setFocus()
+        self._mouse(event, "press")
+
+    def mouseReleaseEvent(self, event):
+        self._mouse(event, "release")
+
+    def mouseMoveEvent(self, event):
+        self._mouse(event, "move")
+
+    def mouseDoubleClickEvent(self, event):
+        self._mouse(event, "double")
+
+    def keyPressEvent(self, event):
+        # Escape still belongs to SpriteLink's fullscreen window.
+        if event.key() == Qt.Key.Key_Escape:
+            super().keyPressEvent(event)
+            return
+        self._send_input({"kind": "key", "key": event.key(), "text": event.text(),
+                          "modifiers": event.modifiers().value, "pressed": True})
+        event.accept()
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            super().keyReleaseEvent(event)
+            return
+        self._send_input({"kind": "key", "key": event.key(), "text": event.text(),
+                          "modifiers": event.modifiers().value, "pressed": False})
+        event.accept()
+
+
 class VideoCanvas(QWidget):
     """Center the video over black in every player mode."""
     def __init__(self, parent=None):
@@ -603,8 +666,11 @@ class VideoPlayer(QWidget):
     mode_requested = Signal(str)
     mode_changed = Signal(str)
 
-    def __init__(self, parent=None, slider_factory=QSlider):
+    def __init__(self, parent=None, slider_factory=QSlider, *, use_process=True, mirror_native=False):
         super().__init__(parent)
+        self._use_process = use_process
+        self._mirror_native = mirror_native
+        self._remote_engine = None
         self.info = None
         self.media_player = None
         self.audio = None
@@ -855,6 +921,9 @@ class VideoPlayer(QWidget):
             self._load_provider(info)
 
     def _load_direct(self, info: VideoInfo) -> None:
+        if self._use_process:
+            self._load_remote(info)
+            return
         from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
         self.video_widget = VideoFrameView()
         self.canvas.set_backend(self.video_widget)
@@ -870,6 +939,9 @@ class VideoPlayer(QWidget):
         self.timer.start()
 
     def _load_provider(self, info: VideoInfo) -> None:
+        if self._use_process:
+            self._load_remote(info)
+            return
         # Lazy: loading chat or creating a thumbnail never starts Chromium.
         try:
             from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
@@ -900,7 +972,7 @@ class VideoPlayer(QWidget):
             # Expand the logical viewport so remaining fixed-size YouTube
             # chrome is four times smaller, without changing video geometry.
             self.web.setZoomFactor(YOUTUBE_ZOOM_FACTOR)
-        if info.link.provider in ("youtube", "vimeo"):
+        if info.link.provider in ("youtube", "vimeo") or self._mirror_native:
             self.video_widget = BrowserFrameView(self.web)
             self.canvas.set_backend(self.video_widget)
         else:
@@ -918,6 +990,37 @@ class VideoPlayer(QWidget):
             for widget in (self.play_button, self.seek, self.time_label, self.mute_button, self.volume):
                 widget.hide()
 
+    def _load_remote(self, info: VideoInfo) -> None:
+        from spritelink_video_process import VideoProcess
+        if self._remote_engine is None:
+            self._remote_engine = VideoProcess(self)
+            self._remote_engine.frame_ready.connect(self._remote_frame)
+            self._remote_engine.state_ready.connect(self._update_state)
+            self._remote_engine.failed.connect(self._error)
+            self.destroyed.connect(self._remote_engine.shutdown)
+            QApplication.instance().aboutToQuit.connect(self._remote_engine.shutdown)
+        if info.link.provider in ("dailymotion", "streamable"):
+            self.video_widget = InteractiveVideoFrame(self._remote_input)
+            for widget in (self.play_button, self.seek, self.time_label, self.mute_button, self.volume):
+                widget.hide()
+        else:
+            self.video_widget = VideoFrameView()
+        self.canvas.set_backend(self.video_widget)
+        # Keep Loading... visible until the first complete frame arrives.
+        try:
+            self._remote_engine.load(info, self.volume.value(), self._generation)
+        except (OSError, RuntimeError):
+            self._error("Video player unavailable. Open in Browser to watch.")
+
+    def _remote_frame(self, image) -> None:
+        if self.info is not None and self.video_widget is not None:
+            self.video_widget.set_frame(image)
+            self.surface.setCurrentWidget(self.canvas)
+
+    def _remote_input(self, value) -> None:
+        if self.info is not None and self._remote_engine is not None:
+            self._remote_engine.send({"type": "input", "value": value, "generation": self._generation})
+
     def _check_ready(self, generation: int) -> None:
         if generation == self._generation and self.info and not self._ready:
             # A slow control bridge is not proof that the video failed. Never
@@ -930,6 +1033,8 @@ class VideoPlayer(QWidget):
 
     def _error(self, text: str) -> None:
         # Prevent a late SDK ready callback from autoplaying behind an error.
+        if self._remote_engine is not None:
+            self._remote_engine.stop()
         if self.web is not None:
             self.web.stop()
             self.web.setUrl(QUrl("about:blank"))
@@ -1037,7 +1142,9 @@ class VideoPlayer(QWidget):
     def _command(self, command: str, value=0) -> None:
         if not self.info or not self._ready:
             return
-        if self.media_player is not None:
+        if self._remote_engine is not None and self._remote_engine.generation == self._generation:
+            self._remote_engine.command(command, value)
+        elif self.media_player is not None:
             if command == "play":
                 self.media_player.play()
             elif command == "pause":
@@ -1248,6 +1355,8 @@ class VideoPlayer(QWidget):
         return width, video_height + chrome
 
     def stop(self) -> None:
+        if self._remote_engine is not None:
+            self._remote_engine.stop()
         self.canvas.clear_backend()
         self._remember_embedded_geometry()
         self._remove_window()

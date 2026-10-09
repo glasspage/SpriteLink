@@ -33,6 +33,7 @@ a = Analysis(
         "PySide6.QtQuickWidgets",
         "PySide6.QtWebEngineCore",
         "PySide6.QtWebEngineWidgets",
+        "spritelink_video_worker",
     ],
     hookspath=[],
     hooksconfig={},

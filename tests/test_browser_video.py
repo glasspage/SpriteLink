@@ -119,7 +119,7 @@ import spritelink_video as V
 app = QApplication([])
 root = QWidget(); root.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 root.resize(640,480); QVBoxLayout(root)
-player = V.VideoPlayer(root); root.layout().addWidget(player); root.show()
+player = V.VideoPlayer(root, use_process=False); root.layout().addWidget(player); root.show()
 root_id = int(root.winId())
 html = """<html><body style='margin:0;background:blue'>
 <script>window.spriteState=()=>({ready:true,playing:false,duration:120});
@@ -158,7 +158,7 @@ from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
 import spritelink_video as V
 app = QApplication([])
 root = QWidget(); root.resize(640,480); QVBoxLayout(root)
-player = V.VideoPlayer(root); root.layout().addWidget(player); root.show()
+player = V.VideoPlayer(root, use_process=False); root.layout().addWidget(player); root.show()
 html = """<style>html,body{margin:0;width:100%;height:100%;background:blue}
 #logo{position:absolute;left:0;top:0;width:40px;height:40px;background:red}</style>
 <div id='logo'></div><script>window.spriteState=()=>({ready:true,playing:false,duration:120});</script>"""

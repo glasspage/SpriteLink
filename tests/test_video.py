@@ -175,7 +175,7 @@ class VideoControlsTests(unittest.TestCase):
 
     def test_volume_persists_between_videos_and_resets_for_a_new_player(self):
         from PySide6 import QtMultimedia
-        player = V.VideoPlayer()
+        player = V.VideoPlayer(use_process=False)
         self.assertEqual(player.volume.value(), 20)
         with mock.patch.object(QtMultimedia, "QAudioOutput") as audio_factory, \
                 mock.patch.object(QtMultimedia, "QMediaPlayer"), \
@@ -867,14 +867,15 @@ class VideoModeIntegrationTests(unittest.TestCase):
                            capture_output=True, check=True)
             info = V.VideoInfo(V.VideoLink("direct", "", QUrl.fromLocalFile(filename).toString()), "local")
             self.player.load(info)
-            for _ in range(40):
+            for _ in range(240):
                 QTest.qWait(25)
-                if self.player._ready and self.player.video_widget.videoSink().videoFrame().isValid():
+                if self.player._ready and not self.player.video_widget.frame.isNull():
                     break
             self.assertTrue(self.player._ready)
-            self.assertTrue(self.player.video_widget.videoSink().videoFrame().isValid())
-            backend, generation = self.player.media_player, self.player._generation
-            backend.pause()
+            self.assertFalse(self.player.video_widget.frame.isNull())
+            backend, generation = self.player._remote_engine, self.player._generation
+            self.player._command("pause")
+            QTest.qWait(350)
             for theme in ("Glassy", "Modern", "Classic", "Glassy"):
                 self.client.theme_var.set(theme)
                 self.client._apply_theme()
@@ -886,16 +887,17 @@ class VideoModeIntegrationTests(unittest.TestCase):
                     self.assertGreater(color.blue(), 200)
                     self.assertLess(color.red(), 25)
                     self.assertLess(color.green(), 25)
-                    self.assertIs(self.player.media_player, backend)
+                    self.assertIs(self.player._remote_engine, backend)
                     self.assertEqual(self.player._generation, generation)
-            position = backend.position()
+            position = self.player.seek.value()
             for mode in ("mini", "popout", "main"):
                 self.client._set_video_player_mode(mode)
                 QTest.qWait(25)
-                self.assertIs(self.player.media_player, backend)
+                self.assertIs(self.player._remote_engine, backend)
                 self.assertEqual(self.player._generation, generation)
-                self.assertEqual(backend.position(), position)
+                self.assertEqual(self.player.seek.value(), position)
             self.player.stop()
+            backend.shutdown()
             QTest.qWait(25)
 
 

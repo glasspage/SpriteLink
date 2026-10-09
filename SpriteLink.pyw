@@ -41,6 +41,14 @@ import threading
 import time
 import traceback
 import sys
+
+# Route the frozen helper before chat imports, the single-instance lock, or
+# notification registration. QProcess supplies its private standard pipes.
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--spritelink-video-worker":
+    from spritelink_video_worker import main as video_worker_main
+    video_worker_main(sys.argv[2])
+    raise SystemExit
+
 import unicodedata
 import uuid
 import zlib
