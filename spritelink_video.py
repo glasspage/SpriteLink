@@ -293,13 +293,37 @@ def provider_player_html(info: VideoInfo, volume: int = DEFAULT_VIDEO_VOLUME) ->
     if link.provider == "youtube":
         script = """
 let player;
+// The SDK can report its default before the iframe applies our command.
+// Preserve the requested slider value until it settles, or until a failed
+// attempt has had two seconds to leave a persistent different value.
+let pendingVolume={value:initialVolume, sentAt:null, reported:null, stableAt:null};
+function setYouTubeVolume(value) {
+  pendingVolume={value:value, sentAt:Date.now(), reported:null, stableAt:null};
+  state.volume=value;
+  player.setVolume(value);
+}
+function readYouTubeVolume() {
+  const actual=player.getVolume();
+  if (!Number.isFinite(actual)) return;
+  if (!pendingVolume) { state.volume=actual; return; }
+  state.volume=pendingVolume.value;
+  if (pendingVolume.sentAt===null) return;
+  const now=Date.now();
+  if (pendingVolume.reported!==actual) {
+    pendingVolume.reported=actual;
+    pendingVolume.stableAt=now;
+  }
+  if (now-pendingVolume.sentAt<2000 || now-pendingVolume.stableAt<500) return;
+  state.volume=actual;
+  pendingVolume=null;
+}
 function onYouTubeIframeAPIReady() {
   player = new YT.Player('player', {
     width:'100%', height:'100%', videoId:VIDEO_ID,
     host:'https://www.youtube-nocookie.com',
     playerVars:{controls:0, disablekb:1, fs:0, playsinline:1, rel:0,
                 origin:location.origin, start:START_SECONDS},
-    events:{onReady:() => { player.setVolume(initialVolume); state.ready=true; readYouTubeState(); player.playVideo(); },
+    events:{onReady:() => { setYouTubeVolume(initialVolume); state.ready=true; readYouTubeState(); player.playVideo(); },
       onStateChange:e => {
         state.playerState=e.data;
         if ([0,1,2,3,5].includes(e.data)) state.ready=true;
@@ -316,7 +340,7 @@ window.spriteCommand = (command, value) => {
   if(command==='play') player.playVideo();
   if(command==='pause') player.pauseVideo();
   if(command==='seek') player.seekTo(value, true);
-  if(command==='volume') player.setVolume(value);
+  if(command==='volume') setYouTubeVolume(value);
   if(command==='mute') value ? player.mute() : player.unMute();
 };
 function readYouTubeState() {
@@ -331,7 +355,7 @@ function readYouTubeState() {
       state.position=player.getCurrentTime();
       const duration=player.getDuration();
       if (Number.isFinite(duration) && duration>0) state.duration=duration;
-      state.volume=player.getVolume(); state.muted=player.isMuted();
+      readYouTubeVolume(); state.muted=player.isMuted();
     }
   } catch (_) { /* The iframe may be between initialization messages. */ }
   return state;
