@@ -177,6 +177,7 @@ from spritelink_update import (
     release_is_newer,
 )
 from spritelink_video import (
+    configure_video_rendering,
     DirectVideoThumbnail,
     VideoInfo,
     VideoPlayer,
@@ -4514,21 +4515,22 @@ class ConfigOverlay(QWidget):
             self._blurred_background = None
             return
 
-        was_visible = self.isVisible()
-        focused_widget = QApplication.focusWidget() if was_visible else None
-        if was_visible:
-            super().hide()
-        try:
-            self._blurred_background = self._blur_pixmap(parent.grab())
-        finally:
-            if was_visible:
-                super().show()
-                self.raise_()
-                if (
-                    focused_widget is not None
-                    and self.isAncestorOf(focused_widget)
-                ):
-                    focused_widget.setFocus()
+        # Render the background and siblings without hiding this overlay.
+        # Hiding a live Chromium child during each resize invalidates its
+        # compositor and can corrupt the Glassy window's alpha backing store.
+        ratio = parent.devicePixelRatioF()
+        capture = QPixmap(parent.size() * ratio)
+        capture.setDevicePixelRatio(ratio)
+        capture.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(capture)
+        parent.render(painter, QPoint(), QRegion(), QWidget.RenderFlag.DrawWindowBackground)
+        for child in parent.findChildren(QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly):
+            if child is self or not child.isVisible():
+                continue
+            child.render(painter, child.pos(), QRegion(),
+                         QWidget.RenderFlag.DrawWindowBackground | QWidget.RenderFlag.DrawChildren)
+        painter.end()
+        self._blurred_background = self._blur_pixmap(capture)
         self.update()
 
     def show(self) -> None:
@@ -6153,6 +6155,7 @@ class MessageLogBrowser(QTextBrowser):
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
+        configure_video_rendering()
         super().__init__()
         if os.name == "nt":
             # Allocate an alpha backing store before the native HWND exists.
@@ -10347,6 +10350,8 @@ QComboBox::drop-down {
 
     def _sync_image_preview_overlay_geometry(self) -> None:
         self.image_preview_overlay.setGeometry(self.chat_content.rect())
+        self.image_preview_overlay.layout().activate()
+        self.image_preview_panel.layout().activate()
 
     def _ensure_animated_media_controller(
         self,
@@ -17144,6 +17149,7 @@ def main() -> None:
             )
         except Exception:
             pass
+    configure_video_rendering()
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("SpriteLink")
     window_icon = QIcon(str(WINDOW_ICON_PATH))

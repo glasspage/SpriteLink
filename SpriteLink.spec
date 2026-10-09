@@ -30,6 +30,7 @@ a = Analysis(
     hiddenimports=generated_hidden_imports + [
         "PySide6.QtSvg",
         "PySide6.QtMultimediaWidgets",
+        "PySide6.QtQuickWidgets",
         "PySide6.QtWebEngineCore",
         "PySide6.QtWebEngineWidgets",
     ],

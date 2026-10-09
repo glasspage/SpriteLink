@@ -14,8 +14,8 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from PIL import Image
 import requests
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF, QSurfaceFormat
 from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import (
     QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QSlider,
@@ -28,6 +28,34 @@ PLAYER_BASE_URL = "https://github.com/glasspage/SpriteLink/"
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024
 MAX_THUMBNAIL_PIXELS = 16 * 1024 * 1024
+
+
+def configure_video_rendering() -> None:
+    # Chromium's Qt Quick surface must preserve the alpha channel of the
+    # Glassy top-level window when Qt switches it to GPU composition.
+    surface_format = QSurfaceFormat.defaultFormat()
+    if surface_format.alphaBufferSize() < 8:
+        surface_format.setAlphaBufferSize(8)
+        QSurfaceFormat.setDefaultFormat(surface_format)
+
+
+YOUTUBE_CHROME_SCRIPT = r"""
+(() => {
+  if (!['www.youtube.com', 'www.youtube-nocookie.com'].includes(location.hostname)
+      || !location.pathname.startsWith('/embed/')) return;
+  const style = document.createElement('style');
+  style.id = 'spritelink-player-chrome';
+  style.textContent = `
+    .ytp-chrome-top, .ytp-chrome-bottom, .ytp-gradient-top, .ytp-gradient-bottom,
+    .ytp-large-play-button, .ytp-pause-overlay, .ytp-bezel, .ytp-watermark,
+    .ytp-cued-thumbnail-overlay, .ytp-caption-window-container,
+    .ytp-ce-element, .ytp-cards-button, .ytp-cards-teaser {
+      display: none !important;
+    }
+  `;
+  document.head.appendChild(style);
+})();
+"""
 
 
 @dataclass(frozen=True)
@@ -333,10 +361,11 @@ window.spriteCommand = (command, value) => {
         "START_SECONDS", str(link.start_seconds))
     # YouTube chooses quality automatically: setPlaybackQuality and
     # suggestedQuality are no-ops. Do not offer a nonfunctional quality control.
+    pointer_style = "#player{pointer-events:none}" if link.provider == "youtube" else ""
     return ("<!doctype html><html><head><meta charset='utf-8'>"
             "<meta name='referrer' content='strict-origin-when-cross-origin'>"
             "<style>html,body{margin:0;width:100%;height:100%;background:#000;overflow:hidden}"
-            "#player{display:block;width:100%;height:100%;border:0}</style></head><body>"
+            "#player{display:block;width:100%;height:100%;border:0}" + pointer_style + "</style></head><body>"
             + content + "<script>const state={ready:false,playing:false,ended:false,"
             "position:0,duration:" + str(max(0, int(info.duration))) + ",volume:100,muted:false,error:''};"
             "window.spriteState=()=>state;</script>" + loader + "<script>" + script
@@ -392,6 +421,191 @@ class DirectVideoThumbnail(QObject):
             self.sink = None
 
 
+class VideoFrameView(QWidget):
+    """An opaque raster surface that retains the last valid decoded frame."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.frame = QImage()
+        self._sink = None
+        self.setMinimumSize(0, 0)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+
+    def videoSink(self):
+        if self._sink is None:
+            from PySide6.QtMultimedia import QVideoSink
+            self._sink = QVideoSink(self)
+            self._sink.videoFrameChanged.connect(self._receive_frame)
+        return self._sink
+
+    def _receive_frame(self, frame) -> None:
+        if frame.isValid():
+            self.set_frame(frame.toImage())
+
+    def set_frame(self, image: QImage) -> None:
+        if not image.isNull():
+            self.frame = image.copy()
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(self.rect(), Qt.GlobalColor.black)
+        if not self.frame.isNull():
+            size = self.frame.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+            target = QRect((self.width() - size.width()) // 2,
+                           (self.height() - size.height()) // 2, size.width(), size.height())
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.drawImage(target, self.frame)
+        painter.end()
+
+
+class VideoCanvas(QWidget):
+    """Center the browser and cover resize gaps with its last rendered frame."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(0, 0)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self.backend = None
+        self._quick = None
+        self._resizing = False
+        self._frame_ready = False
+        self._capturing = False
+        self._epoch = 0
+        self.hold = VideoFrameView(self)
+        # Qt must keep painting the renderer underneath this mask so a fresh
+        # frame can arrive. Declaring the mask opaque would cull those paints.
+        self.hold.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self.hold.hide()
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(80)
+        self._settle_timer.timeout.connect(self._finish_resize)
+
+    def set_backend(self, backend) -> None:
+        self.clear_backend()
+        self.backend = backend
+        backend.setParent(self)
+        backend.installEventFilter(self)
+        backend.show()
+        self._bind_renderer()
+        self._layout_backend()
+
+    def clear_backend(self) -> None:
+        self._epoch += 1
+        self._settle_timer.stop()
+        if self._quick is not None:
+            self._quick.removeEventFilter(self)
+            self._quick.destroyed.disconnect(self._renderer_destroyed)
+        self._quick = None
+        if self.backend is not None:
+            self.backend.removeEventFilter(self)
+            self.backend.hide()
+        self.backend = None
+        self._resizing = False
+        self.hold.hide()
+        self.hold.frame = QImage()
+
+    def _bind_renderer(self) -> None:
+        if self.backend is None or isinstance(self.backend, VideoFrameView):
+            return
+        from PySide6.QtQuickWidgets import QQuickWidget
+        widgets = self.backend.findChildren(QQuickWidget)
+        if not widgets:
+            return
+        quick = widgets[0]
+        if quick is not self._quick:
+            if self._quick is not None:
+                self._quick.removeEventFilter(self)
+                self._quick.destroyed.disconnect(self._renderer_destroyed)
+            self._quick = quick
+            quick.installEventFilter(self)
+            quick.destroyed.connect(self._renderer_destroyed)
+        surface_format = self._quick.format()
+        if surface_format.alphaBufferSize() < 8:
+            surface_format.setAlphaBufferSize(8)
+            self._quick.setFormat(surface_format)
+
+    def _renderer_destroyed(self) -> None:
+        self._quick = None
+
+    def _snapshot(self) -> QImage:
+        if self.backend is None or self._capturing or not self.backend.isVisible():
+            return QImage()
+        self._capturing = True
+        try:
+            if self._quick is not None:
+                if self._quick.width() <= 0 or self._quick.height() <= 0:
+                    return QImage()
+                return self._quick.grabFramebuffer()
+            return self.backend.grab().toImage()
+        finally:
+            self._capturing = False
+
+    def _layout_backend(self) -> None:
+        if self.backend is None:
+            return
+        if isinstance(self.backend, VideoFrameView):
+            rect = self.rect()
+        else:
+            size = QSize(16, 9).scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+            rect = QRect((self.width() - size.width()) // 2,
+                         (self.height() - size.height()) // 2, size.width(), size.height())
+        self.backend.setGeometry(rect)
+        self.hold.setGeometry(self.rect())
+
+    def resizeEvent(self, event) -> None:
+        if self.backend is not None and not isinstance(self.backend, VideoFrameView):
+            self._epoch += 1
+            if not self._resizing:
+                self.hold.set_frame(self._snapshot())
+            self._resizing = True
+            self._frame_ready = False
+            if not self.hold.frame.isNull():
+                self.hold.show()
+                self.hold.raise_()
+            self._settle_timer.start()
+        self._layout_backend()
+        super().resizeEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._bind_renderer()
+        self._layout_backend()
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.backend and event.type() in (QEvent.Type.ChildAdded, QEvent.Type.ChildPolished):
+            # Chromium may create its rendering widget after setHtml/load.
+            QTimer.singleShot(0, self._bind_renderer)
+        if (watched is (self._quick or self.backend) and event.type() == QEvent.Type.Paint
+                and self._resizing and not self._capturing):
+            epoch = self._epoch
+            QTimer.singleShot(0, lambda: self._paint_finished(epoch))
+        return super().eventFilter(watched, event)
+
+    def _paint_finished(self, epoch: int) -> None:
+        if epoch == self._epoch:
+            self._frame_ready = True
+            self._finish_resize()
+
+    def _finish_resize(self) -> None:
+        if not self._resizing or not self._frame_ready or self.backend is None:
+            return
+        image = self._snapshot()
+        ratio = self.backend.devicePixelRatioF()
+        expected = self.backend.size() * ratio
+        if image.isNull() or image.size() != expected:
+            return
+        self._resizing = False
+        self.hold.hide()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(self.rect(), Qt.GlobalColor.black)
+        painter.end()
+
+
 class VideoPlayer(QWidget):
     """Native theme-aware controls shared by direct, YouTube and Vimeo videos."""
     duration_available = Signal(int)
@@ -432,6 +646,8 @@ class VideoPlayer(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         self.surface = QStackedWidget()
+        self.surface.setObjectName("videoSurface")
+        self.surface.setStyleSheet("QStackedWidget#videoSurface {background:#000; border:0;}")
         self.surface.setMinimumSize(0, 0)
         self.surface.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.status = QLabel("Loading...")
@@ -439,6 +655,8 @@ class VideoPlayer(QWidget):
         self.status.setWordWrap(True)
         self.status.setStyleSheet("background: black; color: white;")
         self.surface.addWidget(self.status)
+        self.canvas = VideoCanvas()
+        self.surface.addWidget(self.canvas)
         layout.addWidget(self.surface, 1)
         self.controls = QFrame()
         self.controls.setObjectName("videoControls")
@@ -646,17 +864,14 @@ class VideoPlayer(QWidget):
 
     def _load_direct(self, info: VideoInfo) -> None:
         from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-        from PySide6.QtMultimediaWidgets import QVideoWidget
-        self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumSize(0, 0)
-        self.video_widget.setStyleSheet("background: black;")
-        self.surface.addWidget(self.video_widget)
-        self.surface.setCurrentWidget(self.video_widget)
+        self.video_widget = VideoFrameView()
+        self.canvas.set_backend(self.video_widget)
+        self.surface.setCurrentWidget(self.canvas)
         self.audio = QAudioOutput(self)
         self.audio.setVolume(self.volume.value() / 100)
         self.media_player = QMediaPlayer(self)
         self.media_player.setAudioOutput(self.audio)
-        self.media_player.setVideoOutput(self.video_widget)
+        self.media_player.setVideoSink(self.video_widget.videoSink())
         self.media_player.errorOccurred.connect(self._direct_error)
         self.media_player.setSource(QUrl(info.link.source_url))
         self.media_player.play()
@@ -665,7 +880,7 @@ class VideoPlayer(QWidget):
     def _load_provider(self, info: VideoInfo) -> None:
         # Lazy: loading chat or creating a thumbnail never starts Chromium.
         try:
-            from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
+            from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineScript, QWebEngineSettings
             from PySide6.QtWebEngineWidgets import QWebEngineView
         except ImportError:
             self.status.setText("Video player unavailable. Open in Browser to watch.")
@@ -688,8 +903,17 @@ class VideoPlayer(QWidget):
         self.web.setPage(page)
         page.setBackgroundColor(QColor("black"))
         page.settings().setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
-        self.surface.addWidget(self.web)
-        self.surface.setCurrentWidget(self.web)
+        if info.link.provider == "youtube":
+            script = QWebEngineScript()
+            script.setName("SpriteLink YouTube controls")
+            script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+            script.setWorldId(QWebEngineScript.ScriptWorldId.ApplicationWorld)
+            script.setRunsOnSubFrames(True)
+            script.setSourceCode(YOUTUBE_CHROME_SCRIPT)
+            page.scripts().insert(script)
+        self.canvas.set_backend(self.web)
+        self.surface.setCurrentWidget(self.canvas)
+        self.web.loadFinished.connect(self.canvas._bind_renderer)
         self.web.setHtml(provider_player_html(info), QUrl(PLAYER_BASE_URL))
         if info.link.provider in ("youtube", "vimeo"):
             self.timer.start()
@@ -982,6 +1206,7 @@ class VideoPlayer(QWidget):
         return width, video_height + chrome
 
     def stop(self) -> None:
+        self.canvas.clear_backend()
         self._remember_embedded_geometry()
         self._remove_window()
         if self._mini_host is not None:
@@ -1011,7 +1236,6 @@ class VideoPlayer(QWidget):
                 if widget is self.web:
                     widget.stop()
                     widget.setUrl(QUrl("about:blank"))
-                self.surface.removeWidget(widget)
                 widget.deleteLater()
         self.video_widget = self.web = None
         profile = getattr(self, "profile", None)

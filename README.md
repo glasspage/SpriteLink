@@ -10,4 +10,6 @@ YouTube, Vimeo, and direct videos use SpriteLink's themed playback controls. Oth
 
 Videos open inside the main SpriteLink window at any window size. **Pop-out** moves playback into a separate nonmodal window and removes the main-window overlay, retaining the video link in its footer. **Mini player** keeps a compact 16:9 video at the top right of the chat log and continues playing across chatroom switches. Mode changes preserve playback, and fullscreen uses the same SpriteLink controls. Scroll over the volume button or slider to adjust volume in 10% increments; scrolling the seek bar does not change playback position.
 
+The video stays centered over black while resizing and retains its last frame until the renderer updates. YouTube's extra player overlays are hidden with styling scoped to its embedded player documents; this is best-effort because YouTube can change its interface.
+
 DISCLAIMER: The code in this repository was created with assistance from AI tools. I made the architecture, design and implementation decisions; AI was used to write the code based on them.

@@ -1,8 +1,10 @@
 import io
 from contextlib import ExitStack
 import json
+import os
 import shutil
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -230,6 +232,137 @@ class VideoControlsTests(unittest.TestCase):
             self.assertEqual(player.seek.value(), position)
             player._command.assert_not_called()
         player.stop()
+
+    def test_last_valid_video_frame_stays_centered_over_black_during_resize(self):
+        from PySide6.QtMultimedia import QVideoFrame
+        view = V.VideoFrameView()
+        image = QImage(160, 90, QImage.Format.Format_RGB32)
+        image.fill(QColor("blue"))
+        view.set_frame(image)
+        view.show()
+        for width, height in ((320, 240), (480, 150), (100, 250), (640, 360)):
+            view.resize(width, height)
+            view._receive_frame(QVideoFrame())
+            result = view.grab().toImage()
+            self.assertEqual(result.pixelColor(width // 2, height // 2), QColor("blue"))
+            self.assertEqual(view.frame, image)
+            fitted = image.size().scaled(view.size(), Qt.AspectRatioMode.KeepAspectRatio)
+            left, top = (width - fitted.width()) // 2, (height - fitted.height()) // 2
+            if left:
+                self.assertEqual(result.pixelColor(0, height // 2), QColor("black"))
+                self.assertEqual(result.pixelColor(width - 1, height // 2), QColor("black"))
+            if top:
+                self.assertEqual(result.pixelColor(width // 2, 0), QColor("black"))
+                self.assertEqual(result.pixelColor(width // 2, height - 1), QColor("black"))
+        view.close()
+        view.deleteLater()
+
+    def test_browser_resize_holds_last_frame_until_matching_render_completes(self):
+        canvas, backend = V.VideoCanvas(), QWidget()
+        backend.setStyleSheet("background:blue")
+        canvas.resize(320, 240)
+        canvas.set_backend(backend)
+        canvas.show()
+        QTest.qWait(20)
+        self.assertFalse(canvas.hold.isVisible())
+        old_frame = QImage(320, 180, QImage.Format.Format_RGB32)
+        old_frame.fill(QColor("blue"))
+        with mock.patch.object(canvas, "_snapshot", return_value=old_frame):
+            canvas.resize(480, 240)
+        self.assertTrue(canvas.hold.isVisible())
+        self.assertEqual(canvas.hold.frame, old_frame)
+        self.assertEqual(backend.geometry().center(), canvas.rect().center())
+        # Missing frames and stale paint callbacks never replace the held image.
+        canvas._finish_resize()
+        self.assertTrue(canvas.hold.isVisible())
+        canvas._paint_finished(canvas._epoch - 1)
+        self.assertTrue(canvas.hold.isVisible())
+        canvas._frame_ready = True
+        for frame in (QImage(), old_frame):
+            with mock.patch.object(canvas, "_snapshot", return_value=frame):
+                canvas._finish_resize()
+            self.assertTrue(canvas.hold.isVisible())
+        valid_frame = QImage(backend.size(), QImage.Format.Format_RGB32)
+        valid_frame.fill(QColor("green"))
+        with mock.patch.object(canvas, "_snapshot", return_value=valid_frame):
+            canvas._finish_resize()
+        self.assertFalse(canvas.hold.isVisible())
+        canvas.clear_backend()
+        self.assertFalse(canvas._settle_timer.isActive())
+        self.assertTrue(canvas.hold.frame.isNull())
+        canvas.close()
+        canvas.deleteLater()
+
+    @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the browser styling script")
+    def test_youtube_overlay_styling_is_scoped_to_trusted_embed_documents(self):
+        runner = r"""
+const fs=require('fs'), vm=require('vm'), source=fs.readFileSync(0,'utf8');
+const output=[];
+for (const [hostname,pathname] of [
+  ['www.youtube.com','/embed/M7lc1UVf-VE'], ['www.youtube-nocookie.com','/embed/M7lc1UVf-VE'],
+  ['www.youtube.com','/watch'], ['www.youtube.com.evil.test','/embed/M7lc1UVf-VE'],
+  ['player.vimeo.com','/embed/M7lc1UVf-VE']]) {
+  const styles=[];
+  const c={location:{hostname,pathname},document:{createElement:()=>({}),head:{appendChild:s=>styles.push(s)}}};
+  vm.runInNewContext(source,c); output.push(styles);
+}
+process.stdout.write(JSON.stringify(output));
+"""
+        result = subprocess.run([shutil.which("node"), "-e", runner], input=V.YOUTUBE_CHROME_SCRIPT,
+                                text=True, capture_output=True, check=True)
+        output = json.loads(result.stdout)
+        for styles in output[:2]:
+            self.assertEqual(len(styles), 1)
+            sheet = styles[0]["textContent"]
+            for selector in (".ytp-chrome-top", ".ytp-large-play-button", ".ytp-bezel",
+                             ".ytp-pause-overlay", ".ytp-caption-window-container"):
+                self.assertIn(selector, sheet)
+            self.assertNotIn(".ytp-error", sheet)
+        self.assertEqual(output[2:], [[], [], []])
+        youtube = V.VideoInfo(V.VideoLink("youtube", "M7lc1UVf-VE", ""), "youtube.com")
+        self.assertIn("pointer-events:none", V.provider_player_html(youtube))
+        vimeo = V.VideoInfo(V.VideoLink("vimeo", "123456", ""), "vimeo.com")
+        self.assertNotIn("pointer-events:none", V.provider_player_html(vimeo))
+
+    def test_quick_renderer_releases_held_frame_after_resizing_without_swap_signals(self):
+        runner = r"""
+import sys
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QColor
+from PySide6.QtQuickWidgets import QQuickWidget
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
+from spritelink_video import VideoCanvas, configure_video_rendering
+configure_video_rendering()
+app = QApplication([])
+root = QWidget(); root.resize(640, 480); QVBoxLayout(root)
+canvas = VideoCanvas(); root.layout().addWidget(canvas)
+backend = QWidget(); layout = QVBoxLayout(backend); layout.setContentsMargins(0, 0, 0, 0)
+canvas.set_backend(backend); root.show(); QTest.qWait(20)
+quick = QQuickWidget(); quick.setMinimumSize(0, 0)
+quick.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+quick.setSource(QUrl.fromLocalFile(sys.argv[1])); layout.addWidget(quick)
+QTest.qWait(80)
+assert canvas._quick is quick
+assert not canvas._resizing
+for size in ((480, 360), (800, 450), (400, 600)):
+    root.resize(*size); root.layout().activate()
+    assert not canvas.hold.frame.isNull()
+    assert canvas.hold.frame.pixelColor(canvas.hold.frame.width()//2, canvas.hold.frame.height()//2) == QColor('blue')
+    QTest.qWait(80)
+    assert not canvas.hold.isVisible()
+    assert not canvas._resizing
+    assert quick.grabFramebuffer().size() == backend.size()
+canvas.clear_backend(); root.close(); root.deleteLater(); QTest.qWait(20)
+"""
+        with TemporaryDirectory() as folder:
+            filename = folder + "/renderer.qml"
+            with open(filename, "w", encoding="utf-8") as qml:
+                qml.write('import QtQuick\nRectangle { width: 320; height: 180; color: "blue" }')
+            result = subprocess.run([sys.executable, "-c", runner, filename],
+                                    env={**os.environ, "QT_QPA_PLATFORM": "offscreen", "QT_QUICK_BACKEND": "software"},
+                                    text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_connecting_bridge_never_destroys_a_loaded_iframe_on_timeout(self):
         player = V.VideoPlayer()
@@ -581,6 +714,19 @@ class VideoModeIntegrationTests(unittest.TestCase):
             self.assertTrue(self.player.video_widget.videoSink().videoFrame().isValid())
             backend, generation = self.player.media_player, self.player._generation
             backend.pause()
+            for theme in ("Glassy", "Modern", "Classic", "Glassy"):
+                self.client.theme_var.set(theme)
+                self.client._apply_theme()
+                for size in ((630, 360), (470, 250), (720, 500)):
+                    self.root.resize(*size)
+                    QTest.qWait(20)
+                    frame = self.player.video_widget.grab().toImage()
+                    color = frame.pixelColor(frame.width() // 2, frame.height() // 2)
+                    self.assertGreater(color.blue(), 200)
+                    self.assertLess(color.red(), 25)
+                    self.assertLess(color.green(), 25)
+                    self.assertIs(self.player.media_player, backend)
+                    self.assertEqual(self.player._generation, generation)
             position = backend.position()
             for mode in ("mini", "popout", "main"):
                 self.client._set_video_player_mode(mode)
