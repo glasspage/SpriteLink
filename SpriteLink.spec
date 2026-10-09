@@ -28,6 +28,7 @@ a = Analysis(
         ("assets", "assets"),
     ],
     hiddenimports=generated_hidden_imports + [
+        "requests",
         "PySide6.QtSvg",
         "PySide6.QtMultimediaWidgets",
         "PySide6.QtQuickWidgets",

@@ -13,7 +13,7 @@ import re
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from PIL import Image
-import requests
+from spritelink_http import requests
 from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF
 from PySide6.QtCore import QPointF

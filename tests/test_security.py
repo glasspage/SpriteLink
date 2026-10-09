@@ -2850,7 +2850,8 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
         self.assertNotIn(".join(", close_source)
         self.assertIn("self.subscription_refresh_event.set()", close_source)
         self.assertIn("daemon=True", close_source)
-        self.assertIn("self.session.close()", close_source)
+        self.assertIn("if session is not None:", close_source)
+        self.assertIn("session.close()", close_source)
         self.assertIn(
             "_release_message_sound_resources()",
             close_source,

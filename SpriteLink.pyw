@@ -170,13 +170,7 @@ def ensure_qt_multimedia_loaded() -> None:
     QVideoSink = VideoSink
 
 
-try:
-    import requests
-except ImportError as exc:
-    raise SystemExit(
-        "Missing dependency: requests\n\nInstall it with:\n"
-        "pip install PySide6 requests cryptography Pillow"
-    ) from exc
+from spritelink_http import requests
 
 from spritelink_update import (
     ReleaseInfo,
@@ -3363,13 +3357,25 @@ def default_config() -> dict[str, Any]:
     }
 
 
+_loaded_config_snapshot: tuple[str, str] | None = None
+
+
+def _config_snapshot(config: dict[str, Any]) -> tuple[str, str]:
+    stored = dict(config)
+    stored.pop("history", None)
+    return str(CONFIG_PATH), json.dumps(stored, sort_keys=True)
+
+
 def load_config() -> dict[str, Any]:
+    global _loaded_config_snapshot
+    _loaded_config_snapshot = None
     config = default_config()
     apply_minimize_to_tray_1_2_default = False
 
     if CONFIG_PATH.exists():
         try:
             loaded = _load_dpapi_config(CONFIG_PATH.read_bytes())
+            _loaded_config_snapshot = str(CONFIG_PATH), json.dumps(loaded, sort_keys=True)
             if loaded.get("config_version") != CONFIG_FORMAT_VERSION:
                 return config
             apply_minimize_to_tray_1_2_default = not bool(
@@ -3649,6 +3655,7 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(config: dict[str, Any]) -> None:
+    global _loaded_config_snapshot
     stored_config = dict(config)
     stored_config.pop("history", None)
     _write_dpapi_json(
@@ -3656,6 +3663,14 @@ def save_config(config: dict[str, Any]) -> None:
         stored_config,
         SETTINGS_DPAPI_ENTROPY,
     )
+    _loaded_config_snapshot = _config_snapshot(stored_config)
+
+
+def _save_startup_config(config: dict[str, Any]) -> None:
+    # Existing settings need no DPAPI rewrite. New identities and migrations
+    # must still reach disk before networking can send a message.
+    if _loaded_config_snapshot != _config_snapshot(config):
+        save_config(config)
 
 
 def normalize_window_size(
@@ -3701,7 +3716,15 @@ def windows_startup_command() -> str:
     return subprocess.list2cmdline(executable_parts)
 
 
+_windows_startup_registry_lock = threading.RLock()
+
+
 def set_start_with_windows(enabled: bool) -> bool:
+    with _windows_startup_registry_lock:
+        return _set_start_with_windows(enabled)
+
+
+def _set_start_with_windows(enabled: bool) -> bool:
     if os.name != "nt":
         return not enabled
     try:
@@ -6360,8 +6383,17 @@ class AnimatedMediaController(QObject):
 class EncryptedChatClient(QObject):
     ui_event_available = Signal()
 
-    def __init__(self, root: MainWindow) -> None:
+    def __init__(self, root: MainWindow, *, defer_startup: bool = False) -> None:
         super().__init__(root)
+        # Embedded callers can request a fully prepared UI. The application
+        # entry point defers optional work until after showing the window.
+        self._defer_startup = defer_startup
+        self._startup_begun = False
+        self._startup_complete = False
+        self._prepared_popups: set[str] = set()
+        self._available_font_families: tuple[str, ...] | None = None
+        self.video_player: VideoPlayer | None = None
+        self.current_link_warning_url: str | None = None
         self.root = root
         self.root.setWindowTitle("SpriteLink")
         self.config_data = load_config()
@@ -6373,13 +6405,13 @@ class EncryptedChatClient(QObject):
             int(self.config_data["window_height"]),
         )
         self.root.installEventFilter(self)
-        if os.name == "nt":
+        if os.name == "nt" and not defer_startup:
             set_start_with_windows(
                 bool(self.config_data.get("start_with_windows", False))
             )
         # Persist a newly generated signing identity before any messages are
         # created so the authenticated ID survives a crash.
-        save_config(self.config_data)
+        _save_startup_config(self.config_data)
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -6395,16 +6427,9 @@ class EncryptedChatClient(QObject):
         self._basic_application_stylesheet = (
             app.styleSheet() if app is not None else ""
         )
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
-            "Accept": "application/json, application/x-ndjson",
-        })
-        self.subscription_session = requests.Session()
-        self.subscription_session.headers.update({
-            "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
-            "Accept": "application/x-ndjson, application/json",
-        })
+        self.session = None
+        self.subscription_session = None
+        self._http_session_lock = threading.Lock()
 
         self.stop_event = threading.Event()
         self.network_wakeup_event = threading.Event()
@@ -6705,16 +6730,106 @@ class EncryptedChatClient(QObject):
         self._build_tray_icon()
         self._schedule_utc_midnight_reset()
         self._apply_server_preset_state()
-        self._load_saved_history_for_current_room()
+        if not defer_startup:
+            self._load_saved_history_for_current_room()
 
         self.root.close_callback = self._on_close
         QTimer.singleShot(0, self._apply_titlebar_theme)
-        QTimer.singleShot(0, self._check_for_updates)
-        self.update_check_timer.start()
+        if not defer_startup:
+            QTimer.singleShot(0, self._check_for_updates)
+            self.update_check_timer.start()
         self.background_history_prune_timer.start()
         self.timed_mute_timer.start()
         self.unread_divider_timer.start()
-        self._start_network_thread()
+        self.startup_timer = QTimer(self)
+        self.startup_timer.setSingleShot(True)
+        self.startup_timer.timeout.connect(self._prepare_next_startup_popup)
+        self._startup_popups = ["config", "message_limit", "image_preview", "link_warning"]
+        if not defer_startup:
+            self._prepare_http_sessions()
+            self._start_network_thread()
+
+    def prepare_after_show(self) -> None:
+        """Warm optional features once the main window can paint."""
+        if self._startup_begun or self._closing:
+            return
+        self._startup_begun = True
+        self.startup_timer.start(50)
+        self._load_saved_history_for_current_room()
+        threading.Thread(
+            target=self._prepare_startup_services,
+            name="SpriteLinkStartupServices",
+            daemon=True,
+        ).start()
+
+    def _prepare_http_sessions(self) -> bool:
+        # Imports and session construction happen outside the UI thread in
+        # normal startup. Publish both sessions together, or discard on exit.
+        session = requests.Session()
+        subscription_session = requests.Session()
+        session.headers.update({
+            "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
+            "Accept": "application/json, application/x-ndjson",
+        })
+        subscription_session.headers.update({
+            "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
+            "Accept": "application/x-ndjson, application/json",
+        })
+        with self._http_session_lock:
+            if self.stop_event.is_set():
+                session.close()
+                subscription_session.close()
+                return False
+            self.session = session
+            self.subscription_session = subscription_session
+        return True
+
+    def _prepare_startup_services(self) -> None:
+        if self.stop_event.is_set():
+            return
+        try:
+            if self._prepare_http_sessions():
+                with self._http_session_lock:
+                    if not self.stop_event.is_set():
+                        self._start_network_thread()
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self._queue_ui_event(("startup_error", str(exc)))
+        if not self.stop_event.is_set() and os.name == "nt":
+            register_windows_notification_protocol()
+            with _windows_startup_registry_lock:
+                if not self.stop_event.is_set():
+                    set_start_with_windows(bool(self.start_with_windows_var.get()))
+
+    def _ensure_popup(self, name: str) -> None:
+        if name in self._prepared_popups:
+            return
+        getattr(self, f"_build_{name}_popup")()
+        self._prepared_popups.add(name)
+        overlay = getattr(self, f"{name}_overlay")
+        overlay.apply_theme(self._is_glassy_theme())
+        self._apply_ui_size_to_widget_tree(overlay)
+        self._apply_layout_density()
+        if name == "config":
+            self._apply_server_preset_state()
+
+    def _prepare_next_startup_popup(self) -> None:
+        if self._closing or self._startup_complete:
+            return
+        while self._startup_popups:
+            name = self._startup_popups.pop(0)
+            if name not in self._prepared_popups:
+                self._ensure_popup(name)
+                self.startup_timer.start(25)
+                return
+        self._startup_complete = True
+        self._prepare_tray_notification_icon()
+        self._check_for_updates()
+
+    def _font_families(self) -> tuple[str, ...]:
+        if self._available_font_families is None:
+            self._available_font_families = tuple(QFontDatabase.families())
+        return self._available_font_families
 
     def _font_style_strategy(self) -> QFont.StyleStrategy:
         return (
@@ -7033,7 +7148,7 @@ class EncryptedChatClient(QObject):
     def _make_link_warning_url_font(self) -> QFont:
         available_families = {
             family.casefold(): family
-            for family in QFontDatabase.families()
+            for family in self._font_families()
         }
         family = available_families.get(
             "lucida console",
@@ -7080,7 +7195,7 @@ class EncryptedChatClient(QObject):
         if self._is_windows_classic_theme():
             return "Tahoma"
         if not self._is_glassy_theme():
-            families = set(QFontDatabase.families())
+            families = set(self._font_families())
             # Static Segoe UI provides consistent regular/bold faces in Qt.
             for family in ("Segoe UI", "Segoe UI Variable"):
                 if family in families:
@@ -7457,11 +7572,10 @@ class EncryptedChatClient(QObject):
         self._tray_normal_icon = QIcon(str(WINDOW_ICON_PATH))
         if self._tray_normal_icon.isNull():
             self._tray_normal_icon = self.root.windowIcon()
-        self._tray_notification_icon = (
-            self._build_tray_notification_icon(self._tray_normal_icon)
-            if not self._tray_normal_icon.isNull()
-            else QIcon()
-        )
+        self._tray_notification_icon = QIcon()
+        self._tray_notification_icon_ready = False
+        if not self._defer_startup:
+            self._prepare_tray_notification_icon()
         self.tray_icon = QSystemTrayIcon(
             self._tray_normal_icon,
             self.root,
@@ -7490,6 +7604,15 @@ class EncryptedChatClient(QObject):
         if self._tray_available():
             self.tray_icon.show()
         if self._has_unread_messages():
+            self._mark_tray_notification()
+
+    def _prepare_tray_notification_icon(self) -> None:
+        if self._tray_notification_icon_ready:
+            return
+        self._tray_notification_icon_ready = True
+        if not self._tray_normal_icon.isNull():
+            self._tray_notification_icon = self._build_tray_notification_icon(self._tray_normal_icon)
+        if hasattr(self, "tray_icon") and self._has_unread_messages():
             self._mark_tray_notification()
 
     def _tray_available(self) -> bool:
@@ -7565,9 +7688,9 @@ class EncryptedChatClient(QObject):
         self._sync_window_activity()
         self.viewport_media_timer.stop()
         self._hide_chat_tooltip()
-        if self.link_warning_overlay.isVisible():
+        if hasattr(self, "link_warning_overlay") and self.link_warning_overlay.isVisible():
             self._hide_link_warning_popup()
-        if self.image_preview_overlay.isVisible() or self.current_image_preview_url:
+        if (hasattr(self, "image_preview_overlay") and self.image_preview_overlay.isVisible()) or self.current_image_preview_url:
             self._hide_image_preview_popup()
         self._pause_animated_media()
         self._release_message_sound_resources()
@@ -7946,10 +8069,10 @@ QComboBox::drop-down {
         central_layout.addWidget(self.chat_tab, 1)
 
         self._build_chat_tab()
-        self._build_config_popup()
-        self._build_message_limit_popup()
-        self._build_image_preview_popup()
-        self._build_link_warning_popup()
+        self.chat_content.installEventFilter(self)
+        if not self._defer_startup:
+            for name in ("config", "message_limit", "image_preview", "link_warning"):
+                self._ensure_popup(name)
 
     def _build_chatroom_sidebar(self, root_layout: QHBoxLayout) -> None:
         self.chatrooms_panel = QWidget()
@@ -10183,6 +10306,7 @@ QComboBox::drop-down {
         self.message_limit_overlay.setGeometry(self.chat_content.rect())
 
     def _show_message_limit_popup(self) -> None:
+        self._ensure_popup("message_limit")
         self.message_size_timer.stop()
         self._run_message_size_check()
         self._update_message_limit_popup()
@@ -10191,6 +10315,8 @@ QComboBox::drop-down {
         self.message_limit_overlay.raise_()
 
     def _hide_message_limit_popup(self) -> None:
+        if not hasattr(self, "message_limit_overlay"):
+            return
         self.message_limit_overlay.hide()
         self.message_entry.setFocus()
 
@@ -10359,6 +10485,7 @@ QComboBox::drop-down {
         url: str,
         analysis: LinkSafetyAnalysis,
     ) -> None:
+        self._ensure_popup("link_warning")
         self._hide_chat_tooltip()
         self.current_link_warning_url = url
         self.link_warning_url_label.setText(
@@ -10390,6 +10517,8 @@ QComboBox::drop-down {
         self.link_warning_cancel_button.setFocus()
 
     def _hide_link_warning_popup(self) -> None:
+        if not hasattr(self, "link_warning_overlay"):
+            return
         self.link_warning_overlay.hide()
         self.current_link_warning_url = None
         self.link_warning_url_label.clear()
@@ -10543,6 +10672,7 @@ QComboBox::drop-down {
         media = self.image_preview_cache.get(url)
         if not isinstance(media, RemoteMediaPreview):
             return
+        self._ensure_popup("image_preview")
         if self.video_player is not None:
             self.video_player.stop()
             self.video_player.hide()
@@ -10611,6 +10741,8 @@ QComboBox::drop-down {
         self.image_preview_url_label.setToolTip(url or "")
 
     def _hide_image_preview_popup(self) -> None:
+        if not hasattr(self, "image_preview_overlay"):
+            return
         url = self.current_image_preview_url
         self.image_preview_overlay.hide()
         if self.video_player is not None:
@@ -11332,6 +11464,7 @@ QComboBox::drop-down {
 
     def _on_config_toggled(self, checked: bool) -> None:
         if checked:
+            self._ensure_popup("config")
             self._config_snapshot_at_open = self._config_ui_snapshot()
             self._sync_config_overlay_geometry()
             self.config_overlay.show()
@@ -11346,7 +11479,7 @@ QComboBox::drop-down {
         self._dismiss_config_popup()
 
     def _dismiss_config_popup(self) -> bool:
-        if not self.config_overlay.isVisible():
+        if not hasattr(self, "config_overlay") or not self.config_overlay.isVisible():
             self._set_config_toggle_checked(False)
             return True
 
@@ -11374,6 +11507,8 @@ QComboBox::drop-down {
         return True
 
     def _apply_server_preset_state(self) -> None:
+        if not hasattr(self, "server_url_entry"):
+            return
         preset = str(self.server_preset_var.get())
         self.server_url_entry.setReadOnly(
             preset != "Custom ntfy server"
@@ -12864,7 +12999,10 @@ QComboBox::drop-down {
             for _event_index in range(UI_EVENT_BATCH_LIMIT):
                 event_type, payload = self.ui_queue.get_nowait()
 
-                if event_type == "status":
+                if event_type == "startup_error":
+                    messagebox.showerror("Could not start networking", payload, parent=self.root)
+
+                elif event_type == "status":
                     status, _detail, room_id = payload
                     if room_id == self.active_chatroom_id:
                         self.status_var.set(status)
@@ -14735,9 +14873,9 @@ QComboBox::drop-down {
         if (
             watched is getattr(self, "chat_content", None)
             and event.type() == QEvent.Type.Resize
-            and hasattr(self, "config_overlay")
         ):
-            self._sync_config_overlay_geometry()
+            if hasattr(self, "config_overlay"):
+                self._sync_config_overlay_geometry()
             if hasattr(self, "message_limit_overlay"):
                 self._sync_message_limit_overlay_geometry()
             if hasattr(self, "image_preview_overlay"):
@@ -16669,12 +16807,12 @@ QComboBox::drop-down {
     def _clear_visible_room(self, *, preserve_detached_video: bool = False) -> None:
         self._reset_history_render_window()
         self._hide_chat_tooltip()
-        if self.link_warning_overlay.isVisible():
+        if hasattr(self, "link_warning_overlay") and self.link_warning_overlay.isVisible():
             self._hide_link_warning_popup()
         player = self.video_player
         keep_video = (preserve_detached_video and player is not None and player.info is not None
                       and player._mode in ("mini", "popout"))
-        if not keep_video and (self.image_preview_overlay.isVisible() or self.current_image_preview_url):
+        if not keep_video and ((hasattr(self, "image_preview_overlay") and self.image_preview_overlay.isVisible()) or self.current_image_preview_url):
             self._hide_image_preview_popup()
         self.seen_client_message_ids.clear()
         self.seen_ntfy_message_ids.clear()
@@ -17079,6 +17217,7 @@ QComboBox::drop-down {
                 return False
 
         self._closing = True
+        self.startup_timer.stop()
         self._minimized_to_tray = False
         self.theme_color_save_timer.stop()
         QToolTip.hideText()
@@ -17106,12 +17245,17 @@ QComboBox::drop-down {
         self.subscription_refresh_event.set()
         # Network workers are daemons. Do not block the GUI thread waiting on
         # a request or streaming response while the application is exiting.
-        self.session.close()
-        threading.Thread(
-            target=self.subscription_session.close,
-            name="SpriteLinkSubscriptionClose",
-            daemon=True,
-        ).start()
+        with self._http_session_lock:
+            session = self.session
+            subscription_session = self.subscription_session
+        if session is not None:
+            session.close()
+        if subscription_session is not None:
+            threading.Thread(
+                target=subscription_session.close,
+                name="SpriteLinkSubscriptionClose",
+                daemon=True,
+            ).start()
         for controller in self.animated_media_controllers.values():
             controller.stop()
         self.animated_media_controllers.clear()
@@ -17186,7 +17330,6 @@ def main() -> None:
         else None
     )
     if os.name == "nt":
-        register_windows_notification_protocol()
         try:
             if not acquire_single_instance_lock():
                 if notification_room_id is not None:
@@ -17252,7 +17395,7 @@ def main() -> None:
         return
 
     try:
-        client = EncryptedChatClient(root)
+        client = EncryptedChatClient(root, defer_startup=True)
     except Exception:
         error_text = traceback.format_exc()
         crash_path = _write_crash_log(error_text)
@@ -17269,6 +17412,7 @@ def main() -> None:
         return
 
     root.show()
+    QTimer.singleShot(50, client.prepare_after_show)
     if notification_room_id is not None:
         QTimer.singleShot(
             0,

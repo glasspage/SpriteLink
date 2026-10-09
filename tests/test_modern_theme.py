@@ -133,12 +133,14 @@ class ModernThemeTests(unittest.TestCase):
 
     def test_segoe_font_prefers_static_faces_and_falls_back_without_it(self):
         family = SPRITELINK.EncryptedChatClient._ui_font_family
+        self.client._font_families = lambda: SPRITELINK.EncryptedChatClient._font_families(self.client)
         for available, expected in (
             (["Segoe UI", "Segoe UI Variable"], "Segoe UI"),
             (["Segoe UI"], "Segoe UI"),
             (["Segoe UI Variable"], "Segoe UI Variable"),
             ([], "Fallback"),
         ):
+            self.client._available_font_families = None
             with mock.patch.object(SPRITELINK.QFontDatabase, "families", return_value=available):
                 self.assertEqual(family(self.client), expected)
         self.theme = "Glassy"
