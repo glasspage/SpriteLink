@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from PIL import Image
 import requests
-from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF
 from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import (
@@ -414,6 +414,7 @@ class VideoPlayer(QWidget):
         self._muted = False
         self._ended = False
         self._duration = 0.0
+        self._volume_wheel_delta = 0
         self._fullscreen = None
         self._popout_mode = False
         self._embedded_parent = parent
@@ -460,9 +461,13 @@ class VideoPlayer(QWidget):
         self.volume = slider_factory(Qt.Orientation.Horizontal)
         self.volume.setAccessibleName("Volume")
         self.volume.setRange(0, 100)
+        self.volume.setSingleStep(10)
+        self.volume.setPageStep(10)
         self.volume.setValue(100)
         self.volume.setFixedWidth(55)
         self.volume.valueChanged.connect(lambda value: self._command("volume", value))
+        for widget in (self.seek, self.volume, self.mute_button):
+            widget.installEventFilter(self)
         self.fullscreen_button = QPushButton()
         self.fullscreen_button.setAccessibleName("Fullscreen")
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
@@ -478,7 +483,15 @@ class VideoPlayer(QWidget):
         modes = QHBoxLayout(self.mode_controls)
         modes.setContentsMargins(0, 0, 0, 0)
         modes.setSpacing(5)
-        modes.addStretch(1)
+        self.mini_spacer = QWidget()
+        modes.addWidget(self.mini_spacer, 1)
+        self.mini_spacer.hide()
+        self.source_label = QLabel()
+        self.source_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.source_label.setMinimumWidth(0)
+        self.source_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        modes.addWidget(self.source_label, 1)
+        self.source_label.installEventFilter(self)
         self.popout_button = QPushButton("Pop-out")
         self.popout_button.clicked.connect(lambda: self.mode_requested.emit(
             "main" if self._mode == "popout" else "popout"))
@@ -490,7 +503,12 @@ class VideoPlayer(QWidget):
         self.mini_close.setFixedWidth(24)
         self.mini_close.clicked.connect(self.popup_closed.emit)
         self.mini_close.hide()
-        for button in (self.popout_button, self.mini_button, self.mini_close):
+        self.browser_button = QPushButton("Open in Browser")
+        self.browser_button.clicked.connect(self.open_in_browser.emit)
+        self.dismiss_button = QPushButton("Dismiss")
+        self.dismiss_button.clicked.connect(self._dismiss)
+        for button in (self.popout_button, self.mini_button, self.browser_button,
+                       self.dismiss_button, self.mini_close):
             modes.addWidget(button)
         layout.addWidget(self.mode_controls)
         self.timer = QTimer(self)
@@ -498,6 +516,43 @@ class VideoPlayer(QWidget):
         self.timer.timeout.connect(self._poll)
         self._set_enabled(False)
         self._refresh_icons()
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.Resize and watched is getattr(self, "source_label", None):
+            self._update_source_label()
+        if event.type() == QEvent.Type.Wheel:
+            if watched is self.seek:
+                event.accept()
+                return True
+            if watched in (self.volume, self.mute_button):
+                if self._ready:
+                    delta = event.angleDelta().y() or event.angleDelta().x()
+                    if delta:
+                        self._volume_wheel_delta += delta
+                        steps = int(self._volume_wheel_delta / 120)
+                        self._volume_wheel_delta -= steps * 120
+                    else:
+                        pixels = event.pixelDelta().y() or event.pixelDelta().x()
+                        steps = (1 if pixels > 0 else -1) if pixels else 0
+                    self.volume.setValue(self.volume.value() + steps * 10)
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _dismiss(self) -> None:
+        if self._mode == "popout" and self._fullscreen is not None:
+            self._fullscreen.close()
+        else:
+            self.popup_closed.emit()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_source_label()
+
+    def _update_source_label(self) -> None:
+        url = self.info.link.source_url if self.info else ""
+        self.source_label.setText(self.source_label.fontMetrics().elidedText(
+            url, Qt.TextElideMode.ElideMiddle, max(1, self.source_label.width())))
 
     def _refresh_icons(self) -> None:
         for button, kind in (
@@ -571,6 +626,8 @@ class VideoPlayer(QWidget):
     def load(self, info: VideoInfo) -> None:
         self.stop()
         self.info = info
+        self.source_label.setToolTip(info.link.source_url)
+        self._update_source_label()
         self._ready = self._playing = self._muted = self._ended = False
         self._duration = max(0, info.duration)
         self._set_enabled(False)
@@ -796,6 +853,8 @@ class VideoPlayer(QWidget):
                 self._embedded_minimum_height = self.minimumHeight()
 
     def _move_to_host(self, host: QWidget) -> None:
+        self.surface.setMinimumHeight(0)
+        self.surface.setMaximumHeight(16777215)
         self.setMinimumHeight(0)
         self.setMaximumHeight(16777215)
         self.setParent(host)
@@ -844,12 +903,21 @@ class VideoPlayer(QWidget):
 
     def _update_mode_controls(self) -> None:
         mini = self._mode == "mini" and self._fullscreen_restore_mode is None
+        margins = (8, 4, 8, 8) if self._mode == "popout" else (0, 0, 0, 0)
+        self.mode_controls.layout().setContentsMargins(*margins)
         self.popout_button.setText("Main window" if self._mode == "popout" else "Pop-out")
         self.mini_button.setText("Restore" if self._mode == "mini" else "Mini player")
+        self.popout_button.setVisible(self._mode != "mini")
+        self.mini_button.setVisible(self._mode != "popout")
+        self.source_label.setVisible(not mini)
+        self.mini_spacer.setVisible(mini)
+        self.browser_button.setVisible(not mini)
+        self.dismiss_button.setVisible(not mini)
         self.mini_close.setVisible(mini)
         supported = self.info is None or self.info.link.provider in ("direct", "youtube", "vimeo")
         self.volume.setVisible(supported and not mini)
         self.set_theme(self._theme, self._theme_transform, self._tiny)
+        self._update_source_label()
 
     def _create_window(self, *, fullscreen: bool) -> None:
         # Parent to the chat's window, not the previous detached window.
@@ -863,16 +931,9 @@ class VideoPlayer(QWidget):
             dialog.setMinimumSize(480, 360)
             dialog.resize(640, 420)
             dialog.setWindowModality(Qt.WindowModality.NonModal)
-            footer = QHBoxLayout()
-            footer.setContentsMargins(8, 4, 8, 8)
-            footer.addStretch(1)
-            open_button = QPushButton("Open in Browser")
-            open_button.clicked.connect(self.open_in_browser.emit)
-            footer.addWidget(open_button)
-            dismiss = QPushButton("Dismiss")
-            dismiss.clicked.connect(dialog.close)
-            footer.addWidget(dismiss)
-            layout.addLayout(footer)
+            self.mode_controls.layout().setContentsMargins(8, 4, 8, 8)
+        else:
+            self.mode_controls.layout().setContentsMargins(0, 0, 0, 0)
         self._fullscreen = dialog
         dialog.finished.connect(lambda: self._leave_fullscreen(dialog))
         dialog.showFullScreen() if fullscreen else dialog.show()
@@ -910,6 +971,16 @@ class VideoPlayer(QWidget):
         self.setMinimumHeight(height)
         self.setMaximumHeight(height)
 
+    def mini_size(self, maximum_width: int, maximum_height: int):
+        """Reserve the controls' height in addition to a 16:9 video surface."""
+        self.layout().activate()
+        chrome = self.controls.sizeHint().height() + self.mode_controls.sizeHint().height()
+        chrome += self.layout().spacing() * 2
+        width = max(1, min(maximum_width, round(max(1, maximum_height - chrome) * 16 / 9)))
+        video_height = max(1, round(width * 9 / 16))
+        self.surface.setFixedHeight(video_height)
+        return width, video_height + chrome
+
     def stop(self) -> None:
         self._remember_embedded_geometry()
         self._remove_window()
@@ -923,6 +994,9 @@ class VideoPlayer(QWidget):
         self._poll_pending = False
         self.timer.stop()
         self.info = None
+        self._volume_wheel_delta = 0
+        self.source_label.clear()
+        self.source_label.setToolTip("")
         if self.media_player is not None:
             self.media_player.stop()
             self.media_player.setVideoOutput(None)

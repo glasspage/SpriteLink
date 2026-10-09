@@ -9,8 +9,8 @@ import unittest
 from unittest import mock
 
 from PIL import Image
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtCore import QPoint, QPointF, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QImage, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 
@@ -191,6 +191,44 @@ class VideoControlsTests(unittest.TestCase):
             player._check_ready(player._generation)
             error.assert_not_called()
         player.web = None
+        player.stop()
+
+    def test_volume_wheel_changes_ten_percent_and_seek_ignores_wheel(self):
+        player = V.VideoPlayer(slider_factory=S.ThemeSlider)
+        player.info = V.VideoInfo(V.VideoLink("youtube", "M7lc1UVf-VE", ""), "youtube.com")
+        player._update_state({"ready": True, "duration": 120, "position": 30, "volume": 50})
+        player._command = mock.Mock()
+
+        def wheel(widget, delta, modifiers=Qt.KeyboardModifier.NoModifier):
+            event = QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(), QPoint(0, delta),
+                                Qt.MouseButton.NoButton, modifiers, Qt.ScrollPhase.NoScrollPhase, False)
+            QApplication.sendEvent(widget, event)
+
+        for theme in ("Classic", "Glassy", "Modern"):
+            player.set_theme(theme, tiny=True)
+            player.volume.setValue(50)
+            player._command.reset_mock()
+            wheel(player.volume, 120)
+            self.assertEqual(player.volume.value(), 60)
+            wheel(player.mute_button, -120)
+            self.assertEqual(player.volume.value(), 50)
+            wheel(player.mute_button, 240, Qt.KeyboardModifier.ControlModifier)
+            self.assertEqual(player.volume.value(), 70)
+            wheel(player.volume, 60)
+            self.assertEqual(player.volume.value(), 70)
+            wheel(player.mute_button, 60)
+            self.assertEqual(player.volume.value(), 80)
+            wheel(player.mute_button, 600)
+            self.assertEqual(player.volume.value(), 100)
+            wheel(player.volume, -1200)
+            self.assertEqual(player.volume.value(), 0)
+            self.assertTrue(all(call.args[0] == "volume" for call in player._command.call_args_list))
+            player._command.reset_mock()
+            position = player.seek.value()
+            wheel(player.seek, 120)
+            wheel(player.seek, -120, Qt.KeyboardModifier.ShiftModifier)
+            self.assertEqual(player.seek.value(), position)
+            player._command.assert_not_called()
         player.stop()
 
     def test_connecting_bridge_never_destroys_a_loaded_iframe_on_timeout(self):
@@ -409,6 +447,7 @@ class VideoModeIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(dialog)
         self.assertEqual(dialog.windowModality(), Qt.WindowModality.NonModal)
         self.assertFalse(self.client.image_preview_overlay.isVisible())
+        self.player.popout_button.click()
         self.player.mini_button.click()
         panel = self.client.video_mini_panel
         self.assertIsNone(self.player._fullscreen)
@@ -442,6 +481,7 @@ class VideoModeIntegrationTests(unittest.TestCase):
         self.assertEqual(self.player._mode, "mini")
         self.assertTrue(self.client.video_mini_panel.isVisible())
         self.assertFalse(self.client.image_preview_overlay.isVisible())
+        self.player.mini_button.click()
         self.player.popout_button.click()
         self.player._fullscreen.close()
         self.assertIsNone(self.player.info)
@@ -454,6 +494,75 @@ class VideoModeIntegrationTests(unittest.TestCase):
         self.assertIsNone(self.player.info)
         self.assertIsNone(self.client.current_image_preview_url)
         self.assertFalse(self.client.video_mini_panel.isVisible())
+
+    def test_footer_buttons_share_row_and_follow_mode_visibility(self):
+        for theme in ("Classic", "Glassy", "Modern"):
+            self.client.theme_var.set(theme)
+            self.client._apply_theme()
+            QTest.qWait(20)
+            buttons = (self.player.popout_button, self.player.mini_button,
+                       self.player.browser_button, self.player.dismiss_button)
+            self.assertTrue(all(button.isVisible() for button in buttons))
+            self.assertEqual(len({button.geometry().center().y() for button in buttons}), 1)
+            self.assertTrue(all(self.player.mode_controls.rect().contains(button.geometry()) for button in buttons))
+            self.assertFalse(self.client.image_preview_footer.isVisible())
+            self.player.popout_button.click()
+            QTest.qWait(20)
+            self.assertFalse(self.player.mini_button.isVisible())
+            self.assertTrue(self.player.source_label.isVisible())
+            self.assertEqual(self.player.source_label.toolTip(), self.url)
+            self.assertTrue(self.player.source_label.text())
+            self.player.popout_button.click()
+            self.player.mini_button.click()
+            self.assertFalse(self.player.popout_button.isVisible())
+            self.assertTrue(self.player.mini_button.isVisible())
+            self.assertFalse(self.player.browser_button.isVisible())
+            self.assertFalse(self.player.dismiss_button.isVisible())
+            self.player.mini_button.click()
+        with mock.patch.object(self.client, "_open_url_in_browser") as open_browser:
+            self.player.popout_button.click()
+            self.player.browser_button.click()
+            open_browser.assert_called_once_with(self.url, None)
+        self.player.dismiss_button.click()
+        self.assertIsNone(self.player.info)
+        self.assertFalse(self.client.image_preview_overlay.isVisible())
+
+    def test_mini_video_surface_stays_sixteen_by_nine_across_sizes_and_themes(self):
+        self.player.mini_button.click()
+        for theme in ("Classic", "Glassy", "Modern"):
+            self.client.theme_var.set(theme)
+            self.client._apply_theme()
+            for width, height in ((470, 250), (630, 360), (900, 700)):
+                self.root.resize(width, height)
+                QTest.qWait(30)
+                surface = self.player.surface
+                self.assertLessEqual(abs(surface.height() - surface.width() * 9 / 16), 1)
+                panel = self.client.video_mini_panel
+                self.assertLessEqual(panel.geometry().bottom(), panel.parentWidget().height())
+                self.assertTrue(self.player.rect().contains(self.player.controls.geometry()))
+                self.assertTrue(self.player.rect().contains(self.player.mode_controls.geometry()))
+
+    def test_mini_persists_across_room_switches_and_restores_original_video(self):
+        self.player.mini_button.click()
+        info, generation, position = self.player.info, self.player._generation, self.player.seek.value()
+        with mock.patch.object(self.client, "_request_network_refresh"), \
+             mock.patch.object(self.client, "_request_subscription_refresh"):
+            for room in ("other-room", "global"):
+                self.client.active_chatroom_id = room
+                self.client._switch_active_chatroom()
+                QTest.qWait(25)
+                self.assertTrue(self.client.video_mini_panel.isVisible())
+                self.assertFalse(self.client.image_preview_overlay.isVisible())
+                self.assertEqual(self.client.current_image_preview_url, self.url)
+                self.assertIs(self.player.info, info)
+                self.assertEqual(self.player._generation, generation)
+                self.assertEqual(self.player.seek.value(), position)
+        self.player.mini_button.click()
+        self.assertTrue(self.client.image_preview_overlay.isVisible())
+        self.assertEqual(self.player.source_label.toolTip(), self.url)
+        self.player.dismiss_button.click()
+        self.assertIsNone(self.client.current_image_preview_url)
+        self.assertIsNone(self.player.info)
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is needed to create a native playback fixture")
     def test_native_video_survives_mini_popout_and_window_cleanup(self):

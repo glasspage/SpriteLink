@@ -8988,7 +8988,7 @@ QComboBox::drop-down {
             save_config(self.config_data)
         except Exception:
             pass
-        self._clear_visible_room()
+        self._clear_visible_room(preserve_mini_video=True)
         self._load_active_room_profile_into_controls()
         self._load_saved_history_for_current_room()
         self.connected = False
@@ -10160,6 +10160,7 @@ QComboBox::drop-down {
         overlay_layout.addStretch(1)
 
         panel_row = QHBoxLayout()
+        self.image_preview_panel_row = panel_row
         panel_row.addStretch(1)
         self.image_preview_panel = QFrame()
         self.image_preview_panel.setObjectName("configPanel")
@@ -10195,7 +10196,9 @@ QComboBox::drop-down {
         mini_layout.setSpacing(0)
         self.video_mini_panel.hide()
 
-        button_row = QHBoxLayout()
+        self.image_preview_footer = QWidget()
+        button_row = QHBoxLayout(self.image_preview_footer)
+        button_row.setContentsMargins(0, 0, 0, 0)
         self.image_preview_button_row = button_row
         self.image_preview_url_label = QLabel()
         self.image_preview_url_label.setMinimumWidth(0)
@@ -10210,7 +10213,7 @@ QComboBox::drop-down {
         dismiss_button = QPushButton("Dismiss")
         dismiss_button.clicked.connect(self._hide_image_preview_popup)
         button_row.addWidget(dismiss_button)
-        panel_layout.addLayout(button_row)
+        panel_layout.addWidget(self.image_preview_footer)
 
         self.image_preview_overlay.hide()
         QTimer.singleShot(0, self._sync_image_preview_overlay_geometry)
@@ -10492,6 +10495,9 @@ QComboBox::drop-down {
         self.image_preview_overlay.show()
         self.image_preview_overlay.raise_()
         if media.kind == "video" and media.video_info is not None:
+            self.image_preview_footer.hide()
+            self.image_preview_panel_row.setStretch(0, 0)
+            self.image_preview_panel_row.setStretch(2, 0)
             if self.video_player is None:
                 self.video_player = VideoPlayer(self.image_preview_panel, ThemeSlider)
                 self.video_player.duration_available.connect(self._on_video_duration_available)
@@ -10506,6 +10512,9 @@ QComboBox::drop-down {
             self._apply_video_player_theme()
             self.video_player.load(media.video_info)
         else:
+            self.image_preview_footer.show()
+            self.image_preview_panel_row.setStretch(0, 1)
+            self.image_preview_panel_row.setStretch(2, 1)
             self.image_preview_label.show()
         self._update_image_preview_popup()
         QTimer.singleShot(0, self._update_image_preview_popup)
@@ -10524,7 +10533,7 @@ QComboBox::drop-down {
             margins = self.image_preview_overlay.layout().contentsMargins()
             self.video_player.fit_viewport(
                 max(100, self.image_preview_overlay.height() - margins.top() - margins.bottom()
-                    - self.image_preview_button_row.sizeHint().height() - 44),
+                    - 32),
                 self.video_player.width(),
             )
         elif isinstance(media.frame, QImage) and not media.frame.isNull():
@@ -10593,7 +10602,20 @@ QComboBox::drop-down {
         rect = self.chat_display.viewport().rect()
         margin = 6
         width = max(1, min(280, rect.width() - margin * 2))
-        height = max(1, min(184, rect.height() - margin * 2))
+        player = getattr(self, "video_player", None)
+        if player is None or player._mode != "mini" or player._fullscreen is not None:
+            return
+        # A short log may leave the player over the composer; reserve enough
+        # height for a 16:9 video and keep all controls inside the main window.
+        origin = self.chat_display.viewport().mapTo(panel.parentWidget(), QPoint(0, margin))
+        frame = panel.frameWidth() * 2
+        margins = panel.layout().contentsMargins()
+        horizontal_chrome = frame + margins.left() + margins.right()
+        vertical_chrome = frame + margins.top() + margins.bottom()
+        available_height = max(1, panel.parentWidget().height() - origin.y() - margin)
+        inner_width, inner_height = player.mini_size(
+            max(1, width - horizontal_chrome), max(1, available_height - vertical_chrome))
+        width, height = inner_width + horizontal_chrome, inner_height + vertical_chrome
         position = self.chat_display.viewport().mapTo(
             panel.parentWidget(), QPoint(max(0, rect.width() - width - margin), margin)
         )
@@ -10617,6 +10639,8 @@ QComboBox::drop-down {
         # Reparented controls retain the current other-UI font in every mode.
         for widget in (player, *player.findChildren(QWidget)):
             self._set_widget_text_size(widget, "other_ui")
+        if player._mode == "mini" and player._fullscreen is None:
+            self._sync_video_mini_geometry()
 
     def _on_video_duration_available(self, duration: int) -> None:
         media = self.image_preview_cache.get(self.current_image_preview_url or "")
@@ -12944,7 +12968,10 @@ QComboBox::drop-down {
                         )
                         > MAX_REMOTE_MEDIA_CACHE_BYTES
                     ):
-                        oldest_url = next(iter(self.image_preview_cache))
+                        oldest_url = next((candidate for candidate in self.image_preview_cache
+                                           if candidate != self.current_image_preview_url), None)
+                        if oldest_url is None:
+                            break
                         self.image_preview_cache.pop(oldest_url, None)
                         controller = (
                             self.animated_media_controllers.pop(
@@ -16575,12 +16602,15 @@ QComboBox::drop-down {
         scrollbar = self.chat_display.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def _clear_visible_room(self) -> None:
+    def _clear_visible_room(self, *, preserve_mini_video: bool = False) -> None:
         self._reset_history_render_window()
         self._hide_chat_tooltip()
         if self.link_warning_overlay.isVisible():
             self._hide_link_warning_popup()
-        if self.image_preview_overlay.isVisible() or self.current_image_preview_url:
+        player = self.video_player
+        keep_video = (preserve_mini_video and player is not None and player.info is not None
+                      and player._mode == "mini")
+        if not keep_video and (self.image_preview_overlay.isVisible() or self.current_image_preview_url):
             self._hide_image_preview_popup()
         self.seen_client_message_ids.clear()
         self.seen_ntfy_message_ids.clear()
@@ -16607,6 +16637,9 @@ QComboBox::drop-down {
         self.chat_display.unread_divider_block_number = None
         self.chat_display.setExtraSelections([])
         self._reset_chat_document()
+        if keep_video:
+            self._sync_video_mini_geometry()
+            self.video_mini_panel.raise_()
 
     def _should_play_message_sound(self, room_id: str) -> bool:
         return (
