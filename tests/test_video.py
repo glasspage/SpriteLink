@@ -173,6 +173,28 @@ class VideoControlsTests(unittest.TestCase):
         player.web = None
         player.stop()
 
+    def test_volume_persists_between_videos_and_resets_for_a_new_player(self):
+        from PySide6 import QtMultimedia
+        player = V.VideoPlayer()
+        self.assertEqual(player.volume.value(), 20)
+        with mock.patch.object(QtMultimedia, "QAudioOutput") as audio_factory, \
+                mock.patch.object(QtMultimedia, "QMediaPlayer"), \
+                mock.patch.object(player, "_load_provider"):
+            for value in (20, 70, 0):
+                player.volume.setValue(value)
+                player.load(V.VideoInfo(V.VideoLink("direct", "", "https://example.org/video.mp4"), "example.org"))
+                audio_factory.return_value.setVolume.assert_called_with(value / 100)
+                player.stop()
+                for provider in ("youtube", "vimeo"):
+                    player.load(V.VideoInfo(V.VideoLink(provider, "123456", ""), provider))
+                    self.assertEqual(player.volume.value(), value)
+                    player.stop()
+                    self.assertEqual(player.volume.value(), value)
+        fresh = V.VideoPlayer()
+        self.assertEqual(fresh.volume.value(), 20)
+        fresh.close()
+        player.close()
+
     def test_serialized_paused_state_enables_controls_and_preserves_duration(self):
         player = V.VideoPlayer()
         player.info = V.VideoInfo(V.VideoLink("youtube", "M7lc1UVf-VE", ""), "youtube.com")
@@ -505,9 +527,44 @@ process.stdout.write(JSON.stringify({options,calls,state:c.window.spriteState()}
         self.assertEqual(output["options"]["playerVars"]["controls"], 0)
         self.assertEqual(output["options"]["playerVars"]["disablekb"], 1)
         self.assertEqual(output["options"]["playerVars"]["start"], 42)
-        self.assertEqual(output["calls"], [["play"], ["pause"], ["seek", 60], ["volume", 40], ["mute"]])
+        self.assertEqual(output["calls"], [["volume", 20], ["play"], ["pause"], ["seek", 60], ["volume", 40], ["mute"]])
         self.assertEqual(output["state"]["duration"], 120)
         self.assertTrue(output["state"]["playing"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the provider bridge")
+    def test_provider_initial_volume_applies_before_play_even_after_early_state_changes(self):
+        runner = r"""
+const fs=require('fs'),vm=require('vm');
+const html=fs.readFileSync(0,'utf8'), calls=[];
+let options, ready, volume=100;
+const c={window:{},document:{getElementById:()=>({})},location:{origin:'https://github.com'}};
+c.YT={Player:function(id,o){options=o;return {
+  playVideo:()=>calls.push(['play',volume]), setVolume:v=>{volume=v;calls.push(['volume',v]);},
+  getCurrentTime:()=>0,getDuration:()=>120,getVolume:()=>volume,isMuted:()=>false,getPlayerState:()=>2
+};}};
+c.Vimeo={Player:function(){return {
+  ready:()=>new Promise(resolve=>ready=resolve),
+  on:(event,callback)=>{if(event==='volumechange')callback({volume:1});},
+  setVolume:v=>{volume=v*100;calls.push(['volume',volume]);return Promise.resolve();},
+  play:()=>{calls.push(['play',volume]);return Promise.resolve();}
+};}};
+vm.createContext(c);
+for(const match of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)) vm.runInContext(match[1],c);
+if(c.onYouTubeIframeAPIReady){
+  c.onYouTubeIframeAPIReady();c.window.spriteState();options.events.onReady();
+}else ready();
+setImmediate(()=>process.stdout.write(JSON.stringify({calls,state:c.window.spriteState()})));
+"""
+        for provider in ("youtube", "vimeo"):
+            info = V.VideoInfo(V.VideoLink(provider, "123456", ""), provider)
+            for value in (20, 70, 0):
+                with self.subTest(provider=provider, volume=value):
+                    html = V.provider_player_html(info, value)
+                    result = subprocess.run([shutil.which("node"), "-e", runner],
+                                            input=html, text=True, capture_output=True, check=True)
+                    self.assertEqual(json.loads(result.stdout)["calls"], [["volume", value], ["play", value]])
+                    if provider == "vimeo":
+                        self.assertIn("autoplay=0", html)
 
     @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the provider bridge")
     def test_youtube_duration_and_readiness_are_read_while_paused_without_js_timer(self):

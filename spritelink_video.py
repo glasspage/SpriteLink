@@ -29,6 +29,7 @@ MAX_METADATA_BYTES = 1024 * 1024
 MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024
 MAX_THUMBNAIL_PIXELS = 16 * 1024 * 1024
 YOUTUBE_ZOOM_FACTOR = 0.25
+DEFAULT_VIDEO_VOLUME = 20
 
 
 YOUTUBE_CHROME_SCRIPT = r"""
@@ -286,7 +287,7 @@ def video_thumbnail(frame: QImage | None, width: int, height: int) -> QImage:
     return result
 
 
-def provider_player_html(info: VideoInfo) -> str:
+def provider_player_html(info: VideoInfo, volume: int = DEFAULT_VIDEO_VOLUME) -> str:
     """Only constants and JSON-encoded IDs enter executable JavaScript."""
     link = info.link
     if link.provider == "youtube":
@@ -298,7 +299,7 @@ function onYouTubeIframeAPIReady() {
     host:'https://www.youtube-nocookie.com',
     playerVars:{controls:0, disablekb:1, fs:0, playsinline:1, rel:0,
                 origin:location.origin, start:START_SECONDS},
-    events:{onReady:() => { state.ready=true; readYouTubeState(); player.playVideo(); },
+    events:{onReady:() => { player.setVolume(initialVolume); state.ready=true; readYouTubeState(); player.playVideo(); },
       onStateChange:e => {
         state.playerState=e.data;
         if ([0,1,2,3,5].includes(e.data)) state.ready=true;
@@ -346,7 +347,7 @@ window.spriteState=readYouTubeState;
         video_hash = params.get("h", [""])[0]
         if len(path) == 2 and path[0] == link.video_id:
             video_hash = path[1]
-        query = {"controls": "0", "autoplay": "1"}
+        query = {"controls": "0", "autoplay": "0"}
         if re.fullmatch(r"[A-Za-z0-9]+", video_hash):
             query["h"] = video_hash
         src = f"https://player.vimeo.com/video/{link.video_id}?" + urlencode(query)
@@ -354,7 +355,10 @@ window.spriteState=readYouTubeState;
         loader = '<script src="https://player.vimeo.com/api/player.js"></script>'
         script = """
 const player = new Vimeo.Player(document.getElementById('player'));
-player.ready().then(() => { state.ready=true; }).catch(() => {state.error='Vimeo playback unavailable';});
+player.ready().then(() => {
+  state.ready=true;
+  return player.setVolume(initialVolume/100).catch(() => {});
+}).then(() => player.play()).catch(() => {state.error='Vimeo playback unavailable';});
 player.on('play', () => {state.playing=true; state.ended=false;});
 player.on('pause', () => {state.playing=false;});
 player.on('ended', () => {state.playing=false; state.ended=true;});
@@ -388,8 +392,10 @@ window.spriteCommand = (command, value) => {
             "<meta name='referrer' content='strict-origin-when-cross-origin'>"
             "<style>html,body{margin:0;width:100%;height:100%;background:#000;overflow:hidden}"
             "#player{display:block;width:100%;height:100%;border:0}" + pointer_style + "</style></head><body>"
-            + content + "<script>const state={ready:false,playing:false,ended:false,"
-            "position:0,duration:" + str(max(0, int(info.duration))) + ",volume:100,muted:false,error:''};"
+            + content + "<script>const initialVolume=" + str(max(0, min(100, int(volume))))
+            + ";const state={ready:false,playing:false,ended:false,"
+            "position:0,duration:" + str(max(0, int(info.duration)))
+            + ",volume:initialVolume,muted:false,error:''};"
             "window.spriteState=()=>state;</script>" + loader + "<script>" + script
             + "</script></body></html>")
 
@@ -664,7 +670,8 @@ class VideoPlayer(QWidget):
         self.volume.setRange(0, 100)
         self.volume.setSingleStep(10)
         self.volume.setPageStep(10)
-        self.volume.setValue(100)
+        # The player lives for the app session; stop/load retain this value.
+        self.volume.setValue(DEFAULT_VIDEO_VOLUME)
         self.volume.setFixedWidth(55)
         self.volume.valueChanged.connect(lambda value: self._command("volume", value))
         for widget in (self.seek, self.volume, self.mute_button):
@@ -901,7 +908,7 @@ class VideoPlayer(QWidget):
             self.canvas.set_backend(self.web)
         self.surface.setCurrentWidget(self.canvas)
         self.web.loadFinished.connect(self._hide_youtube_chrome)
-        self.web.setHtml(provider_player_html(info), QUrl(PLAYER_BASE_URL))
+        self.web.setHtml(provider_player_html(info, self.volume.value()), QUrl(PLAYER_BASE_URL))
         if info.link.provider in ("youtube", "vimeo"):
             self.timer.start()
             generation = self._generation

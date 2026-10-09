@@ -163,8 +163,10 @@ html = """<style>html,body{margin:0;width:100%;height:100%;background:blue}
 #logo{position:absolute;left:0;top:0;width:40px;height:40px;background:red}</style>
 <div id='logo'></div><script>window.spriteState=()=>({ready:true,playing:false,duration:120});</script>"""
 for provider, factor, extent in [('youtube',0.25,10),('vimeo',1.0,40)]:
-    with mock.patch.object(V, 'provider_player_html', return_value=html):
-        player.load(V.VideoInfo(V.VideoLink(provider,'M7lc1UVf-VE','https://example.org'),provider))
+    info=V.VideoInfo(V.VideoLink(provider,'M7lc1UVf-VE','https://example.org'),provider)
+    with mock.patch.object(V, 'provider_player_html', return_value=html) as make_html:
+        player.load(info)
+        make_html.assert_called_once_with(info, player.volume.value())
     web, mirror = player.web, player.video_widget
     assert web.zoomFactor() == factor
     for _ in range(100):
@@ -181,8 +183,49 @@ for provider, factor, extent in [('youtube',0.25,10),('vimeo',1.0,40)]:
     viewport=json.loads(state[-1]); ratio=web.devicePixelRatioF()
     assert abs(viewport['width']*ratio*factor-1920) < 2, viewport
     assert abs(viewport['height']*ratio*factor-1080) < 2, viewport
+    if provider == 'youtube':
+        # An initialized renderer rejects values below the documented minimum.
+        for unsupported in (0.1,0.2,0.249):
+            web.setZoomFactor(unsupported); QTest.qWait(50)
+            assert web.zoomFactor() == 0.25
+            mirror._capture_frame()
+            assert mirror.frame.pixelColor(9,9) == QColor('red')
+            assert mirror.frame.pixelColor(12,12) == QColor('blue')
+        player.volume.setValue(70)
     player.stop(); QTest.qWait(50)
+assert player.volume.value() == 70
 root.close(); root.deleteLater(); QTest.qWait(50)
+''')
+
+    def test_below_minimum_zoom_on_a_fresh_page_is_rejected_after_renderer_initializes(self):
+        self.run_browser(r'''
+import json
+from PySide6.QtGui import QColor
+from PySide6.QtTest import QTest
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
+from spritelink_video import BrowserFrameView
+app=QApplication([])
+root=QWidget();root.resize(640,480);QVBoxLayout(root);root.show()
+html="""<style>html,body{margin:0;width:100%;height:100%;background:blue}
+#logo{width:100px;height:100px;background:red}</style><div id='logo'></div>"""
+for requested in (0.1,0.2,0.249):
+    web=QWebEngineView();web.setZoomFactor(requested)
+    mirror=BrowserFrameView(web);root.layout().addWidget(mirror);web.setHtml(html)
+    for _ in range(100):
+        QTest.qWait(20);mirror._capture_frame()
+        if not mirror.frame.isNull() and mirror.frame.pixelColor(1,1)==QColor('red'):break
+    assert web.zoomFactor()==1.0, (requested,web.zoomFactor())
+    assert mirror.frame.pixelColor(99,99)==QColor('red')
+    assert mirror.frame.pixelColor(102,102)==QColor('blue')
+    viewport=[]
+    web.page().runJavaScript('JSON.stringify({width:innerWidth,height:innerHeight})',lambda s:viewport.append(s))
+    QTest.qWait(50);size=json.loads(viewport[-1]);ratio=web.devicePixelRatioF()
+    assert abs(size['width']*ratio-1920)<2, size
+    assert abs(size['height']*ratio-1080)<2, size
+    mirror.release();root.layout().removeWidget(mirror)
+    web.deleteLater();mirror.deleteLater();QTest.qWait(50)
+root.close();root.deleteLater();QTest.qWait(50)
 ''')
 
 
