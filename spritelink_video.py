@@ -28,6 +28,7 @@ PLAYER_BASE_URL = "https://github.com/glasspage/SpriteLink/"
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024
 MAX_THUMBNAIL_PIXELS = 16 * 1024 * 1024
+YOUTUBE_ZOOM_FACTOR = 0.25
 
 
 YOUTUBE_CHROME_SCRIPT = r"""
@@ -577,6 +578,17 @@ class VideoCanvas(QWidget):
         painter.end()
 
 
+class VideoWindow(QDialog):
+    exit_fullscreen = Signal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self.exit_fullscreen.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class VideoPlayer(QWidget):
     """Native theme-aware controls shared by direct, YouTube and Vimeo videos."""
     duration_available = Signal(int)
@@ -796,6 +808,8 @@ class VideoPlayer(QWidget):
         # Buttons and sliders inherit the app's separate Classic, Glassy and
         # Modern styles, including bevel painting, color variants and density.
         stylesheet = styles.get(theme, styles["Modern"])
+        if self._fullscreen is not None and self._fullscreen.property("spritelinkVideoFullscreen"):
+            stylesheet += "QFrame#videoControls {border-radius:0px;}"
         if mini:
             stylesheet += "QFrame#videoControls QPushButton {padding:2px; min-height:14px;}"
         self.controls.setStyleSheet(transform(stylesheet))
@@ -876,6 +890,9 @@ class VideoPlayer(QWidget):
         page.settings().setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
         if info.link.provider == "youtube":
             install_youtube_chrome(self.profile)
+            # Expand the logical viewport so remaining fixed-size YouTube
+            # chrome is four times smaller, without changing video geometry.
+            self.web.setZoomFactor(YOUTUBE_ZOOM_FACTOR)
         if info.link.provider in ("youtube", "vimeo"):
             self.video_widget = BrowserFrameView(self.web)
             self.canvas.set_backend(self.video_widget)
@@ -1044,10 +1061,8 @@ class VideoPlayer(QWidget):
     def toggle_fullscreen(self) -> None:
         if self._fullscreen is not None:
             if self._mode == "popout":
-                if self._fullscreen.isFullScreen():
-                    self._fullscreen.showNormal()
-                else:
-                    self._fullscreen.showFullScreen()
+                self._set_window_fullscreen(self._fullscreen, not self._fullscreen.isFullScreen())
+                self._update_mode_controls()
             else:
                 self._fullscreen.close()
             return
@@ -1120,7 +1135,8 @@ class VideoPlayer(QWidget):
 
     def _update_mode_controls(self) -> None:
         mini = self._mode == "mini" and self._fullscreen_restore_mode is None
-        margins = (8, 4, 8, 8) if self._mode == "popout" else (0, 0, 0, 0)
+        fullscreen = self._fullscreen is not None and bool(self._fullscreen.property("spritelinkVideoFullscreen"))
+        margins = (8, 4, 8, 8) if self._mode == "popout" and not fullscreen else (0, 0, 0, 0)
         self.mode_controls.layout().setContentsMargins(*margins)
         self.popout_button.setText("Main window" if self._mode == "popout" else "Pop-out")
         self.mini_button.setText("Restore" if self._mode == "mini" else "Mini player")
@@ -1139,7 +1155,10 @@ class VideoPlayer(QWidget):
     def _create_window(self, *, fullscreen: bool) -> None:
         # Parent to the chat's window, not the previous detached window.
         owner = self._embedded_parent.window() if self._embedded_parent else None
-        dialog = QDialog(owner)
+        dialog = VideoWindow(owner)
+        dialog.setProperty("spritelinkVideoWindow", True)
+        dialog.setObjectName("videoWindow")
+        dialog.exit_fullscreen.connect(self.toggle_fullscreen)
         dialog.setWindowTitle(self.info.title if self.info and self.info.title else "SpriteLink Video")
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1153,7 +1172,30 @@ class VideoPlayer(QWidget):
             self.mode_controls.layout().setContentsMargins(0, 0, 0, 0)
         self._fullscreen = dialog
         dialog.finished.connect(lambda: self._leave_fullscreen(dialog))
-        dialog.showFullScreen() if fullscreen else dialog.show()
+        if fullscreen:
+            self._set_window_fullscreen(dialog, True)
+        else:
+            dialog.show()
+
+    def _set_window_fullscreen(self, dialog, fullscreen: bool) -> None:
+        screen = dialog.screen()
+        dialog.setProperty("spritelinkVideoFullscreen", fullscreen)
+        if fullscreen:
+            dialog._video_normal_geometry = dialog.geometry()
+            dialog._video_normal_flags = dialog.windowFlags()
+            dialog.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+                                  | Qt.WindowType.NoDropShadowWindowHint)
+            dialog.setStyleSheet("QDialog#videoWindow {background:#000; border:0; border-radius:0px;}")
+            dialog.setScreen(screen)
+            dialog.setGeometry(screen.geometry())
+            dialog.showFullScreen()
+        else:
+            dialog.setWindowFlags(dialog._video_normal_flags)
+            dialog.setStyleSheet("")
+            dialog.showNormal()
+            dialog.setGeometry(dialog._video_normal_geometry)
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _leave_fullscreen(self, dialog) -> None:
         if dialog is not self._fullscreen:

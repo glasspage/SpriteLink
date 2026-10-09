@@ -644,6 +644,51 @@ class VideoModeIntegrationTests(unittest.TestCase):
         self.assertIsNone(self.client.current_image_preview_url)
         self.assertFalse(self.client.image_preview_overlay.isVisible())
 
+    def test_fullscreen_uses_entire_screen_and_square_chrome_in_each_theme(self):
+        for theme in ("Classic", "Glassy", "Modern"):
+            self.client.theme_var.set(theme)
+            self.client._apply_theme()
+            self.player.toggle_fullscreen()
+            QTest.qWait(30)
+            dialog = self.player._fullscreen
+            self.assertTrue(dialog.isFullScreen())
+            self.assertEqual(dialog.windowType(), Qt.WindowType.Window)
+            self.assertTrue(dialog.windowFlags() & Qt.WindowType.FramelessWindowHint)
+            self.assertEqual(dialog.geometry(), dialog.screen().geometry())
+            self.assertEqual(self.player.geometry(), dialog.rect())
+            self.assertTrue(dialog.property("spritelinkVideoFullscreen"))
+            self.assertIn("border-radius:0px", self.player.controls.styleSheet())
+            self.assertTrue(self.player.rect().contains(self.player.controls.geometry()))
+            self.assertTrue(self.player.rect().contains(self.player.mode_controls.geometry()))
+            QTest.keyClick(dialog, Qt.Key.Key_Escape)
+            self.assertEqual(self.player._mode, "main")
+            self.assertIsNone(self.player._fullscreen)
+            self.assertTrue(self.client.image_preview_overlay.isVisible())
+
+    def test_popout_fullscreen_escape_restores_its_window_and_geometry(self):
+        self.player.popout_button.click()
+        dialog = self.player._fullscreen
+        QTest.qWait(20)
+        geometry, flags = dialog.geometry(), dialog.windowFlags()
+        for theme in ("Glassy", "Modern", "Classic"):
+            self.client.theme_var.set(theme)
+            self.client._apply_theme()
+            self.player.toggle_fullscreen()
+            QTest.qWait(20)
+            self.assertEqual(dialog.geometry(), dialog.screen().geometry())
+            self.assertTrue(dialog.windowFlags() & Qt.WindowType.FramelessWindowHint)
+            self.assertEqual(self.player.mode_controls.layout().contentsMargins().bottom(), 0)
+            QTest.keyClick(dialog, Qt.Key.Key_Escape)
+            QTest.qWait(20)
+            self.assertFalse(dialog.isFullScreen())
+            self.assertFalse(dialog.property("spritelinkVideoFullscreen"))
+            self.assertEqual(dialog.geometry(), geometry)
+            self.assertEqual(dialog.windowFlags(), flags)
+            self.assertEqual(self.player._mode, "popout")
+            self.assertIsNotNone(self.player.info)
+            self.assertFalse(self.client.image_preview_overlay.isVisible())
+            self.assertEqual(self.player.mode_controls.layout().contentsMargins().bottom(), 8)
+
     def test_tray_suspension_stops_mini_when_main_overlay_is_hidden(self):
         self.player.mini_button.click()
         self.client._suspend_for_tray()
@@ -719,6 +764,42 @@ class VideoModeIntegrationTests(unittest.TestCase):
         self.player.dismiss_button.click()
         self.assertIsNone(self.client.current_image_preview_url)
         self.assertIsNone(self.player.info)
+
+    def test_popout_persists_across_room_switches_in_normal_and_fullscreen_modes(self):
+        self.player.popout_button.click()
+        dialog = self.player._fullscreen
+        info, generation, position = self.player.info, self.player._generation, self.player.seek.value()
+        with mock.patch.object(self.client, "_request_network_refresh"), \
+             mock.patch.object(self.client, "_request_subscription_refresh"):
+            for fullscreen in (False, True):
+                if fullscreen:
+                    self.player.toggle_fullscreen()
+                for room in ("other-room", "global"):
+                    self.client.active_chatroom_id = room
+                    self.client._switch_active_chatroom()
+                    QTest.qWait(20)
+                    self.assertIs(self.player._fullscreen, dialog)
+                    self.assertTrue(dialog.isVisible())
+                    self.assertEqual(dialog.isFullScreen(), fullscreen)
+                    self.assertFalse(self.client.image_preview_overlay.isVisible())
+                    self.assertEqual(self.client.current_image_preview_url, self.url)
+                    self.assertIs(self.player.info, info)
+                    self.assertEqual(self.player._generation, generation)
+                    self.assertEqual(self.player.seek.value(), position)
+        self.player.popout_button.click()
+        self.assertEqual(self.player._mode, "main")
+        self.assertTrue(self.client.image_preview_overlay.isVisible())
+        self.assertEqual(self.player.source_label.toolTip(), self.url)
+        self.player.dismiss_button.click()
+        self.assertIsNone(self.player.info)
+        self.assertIsNone(self.client.current_image_preview_url)
+
+    def test_clearing_room_for_reconnect_still_stops_popout_playback(self):
+        self.player.popout_button.click()
+        self.client._clear_visible_room()
+        self.assertIsNone(self.player.info)
+        self.assertIsNone(self.player._fullscreen)
+        self.assertIsNone(self.client.current_image_preview_url)
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is needed to create a native playback fixture")
     def test_native_video_survives_mini_popout_and_window_cleanup(self):

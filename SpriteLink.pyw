@@ -1768,6 +1768,47 @@ def set_windows_taskbar_attention(
     return True
 
 
+def set_windows_fullscreen_window(window_handle: int, fullscreen: bool) -> bool:
+    """Ask the Windows shell to place its taskbar behind active fullscreen video."""
+    if os.name != "nt" or not hasattr(ctypes, "windll") or not window_handle:
+        return False
+    interface = ctypes.c_void_p()
+    initialized = False
+    release = None
+    try:
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        ole32.CoInitializeEx.restype = ctypes.c_int32
+        ole32.CoUninitialize.argtypes = []
+        ole32.CoUninitialize.restype = None
+        status = int(ole32.CoInitializeEx(None, 2))  # COINIT_APARTMENTTHREADED
+        initialized = status in (0, 1)
+        if status < 0 and status != -2147417850:  # RPC_E_CHANGED_MODE: use existing apartment.
+            return False
+        guid_type = ctypes.c_ubyte * 16
+        clsid = guid_type.from_buffer_copy(uuid.UUID("56fdf344-fd6d-11d0-958a-006097c9a090").bytes_le)
+        iid = guid_type.from_buffer_copy(uuid.UUID("602d4995-b13a-429b-a66e-1935e44f4317").bytes_le)
+        ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                                          ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        ole32.CoCreateInstance.restype = ctypes.c_int32
+        if ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid),
+                                  ctypes.byref(interface)) < 0 or not interface.value:
+            return False
+        table = ctypes.cast(interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        release = ctypes.WINFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p)(table[2])
+        hr_init = ctypes.WINFUNCTYPE(ctypes.c_int32, ctypes.c_void_p)(table[3])
+        mark = ctypes.WINFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, wintypes.HWND,
+                                 wintypes.BOOL)(table[8])
+        return hr_init(interface) >= 0 and mark(interface, wintypes.HWND(window_handle), fullscreen) >= 0
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    finally:
+        if release is not None:
+            release(interface)
+        if initialized:
+            ole32.CoUninitialize()
+
+
 def _bytes_to_blob(data: bytes) -> tuple[DATA_BLOB, Any]:
     buffer = ctypes.create_string_buffer(data, len(data))
     blob = DATA_BLOB(
@@ -7236,6 +7277,9 @@ class EncryptedChatClient(QObject):
 
         try:
             hwnd = wintypes.HWND(int(window.winId()))
+            video_fullscreen = bool(window.property("spritelinkVideoFullscreen"))
+            if bool(window.property("spritelinkVideoWindow")):
+                set_windows_fullscreen_window(int(window.winId()), video_fullscreen)
             dwmapi = ctypes.windll.dwmapi
             dwmapi.DwmSetWindowAttribute.argtypes = [
                 wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD
@@ -7258,7 +7302,11 @@ class EncryptedChatClient(QObject):
             # Keep all themes light, then color the Windows 11 non-client
             # frame where the DWM color attributes are supported.
             set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
-            if self._is_windows_classic_theme():
+            if video_fullscreen:
+                border, caption, text = "#000000", "#000000", "#ffffff"
+                corner_preference = 1  # DWMWCP_DONOTROUND
+                backdrop = 1  # DWMSBT_NONE
+            elif self._is_windows_classic_theme():
                 border = "#000000"
                 caption = CLASSIC_COLOR_SCHEMES[client_theme_color(self, "Classic")]["title"]
                 text = "#ffffff"
@@ -7297,7 +7345,7 @@ class EncryptedChatClient(QObject):
                     ("bottom", ctypes.c_int),
                 ]
 
-            glass_margin = -1 if self._is_glassy_theme() else 0
+            glass_margin = -1 if self._is_glassy_theme() and not video_fullscreen else 0
             margins = Margins(
                 glass_margin,
                 glass_margin,
@@ -7312,12 +7360,12 @@ class EncryptedChatClient(QObject):
                 self._set_windows_legacy_blur(hwnd, False)
                 window.setProperty("spritelinkLegacyBlur", False)
             desktop_blur = (
-                self._is_glassy_theme()
+                self._is_glassy_theme() and not video_fullscreen
                 and frame_result == 0
                 and backdrop_result == 0
             )
             if (
-                self._is_glassy_theme()
+                self._is_glassy_theme() and not video_fullscreen
                 and frame_result == 0
                 and not desktop_blur
             ):
@@ -8989,7 +9037,7 @@ QComboBox::drop-down {
             save_config(self.config_data)
         except Exception:
             pass
-        self._clear_visible_room(preserve_mini_video=True)
+        self._clear_visible_room(preserve_detached_video=True)
         self._load_active_room_profile_into_controls()
         self._load_saved_history_for_current_room()
         self.connected = False
@@ -14651,10 +14699,15 @@ QComboBox::drop-down {
             and event.type() in (
                 QEvent.Type.Show,
                 QEvent.Type.WindowActivate,
+                QEvent.Type.WindowStateChange,
             )
         ):
             self._apply_dialog_window_theme(watched)
             self._apply_ui_size_to_widget_tree(watched)
+
+        if (isinstance(watched, QDialog) and watched.property("spritelinkVideoWindow")
+                and event.type() == QEvent.Type.Hide and watched.windowHandle() is not None):
+            set_windows_fullscreen_window(int(watched.winId()), False)
 
         if (
             watched is self.root
@@ -16605,14 +16658,14 @@ QComboBox::drop-down {
         scrollbar = self.chat_display.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def _clear_visible_room(self, *, preserve_mini_video: bool = False) -> None:
+    def _clear_visible_room(self, *, preserve_detached_video: bool = False) -> None:
         self._reset_history_render_window()
         self._hide_chat_tooltip()
         if self.link_warning_overlay.isVisible():
             self._hide_link_warning_popup()
         player = self.video_player
-        keep_video = (preserve_mini_video and player is not None and player.info is not None
-                      and player._mode == "mini")
+        keep_video = (preserve_detached_video and player is not None and player.info is not None
+                      and player._mode in ("mini", "popout"))
         if not keep_video and (self.image_preview_overlay.isVisible() or self.current_image_preview_url):
             self._hide_image_preview_popup()
         self.seen_client_message_ids.clear()
@@ -16640,7 +16693,7 @@ QComboBox::drop-down {
         self.chat_display.unread_divider_block_number = None
         self.chat_display.setExtraSelections([])
         self._reset_chat_document()
-        if keep_video:
+        if keep_video and player._mode == "mini":
             self._sync_video_mini_geometry()
             self.video_mini_panel.raise_()
 

@@ -148,6 +148,43 @@ player.stop(); assert not mirror._frame_timer.isActive()
 root.close(); root.deleteLater(); QTest.qWait(100)
 ''')
 
+    def test_youtube_zoom_shrinks_native_css_elements_and_keeps_full_video_viewport(self):
+        self.run_browser(r'''
+import json
+from unittest import mock
+from PySide6.QtGui import QColor
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
+import spritelink_video as V
+app = QApplication([])
+root = QWidget(); root.resize(640,480); QVBoxLayout(root)
+player = V.VideoPlayer(root); root.layout().addWidget(player); root.show()
+html = """<style>html,body{margin:0;width:100%;height:100%;background:blue}
+#logo{position:absolute;left:0;top:0;width:40px;height:40px;background:red}</style>
+<div id='logo'></div><script>window.spriteState=()=>({ready:true,playing:false,duration:120});</script>"""
+for provider, factor, extent in [('youtube',0.25,10),('vimeo',1.0,40)]:
+    with mock.patch.object(V, 'provider_player_html', return_value=html):
+        player.load(V.VideoInfo(V.VideoLink(provider,'M7lc1UVf-VE','https://example.org'),provider))
+    web, mirror = player.web, player.video_widget
+    assert web.zoomFactor() == factor
+    for _ in range(100):
+        QTest.qWait(20); mirror._capture_frame()
+        if not mirror.frame.isNull() and mirror.frame.pixelColor(1,1) == QColor('red'): break
+    frame = mirror.frame
+    assert frame.size().width() == 1920 and frame.size().height() == 1080
+    assert frame.pixelColor(extent-1,extent-1) == QColor('red')
+    assert frame.pixelColor(extent+2,extent+2) == QColor('blue')
+    assert frame.pixelColor(1918,1078) == QColor('blue')
+    state=[]
+    web.page().runJavaScript('JSON.stringify({width:innerWidth,height:innerHeight})',lambda s:state.append(s))
+    QTest.qWait(50)
+    viewport=json.loads(state[-1]); ratio=web.devicePixelRatioF()
+    assert abs(viewport['width']*ratio*factor-1920) < 2, viewport
+    assert abs(viewport['height']*ratio*factor-1080) < 2, viewport
+    player.stop(); QTest.qWait(50)
+root.close(); root.deleteLater(); QTest.qWait(50)
+''')
+
 
 if __name__ == "__main__":
     unittest.main()
