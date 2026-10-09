@@ -179,6 +179,7 @@ from spritelink_update import (
     release_is_newer,
 )
 from spritelink_video import (
+    VIDEO_EMBED_BORDER_COLOR,
     DirectVideoThumbnail,
     VideoInfo,
     VideoPlayer,
@@ -14584,7 +14585,7 @@ QComboBox::drop-down {
                 self.embedded_image_preview_sizes[url] = preview_size
             self._set_rendered_inline_image(
                 url,
-                self._unloaded_image_placeholder(*preview_size),
+                self._unloaded_image_placeholder(*preview_size, url=url),
                 loaded=False,
             )
             if self.current_image_preview_url != url:
@@ -15577,7 +15578,7 @@ QComboBox::drop-down {
         media: RemoteMediaPreview,
     ) -> QImage:
         if is_likely_nsfw_image_url(url):
-            return self._likely_nsfw_image_placeholder()
+            return self._likely_nsfw_image_placeholder(url=url)
         if media.kind == "video":
             return video_thumbnail(media.frame, EMBEDDED_IMAGE_MAX_WIDTH, EMBEDDED_IMAGE_MAX_HEIGHT)
         if isinstance(media.frame, QImage) and not media.frame.isNull():
@@ -15588,6 +15589,8 @@ QComboBox::drop-down {
         self,
         width: int,
         height: int,
+        *,
+        url: str = "",
     ) -> QImage:
         placeholder = QImage(
             max(1, int(width)),
@@ -15596,7 +15599,7 @@ QComboBox::drop-down {
         )
         placeholder.fill(QColor("#d0d0d0"))
         painter = QPainter(placeholder)
-        painter.setPen(QColor("#aaaaaa"))
+        painter.setPen(QColor(VIDEO_EMBED_BORDER_COLOR if is_click_to_play_video_url(url) else "#aaaaaa"))
         painter.drawRect(placeholder.rect().adjusted(0, 0, -1, -1))
         painter.end()
         return placeholder
@@ -15629,7 +15632,7 @@ QComboBox::drop-down {
                     EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
                 )
                 self.embedded_image_preview_sizes[url] = preview_size
-            preview = self._unloaded_image_placeholder(*preview_size)
+            preview = self._unloaded_image_placeholder(*preview_size, url=url)
 
         link_token = hashlib.sha256(
             f"{client_id}\0{url}".encode("utf-8")
@@ -15692,7 +15695,7 @@ QComboBox::drop-down {
         painter.end()
         return placeholder
 
-    def _likely_nsfw_image_placeholder(self) -> QImage:
+    def _likely_nsfw_image_placeholder(self, *, url: str = "") -> QImage:
         placeholder = QImage(
             NSFW_IMAGE_PLACEHOLDER_SIZE,
             NSFW_IMAGE_PLACEHOLDER_SIZE,
@@ -15704,7 +15707,7 @@ QComboBox::drop-down {
             QPainter.RenderHint.TextAntialiasing,
             not self._is_windows_classic_theme(),
         )
-        painter.setPen(QColor("#c29a70"))
+        painter.setPen(QColor(VIDEO_EMBED_BORDER_COLOR if is_click_to_play_video_url(url) else "#c29a70"))
         painter.drawRect(placeholder.rect().adjusted(0, 0, -1, -1))
         painter.setPen(QColor("#704825"))
         painter.setFont(self._make_font(

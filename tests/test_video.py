@@ -122,14 +122,14 @@ class VideoControlsTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_thumbnail_has_size_limit_black_border_and_play_symbol(self):
+    def test_thumbnail_has_size_limit_blue_border_and_play_symbol(self):
         frame = QImage(1920, 1080, QImage.Format.Format_RGB32)
         frame.fill(QColor("white"))
         result = V.video_thumbnail(frame, S.EMBEDDED_IMAGE_MAX_WIDTH, S.EMBEDDED_IMAGE_MAX_HEIGHT)
         self.assertLessEqual(result.width(), 256)
         self.assertLessEqual(result.height(), 96)
-        self.assertEqual(result.pixelColor(0, 0), QColor("black"))
-        self.assertEqual(result.pixelColor(result.width() - 1, 0), QColor("black"))
+        self.assertEqual(result.pixelColor(0, 0), QColor("blue"))
+        self.assertEqual(result.pixelColor(result.width() - 1, 0), QColor("blue"))
         self.assertNotEqual(result.pixelColor(result.width() // 2 - 12, result.height() // 2), QColor("white"))
         self.assertEqual(result.pixelColor(15, 15), QColor("white"))
 

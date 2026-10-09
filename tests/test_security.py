@@ -81,7 +81,7 @@ class LazyViewportMediaTests(unittest.TestCase):
             preview_source,
         )
         self.assertIn(
-            "preview = self._unloaded_image_placeholder(*preview_size)",
+            "preview = self._unloaded_image_placeholder(*preview_size, url=url)",
             preview_source,
         )
         self.assertIn(
@@ -127,7 +127,7 @@ class LazyViewportMediaTests(unittest.TestCase):
             insert_source,
         )
         self.assertIn(
-            "preview = self._unloaded_image_placeholder(*preview_size)",
+            "preview = self._unloaded_image_placeholder(*preview_size, url=url)",
             insert_source,
         )
         self.assertEqual(SPRITELINK.EMBEDDED_IMAGE_PLACEHOLDER_SIZE, 48)

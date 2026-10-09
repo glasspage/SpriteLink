@@ -30,6 +30,7 @@ MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024
 MAX_THUMBNAIL_PIXELS = 16 * 1024 * 1024
 YOUTUBE_ZOOM_FACTOR = 0.25
 DEFAULT_VIDEO_VOLUME = 20
+VIDEO_EMBED_BORDER_COLOR = "#0000ff"
 
 
 YOUTUBE_CHROME_SCRIPT = r"""
@@ -268,7 +269,7 @@ def video_thumbnail(frame: QImage | None, width: int, height: int) -> QImage:
                         QImage.Format.Format_ARGB32_Premultiplied)
         result.fill(QColor("#30343a"))
     painter = QPainter(result)
-    painter.setPen(QPen(QColor("black"), 1))
+    painter.setPen(QPen(QColor(VIDEO_EMBED_BORDER_COLOR), 1))
     painter.drawRect(result.rect().adjusted(0, 0, -1, -1))
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     center = QPointF(result.width() / 2, result.height() / 2)
