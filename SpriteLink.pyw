@@ -177,7 +177,6 @@ from spritelink_update import (
     release_is_newer,
 )
 from spritelink_video import (
-    configure_video_rendering,
     DirectVideoThumbnail,
     VideoInfo,
     VideoPlayer,
@@ -6155,7 +6154,6 @@ class MessageLogBrowser(QTextBrowser):
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
-        configure_video_rendering()
         super().__init__()
         if os.name == "nt":
             # Allocate an alpha backing store before the native HWND exists.
@@ -17149,7 +17147,6 @@ def main() -> None:
             )
         except Exception:
             pass
-    configure_video_rendering()
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("SpriteLink")
     window_icon = QIcon(str(WINDOW_ICON_PATH))

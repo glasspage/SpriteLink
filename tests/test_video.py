@@ -257,103 +257,126 @@ class VideoControlsTests(unittest.TestCase):
         view.close()
         view.deleteLater()
 
-    def test_browser_resize_holds_last_frame_until_matching_render_completes(self):
-        canvas, backend = V.VideoCanvas(), QWidget()
-        backend.setStyleSheet("background:blue")
-        canvas.resize(320, 240)
-        canvas.set_backend(backend)
-        canvas.show()
-        QTest.qWait(20)
-        self.assertFalse(canvas.hold.isVisible())
-        old_frame = QImage(320, 180, QImage.Format.Format_RGB32)
-        old_frame.fill(QColor("blue"))
-        with mock.patch.object(canvas, "_snapshot", return_value=old_frame):
-            canvas.resize(480, 240)
-        self.assertTrue(canvas.hold.isVisible())
-        self.assertEqual(canvas.hold.frame, old_frame)
-        self.assertEqual(backend.geometry().center(), canvas.rect().center())
-        # Missing frames and stale paint callbacks never replace the held image.
-        canvas._finish_resize()
-        self.assertTrue(canvas.hold.isVisible())
-        canvas._paint_finished(canvas._epoch - 1)
-        self.assertTrue(canvas.hold.isVisible())
-        canvas._frame_ready = True
-        for frame in (QImage(), old_frame):
-            with mock.patch.object(canvas, "_snapshot", return_value=frame):
-                canvas._finish_resize()
-            self.assertTrue(canvas.hold.isVisible())
-        valid_frame = QImage(backend.size(), QImage.Format.Format_RGB32)
-        valid_frame.fill(QColor("green"))
-        with mock.patch.object(canvas, "_snapshot", return_value=valid_frame):
-            canvas._finish_resize()
-        self.assertFalse(canvas.hold.isVisible())
-        canvas.clear_backend()
-        self.assertFalse(canvas._settle_timer.isActive())
-        self.assertTrue(canvas.hold.frame.isNull())
-        canvas.close()
-        canvas.deleteLater()
+    def test_browser_frames_stay_centered_and_gpu_host_is_separate_during_resize(self):
+        root, browser = QWidget(), QWidget()
+        root.resize(320, 240)
+        layout = QVBoxLayout(root)
+        browser.setStyleSheet("background:blue")
+        mirror = V.BrowserFrameView(browser)
+        layout.addWidget(mirror)
+        root.show()
+        QTest.qWait(30)
+        mirror._capture_frame()
+        self.assertFalse(root.isAncestorOf(browser))
+        self.assertTrue(browser.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen))
+        self.assertFalse(browser.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground))
+        original = mirror.frame.copy()
+        self.assertFalse(original.isNull())
+        browser_size = browser.size()
+        for size in ((480, 240), (100, 250), (640, 360)):
+            root.resize(*size)
+            layout.activate()
+            # Only the raster display resizes; Chromium's render surface and
+            # the last valid frame remain stable throughout the drag.
+            self.assertEqual(mirror.frame, original)
+            self.assertEqual(browser.size(), browser_size)
+            result = mirror.grab().toImage()
+            self.assertEqual(result.pixelColor(mirror.width()//2, mirror.height()//2), QColor("blue"))
+            fitted = original.size().scaled(mirror.size(), Qt.AspectRatioMode.KeepAspectRatio)
+            if fitted.width() < mirror.width():
+                self.assertEqual(result.pixelColor(0, mirror.height()//2), QColor("black"))
+            if fitted.height() < mirror.height():
+                self.assertEqual(result.pixelColor(mirror.width()//2, 0), QColor("black"))
+        wrong_size = QImage(15, 15, QImage.Format.Format_RGB32)
+        wrong_size.fill(QColor("green"))
+        for invalid in (QImage(), wrong_size):
+            with mock.patch.object(mirror, "_snapshot", return_value=invalid):
+                mirror._capture_frame()
+            self.assertEqual(mirror.frame, original)
+        mirror.release()
+        self.assertFalse(mirror._frame_timer.isActive())
+        self.assertTrue(mirror.frame.isNull())
+        self.assertIsNone(mirror.browser)
+        root.close(); browser.close()
+        root.deleteLater(); browser.deleteLater()
 
     @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the browser styling script")
-    def test_youtube_overlay_styling_is_scoped_to_trusted_embed_documents(self):
+    def test_youtube_overlay_styling_handles_new_markup_and_mutations_only_in_embed_documents(self):
         runner = r"""
 const fs=require('fs'), vm=require('vm'), source=fs.readFileSync(0,'utf8');
 const output=[];
+function element(kind='') {
+  const e={kind, children:[], value:'', priority:'',
+    style:{getPropertyValue:()=>e.value, getPropertyPriority:()=>e.priority,
+           setProperty:(n,v,p)=>{e.value=v;e.priority=p;}},
+    matches:s=>['error','ad'].includes(kind),
+    querySelector:s=>e.children.find(x=>s==='video'?x.kind==='video':['error','ad'].includes(x.kind))||null};
+  e.add=x=>{e.children.push(x);x.parentElement=e;};return e;
+}
 for (const [hostname,pathname] of [
   ['www.youtube.com','/embed/M7lc1UVf-VE'], ['www.youtube-nocookie.com','/embed/M7lc1UVf-VE'],
   ['www.youtube.com','/watch'], ['www.youtube.com.evil.test','/embed/M7lc1UVf-VE'],
   ['player.vimeo.com','/embed/M7lc1UVf-VE']]) {
-  const styles=[];
-  const c={location:{hostname,pathname},document:{createElement:()=>({}),head:{appendChild:s=>styles.push(s)}}};
-  vm.runInNewContext(source,c); output.push(styles);
+  const player=element(),video=element('video'),ui=element('unknown-new-control');
+  const error=element('error'),ad=element('ad');
+  player.add(video);player.add(ui);player.add(error);player.add(ad);
+  let observer;
+  const c={window:{},location:{hostname,pathname},document:{getElementById:()=>player},
+           MutationObserver:class {constructor(f){observer=f;} observe(){}}};
+  vm.runInNewContext(source,c);
+  const initial=ui.value;
+  const added=element('new-caption-ui');player.add(added);
+  ui.value='block';if(observer)observer();
+  vm.runInNewContext(source,c); // Reinjection must be idempotent.
+  output.push({initial,restored:ui.value,added:added.value,error:error.value,ad:ad.value,controls:video.controls});
 }
 process.stdout.write(JSON.stringify(output));
 """
         result = subprocess.run([shutil.which("node"), "-e", runner], input=V.YOUTUBE_CHROME_SCRIPT,
                                 text=True, capture_output=True, check=True)
         output = json.loads(result.stdout)
-        for styles in output[:2]:
-            self.assertEqual(len(styles), 1)
-            sheet = styles[0]["textContent"]
-            for selector in (".ytp-chrome-top", ".ytp-large-play-button", ".ytp-bezel",
-                             ".ytp-pause-overlay", ".ytp-caption-window-container"):
-                self.assertIn(selector, sheet)
-            self.assertNotIn(".ytp-error", sheet)
-        self.assertEqual(output[2:], [[], [], []])
+        for state in output[:2]:
+            self.assertEqual(state, {"initial":"none", "restored":"none", "added":"none",
+                                     "error":"", "ad":"", "controls":False})
+        for state in output[2:]:
+            self.assertEqual(state["initial"], "")
+            self.assertEqual(state["restored"], "block")
+            self.assertEqual(state["added"], "")
         youtube = V.VideoInfo(V.VideoLink("youtube", "M7lc1UVf-VE", ""), "youtube.com")
         self.assertIn("pointer-events:none", V.provider_player_html(youtube))
         vimeo = V.VideoInfo(V.VideoLink("vimeo", "123456", ""), "vimeo.com")
         self.assertNotIn("pointer-events:none", V.provider_player_html(vimeo))
 
-    def test_quick_renderer_releases_held_frame_after_resizing_without_swap_signals(self):
+    def test_quick_renderer_is_isolated_from_translucent_window_and_survives_resize(self):
         runner = r"""
 import sys
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
-from spritelink_video import VideoCanvas, configure_video_rendering
-configure_video_rendering()
+from spritelink_video import BrowserFrameView
 app = QApplication([])
-root = QWidget(); root.resize(640, 480); QVBoxLayout(root)
-canvas = VideoCanvas(); root.layout().addWidget(canvas)
+root = QWidget(); root.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+root.resize(640, 480); QVBoxLayout(root)
 backend = QWidget(); layout = QVBoxLayout(backend); layout.setContentsMargins(0, 0, 0, 0)
-canvas.set_backend(backend); root.show(); QTest.qWait(20)
+mirror = BrowserFrameView(backend); root.layout().addWidget(mirror); root.show()
 quick = QQuickWidget(); quick.setMinimumSize(0, 0)
 quick.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
 quick.setSource(QUrl.fromLocalFile(sys.argv[1])); layout.addWidget(quick)
 QTest.qWait(80)
-assert canvas._quick is quick
-assert not canvas._resizing
+assert root.findChildren(QQuickWidget) == []
+assert backend.findChildren(QQuickWidget) == [quick]
+mirror._capture_frame()
 for size in ((480, 360), (800, 450), (400, 600)):
+    old = mirror.frame.copy()
     root.resize(*size); root.layout().activate()
-    assert not canvas.hold.frame.isNull()
-    assert canvas.hold.frame.pixelColor(canvas.hold.frame.width()//2, canvas.hold.frame.height()//2) == QColor('blue')
-    QTest.qWait(80)
-    assert not canvas.hold.isVisible()
-    assert not canvas._resizing
-    assert quick.grabFramebuffer().size() == backend.size()
-canvas.clear_backend(); root.close(); root.deleteLater(); QTest.qWait(20)
+    assert mirror.frame == old
+    QTest.qWait(140)
+    assert mirror.frame.pixelColor(mirror.frame.width()//2, mirror.frame.height()//2) == QColor('blue')
+    assert mirror.frame.size() == backend.size()
+    assert root.findChildren(QQuickWidget) == []
+mirror.release(); backend.deleteLater(); root.close(); root.deleteLater(); QTest.qWait(20)
 """
         with TemporaryDirectory() as folder:
             filename = folder + "/renderer.qml"
