@@ -27,7 +27,12 @@ a = Analysis(
         ("sounds", "sounds"),
         ("assets", "assets"),
     ],
-    hiddenimports=generated_hidden_imports + ["PySide6.QtSvg"],
+    hiddenimports=generated_hidden_imports + [
+        "PySide6.QtSvg",
+        "PySide6.QtMultimediaWidgets",
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineWidgets",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

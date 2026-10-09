@@ -176,6 +176,14 @@ from spritelink_update import (
     fetch_latest_release,
     release_is_newer,
 )
+from spritelink_video import (
+    DirectVideoThumbnail,
+    VideoInfo,
+    VideoPlayer,
+    fetch_video_info,
+    video_link,
+    video_thumbnail,
+)
 
 try:
     from cryptography.hazmat.primitives import hashes, serialization
@@ -629,6 +637,16 @@ TRUSTED_LINK_DOMAINS = (
     "youtube.com",
     "youtu.be",
     "ytimg.com",
+    "youtube-nocookie.com",
+    "vimeo.com",
+    "vimeocdn.com",
+    "dailymotion.com",
+    "dai.ly",
+    "dmcdn.net",
+    "streamable.com",
+    "streamablecdn.com",
+    "googlevideo.com",
+    "ttvnw.net",
     "github.com",
     "githubassets.com",
     "githubusercontent.com",
@@ -2535,6 +2553,16 @@ def is_embeddable_media_url(url: str) -> bool:
         is_direct_image_url(url)
         or is_trusted_looping_video_url(url)
         or is_supported_media_page_url(url)
+        or is_click_to_play_video_url(url)
+    )
+
+
+def is_click_to_play_video_url(url: str) -> bool:
+    # GIF-style clips retain their existing silent looping behavior.
+    return (
+        not is_trusted_looping_video_url(url)
+        and not is_supported_media_page_url(url)
+        and video_link(url, lambda candidate: analyze_link_url(candidate).trusted) is not None
     )
 
 
@@ -2738,6 +2766,8 @@ def is_image_url_trusted_for_sender(
     is_local: bool,
     trusted_user_ids: set[str],
 ) -> bool:
+    if is_click_to_play_video_url(url):
+        return analyze_link_url(url).trusted
     return (
         is_local
         or client_id in trusted_user_ids
@@ -6161,6 +6191,8 @@ class RemoteMediaPreview:
     data: bytes
     kind: str
     frame: QImage | None
+    video_info: VideoInfo | None = None
+    thumbnail_attempted: bool = False
 
 
 class AnimatedMediaController(QObject):
@@ -7794,6 +7826,7 @@ QComboBox::drop-down {
             self.image_preview_panel.setStyleSheet(
                 self._config_panel_stylesheet()
             )
+        EncryptedChatClient._apply_video_player_theme(self)
         if hasattr(self, "link_warning_panel"):
             self.link_warning_panel.setStyleSheet(
                 self._config_panel_stylesheet()
@@ -10151,6 +10184,7 @@ QComboBox::drop-down {
         self.image_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_preview_label.setMinimumHeight(96)
         panel_layout.addWidget(self.image_preview_label, 1)
+        self.video_player: VideoPlayer | None = None
 
         button_row = QHBoxLayout()
         self.image_preview_button_row = button_row
@@ -10307,7 +10341,15 @@ QComboBox::drop-down {
         url: str,
         media: RemoteMediaPreview,
     ) -> None:
-        if media.kind not in {"animated_gif", "looping_video"}:
+        if media.kind == "video":
+            if (
+                media.video_info is None
+                or media.video_info.link.provider != "direct"
+                or media.frame is not None
+                or media.thumbnail_attempted
+            ):
+                return
+        elif media.kind not in {"animated_gif", "looping_video"}:
             return
         if url in self.animated_media_controllers:
             return
@@ -10322,7 +10364,11 @@ QComboBox::drop-down {
             controller.deleteLater()
             self.last_inline_animation_frame_at.pop(oldest_url, None)
 
-        controller = AnimatedMediaController(url, media, self)
+        if media.kind == "video":
+            media.thumbnail_attempted = True
+            controller = DirectVideoThumbnail(media.source_url, self)
+        else:
+            controller = AnimatedMediaController(url, media, self)
         controller.frame_ready.connect(self._on_animated_media_frame)
         self.animated_media_controllers[url] = controller
         controller.start()
@@ -10338,8 +10384,16 @@ QComboBox::drop-down {
         if not isinstance(media, RemoteMediaPreview):
             return
         media.frame = frame_value
+        if media.kind == "video" and media.video_info is not None:
+            controller = self.animated_media_controllers.get(url)
+            if isinstance(controller, DirectVideoThumbnail) and controller.duration:
+                info = media.video_info
+                media.video_info = VideoInfo(
+                    info.link, info.hostname, info.title, info.author,
+                    controller.duration, info.thumbnail_url,
+                )
 
-        if self.current_image_preview_url == url:
+        if self.current_image_preview_url == url and media.kind != "video":
             self._set_large_image_preview_frame(frame_value)
 
         if is_likely_nsfw_image_url(url):
@@ -10354,6 +10408,9 @@ QComboBox::drop-down {
             media,
             frame_value,
         )
+        if media.kind == "video":
+            self._set_rendered_inline_image(url, preview, loaded=True)
+            return
         token = hashlib.sha256(url.encode("utf-8")).hexdigest()
         resource_url = QUrl(f"spritelink-chat-image-resource:{token}")
         document = self.chat_display.document()
@@ -10415,6 +10472,9 @@ QComboBox::drop-down {
         media = self.image_preview_cache.get(url)
         if not isinstance(media, RemoteMediaPreview):
             return
+        if self.video_player is not None:
+            self.video_player.stop()
+            self.video_player.hide()
         self._hide_chat_tooltip()
         self.current_image_preview_url = url
         self.current_image_preview_client_id = client_id
@@ -10422,6 +10482,20 @@ QComboBox::drop-down {
         self._sync_image_preview_overlay_geometry()
         self.image_preview_overlay.show()
         self.image_preview_overlay.raise_()
+        if media.kind == "video" and media.video_info is not None:
+            if self.video_player is None:
+                self.video_player = VideoPlayer(self.image_preview_panel, ThemeSlider)
+                self.video_player.duration_available.connect(self._on_video_duration_available)
+                self.video_player.popup_closed.connect(self._hide_image_preview_popup)
+                self.video_player.open_in_browser.connect(self._open_current_image_in_browser)
+                self.image_preview_panel.layout().insertWidget(0, self.video_player, 1)
+            self.image_preview_label.hide()
+            self.video_player.show()
+            self._apply_ui_size_to_widget_tree(self.video_player)
+            self._apply_video_player_theme()
+            self.video_player.load(media.video_info)
+        else:
+            self.image_preview_label.show()
         self._update_image_preview_popup()
         QTimer.singleShot(0, self._update_image_preview_popup)
 
@@ -10433,7 +10507,23 @@ QComboBox::drop-down {
             self.image_preview_url_label.clear()
             return
         self._ensure_animated_media_controller(url or "", media)
-        if isinstance(media.frame, QImage) and not media.frame.isNull():
+        if (
+            media.kind == "video" and self.video_player is not None
+            and self.video_player._fullscreen is None
+        ):
+            margins = self.image_preview_overlay.layout().contentsMargins()
+            self.video_player.fit_viewport(
+                max(100, self.image_preview_overlay.height() - margins.top() - margins.bottom()
+                    - self.image_preview_button_row.sizeHint().height() - 44),
+                self.video_player.width(),
+            )
+            if (
+                media.video_info is not None
+                and media.video_info.link.provider == "youtube"
+                and self.video_player.maximumHeight() - self.video_player.controls.sizeHint().height() - 4 < 200
+            ):
+                self.video_player.pop_out()
+        elif isinstance(media.frame, QImage) and not media.frame.isNull():
             self._set_large_image_preview_frame(media.frame)
         else:
             self.image_preview_label.setPixmap(QPixmap())
@@ -10451,6 +10541,10 @@ QComboBox::drop-down {
     def _hide_image_preview_popup(self) -> None:
         url = self.current_image_preview_url
         self.image_preview_overlay.hide()
+        if self.video_player is not None:
+            self.video_player.stop()
+            self.video_player.hide()
+        self.image_preview_label.show()
         self.current_image_preview_url = None
         self.current_image_preview_client_id = None
         self.image_preview_label.clear()
@@ -10463,6 +10557,27 @@ QComboBox::drop-down {
                 controller.deleteLater()
             self.last_inline_animation_frame_at.pop(url, None)
         self.message_entry.setFocus()
+
+    def _apply_video_player_theme(self) -> None:
+        player = getattr(self, "video_player", None)
+        if player is None:
+            return
+        theme = str(self.theme_var.get())
+        position = client_theme_color(self, theme)
+        transform = (
+            (lambda text: classic_theme_stylesheet(text, position))
+            if theme == "Classic"
+            else (lambda text: hue_theme_stylesheet(text, position))
+        )
+        player.set_theme(theme, transform, self._is_tiny_ui())
+
+    def _on_video_duration_available(self, duration: int) -> None:
+        media = self.image_preview_cache.get(self.current_image_preview_url or "")
+        if isinstance(media, RemoteMediaPreview) and media.video_info is not None:
+            info = media.video_info
+            media.video_info = VideoInfo(
+                info.link, info.hostname, info.title, info.author, duration, info.thumbnail_url,
+            )
 
     def _open_current_image_in_browser(self) -> None:
         if self.current_image_preview_url:
@@ -11252,6 +11367,7 @@ QComboBox::drop-down {
         self._apply_titlebar_theme()
         self._applied_theme_color = (theme, position)
         self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
+        EncryptedChatClient._apply_video_player_theme(self)
         return True
 
     def _save_theme_colors(self) -> None:
@@ -12745,7 +12861,14 @@ QComboBox::drop-down {
                     if self._tray_ui_suspended:
                         continue
                     media: RemoteMediaPreview | None = None
-                    if isinstance(data, bytes) and data:
+                    video_info = payload.get("video_info")
+                    if kind == "video" and isinstance(video_info, VideoInfo):
+                        frame = QImage.fromData(data) if isinstance(data, bytes) and data else QImage()
+                        media = RemoteMediaPreview(
+                            source_url, data or b"", kind,
+                            frame if not frame.isNull() else None, video_info,
+                        )
+                    elif isinstance(data, bytes) and data:
                         if kind == "looping_video":
                             media = RemoteMediaPreview(
                                 source_url,
@@ -13810,8 +13933,17 @@ QComboBox::drop-down {
         self._pending_tooltip_message_id = None
         if not message_id or message_id != self._hovered_message_id:
             return
-        item = self.rendered_message_items.get(message_id)
-        tooltip = self._tooltip_for_message_item(item) if item else ""
+        if message_id.startswith("video:"):
+            url = message_id[len("video:"):]
+            media = self.image_preview_cache.get(url)
+            tooltip = (
+                media.video_info.tooltip()
+                if isinstance(media, RemoteMediaPreview) and media.video_info is not None
+                else escape(urlsplit(url).hostname or "")
+            )
+        else:
+            item = self.rendered_message_items.get(message_id)
+            tooltip = self._tooltip_for_message_item(item) if item else ""
         if tooltip:
             QToolTip.showText(
                 self._pending_tooltip_global_position,
@@ -14230,6 +14362,18 @@ QComboBox::drop-down {
             self.pending_image_previews.discard(url)
 
     def _fetch_remote_image_preview(self, url: str) -> None:
+        if is_click_to_play_video_url(url):
+            link = video_link(url, lambda candidate: analyze_link_url(candidate).trusted)
+            if link is not None:
+                info, data = fetch_video_info(
+                    link, lambda candidate: analyze_link_url(candidate).trusted,
+                )
+                if not self._closing:
+                    self._queue_ui_event(("image_preview_loaded", {
+                        "url": url, "source_url": link.source_url, "kind": "video",
+                        "data": data, "video_info": info,
+                    }))
+                return
         image_data: bytes | None = None
         media_kind: str | None = None
         source_url = url
@@ -14504,6 +14648,10 @@ QComboBox::drop-down {
                         self._schedule_chat_tooltip(
                             message_id,
                             event.globalPosition().toPoint(),
+                        )
+                    elif (image_url := self._image_url_from_anchor(anchor)) and is_click_to_play_video_url(image_url):
+                        self._schedule_chat_tooltip(
+                            "video:" + image_url, event.globalPosition().toPoint(),
                         )
                     else:
                         self._hide_chat_tooltip()
@@ -15113,6 +15261,8 @@ QComboBox::drop-down {
         media: RemoteMediaPreview,
         frame: QImage,
     ) -> QImage:
+        if media.kind == "video":
+            return video_thumbnail(frame, EMBEDDED_IMAGE_MAX_WIDTH, EMBEDDED_IMAGE_MAX_HEIGHT)
         preserve_native_size = (
             frame.width() <= EMBEDDED_IMAGE_MAX_WIDTH
             and frame.height() <= EMBEDDED_IMAGE_MAX_HEIGHT
@@ -15151,6 +15301,8 @@ QComboBox::drop-down {
     ) -> QImage:
         if is_likely_nsfw_image_url(url):
             return self._likely_nsfw_image_placeholder()
+        if media.kind == "video":
+            return video_thumbnail(media.frame, EMBEDDED_IMAGE_MAX_WIDTH, EMBEDDED_IMAGE_MAX_HEIGHT)
         if isinstance(media.frame, QImage) and not media.frame.isNull():
             return self._scaled_inline_media_frame(media, media.frame)
         return self._animated_media_loading_placeholder()
@@ -16818,6 +16970,8 @@ QComboBox::drop-down {
         for controller in self.animated_media_controllers.values():
             controller.stop()
         self.animated_media_controllers.clear()
+        if self.video_player is not None:
+            self.video_player.stop()
         self.last_inline_animation_frame_at.clear()
         self.history_load_executor.shutdown(
             wait=False,
