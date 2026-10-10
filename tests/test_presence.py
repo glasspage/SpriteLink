@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from cryptography.exceptions import InvalidTag
 from test_security import SPRITELINK as S
 
 
@@ -23,6 +24,8 @@ class PresenceTests(unittest.TestCase):
             session=mock.Mock(),
             _queue_ui_event=mock.Mock(),
         )
+        self.global_topic = S.derive_ntfy_topic(S.GLOBAL_CHATROOM_KEY)
+        self.client._chatroom_definitions = lambda: [{"key": S.GLOBAL_CHATROOM_KEY}]
         self.clock = mock.patch.object(S.time, "time", side_effect=lambda: self.now)
         self.save = mock.patch.object(S, "save_config")
         self.clock.start()
@@ -35,7 +38,7 @@ class PresenceTests(unittest.TestCase):
 
     def record(self, token, timestamp=None):
         return {"event": "message", "time": self.now if timestamp is None else timestamp,
-                "message": S.make_recently_online_packet(token)}
+                "message": S.make_recently_online_packet(token, [self.global_topic])}
 
     def test_packets_are_randomized_and_deduplicate_without_chat_identity(self):
         token = "ab" * 16
@@ -46,12 +49,98 @@ class PresenceTests(unittest.TestCase):
         self.assertNotEqual(topic, S.derive_ntfy_topic(S.GLOBAL_CHATROOM_KEY))
         raw = S.base64.b64decode(first["message"])
         plaintext = S.ChaCha20Poly1305(key).decrypt(
-            raw[1:13], raw[13:], b"SpriteLink-recently-online-v1"
+            raw[1:13], raw[13:], S.RECENTLY_ONLINE_AAD
         )
-        self.assertEqual(plaintext, bytes.fromhex(token))
-        self.assertEqual(S.recently_online_pings([first, second], now=self.now), {token: self.now})
+        self.assertEqual(json.loads(plaintext), {"token": token, "topics": [self.global_topic]})
+        self.assertEqual(S.recently_online_pings([first, second], now=self.now), {token: (self.now, (self.global_topic,))})
 
-    def test_tally_uses_exact_six_hour_window_and_rejects_invalid_packets(self):
+    def test_counts_each_topic_once_per_token_and_uses_latest_retry(self):
+        private = S.derive_ntfy_topic("private-room-key")
+        other = S.derive_ntfy_topic("other-room-key")
+        def record(token, topics, timestamp):
+            return {"time": timestamp, "message": S.make_recently_online_packet(token, topics)}
+        older = record("aa" * 16, [self.global_topic, other], self.now - 1)
+        latest = record("aa" * 16, [self.global_topic, private, private], self.now)
+        second_user = record("bb" * 16, [self.global_topic, other], self.now)
+        for records in ([older, latest, latest, second_user], [latest, second_user, older]):
+            with self.subTest(records=records):
+                counts = S.recently_online_topic_counts(S.recently_online_pings(records, now=self.now))
+                self.assertEqual(counts, {self.global_topic: 2, private: 1, other: 1})
+
+    def test_published_room_list_includes_global_and_all_resident_rooms(self):
+        keys = [S.GLOBAL_CHATROOM_KEY, "private-secret", "muted-secret"]
+        self.client._chatroom_definitions = lambda: [{"key": key} for key in keys]
+        self.client.active_chatroom_id = "private"
+        self.step(100)
+        packet = self.client.session.post.call_args.kwargs["data"].decode("ascii")
+        raw = S.base64.b64decode(packet)
+        _topic, key = S.recently_online_transport()
+        payload = json.loads(S.ChaCha20Poly1305(key).decrypt(raw[1:13], raw[13:], S.RECENTLY_ONLINE_AAD))
+        topics = sorted(S.derive_ntfy_topic(key) for key in keys)
+        self.assertEqual(payload["topics"], topics)
+        self.assertEqual(set(payload), {"token", "topics"})
+        for topic in topics:
+            self.assertNotIn(topic, packet)
+        self.client.session.get.return_value.text = json.dumps({"event": "message", "time": self.now, "message": packet})
+        self.step(106)
+        self.assertEqual(self.client._queue_ui_event.call_args.args[0],
+                         ("recently_online", (self.server, dict.fromkeys(topics, 1))))
+
+    def test_protocol_rotation_is_incompatible_in_both_directions(self):
+        passphrase = S.GLOBAL_CHATROOM_KEY + "\0SpriteLink-recently-online-v1"
+        old_key = S.HKDF(algorithm=S.hashes.SHA256(), length=32,
+                        salt=b"SpriteLink-recently-online-v1", info=b"anonymous-ping").derive(passphrase.encode())
+        topic, key = S.recently_online_transport()
+        self.assertNotEqual(topic, S.derive_ntfy_topic(passphrase))
+        self.assertNotEqual(key, old_key)
+        nonce = b"0" * 12
+        old_ciphertext = S.ChaCha20Poly1305(old_key).encrypt(nonce, bytes.fromhex("ab" * 16), b"SpriteLink-recently-online-v1")
+        packet = S.base64.b64encode(b"\x01" + nonce + old_ciphertext).decode()
+        self.assertEqual(S.recently_online_pings([{"time": self.now, "message": packet}], now=self.now), {})
+        raw = S.base64.b64decode(self.record("ab" * 16)["message"])
+        with self.assertRaises(InvalidTag):
+            S.ChaCha20Poly1305(old_key).decrypt(raw[1:13], raw[13:], b"SpriteLink-recently-online-v1")
+        # Changing the header cannot make a legacy ciphertext valid in v2.
+        packet = S.base64.b64encode(bytes([S.RECENTLY_ONLINE_VERSION]) + nonce + old_ciphertext).decode()
+        self.assertEqual(S.recently_online_pings([{"time": self.now, "message": packet}], now=self.now), {})
+
+    def test_legacy_publish_state_does_not_delay_first_new_protocol_ping(self):
+        self.client.config_data["recently_online_state"][self.server] = {
+            "sent_at": self.now, "pending_token": "aa" * 16,
+        }
+        self.assertTrue(self.step(100))
+        self.client.session.post.assert_called_once()
+        state = self.client.config_data["recently_online_state"][self.server]
+        self.assertEqual(state, {"version": S.RECENTLY_ONLINE_VERSION, "sent_at": self.now})
+        pings = S.recently_online_pings([{"time": self.now, "message": self.client.session.post.call_args.kwargs["data"].decode()}], now=self.now)
+        self.assertNotIn("aa" * 16, pings)
+
+    def test_rejects_authenticated_malformed_payloads_and_tampering(self):
+        _topic, key = S.recently_online_transport()
+        payloads = [[], {}, {"token": 1, "topics": [self.global_topic]},
+                    {"token": "bad", "topics": [self.global_topic]},
+                    {"token": "ab" * 16, "topics": self.global_topic},
+                    {"token": "ab" * 16, "topics": []},
+                    {"token": "ab" * 16, "topics": [None]},
+                    {"token": "ab" * 16, "topics": ["private-room-key"]}]
+        records = []
+        for payload in payloads:
+            nonce = S.os.urandom(12)
+            ciphertext = S.ChaCha20Poly1305(key).encrypt(nonce, json.dumps(payload).encode(), S.RECENTLY_ONLINE_AAD)
+            records.append({"time": self.now, "message": S.base64.b64encode(bytes([S.RECENTLY_ONLINE_VERSION]) + nonce + ciphertext).decode()})
+        raw = bytearray(S.base64.b64decode(self.record("ab" * 16)["message"]))
+        raw[-1] ^= 1
+        records.append({"time": self.now, "message": S.base64.b64encode(raw).decode()})
+        self.assertEqual(S.recently_online_pings(records, now=self.now), {})
+
+    def test_maker_rejects_invalid_topics_and_relay_oversized_packets(self):
+        for topics in ([], [None], ["private-room-key"]):
+            with self.subTest(topics=topics), self.assertRaises(ValueError):
+                S.make_recently_online_packet("ab" * 16, topics)
+        with self.assertRaises(ValueError):
+            S.make_recently_online_packet("ab" * 16, [S.derive_ntfy_topic(f"room-{i}") for i in range(100)])
+
+    def test_tally_uses_exact_three_hour_window_and_rejects_invalid_packets(self):
         cutoff = self.now - S.RECENTLY_ONLINE_INTERVAL_SECONDS
         valid = self.record("aa" * 16, cutoff + 1)
         damaged = self.record("bb" * 16)
@@ -60,9 +149,9 @@ class PresenceTests(unittest.TestCase):
                    damaged, {"time": True, "message": valid["message"]},
                    {"time": self.now, "message": None},
                    {"time": self.now, "message": "A" * 100_000}]
-        self.assertEqual(S.recently_online_pings(records, now=self.now), {"aa" * 16: cutoff + 1})
+        self.assertEqual(S.recently_online_pings(records, now=self.now), {"aa" * 16: (cutoff + 1, (self.global_topic,))})
 
-    def test_one_request_per_step_and_one_ping_per_six_hours_across_restart(self):
+    def test_one_request_per_step_and_one_ping_per_three_hours_across_restart(self):
         self.assertTrue(self.step(100))
         self.client.session.post.assert_called_once()
         self.client.session.get.assert_not_called()
@@ -71,7 +160,7 @@ class PresenceTests(unittest.TestCase):
             "event": "message", "time": self.now, "message": first,
         })
         self.assertTrue(self.step(106))
-        self.assertEqual(self.client.session.get.call_args.kwargs["params"], {"poll": "1", "since": "6h"})
+        self.assertEqual(self.client.session.get.call_args.kwargs["params"], {"poll": "1", "since": "3h"})
         self.assertEqual(self.client._queue_ui_event.call_args.args[0][0], "recently_online")
         self.assertEqual(len(self.client._queue_ui_event.call_args.args[0][1][1]), 1)
         self.assertFalse(self.step(112))
@@ -102,7 +191,7 @@ class PresenceTests(unittest.TestCase):
         self.step(200)
         packet = self.client.session.post.call_args.kwargs["data"].decode("ascii")
         self.assertEqual(S.recently_online_pings([{"time": self.now, "message": packet}], now=self.now),
-                         {pending: self.now})
+                         {pending: (self.now, (self.global_topic,))})
         self.assertNotIn("pending_token", disk["recently_online_state"][self.server])
         self.client._queue_ui_event.assert_called_once_with(("recently_online_sent", None))
 
@@ -133,7 +222,7 @@ class PresenceTests(unittest.TestCase):
             self.client._minimized_to_tray = True
         self.assertEqual(self.client.session.get.call_count, 3)
 
-    def test_six_hour_publishing_continues_in_tray_without_tallying(self):
+    def test_three_hour_publishing_continues_in_tray_without_tallying(self):
         self.client._minimized_to_tray = True
         self.assertTrue(self.step(100))
         self.assertFalse(self.step(400))
@@ -166,7 +255,7 @@ class PresenceTests(unittest.TestCase):
         }
         self.assertTrue(self.step(100))
         self.assertEqual(self.client.session.post.call_count, 1)
-        self.assertEqual(self.client.config_data["recently_online_state"][self.server], {"sent_at": self.now})
+        self.assertEqual(self.client.config_data["recently_online_state"][self.server], {"version": S.RECENTLY_ONLINE_VERSION, "sent_at": self.now})
 
     def _loop_requests(self, *, restore_during_wait=False):
         ticks = [0.0]
@@ -178,7 +267,7 @@ class PresenceTests(unittest.TestCase):
         self.client.send_queue = queue.Queue()
         self.client.window_on_screen_event = threading.Event()
         self.client.window_on_screen_event.set()
-        self.client._chatroom_definitions = lambda: [{"id": S.GLOBAL_CHATROOM_ID}]
+        self.client._chatroom_definitions = lambda: [{"id": S.GLOBAL_CHATROOM_ID, "key": S.GLOBAL_CHATROOM_KEY}]
         self.client._muted_chatroom_ids = lambda: set()
         self.client._network_poll = lambda *args, **kwargs: requests.append(("chat", ticks[0]))
         self.client._network_recently_online_step = lambda **kwargs: self.step(kwargs["now"])
@@ -208,7 +297,7 @@ class PresenceTests(unittest.TestCase):
         ])
 
     def test_restored_tally_wakes_worker_and_bypasses_chat_poll_wait(self):
-        self.client.config_data["recently_online_state"][self.server] = {"sent_at": self.now}
+        self.client.config_data["recently_online_state"][self.server] = {"version": S.RECENTLY_ONLINE_VERSION, "sent_at": self.now}
         self.client.recently_online_poll_attempts[self.server] = 0
         requests = self._loop_requests(restore_during_wait=True)
         interval = S.ON_SCREEN_POLL_INTERVAL_SECONDS

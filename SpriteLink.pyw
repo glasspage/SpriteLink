@@ -484,7 +484,9 @@ CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
 IMMEDIATE_CHATROOM_SWITCH_LIMIT = 2
 CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS = 6
 REQUEST_TIMEOUT_SECONDS = 10
-RECENTLY_ONLINE_INTERVAL_SECONDS = 6 * 60 * 60
+RECENTLY_ONLINE_INTERVAL_SECONDS = 3 * 60 * 60
+RECENTLY_ONLINE_VERSION = 2
+RECENTLY_ONLINE_AAD = b"SpriteLink-recently-online-v2"
 RECENTLY_ONLINE_POLL_SECONDS = 5 * 60
 RECENTLY_ONLINE_RETRY_SECONDS = 60
 SERVER_HISTORY_RETENTION_SECONDS = 12 * 60 * 60
@@ -3750,31 +3752,42 @@ def room_scope_id(server_url: str, passphrase: str) -> str:
 @lru_cache(maxsize=1)
 def recently_online_transport() -> tuple[str, bytes]:
     # Presence keys are separate from chat/signing keys; cache expensive derivation.
-    passphrase = GLOBAL_CHATROOM_KEY + "\0SpriteLink-recently-online-v1"
+    passphrase = GLOBAL_CHATROOM_KEY + "\0SpriteLink-recently-online-v2"
     key = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=b"SpriteLink-recently-online-v1",
-        info=b"anonymous-ping",
+        salt=RECENTLY_ONLINE_AAD,
+        info=b"anonymous-room-presence",
     ).derive(passphrase.encode("utf-8"))
     return derive_ntfy_topic(passphrase), key
 
 
-def make_recently_online_packet(token: str) -> str:
-    if not re.fullmatch(r"[0-9a-f]{32}", token):
+def make_recently_online_packet(token: str, topics: list[str]) -> str:
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
         raise ValueError("Invalid presence token.")
+    if not topics or any(
+        not isinstance(topic, str) or not re.fullmatch(r"e2chat-[a-z2-7]{39}", topic)
+        for topic in topics
+    ):
+        raise ValueError("Invalid presence topics.")
+    payload = json.dumps(
+        {"token": token, "topics": sorted(set(topics))}, separators=(",", ":"),
+    ).encode("utf-8")
     nonce = os.urandom(12)
     _topic, key = recently_online_transport()
     ciphertext = ChaCha20Poly1305(key).encrypt(
-        nonce, bytes.fromhex(token), b"SpriteLink-recently-online-v1"
+        nonce, payload, RECENTLY_ONLINE_AAD
     )
-    return base64.b64encode(b"\x01" + nonce + ciphertext).decode("ascii")
+    packet = base64.b64encode(bytes([RECENTLY_ONLINE_VERSION]) + nonce + ciphertext).decode("ascii")
+    if len(packet) > MAX_ENCRYPTED_PACKET_CHARS:
+        raise ValueError("Presence packet is too large.")
+    return packet
 
 
 def recently_online_pings(
     records: list[dict[str, Any]], *, now: float,
-) -> dict[str, int]:
-    pings: dict[str, int] = {}
+) -> dict[str, tuple[int, tuple[str, ...]]]:
+    pings: dict[str, tuple[int, tuple[str, ...]]] = {}
     _topic, key = recently_online_transport()
     for record in records:
         timestamp = record.get("time")
@@ -3783,20 +3796,44 @@ def recently_online_pings(
             type(timestamp) is not int
             or not now - RECENTLY_ONLINE_INTERVAL_SECONDS < timestamp <= now
             or not isinstance(packet, str)
-            or len(packet) != 60
+            or not 40 <= len(packet) <= MAX_ENCRYPTED_PACKET_CHARS
         ):
             continue
         try:
             raw = base64.b64decode(packet, validate=True)
-            if len(raw) != 45 or raw[0] != 1:
+            if len(raw) < 29 or raw[0] != RECENTLY_ONLINE_VERSION:
                 continue
-            token = ChaCha20Poly1305(key).decrypt(
-                raw[1:13], raw[13:], b"SpriteLink-recently-online-v1"
-            ).hex()
+            payload = json.loads(ChaCha20Poly1305(key).decrypt(
+                raw[1:13], raw[13:], RECENTLY_ONLINE_AAD
+            ))
+            if not isinstance(payload, dict):
+                continue
+            token, topics = payload.get("token"), payload.get("topics")
+            if (
+                not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)
+                or not isinstance(topics, list) or not topics
+                or any(
+                    not isinstance(topic, str) or not re.fullmatch(r"e2chat-[a-z2-7]{39}", topic)
+                    for topic in topics
+                )
+            ):
+                continue
         except Exception:
             continue
-        pings[token] = max(timestamp, pings.get(token, timestamp))
+        # Use the newest retry's room list, regardless of relay response order.
+        if token not in pings or timestamp >= pings[token][0]:
+            pings[token] = (timestamp, tuple(sorted(set(topics))))
     return pings
+
+
+def recently_online_topic_counts(
+    pings: dict[str, tuple[int, tuple[str, ...]]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for _timestamp, topics in pings.values():
+        for topic in topics:
+            counts[topic] = counts.get(topic, 0) + 1
+    return counts
 
 
 def derive_message_key(passphrase: str, salt: bytes) -> bytes:
@@ -6334,7 +6371,7 @@ class EncryptedChatClient(QObject):
         self.recently_online_poll_attempts: dict[str, float] = {}
         self.recently_online_send_attempts: dict[str, float] = {}
         self.recently_online_counts: dict[str, dict[str, int]] = {}
-        self._last_recently_online_count: int | None = None
+        self._last_recently_online_counts: dict[str, int] = {}
         self.recently_online_refresh_event = threading.Event()
 
         self.network_thread: threading.Thread | None = None
@@ -12402,15 +12439,17 @@ QComboBox::drop-down {
         label = getattr(self, "recently_online_label", None)
         if label is None:
             return
-        label.setVisible(self.active_chatroom_id == GLOBAL_CHATROOM_ID)
+        label.setVisible(True)
         server = normalize_server_url(self.config_data.get("server_url", ""))
-        pings = self.recently_online_counts.get(server)
-        if pings is not None:
-            self._last_recently_online_count = len(pings)
-        if self._last_recently_online_count is None:
+        topic = derive_ntfy_topic(self._active_chatroom()["key"])
+        counts = self.recently_online_counts.get(server)
+        if counts is not None:
+            self._last_recently_online_counts[topic] = counts.get(topic, 0)
+        count = self._last_recently_online_counts.get(topic)
+        if count is None:
             label.setText("Recently online: …")
             return
-        label.setText(f"Recently online: {self._last_recently_online_count}")
+        label.setText(f"Recently online: {count}")
 
     def _network_recently_online_step(self, *, now: float) -> bool:
         server = normalize_server_url(self.config_data.get("server_url", ""))
@@ -12418,8 +12457,8 @@ QComboBox::drop-down {
             return False
         states = self.config_data.setdefault("recently_online_state", {})
         state = states.get(server)
-        if not isinstance(state, dict):
-            state = {}
+        if not isinstance(state, dict) or state.get("version") != RECENTLY_ONLINE_VERSION:
+            state = {"version": RECENTLY_ONLINE_VERSION}
             states[server] = state
         sent_at = state.get("sent_at", 0)
         if (
@@ -12455,7 +12494,10 @@ QComboBox::drop-down {
                 topic, _key = recently_online_transport()
                 response = self.session.post(
                     f"{server}/{topic}",
-                    data=make_recently_online_packet(token).encode("ascii"),
+                    data=make_recently_online_packet(token, [
+                        derive_ntfy_topic(room["key"])
+                        for room in self._chatroom_definitions()
+                    ]).encode("ascii"),
                     headers={
                         "Content-Type": "text/plain; charset=utf-8",
                         "X-Firebase": "no",
@@ -12487,12 +12529,12 @@ QComboBox::drop-down {
             topic, _key = recently_online_transport()
             response = self.session.get(
                 f"{server}/{topic}/json",
-                params={"poll": "1", "since": "6h"},
+                params={"poll": "1", "since": "3h"},
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
             pings = recently_online_pings(parse_ntfy_ndjson(response), now=time.time())
-            self._queue_ui_event(("recently_online", (server, pings)))
+            self._queue_ui_event(("recently_online", (server, recently_online_topic_counts(pings))))
         except Exception:
             # Retain the last count on failure; an unknown first count is not zero.
             self.recently_online_poll_attempts[server] = (
@@ -12846,8 +12888,8 @@ QComboBox::drop-down {
                         self.status_var.set(status)
 
                 elif event_type == "recently_online":
-                    server, pings = payload
-                    self.recently_online_counts[server] = pings
+                    server, counts = payload
+                    self.recently_online_counts[server] = counts
                     self._update_recently_online_label()
 
                 elif event_type == "messages":
