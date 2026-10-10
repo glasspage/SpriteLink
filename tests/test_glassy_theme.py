@@ -206,16 +206,14 @@ class GlassyControlRenderingTests(unittest.TestCase):
                     button.setDown(not checked)
                     self.app.processEvents()
                     pressed = button.grab().toImage()
-                    # The face retains overhead lighting; only the narrow
-                    # bevel reverses into a shadow above and highlight below.
+                    # Invert only the bevel; retain face lighting.
                     self.assertGreater(pressed.pixelColor(x, top).lightnessF(),
                                        pressed.pixelColor(x, bottom).lightnessF())
                     self.assertLess(pressed.pixelColor(x, edge).lightnessF(),
                                     pressed.pixelColor(x, pressed.height() - 1 - edge).lightnessF())
                     self.assertEqual(button.geometry(), geometry)
                     self.assertEqual(button.sizeHint(), hint)
-                    # A single rounded outline keeps all four corners inside
-                    # the normal silhouette, including at fractional scaling.
+                    # Check corner clipping at fractional scaling.
                     for y in range(normal.height()):
                         for px in range(normal.width()):
                             if normal.pixelColor(px, y) == background:
@@ -296,7 +294,6 @@ class GlassyControlRenderingTests(unittest.TestCase):
             images.append(checkbox.grab().toImage().copy(rect))
         self.assertNotEqual(images[0], images[1])
         for image in images:
-            # Indicator frames must be visible against a pale glass surface.
             dark = sum(image.pixelColor(x, y).red() < 100
                        for y in range(image.height()) for x in range(image.width()))
             self.assertGreater(dark, 25)
@@ -409,8 +406,6 @@ class GlassyControlRenderingTests(unittest.TestCase):
             self.app.processEvents()
             popup = combo.view().window()
             image = popup.grab().toImage()
-            # Away from text, every interior row is either the light popup
-            # surface or the blue selection, with no black top/bottom bands.
             for y in range(1, image.height() - 1):
                 color = image.pixelColor(image.width() - 8, y)
                 self.assertEqual(color.alpha(), 255)
@@ -426,8 +421,7 @@ class GlassyControlRenderingTests(unittest.TestCase):
         combo.showPopup()
         self.app.processEvents()
         popup = combo.view().window()
-        # Reproduce the styled-panel frame used by some platform popup styles,
-        # and include real space outside the item view rather than only rows.
+        # Include styled popup padding outside the item rows.
         popup.setFrameShape(QFrame.Shape.StyledPanel)
         popup.layout().setContentsMargins(0, 6, 0, 6)
         popup.resize(popup.width(), popup.height() + 12)

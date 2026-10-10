@@ -1,4 +1,4 @@
-"""Asynchronous video process and bounded, acknowledged shared frame transport."""
+"""Isolated video playback with acknowledged shared frames."""
 import json
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
@@ -94,8 +94,7 @@ class VideoProcess(QObject):
                 try:
                     width, height = int(message["width"]), int(message["height"])
                     if current and self.memory is not None and 0 < width <= FRAME_WIDTH and 0 < height <= FRAME_HEIGHT:
-                        # Copy before acknowledgement: the helper cannot change
-                        # these pixels until the UI has finished reading them.
+                        # Copy pixels before acknowledging so the helper cannot overwrite them.
                         image = QImage(self.memory.buf, width, height, width * 4,
                                        QImage.Format.Format_RGBA8888).copy()
                         self.frame_ready.emit(image)

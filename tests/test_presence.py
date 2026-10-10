@@ -75,7 +75,7 @@ class PresenceTests(unittest.TestCase):
         self.assertEqual(self.client._queue_ui_event.call_args.args[0][0], "recently_online")
         self.assertEqual(len(self.client._queue_ui_event.call_args.args[0][1][1]), 1)
         self.assertFalse(self.step(112))
-        self.client.recently_online_send_attempts.clear()  # Simulate restart.
+        self.client.recently_online_send_attempts.clear()
         self.now += S.RECENTLY_ONLINE_INTERVAL_SECONDS - 1
         self.step(400)
         self.assertEqual(self.client.session.post.call_count, 1)
@@ -93,7 +93,6 @@ class PresenceTests(unittest.TestCase):
         self.client.session.post.side_effect = S.requests.Timeout()
         self.step(100)
         pending = disk["recently_online_state"][self.server]["pending_token"]
-        # Before the retry is due, polling may still run, but no second POST.
         self.client.session.get.side_effect = S.requests.Timeout()
         self.step(106)
         self.assertEqual(self.client.session.post.call_count, 1)
@@ -125,7 +124,6 @@ class PresenceTests(unittest.TestCase):
         self.assertFalse(self.step(112))
         self.assertFalse(self.step(406))
         self.assertEqual(self.client.session.get.call_count, 1)
-        # Resume after a short stay as well as a long one.
         for resumed_at in (407, 419):
             self.client._minimized_to_tray = False
             self.client.recently_online_refresh_event.set()

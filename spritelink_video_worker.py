@@ -1,4 +1,4 @@
-"""Video helper entry point. Qt/WebEngine cold startup never runs in chat."""
+"""Isolate Qt/WebEngine cold startup from chat."""
 import json
 import os
 import sys
@@ -9,8 +9,7 @@ def _pipe(name, handle, mode):
     stream = getattr(sys, name)
     if stream is not None:
         return getattr(stream, "buffer", stream)
-    # PyInstaller's Windows GUI bootloader leaves sys.stdin/stdout as None,
-    # while QProcess still supplies native pipe handles to the child.
+    # Windowed PyInstaller sets stdio to None; QProcess still provides native pipes.
     import ctypes
     from ctypes import wintypes
     import msvcrt
@@ -31,7 +30,7 @@ def main(memory_name):
 
     memory = SharedMemory(name=memory_name)
     if os.name != "nt":
-        # This unrelated process must not unlink the owner's mapping on exit.
+        # Only the owner may unlink this shared mapping.
         from multiprocessing import resource_tracker
         resource_tracker.unregister(memory._name, "shared_memory")
     incoming = _pipe("stdin", -10, os.O_RDONLY)

@@ -1,20 +1,3 @@
-# SpriteLink v13
-# Windows + Python 3.10+
-#
-# Required packages:
-#   pip install PySide6 requests cryptography Pillow
-#
-# Default transport:
-#   https://ntfy.sh
-#
-# The client derives an opaque ntfy topic from the shared encryption key.
-# ntfy only sees:
-#   - an opaque topic name
-#   - an opaque padded encrypted packet
-#   - ordinary connection metadata such as IP address and request time
-#
-# Username, username color, hidden client identity, message timestamp,
-# client message ID, and message text are compressed, padded, and encrypted.
 
 from __future__ import annotations
 
@@ -42,8 +25,7 @@ import time
 import traceback
 import sys
 
-# Route the frozen helper before chat imports, the single-instance lock, or
-# notification registration. QProcess supplies its private standard pipes.
+# Route the helper before chat imports and single-instance checks.
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--spritelink-video-worker":
     from spritelink_video_worker import main as video_worker_main
     video_worker_main(sys.argv[2])
@@ -154,7 +136,7 @@ QVideoSink: Any = None
 
 
 def ensure_qt_multimedia_loaded() -> None:
-    """Load Qt's multimedia backend only when audio or video is first used."""
+    """Load multimedia only on first use."""
     global QAudioOutput, QMediaPlayer, QSoundEffect, QVideoSink
     if QMediaPlayer is not None:
         return
@@ -389,9 +371,8 @@ LEGACY_THEME_NAMES = {
     "Modern (Light)": "Modern",
 }
 
-# Windows Classic/XP scheme RGB values, verified against the archived theme
-# files at https://github.com/zkedem/windows10-classic-themes . The first entry
-# retains SpriteLink's original Classic colors for existing configurations.
+# Classic RGB source: https://github.com/zkedem/windows10-classic-themes
+# Keep the original scheme first for existing configurations.
 CLASSIC_COLOR_SCHEMES = (
     dict(name="Default", face="#c0c0c0", shadow="#808080", light="#ffffff",
          title="#000080", highlight="#007f82", highlight_text="#000000",
@@ -456,8 +437,7 @@ def hue_theme_stylesheet(stylesheet: str, degrees: int) -> str:
         else:
             channels = [int(part) for part in re.findall(r"\d+", text)]
             color = QColor(*channels)
-        # Only the original blue/cyan accent family moves. Warning/error
-        # colors, visited links, and neutral whites/grays remain unchanged.
+        # Shift only blue/cyan accents; preserve status colors and neutrals.
         if not 0.45 <= color.hslHueF() <= 0.69:
             return text
         shifted = shift_theme_color(color, degrees)
@@ -495,8 +475,7 @@ ON_SCREEN_POLL_INTERVAL_SECONDS = 6.0
 OFF_SCREEN_POLL_INTERVAL_SECONDS = 9.0
 MUTED_INACTIVE_ON_SCREEN_POLL_INTERVAL_SECONDS = 5 * 60.0
 MUTED_INACTIVE_OFF_SCREEN_POLL_INTERVAL_SECONDS = 7.5 * 60.0
-# Focused catch-up polls use most of ntfy's sustained request allowance.
-# Leave the remaining budget for reconnecting the long-lived stream.
+# Reserve request budget for stream reconnects.
 SUBSCRIPTION_RECONNECT_DELAY_SECONDS = 30.0
 SUBSCRIPTION_READ_TIMEOUT_SECONDS = 75
 SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS = 2 * 60
@@ -990,8 +969,6 @@ QFrame[frameShape="4"], QFrame[frameShape="5"] {
 }
 """
 
-# Keep the chat viewport on its original Base palette color. Modern's extra
-# contrast belongs to the surrounding controls, not the message backdrop.
 MODERN_STYLESHEET = """
 QMainWindow, QDialog, QWidget#glassRoot, QWidget#chatTab {
     background: #f3f3f3;
@@ -1372,9 +1349,6 @@ QFrame[frameShape="4"], QFrame[frameShape="5"] {
 }
 """.replace("SPRITELINK_SCROLLBAR_ASSETS", (Path(__file__).resolve().parent / "assets").as_posix())
 
-# Dark, moderately saturated colors that remain readable against the standard
-# light chat background. A color is selected only when a new local
-# configuration is first created.
 SAFE_USERNAME_COLORS = (
     "#2f6bff",
     "#7a3fd0",
@@ -1390,7 +1364,7 @@ SAFE_USERNAME_COLORS = (
 
 
 def optimize_profile_icon(source_path: str) -> bytes:
-    """Convert a PNG or JPEG to a compact, single-frame 16x16 palette GIF."""
+    """Convert PNG/JPEG to a 16x16 palette GIF."""
     with Image.open(source_path) as source:
         if source.format not in {"PNG", "JPEG"}:
             raise ValueError("Profile icons must be PNG or JPG images.")
@@ -1412,8 +1386,7 @@ def optimize_profile_icon(source_path: str) -> bytes:
     )
     canvas.alpha_composite(icon, offset)
 
-    # GIF supports one transparent palette entry, so normalize partial alpha
-    # before counting and quantizing colors.
+    # GIF allows one transparent palette entry; normalize partial alpha first.
     normalized_pixels = [
         (red, green, blue, 255)
         if alpha >= 128
@@ -1561,11 +1534,11 @@ def normalize_profile_icon(value: Any, fallback: str = "") -> str:
 
 
 FORBIDDEN_USERNAME_UNICODE_CATEGORIES = frozenset({
-    "Cc",  # Control characters, including tabs and CR/LF.
-    "Cf",  # Formatting controls, including zero-width and bidi controls.
-    "Cs",  # Lone UTF-16 surrogate code points.
-    "Zl",  # Unicode line separator.
-    "Zp",  # Unicode paragraph separator.
+    "Cc",  # Control characters.
+    "Cf",  # Zero-width/bidi controls.
+    "Cs",  # UTF-16 surrogates.
+    "Zl",  # Line separator.
+    "Zp",  # Paragraph separator.
 })
 FORBIDDEN_USERNAME_BIDI_CLASSES = frozenset({
     "LRE",
@@ -1741,7 +1714,6 @@ def set_windows_taskbar_attention(
     window_handle: int,
     enabled: bool,
 ) -> bool:
-    """Start or stop native Windows taskbar-button flashing."""
     if (
         os.name != "nt"
         or not hasattr(ctypes, "windll")
@@ -1772,7 +1744,7 @@ def set_windows_taskbar_attention(
 
 
 def set_windows_fullscreen_window(window_handle: int, fullscreen: bool) -> bool:
-    """Ask the Windows shell to place its taskbar behind active fullscreen video."""
+    """Mark fullscreen video for Windows taskbar handling."""
     if os.name != "nt" or not hasattr(ctypes, "windll") or not window_handle:
         return False
     interface = ctypes.c_void_p()
@@ -1786,7 +1758,7 @@ def set_windows_fullscreen_window(window_handle: int, fullscreen: bool) -> bool:
         ole32.CoUninitialize.restype = None
         status = int(ole32.CoInitializeEx(None, 2))  # COINIT_APARTMENTTHREADED
         initialized = status in (0, 1)
-        if status < 0 and status != -2147417850:  # RPC_E_CHANGED_MODE: use existing apartment.
+        if status < 0 and status != -2147417850:  # RPC_E_CHANGED_MODE: reuse the apartment.
             return False
         guid_type = ctypes.c_ubyte * 16
         clsid = guid_type.from_buffer_copy(uuid.UUID("56fdf344-fd6d-11d0-958a-006097c9a090").bytes_le)
@@ -1825,7 +1797,7 @@ def dpapi_encrypt(
     data: bytes,
     entropy: bytes = SETTINGS_DPAPI_ENTROPY,
 ) -> bytes:
-    """Encrypt bytes using Windows DPAPI for the current Windows user."""
+    """Encrypt bytes with user-scoped DPAPI."""
     if os.name != "nt":
         raise RuntimeError("Windows DPAPI is only available on Windows.")
 
@@ -1862,7 +1834,7 @@ def dpapi_decrypt(
     data: bytes,
     entropy: bytes = SETTINGS_DPAPI_ENTROPY,
 ) -> bytes:
-    """Decrypt bytes using Windows DPAPI for the current Windows user."""
+    """Decrypt bytes with user-scoped DPAPI."""
     if os.name != "nt":
         raise RuntimeError("Windows DPAPI is only available on Windows.")
 
@@ -1965,7 +1937,7 @@ RICH_TEXT_TAG_ORDER = ("sp", "b", "i", "u")
 def parse_message_rich_text(
     text: str,
 ) -> tuple[str, tuple[RichTextRun, ...]]:
-    """Parse SpriteLink's small formatting language without accepting HTML."""
+    """Parse message formatting without accepting HTML."""
     parts: list[str] = []
     runs: list[RichTextRun] = []
     active = {tag: 0 for tag in ("b", "i", "u")}
@@ -2034,7 +2006,6 @@ def message_plain_text(text: str) -> str:
 
 
 def message_plain_text_with_spoilers_redacted(text: str) -> str:
-    """Return plain message text with every spoiler character concealed."""
     plain_text, runs = parse_message_rich_text(text)
     redacted = list(plain_text)
     for run in runs:
@@ -2091,8 +2062,7 @@ def message_log_separator_texts(
         previous_local_date = None
         current_local_datetime = None
 
-    # A date row already communicates the break in the conversation. Avoid
-    # placing an elapsed-time row directly beside it as a redundant divider.
+    # Date rows replace elapsed-time dividers.
     if (
         current_local_datetime is not None
         and current_local_datetime.date() != previous_local_date
@@ -2159,9 +2129,7 @@ def message_item_sort_key(
             item.get("ntfy_time", message.get("t", 0)),
         ) or 0),
         int(message.get("t", 0) or 0),
-        # New message IDs begin with a monotonic send-order value. Ntfy's
-        # record IDs are unique but not chronological, so using them here can
-        # visibly reorder messages sent within the same whole second.
+        # Ntfy IDs are not chronological; use send order for same-second messages.
         str(message.get("i") or item.get("ntfy_id", "")),
     )
 
@@ -2171,7 +2139,7 @@ def ordered_message_id(
     *,
     now_ns: int | None = None,
 ) -> tuple[str, int]:
-    """Return a fixed-width ID that increases in composer submission order."""
+    """Monotonic fixed-width ID in submission order."""
     current_ns = time.time_ns() if now_ns is None else int(now_ns)
     order = max(current_ns, int(previous_order) + 1)
     return f"{order:016x}{secrets.token_hex(8)}", order
@@ -2446,7 +2414,6 @@ def clear_windows_notification(tag: str) -> bool:
 def serialize_message_rich_text(
     segments: list[tuple[str, bool, bool, bool, bool]],
 ) -> str:
-    """Serialize visibly formatted composer segments into safe message tags."""
     output: list[str] = []
     active_tags: list[str] = []
     for text, bold, italic, underline, spoiler in segments:
@@ -2602,7 +2569,7 @@ def is_embeddable_media_url(url: str) -> bool:
 
 
 def is_click_to_play_video_url(url: str) -> bool:
-    # GIF-style clips retain their existing silent looping behavior.
+    # Keep GIF-style videos on the silent-loop path.
     return (
         not is_trusted_looping_video_url(url)
         and not is_supported_media_page_url(url)
@@ -2820,7 +2787,6 @@ def is_image_url_trusted_for_sender(
 
 
 def generate_chatroom_key() -> str:
-    # 24 random bytes encode to exactly 32 URL-safe characters.
     return secrets.token_urlsafe(24)
 
 
@@ -3668,8 +3634,7 @@ def save_config(config: dict[str, Any]) -> None:
 
 
 def _save_startup_config(config: dict[str, Any]) -> None:
-    # Existing settings need no DPAPI rewrite. New identities and migrations
-    # must still reach disk before networking can send a message.
+    # Skip unchanged settings; persist new identities before networking.
     if _loaded_config_snapshot != _config_snapshot(config):
         save_config(config)
 
@@ -3759,12 +3724,7 @@ def normalize_server_url(url: str) -> str:
 
 @lru_cache(maxsize=16)
 def derive_ntfy_topic(passphrase: str) -> str:
-    """
-    Derive a stable, opaque topic from the shared room key.
-
-    Scrypt slows down casual dictionary guessing of the topic when a weak
-    human-readable key is used. A strong room key is still recommended.
-    """
+    """Scrypt-derived topics resist guessing weak room keys."""
     if not passphrase:
         raise ValueError("The encryption key is empty.")
 
@@ -3789,8 +3749,7 @@ def room_scope_id(server_url: str, passphrase: str) -> str:
 
 @lru_cache(maxsize=1)
 def recently_online_transport() -> tuple[str, bytes]:
-    # Separate from chat topics, signing identities and message encryption.
-    # A cached key keeps counting many tiny pings inexpensive.
+    # Presence keys are separate from chat/signing keys; cache expensive derivation.
     passphrase = GLOBAL_CHATROOM_KEY + "\0SpriteLink-recently-online-v1"
     key = HKDF(
         algorithm=hashes.SHA256(),
@@ -3855,17 +3814,8 @@ def derive_message_key(passphrase: str, salt: bytes) -> bytes:
 
 
 def make_opaque_packet(message: dict[str, Any], passphrase: str) -> str:
-    """
-    Compress, length-prefix, randomly pad, and encrypt one message.
-
-    Binary layout:
-      1 byte  packet version
-      16 bytes random scrypt salt
-      12 bytes random ChaCha20-Poly1305 nonce
-      remaining authenticated ciphertext
-
-    The plaintext is padded to a 128-byte boundary so the exact text length is
-    less obvious. The final packet is URL-safe Base64 for ntfy text transport.
+    """Compress JSON, pad to 128-byte blocks, encrypt as URL-safe Base64.
+    Layout: version (1 byte), salt (16), nonce (12), authenticated ciphertext.
     """
     raw_json = json.dumps(
         message,
@@ -3897,14 +3847,7 @@ def make_opaque_packet(message: dict[str, Any], passphrase: str) -> str:
 
 
 def estimate_opaque_packet_size(message: dict[str, Any]) -> int:
-    """
-    Calculate the exact UTF-8 byte length of the packet that make_opaque_packet()
-    will produce, without running Scrypt or encryption.
-
-    ChaCha20-Poly1305 ciphertext is always plaintext length + 16 bytes, and all
-    other packet fields have fixed sizes, so the final unpadded Base64 length is
-    deterministic after JSON serialization, compression, and padding.
-    """
+    """Exact UTF-8 packet size without Scrypt/encryption; AEAD adds 16 bytes."""
     raw_json = json.dumps(
         message,
         ensure_ascii=False,
@@ -4038,7 +3981,6 @@ def newest_first_ntfy_records(
 
 
 class ValueModel:
-    """Small get/set model used to keep network and UI state decoupled."""
 
     def __init__(self, value: Any) -> None:
         self._value = value
@@ -4060,7 +4002,7 @@ class ValueModel:
 
 
 class DaemonTaskPool:
-    """Small fixed-size worker pool whose tasks cannot hold process exit."""
+    """Daemon workers never delay process exit."""
 
     def __init__(self, max_workers: int, thread_name_prefix: str) -> None:
         self._tasks: queue.Queue[Any] = queue.Queue()
@@ -4307,7 +4249,7 @@ class ClickableProgressBar(QProgressBar):
 
 
 class ClickableSubmenuMenu(QMenu):
-    """Let a submenu-bearing row retain its own direct click action."""
+    """Allow direct clicks on submenu-bearing rows."""
 
     def mouseReleaseEvent(self, event: Any) -> None:
         action = self.actionAt(event.position().toPoint())
@@ -4324,7 +4266,6 @@ class ClickableSubmenuMenu(QMenu):
 
 
 class SpoilerFormatButton(QPushButton):
-    """Show the revealed spoiler block treatment behind the button text."""
 
     def paintEvent(self, _event: Any) -> None:
         option = QStyleOptionButton()
@@ -4414,8 +4355,7 @@ class ConfigOverlay(QWidget):
         self.update()
 
     def schedule_background_refresh(self) -> None:
-        # Capture after stylesheet, composer and layout updates have settled.
-        # Repeated resize events share one pending capture.
+        # Coalesce captures until layout settles.
         if self._glassy and self.isVisible():
             self._background_refresh_timer.start()
 
@@ -4432,9 +4372,7 @@ class ConfigOverlay(QWidget):
         if source.isNull():
             return None
 
-        # Glassy captures retain the translucent palette/stylesheet alpha.
-        # Flatten before blurring so sharp live controls cannot show through
-        # the blurred composer, even away from the padded window edges.
+        # Flatten translucent captures before blur to hide sharp controls beneath.
         background = shift_theme_color(QColor(224, 240, 250))
         opaque_source = QPixmap(source.size())
         opaque_source.setDevicePixelRatio(source.devicePixelRatio())
@@ -4467,12 +4405,8 @@ class ConfigOverlay(QWidget):
         padded.setDevicePixelRatio(device_ratio)
         padded.fill(Qt.GlobalColor.transparent)
 
-        # A blur fades toward transparency outside its source. Without a
-        # gutter, the live unblurred controls beneath this overlay show
-        # through along the window edges. Stretch each outermost source row
-        # and column into the gutter so the blur stays opaque everywhere.
-        # QPainter pixmap source rectangles use physical pixels; destination
-        # rectangles and graphics-scene bounds use device-independent units.
+        # Extend edge pixels into a gutter to keep blur opaque.
+        # Source pixels are physical; destinations and scene bounds use logical units.
         source_pixel_width = float(source.width())
         source_pixel_height = float(source.height())
         source_rect = QRectF(
@@ -4566,7 +4500,6 @@ class ConfigOverlay(QWidget):
 
         blurred = QPixmap(source.size())
         blurred.setDevicePixelRatio(device_ratio)
-        # Also cover any rounding/blur-kernel transparency at the crop edge.
         blurred.fill(background)
         painter = QPainter(blurred)
         painter.drawPixmap(
@@ -4587,9 +4520,7 @@ class ConfigOverlay(QWidget):
             self._blurred_background = None
             return
 
-        # Render the background and siblings without hiding this overlay.
-        # Hiding a live Chromium child during each resize invalidates its
-        # compositor and can corrupt the Glassy window's alpha backing store.
+        # Capture without hiding the overlay to preserve its alpha backing store.
         ratio = parent.devicePixelRatioF()
         capture = QPixmap(parent.size() * ratio)
         capture.setDevicePixelRatio(ratio)
@@ -4612,7 +4543,6 @@ class ConfigOverlay(QWidget):
     def paintEvent(self, event: Any) -> None:
         if self._glassy and self._blurred_background is not None:
             painter = QPainter(self)
-            # Cover the full overlay while a resized capture is queued.
             painter.drawPixmap(self.rect(), self._blurred_background)
             painter.fillRect(self.rect(), QColor(20, 54, 76, 82))
             painter.end()
@@ -4891,8 +4821,7 @@ class ChatroomListWidget(QListWidget):
         self._dragged_row = -1
 
     def refresh_row_sizes(self) -> None:
-        # Item widgets own their margins. Recalculate their height after a
-        # theme/font change instead of retaining the old font's size hint.
+        # Recompute row heights after font/theme changes.
         for index in range(self.count()):
             item = self.item(index)
             row = self.itemWidget(item)
@@ -4995,8 +4924,7 @@ class ChatroomListWidget(QListWidget):
                     insertion_row,
                 ),
             )
-        # The configuration/list rebuild performs the move. Report Ignore to
-        # Qt's InternalMove source so it does not also delete the dragged row.
+        # Ignore Qt InternalMove cleanup; the configuration rebuild already moved the row.
         event.setDropAction(Qt.DropAction.IgnoreAction)
         event.accept()
 
@@ -5134,9 +5062,8 @@ def next_poll_room_id(
     if now - active_last_poll >= active_poll_deadline:
         return active_room_id
 
-    # Finish the first manual pass for ordinary rooms before stream activity
-    # can favor rooms that have already been checked. Muted inactive rooms
-    # deliberately wait for their long timer before their first poll.
+    # Poll ordinary rooms once before prioritizing stream activity.
+    # Muted inactive rooms wait for their timer.
     never_polled_room_ids = [
         room_id for room_id in regular_room_ids
         if room_id not in last_poll_times
@@ -5171,8 +5098,7 @@ def next_poll_room_id(
     manual_check_deadline = (
         max(0.0, poll_interval) * max(1, len(regular_room_ids))
     )
-    # Once the active-room reservation is satisfied, an overdue ordinary room
-    # gets the next global request slot so passive checks keep progressing.
+    # After reserving the active slot, serve overdue rooms to prevent starvation.
     if (
         now - last_poll_times[oldest_room_id]
         >= manual_check_deadline
@@ -5218,7 +5144,6 @@ def subscription_room_ids(
 
 
 class TextShadowProxyStyle(QProxyStyle):
-    """Theme outlines and optional subtle shadows for standard Qt widgets."""
 
     def pixelMetric(self, metric, option=None, widget=None) -> int:
         app = QApplication.instance()
@@ -5286,8 +5211,7 @@ class TextShadowProxyStyle(QProxyStyle):
         if (element != QStyle.PrimitiveElement.PE_IndicatorCheckBox
                 or app is None or not bool(app.property("spritelinkGlassy"))):
             return
-        # Preserve Fusion's checked/mixed glyph and add a reliable outline
-        # even when the translucent palette makes its native frame faint.
+        # Preserve checked/mixed glyphs; outline faint translucent frames.
         enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
         color = shift_theme_color("#496f87" if enabled else "#7391a4")
         if enabled and option.state & (
@@ -5357,7 +5281,6 @@ class TextShadowProxyStyle(QProxyStyle):
 
 
 class ThemeSlider(QSlider):
-    """Keep native interaction and paint theme-colored handles."""
 
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
@@ -5368,8 +5291,6 @@ class ThemeSlider(QSlider):
         self.initStyleOption(option)
         position = self.property("spritelinkPreviewClassicColor")
         if bool(app.property("spritelinkWindowsClassic")) and position is not None:
-            # Repaint only the native thumb using the selected scheme's bevel
-            # and face colors. The track and application palette stay untouched.
             scheme = CLASSIC_COLOR_SCHEMES[int(position)]
             for role, key in (
                 (QPalette.ColorRole.Window, "face"), (QPalette.ColorRole.Button, "face"),
@@ -5379,8 +5300,7 @@ class ThemeSlider(QSlider):
                 option.palette.setColor(role, QColor(scheme[key]))
             option.subControls = QStyle.SubControl.SC_SliderHandle
             painter = QPainter(self)
-            # Some native styles fill the entire slider background even when
-            # only its handle is requested. Protect the groove/ticks/focus.
+            # Native handle painting may fill the background; clip to protect the track.
             painter.setClipRect(self.style().subControlRect(
                 QStyle.ComplexControl.CC_Slider, option,
                 QStyle.SubControl.SC_SliderHandle, self,
@@ -5394,9 +5314,7 @@ class ThemeSlider(QSlider):
             QStyle.ComplexControl.CC_Slider, option,
             QStyle.SubControl.SC_SliderHandle, self,
         )
-        # Snap the outside to physical pixels, then inset the shared fill/stroke
-        # path by half a pen width. This keeps opposite corners symmetrical
-        # at fractional scaling without stacking two rounded stylesheet edges.
+        # Snap edges to physical pixels and inset by half a pen for symmetric corners.
         ratio = self.devicePixelRatioF()
         rect = QRectF(
             round(handle.x() * ratio) / ratio,
@@ -5406,7 +5324,6 @@ class ThemeSlider(QSlider):
         ).adjusted(0.5, 0.5, -0.5, -0.5)
         enabled = self.isEnabled()
         highlighted = self.hasFocus() or handle.contains(self.mapFromGlobal(QCursor.pos()))
-        # A Color slider can preview its own thumb without restyling the app.
         degrees = self.property("spritelinkPreviewHue")
         if degrees is None:
             degrees = int(app.property("spritelinkThemeHue") or 0)
@@ -5437,13 +5354,11 @@ class ThemeSlider(QSlider):
 
 
 class ThemeComboBox(QComboBox):
-    """Config combo box with theme arrows and no wheel changes."""
 
     def showPopup(self) -> None:
         popup = self.view().window()
         if popup.objectName() != "comboPopup":
-            # The generic translucent QFrame rule must not style the popup's
-            # outside padding. An explicit ID takes precedence over it.
+            # Override generic QFrame styling on popup padding.
             popup.setObjectName("comboPopup")
             popup.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             popup.style().unpolish(popup)
@@ -5451,8 +5366,6 @@ class ThemeComboBox(QComboBox):
         super().showPopup()
 
     def wheelEvent(self, event: Any) -> None:
-        # Let a containing scroll area handle the wheel without changing the
-        # selected setting under the pointer.
         event.ignore()
 
     def paintEvent(self, event: Any) -> None:
@@ -5496,7 +5409,6 @@ class ThemeComboBox(QComboBox):
 
 
 class NoFocusRectItemDelegate(QStyledItemDelegate):
-    """Draw selected font entries without Qt's dotted focus rectangle."""
 
     def paint(
         self,
@@ -5677,7 +5589,6 @@ class IdentityPresetSelector(QPushButton):
 
 
 class MessageLogBrowser(QTextBrowser):
-    """Complete full-width row selections across paragraph left margins."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -5708,7 +5619,6 @@ class MessageLogBrowser(QTextBrowser):
         self,
         block: Any,
     ) -> tuple[int, int]:
-        """Return text-layout bounds without the block's outer margins."""
         layout = block.layout()
         if layout is not None:
             content_rect = layout.boundingRect().translated(
@@ -5719,9 +5629,7 @@ class MessageLogBrowser(QTextBrowser):
                 self.document().documentLayout().blockBoundingRect(block)
             )
 
-        # Separator margin bands are painted separately after Qt draws the
-        # document, so this helper deliberately keeps the content-only layout
-        # rectangle for that path.
+        # Return content bounds; separator margins are painted separately.
         aligned_rect = content_rect.toAlignedRect()
         scroll_y = self.verticalScrollBar().value()
         painted_top = aligned_rect.top() - scroll_y
@@ -5730,14 +5638,13 @@ class MessageLogBrowser(QTextBrowser):
 
     @staticmethod
     def _nearest_pixel_edge(value: float) -> int:
-        """Resolve one document edge without creating overlapping rows."""
         return int(math.floor(float(value) + 0.5))
 
     def _block_row_vertical_bounds(
         self,
         block: Any,
     ) -> tuple[int, int]:
-        """Return shared row edges, assigning top margins to their own row."""
+        """Assign top margins to their row when resolving shared edges."""
         document_layout = self.document().documentLayout()
         block_rect = document_layout.blockBoundingRect(block)
         next_block = block.next()
@@ -5748,9 +5655,7 @@ class MessageLogBrowser(QTextBrowser):
         else:
             bottom_edge = block_rect.top() + block_rect.height()
 
-        # Round each shared edge once. Aligning every QRect independently
-        # makes neighboring rows overlap whenever their coordinates are
-        # fractional, so the later alternating color steals an edge pixel.
+        # Round shared edges once to avoid overlapping fractional rows.
         scroll_y = self.verticalScrollBar().value()
         top_edge = block_rect.top() - block.blockFormat().topMargin()
         painted_top = self._nearest_pixel_edge(top_edge) - scroll_y
@@ -5767,7 +5672,7 @@ class MessageLogBrowser(QTextBrowser):
         block: Any,
         layout: QTextLayout,
     ) -> QRegion:
-        """Exclude inline images while retaining their layout space."""
+        """Retain inline-image layout without painting images."""
         clip_region = event.region()
         block_text = block.text()
         if "\ufffc" not in block_text:
@@ -5837,10 +5742,7 @@ class MessageLogBrowser(QTextBrowser):
             last_block + 1,
         )
 
-        # Enforce opacity on the painter as well as the format. QTextLayout
-        # can use its default foreground for characters outside an explicit
-        # format range on wrapped lines; painter opacity guarantees those
-        # fallback glyphs can never become opaque black.
+        # Painter opacity also covers wrapped glyphs without explicit formats.
         shadow_color = QColor(0, 0, 0)
         shadow_format = QTextCharFormat()
         shadow_format.setForeground(shadow_color)
@@ -5849,10 +5751,7 @@ class MessageLogBrowser(QTextBrowser):
         transparent_spoiler_format.setBackground(QColor(0, 0, 0, 0))
         painter = QPainter(viewport)
         painter.setClipRegion(event.region())
-        # QTextLayout already retains its absolute document position.  The
-        # draw origin must therefore contain only the viewport's scroll
-        # offset; adding each block position again makes the shadow drift
-        # downward by another line for every message.
+        # QTextLayout includes block position; add only the viewport scroll offset.
         layout_origin = QPointF(
             -self.horizontalScrollBar().value(),
             -self.verticalScrollBar().value(),
@@ -5904,7 +5803,6 @@ class MessageLogBrowser(QTextBrowser):
         painter.end()
 
     def _paint_spoilers(self, event: Any) -> None:
-        """Paint spoiler formatting independently from optional shadows."""
         viewport = self.viewport()
         viewport_width = viewport.width()
         viewport_height = viewport.height()
@@ -6042,7 +5940,6 @@ class MessageLogBrowser(QTextBrowser):
         painter.end()
 
     def _paint_row_background_padding(self, event: Any) -> None:
-        """Paint block-margin bands after Qt clears the document viewport."""
         if not self.row_background_padding_blocks:
             return
 
@@ -6053,8 +5950,7 @@ class MessageLogBrowser(QTextBrowser):
         for block_number, padding in (
             self.row_background_padding_blocks.items()
         ):
-            # The full-width row painter already includes both margins.
-            # Repainting a translucent band would increase its opacity.
+            # Row painting includes margins; another translucent pass would darken them.
             if block_number in self.row_background_blocks:
                 continue
             background, top_padding, bottom_padding = padding
@@ -6084,7 +5980,6 @@ class MessageLogBrowser(QTextBrowser):
         painter.end()
 
     def _paint_final_row_background_tail(self, event: Any) -> None:
-        """Extend the final message stripe through the viewport bottom."""
         if not self.row_background_blocks:
             return
 
@@ -6131,21 +6026,12 @@ class MessageLogBrowser(QTextBrowser):
     def paintEvent(self, event: Any) -> None:
         self._paint_row_backgrounds(event)
         super().paintEvent(event)
-        # QTextBrowser clears the document's trailing margin with its base
-        # color. If the newest row is gray, continue that stripe through the
-        # otherwise-white pixels at the bottom edge of the viewport.
+        # Extend the last stripe over QTextBrowser's trailing margin.
         self._paint_final_row_background_tail(event)
-        # QTextDocument paints block backgrounds only behind the text line,
-        # not inside block margins. These bands contain no text, so they can
-        # safely be completed after the base document paint.
+        # Qt omits backgrounds in block margins; fill them after document painting.
         self._paint_row_background_padding(event)
         self._paint_text_shadows(event)
-        # The base QTextBrowser paint can omit character backgrounds after
-        # an application-style replacement.  Text shadows previously hid
-        # that problem because their final layout redraw also happened to
-        # redraw spoilers.  Paint spoiler ranges explicitly in every mode so
-        # they remain visible when shadows start or become disabled, and so
-        # Qt's selection colors cannot replace them.
+        # Style changes can drop character backgrounds; repaint spoilers in every mode.
         self._paint_spoilers(event)
         if not self.collapsed_fade_blocks:
             self._paint_unread_divider(event)
@@ -6229,16 +6115,12 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         if os.name == "nt":
-            # Allocate an alpha backing store before the native HWND exists.
-            # Keep the native frame: DWM composites the client area's alpha,
-            # so no layered/frameless window or titlebar replacement is needed.
-            # The format stays fixed when themes are swapped at runtime.
+            # Allocate alpha before HWND creation; keep this format across themes for DWM.
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.close_callback: Any = None
 
     def paintEvent(self, event: Any) -> None:
-        # Clear every damaged pixel before painting translucent children;
-        # otherwise repeated repaints can accumulate tint over the backdrop.
+        # Clear damaged pixels to prevent translucent tint accumulation.
         background = self.palette().color(QPalette.ColorRole.Window)
         background.setAlpha(
             0 if bool(self.property("spritelinkDesktopBlur")) else 255
@@ -6386,8 +6268,7 @@ class EncryptedChatClient(QObject):
 
     def __init__(self, root: MainWindow, *, defer_startup: bool = False) -> None:
         super().__init__(root)
-        # Embedded callers can request a fully prepared UI. The application
-        # entry point defers optional work until after showing the window.
+        # The entry point defers optional work; embedded callers may prepare synchronously.
         self._defer_startup = defer_startup
         self._startup_begun = False
         self._startup_complete = False
@@ -6410,8 +6291,7 @@ class EncryptedChatClient(QObject):
             set_start_with_windows(
                 bool(self.config_data.get("start_with_windows", False))
             )
-        # Persist a newly generated signing identity before any messages are
-        # created so the authenticated ID survives a crash.
+        # Persist signing identity before sending so it survives a crash.
         _save_startup_config(self.config_data)
         app = QApplication.instance()
         if app is not None:
@@ -6751,7 +6631,7 @@ class EncryptedChatClient(QObject):
             self._start_network_thread()
 
     def prepare_after_show(self) -> None:
-        """Warm optional features once the main window can paint."""
+        """Prepare optional features after the first paint."""
         if self._startup_begun or self._closing:
             return
         self._startup_begun = True
@@ -6764,8 +6644,7 @@ class EncryptedChatClient(QObject):
         ).start()
 
     def _prepare_http_sessions(self) -> bool:
-        # Imports and session construction happen outside the UI thread in
-        # normal startup. Publish both sessions together, or discard on exit.
+        # Import off-thread; publish both sessions together unless exiting.
         session = requests.Session()
         subscription_session = requests.Session()
         session.headers.update({
@@ -6857,8 +6736,7 @@ class EncryptedChatClient(QObject):
         *,
         bold: bool = False,
     ) -> QFont:
-        # UI families (Segoe UI, Tahoma, etc.) must not pass through the
-        # message-font allowlist, which would silently replace them with Arial.
+        # UI fonts must bypass the message-font allowlist to avoid an Arial fallback.
         family = self._resolved_font_family(font_name) if font_name == "System" else font_name
         font = QFont(family, point_size)
         font.setBold(bold)
@@ -7197,7 +7075,7 @@ class EncryptedChatClient(QObject):
             return "Tahoma"
         if not self._is_glassy_theme():
             families = set(self._font_families())
-            # Static Segoe UI provides consistent regular/bold faces in Qt.
+            # Prefer static Segoe UI for consistent regular/bold faces.
             for family in ("Segoe UI", "Segoe UI Variable"):
                 if family in families:
                     return family
@@ -7300,8 +7178,7 @@ class EncryptedChatClient(QObject):
 
     def _modern_palette(self) -> QPalette:
         palette = QPalette(self._basic_palette)
-        # Deliberately retain Base and AlternateBase, including disabled and
-        # inactive groups, so switching to Modern never darkens the chat log.
+        # Preserve chat background colors across palette groups.
         colors = {
             QPalette.ColorRole.Window: "#f3f3f3",
             QPalette.ColorRole.WindowText: "#1b1b1b",
@@ -7364,9 +7241,7 @@ class EncryptedChatClient(QObject):
 
     @staticmethod
     def _set_windows_legacy_blur(hwnd: Any, enabled: bool) -> bool:
-        # Windows 10/early Windows 11 have no DWMWA_SYSTEMBACKDROP_TYPE.
-        # The legacy accent policy provides live blur behind the same alpha
-        # surface. Prefer the supported DWM acrylic API when available.
+        # Use legacy accent blur when Windows lacks DWM acrylic.
         try:
             class AccentPolicy(ctypes.Structure):
                 _fields_ = [
@@ -7423,8 +7298,6 @@ class EncryptedChatClient(QObject):
                     ctypes.sizeof(data),
                 ))
 
-            # Keep all themes light, then color the Windows 11 non-client
-            # frame where the DWM color attributes are supported.
             set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
             if video_fullscreen:
                 border, caption, text = "#000000", "#000000", "#ffffff"
@@ -7454,7 +7327,7 @@ class EncryptedChatClient(QObject):
             set_attribute(34, self._windows_colorref(border))
             set_attribute(
                 35,
-                0xFFFFFFFF  # DWMWA_COLOR_DEFAULT keeps acrylic visible.
+                0xFFFFFFFF  # DWMWA_COLOR_DEFAULT preserves acrylic.
                 if caption is None
                 else self._windows_colorref(caption),
             )
@@ -7498,12 +7371,10 @@ class EncryptedChatClient(QObject):
             window.setProperty("spritelinkDesktopBlur", desktop_blur)
             window.update()
         except Exception:
-            # Older Windows versions do not expose the color attributes.
             window.setProperty("spritelinkDesktopBlur", False)
             window.update()
 
     def _apply_dialog_window_theme(self, dialog: QDialog) -> None:
-        """Apply native theme properties after a dialog window exists."""
         if isinstance(dialog, QFileDialog):
             return
         self._apply_window_titlebar_theme(dialog)
@@ -7513,8 +7384,7 @@ class EncryptedChatClient(QObject):
         )
 
     def _exec_themed_file_dialog(self, dialog: QFileDialog) -> int:
-        # Native Windows dialogs are created when exec() starts. Apply once to
-        # the wrapper and once from the nested event loop after it is visible.
+        # Native dialogs appear during exec(); theme both wrapper and visible window.
         self._apply_window_titlebar_theme(dialog)
         QTimer.singleShot(
             0,
@@ -7811,8 +7681,7 @@ class EncryptedChatClient(QObject):
             return
         self._force_quit = True
         self._tray_quit_pending = True
-        # Let the native tray menu finish handling its action before closing
-        # its owner window and stopping the Qt event loop.
+        # Close after the native tray action finishes.
         QTimer.singleShot(0, self._finish_quit_from_tray)
 
     def _finish_quit_from_tray(self) -> None:
@@ -8575,9 +8444,7 @@ QComboBox::drop-down {
         if not hasattr(self, "chat_display"):
             return
         if self._rendering_message_log:
-            # Block numbers change after every staggered prepend. Keep the
-            # divider hidden until the complete document map is stable so its
-            # line cannot appear to move through partially rendered history.
+            # Hide the divider until prepending stabilizes block numbers.
             self.chat_display.unread_divider_block_number = None
             self.chat_display.viewport().update()
             return
@@ -9133,9 +9000,7 @@ QComboBox::drop-down {
             self.active_chatroom_id in muted_room_ids
             or room_id in muted_room_ids
         )
-        # Every message mutation is persisted when it occurs. Rewriting the
-        # complete history again here made leaving a long room needlessly
-        # proportional to its retained message count.
+        # Mutations already persist history; avoid rewriting it on room exit.
         self.active_chatroom_id = room_id
         self.config_data["active_chatroom_id"] = room_id
         self._switch_active_chatroom(
@@ -9208,14 +9073,12 @@ QComboBox::drop-down {
             return
         self._history_render_updates_suppressed = suppressed
         if suppressed:
-            # A scroll action queued before a document transaction must not
-            # observe the temporary zero-position created by clear/rebuild.
+            # Ignore scroll actions during temporary document rebuild positions.
             self._older_history_user_request = None
         self.chat_display.setUpdatesEnabled(not suppressed)
         if not suppressed:
             self.chat_display.viewport().update()
-            # Theme swaps rebuild the log in batches. Recapture once the
-            # complete document and its saved scroll anchor are restored.
+            # Recapture after batched theme rebuild and anchor restoration.
             for overlay in self.chat_content.findChildren(ConfigOverlay):
                 overlay.schedule_background_refresh()
 
@@ -9225,10 +9088,7 @@ QComboBox::drop-down {
         )
 
     def _on_chat_history_scroll_action(self, _action: int) -> None:
-        # Queue at most one request once a genuine user scroll reaches the
-        # oldest 20 percent of the loaded history. actionTriggered exposes the
-        # new slider position before Qt propagates it to value(), so use that
-        # position to begin loading before the visible rows reach the top.
+        # Coalesce requests in the oldest 20%; actionTriggered precedes value() updates.
         scrollbar = self.chat_display.verticalScrollBar()
         if (
             self._older_history_user_request is not None
@@ -9849,8 +9709,7 @@ QComboBox::drop-down {
         self,
         visible_menu: QWidget | None,
     ) -> None:
-        # Direct switching used to show the new panel before hiding the old
-        # one, making the log jump through a two-menu intermediate height.
+        # Hide the old panel first to avoid an intermediate layout jump.
         self.chat_content.setUpdatesEnabled(False)
         try:
             for menu, button in (
@@ -10370,8 +10229,7 @@ QComboBox::drop-down {
         self.image_preview_label.setMinimumHeight(96)
         panel_layout.addWidget(self.image_preview_label, 1)
         self.video_player: VideoPlayer | None = None
-        # Keep native video surfaces outside QAbstractScrollArea's internal
-        # viewport ownership; the panel still tracks the visible log rectangle.
+        # Keep native video surfaces outside QAbstractScrollArea viewport ownership.
         self.video_mini_panel = QFrame(self.chat_display.parentWidget())
         self.video_mini_panel.setObjectName("configPanel")
         self.video_mini_panel.setStyleSheet(self._config_panel_stylesheet())
@@ -10777,7 +10635,6 @@ QComboBox::drop-down {
             self.image_preview_overlay.raise_()
             self._update_image_preview_popup()
         else:
-            # Keep the live backend while removing the blocking chat overlay.
             self.image_preview_overlay.hide()
             if mode == "mini":
                 self._sync_video_mini_geometry()
@@ -10797,8 +10654,7 @@ QComboBox::drop-down {
         player = getattr(self, "video_player", None)
         if player is None or player._mode != "mini" or player._fullscreen is not None:
             return
-        # A short log may leave the player over the composer; reserve enough
-        # height for a 16:9 video and keep all controls inside the main window.
+        # Reserve controls and a 16:9 surface, even when the log is short.
         origin = self.chat_display.viewport().mapTo(panel.parentWidget(), QPoint(0, margin))
         frame = panel.frameWidth() * 2
         margins = panel.layout().contentsMargins()
@@ -10828,7 +10684,6 @@ QComboBox::drop-down {
             else (lambda text: hue_theme_stylesheet(text, position))
         )
         player.set_theme(theme, transform, self._is_tiny_ui())
-        # Reparented controls retain the current other-UI font in every mode.
         for widget in (player, *player.findChildren(QWidget)):
             self._set_widget_text_size(widget, "other_ui")
         if player._mode == "mini" and player._fullscreen is None:
@@ -11532,8 +11387,7 @@ QComboBox::drop-down {
         slider.setMinimumWidth(compact_width if classic else 64)
         slider.setMaximumWidth(compact_width if classic else 112)
         self.message_sound_volume_slider.setMaximumWidth(compact_width if classic else 16777215)
-        # Reserve the longest label so dragging between schemes keeps the
-        # controls stationary. Both Classic sliders share the compact width.
+        # Reserve the longest label to prevent slider movement.
         labels = [f"Color: {scheme['name']}" for scheme in CLASSIC_COLOR_SCHEMES]
         labels.append("Volume: 100%")
         self.theme_color_label.setMinimumWidth(
@@ -11570,8 +11424,7 @@ QComboBox::drop-down {
         self.theme_color_slider.setProperty("spritelinkPreviewHue", None if theme == "Classic" else value)
         self.theme_color_slider.setProperty("spritelinkPreviewClassicColor", value if theme == "Classic" else None)
         self.theme_color_slider.update()
-        # Stylesheet repolish and log/blur refreshes are deliberately excluded
-        # from dragging, even if the user pauses while holding the thumb.
+        # Do not repolish or refresh blur/history while dragging.
         if self.theme_color_slider.isSliderDown():
             self.theme_color_save_timer.stop()
         else:
@@ -11599,8 +11452,7 @@ QComboBox::drop-down {
             palette = self._modern_palette()
             stylesheet = hue_theme_stylesheet(MODERN_STYLESHEET, position)
         stylesheet = EncryptedChatClient._ui_density_stylesheet(self, stylesheet, theme)
-        # Repolish can reset explicitly assigned families and NoAntialias.
-        # Keep the existing fonts, including Classic headings and user fonts.
+        # Repolish can reset font families and NoAntialias; restore explicit fonts.
         application_font = QFont(app.font())
         fonts = [(widget, QFont(widget.font())) for widget in app.allWidgets()
                  if widget.testAttribute(Qt.WidgetAttribute.WA_SetFont)]
@@ -11640,8 +11492,6 @@ QComboBox::drop-down {
         if self.theme_color_slider.isSliderDown():
             return
         changed = self._apply_theme_colors()
-        # Rebuild changed row brushes once after the committed style update,
-        # keeping history, scroll position, and rendered message fonts intact.
         if changed and hasattr(self, "chat_display"):
             self._rerender_preserving_scroll()
         colors = normalize_theme_colors(self.config_data.get("theme_colors"))
@@ -11684,13 +11534,9 @@ QComboBox::drop-down {
     def _on_text_shadows_toggled(self, enabled: bool) -> None:
         self.text_shadows_var.set(bool(enabled))
         self._apply_theme()
-        # Replacing the application style can reset explicitly assigned
-        # widget fonts. Restore the active theme's font family, especially
-        # Tahoma for Windows Classic headings and the chatroom title.
+        # Restore explicit fonts after application-style replacement.
         self._apply_application_font_strategy()
-        # Applying a new application style can discard QTextDocument's
-        # rendered background brushes. Rebuild the log so spoiler blocks
-        # remain visible whether text shadows are enabled or disabled.
+        # Style replacement can drop spoiler brushes; rebuild the log.
         if hasattr(self, "chat_display"):
             self._rerender_preserving_scroll()
 
@@ -11834,13 +11680,12 @@ QComboBox::drop-down {
         self.message_size_check_pending = True
         self.message_size_timer.start(MESSAGE_SIZE_DEBOUNCE_MS)
 
-        # A stale over-limit result should not block a click after the user
-        # shortens the message. Send performs its own immediate exact check.
+        # Ignore stale size results; Send performs an exact check.
         self.send_button.setEnabled(True)
         self._draw_message_size_bar()
 
     def _resize_message_entry(self) -> None:
-        # Apply stylesheet padding before measuring, including at startup.
+        # Polish before measuring stylesheet padding.
         self.message_entry.ensurePolished()
         document = self.message_entry.document()
         document.setTextWidth(max(1, self.message_entry.viewport().width()))
@@ -11849,7 +11694,7 @@ QComboBox::drop-down {
             QFontMetrics(self.message_entry.font()).lineSpacing(),
         )
         document_margins = int(document.documentMargin() * 2)
-        document.size()  # Force wrapped line layouts to update.
+        document.size()  # Update wrapped line layout.
         display_lines = 0
         line_heights: list[float] = []
         block = document.begin()
@@ -11867,8 +11712,7 @@ QComboBox::drop-down {
             MESSAGE_ENTRY_MIN_LINES,
             min(MESSAGE_ENTRY_MAX_LINES, display_lines),
         )
-        # frameWidth() includes horizontal stylesheet padding and made Glassy
-        # taller than Modern. Only vertical padding belongs in this height.
+        # frameWidth() includes horizontal padding; measure vertical padding separately.
         contents_margins = self.message_entry.contentsMargins()
         margins = contents_margins.top() + contents_margins.bottom() + document_margins + 2
         content_height = math.ceil(sum(line_heights[:visible_lines]))
@@ -12139,8 +11983,7 @@ QComboBox::drop-down {
                 bypass_rate_limits=True,
             )
 
-        # The network worker consumes this FIFO queue synchronously. A newer
-        # message never starts its POST until every earlier one has finished.
+        # Finish each POST before starting the next queued message.
         self.send_queue.put({
             "server_url": server_url,
             "encryption_key": encryption_key,
@@ -12204,8 +12047,7 @@ QComboBox::drop-down {
             except Exception:
                 pass
 
-        # Closing a streaming requests response can wait for the socket reader.
-        # Never let a chatroom or server change block Qt's GUI thread.
+        # Streaming response close can block; run it off the GUI thread.
         threading.Thread(
             target=close_response,
             name="SpriteLinkSubscriptionRefreshClose",
@@ -12453,9 +12295,8 @@ QComboBox::drop-down {
             )
             room_to_poll: dict[str, str] | None = None
             repay_background_after_poll = False
-            # Normal presence work shares the chat request cadence. Restoring
-            # from tray requests a tally immediately, then resumes that cadence.
-            # A step sends a ping or fetches a tally, never both at once.
+            # Presence shares request cadence; tray restore requests an immediate tally.
+            # Each step sends a ping or fetches a tally, never both.
             presence_work = (
                 (
                     (
@@ -12569,8 +12410,6 @@ QComboBox::drop-down {
         if self._last_recently_online_count is None:
             label.setText("Recently online: …")
             return
-        # Keep the last completed tally throughout tray suspension, refreshes
-        # and server changes. Only a successful response replaces the value.
         label.setText(f"Recently online: {self._last_recently_online_count}")
 
     def _network_recently_online_step(self, *, now: float) -> bool:
@@ -12611,7 +12450,7 @@ QComboBox::drop-down {
                 if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
                     token = secrets.token_hex(16)
                     state["pending_token"] = token
-                # Retrying after a timeout or restart must count as one ping.
+                # Retries must reuse the ping token.
                 save_config(self.config_data)
                 topic, _key = recently_online_transport()
                 response = self.session.post(
@@ -12630,8 +12469,7 @@ QComboBox::drop-down {
                 self._queue_ui_event(("recently_online_sent", None))
                 save_config(self.config_data)
             except Exception:
-                # Retry quietly with the same token; presence failures never
-                # produce chat messages, unread markers or notifications.
+                # Retry silently with the same token; presence failures are not chat events.
                 pass
             return True
 
@@ -12656,8 +12494,7 @@ QComboBox::drop-down {
             pings = recently_online_pings(parse_ntfy_ndjson(response), now=time.time())
             self._queue_ui_event(("recently_online", (server, pings)))
         except Exception:
-            # Keep the last completed count on failure. A failed first fetch
-            # remains unknown, rather than suggesting zero users.
+            # Retain the last count on failure; an unknown first count is not zero.
             self.recently_online_poll_attempts[server] = (
                 now - RECENTLY_ONLINE_POLL_SECONDS + RECENTLY_ONLINE_RETRY_SECONDS
             )
@@ -13051,7 +12888,7 @@ QComboBox::drop-down {
                         )
 
                 elif event_type in {"send_succeeded", "recently_online_sent"}:
-                    # Anonymous pings also consume a relay publish request.
+                    # Presence pings consume the relay publish limit.
                     self._record_successful_send()
 
                 elif event_type == "send_failed":
@@ -13100,10 +12937,7 @@ QComboBox::drop-down {
                         self.message_log.extend(accepted_items)
                         self.message_log.sort(key=self._message_sort_key)
                     elif accepted_items:
-                        # The worker emits saved-history chunks newest-first.
-                        # Every later chunk is older than the current prefix,
-                        # so prepend it without repeatedly sorting the growing
-                        # retained history on the GUI thread.
+                        # Prepend newest-first history chunks without repeatedly sorting the log.
                         self.message_log[0:0] = accepted_items
                     if initial_chunk:
                         if self.message_log and not self._tray_ui_suspended:
@@ -13328,7 +13162,6 @@ QComboBox::drop-down {
             return
 
         history.sort(key=self._message_sort_key)
-        # Inactive rooms are pruned by the hourly maintenance timer.
         try:
             save_chatroom_history(
                 server_url,
@@ -13479,9 +13312,7 @@ QComboBox::drop-down {
         history_limit = self._chatroom_history_limit()
         if len(self.message_log) > history_limit:
             del self.message_log[:-history_limit]
-        # The visible history is a growing suffix for the lifetime of this
-        # room view. A newly received message must extend that suffix instead
-        # of pushing its oldest already-loaded message out of the document.
+        # Live arrivals extend the visible history suffix without evicting loaded rows.
         self.rendered_history_message_limit = min(
             len(self.message_log),
             self.rendered_history_message_limit + 1,
@@ -13528,9 +13359,7 @@ QComboBox::drop-down {
             return
 
         if not self._append_live_message_items(items):
-            # A delayed or duplicate message can belong inside an existing
-            # rendered group instead of after it. Keep that exceptional case
-            # correct; normal live arrivals never enter the history renderer.
+            # Delayed messages may belong inside an existing group; use the rebuild fallback.
             self._render_message_log(scroll_to_bottom=True)
 
     def _append_live_message_items(
@@ -13566,9 +13395,7 @@ QComboBox::drop-down {
                 muted_ids,
             )
             if len(boundary_groups) == 1:
-                # Consecutive repeated messages are represented by one row.
-                # Updating that already-rendered row needs the correctness
-                # fallback above instead of appending a second row.
+                # Repeated messages share a row; update it through the rebuild fallback.
                 return False
 
         collapsed_ids = self._room_preference_ids("collapsed_messages")
@@ -14485,27 +14312,18 @@ QComboBox::drop-down {
                 geometry_changed = True
                 changed_image_blocks.add(cursor.block().position())
 
-            # Reapply the inline format on every decoded resource swap. Qt can
-            # otherwise retain the placeholder pixels when the real preview
-            # happens to have the same geometry.
+            # Reapply format even at unchanged size; Qt may retain placeholder pixels.
             cursor.setCharFormat(image_format)
             document.markContentsDirty(position, 1)
 
         if geometry_changed:
-            # Image-only messages top-align their username and profile icon
-            # against the preview.  Those text baseline offsets were created
-            # from the placeholder height, so resize them in the same hidden
-            # transaction as the image character instead of waiting for a
-            # later document rebuild.
+            # Update sender baselines with the preview height in the same hidden transaction.
             for block_position in changed_image_blocks:
                 self._realign_inline_image_block_text(
                     document,
                     block_position,
                 )
-            # Inline-object size changes can leave the surrounding block with
-            # stale line geometry until another scroll event. Complete layout
-            # while the viewport transaction is still hidden; its saved
-            # anchor is restored before updates are enabled again.
+            # Force inline-object layout before restoring the anchor and showing updates.
             document.documentLayout().documentSize()
         self.chat_display.viewport().update()
 
@@ -14902,13 +14720,8 @@ QComboBox::drop-down {
                 and self.chat_display.verticalScrollBar().value()
                 <= self.chat_display.verticalScrollBar().minimum()
             ):
-                # A wheel-up at the top is still meaningful when the first
-                # pages do not fill a tall viewport and the scrollbar cannot
-                # emit a changed value.
-                # Use the same tokenized/coalesced entrypoint as the
-                # scrollbar. Calling the request callback directly would omit
-                # its required generation/room token and crash when the user
-                # overscrolls an already-exhausted history.
+                # Wheel-up can request history without a scrollbar range.
+                # Use the coalesced entry point so generation/room tokens are supplied.
                 self._on_chat_history_scroll_action(0)
 
             elif event.type() == QEvent.Type.MouseMove:
@@ -14959,9 +14772,7 @@ QComboBox::drop-down {
                         event.position().toPoint()
                     )
                     if self._message_id_from_anchor(anchor):
-                        # User links are hover/context targets, not clickable
-                        # navigation. Consuming the click prevents Qt from
-                        # drawing a focus outline around the icon or username.
+                        # Consume user-link clicks to prevent navigation and Qt focus outlines.
                         return True
                     image_url = self._image_url_from_anchor(anchor)
                     if image_url:
@@ -15023,8 +14834,6 @@ QComboBox::drop-down {
                                 clicked_item,
                                 event.globalPos(),
                             )
-                # Never show QTextBrowser's generic Copy/Copy Link/Select All
-                # menu in the log viewport.
                 return True
 
         return super().eventFilter(watched, event)
@@ -15111,9 +14920,7 @@ QComboBox::drop-down {
             )
             cursor.setCharFormat(formatting)
 
-        # QTextDocument may invalidate only the text-format bounds after a
-        # reveal toggle. Repaint the complete viewport so the old opaque
-        # spoiler block cannot leave a thin edge outside that dirty region.
+        # Reveal toggles may invalidate only text bounds; repaint stale spoiler edges.
         self.chat_display.viewport().update()
 
     def _sender_at_position(
@@ -15185,9 +14992,7 @@ QComboBox::drop-down {
             return False
 
         try:
-            # Let Qt detect GIF from its signature. Some PySide6 Windows
-            # builds reject an explicit format argument despite advertising
-            # that overload.
+            # Detect GIF by signature; some PySide6 builds reject the format overload.
             image = QImage.fromData(gif_data)
         except (TypeError, ValueError):
             return False
@@ -15268,9 +15073,7 @@ QComboBox::drop-down {
         image_format.setHeight(displayed_image.height())
         image_format.setAnchor(True)
         image_format.setAnchorHref(f"spritelink:{message_id}")
-        # Keep the icon vertically centered in the current text row while
-        # retaining the slight upward optical offset used by the default
-        # 24-pixel layout. AlignTop avoids AlignMiddle half-pixel rounding.
+        # Keep the optical offset; AlignTop avoids half-pixel AlignMiddle rounding.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
         )
@@ -15735,12 +15538,9 @@ QComboBox::drop-down {
             cursor.insertBlock()
         separator_block = QTextBlockFormat()
         separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # Symmetric padding keeps the text vertically centered. The log's
-        # background painter covers the complete block, including margins.
         separator_block.setTopMargin(7)
         separator_block.setBottomMargin(7)
-        # The full-width row painter owns separators as well as messages.
-        # A QTextBlock background would blend this stripe a second time.
+        # Let the row painter draw the stripe once, including margins.
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
         separator_block_number = cursor.block().blockNumber()
@@ -15912,10 +15712,7 @@ QComboBox::drop-down {
                     boundary_split_groups.append(group)
             display_groups = boundary_split_groups
 
-        # Calculate the final chronological stripe/separator plan once, then
-        # execute it backwards.  The newest row becomes visible immediately;
-        # each later GUI turn prepends one older row while preserving the
-        # completed document's normal oldest-to-newest order.
+        # Render the chronological plan backwards to show the newest row first.
         render_steps: list[dict[str, Any]] = []
         previous_timestamp: int | None = None
         stripe_index = 0
@@ -15946,9 +15743,7 @@ QComboBox::drop-down {
             stripe_index += 1
             previous_timestamp = self._display_timestamp_for_item(group[-1])
 
-        # Expanding the visible suffix can prepend an odd number of message
-        # and separator rows. Anchor the new plan to any message that was
-        # already rendered so existing white/gray stripes never swap places.
+        # Anchor stripes to an existing message so odd prepends do not swap colors.
         background_indices = {
             QColor(color).name().casefold(): index
             for index, color in enumerate(message_row_backgrounds())
@@ -16137,10 +15932,7 @@ QComboBox::drop-down {
             for selection in row_selections
             if selection.cursor.block().isValid()
         }
-        # Forward rendering is used when a theme/style replacement rebuilds
-        # the log while preserving its anchor. Short documents have no
-        # scrollbar position to restore, so reapply their root-frame margin
-        # explicitly instead of letting the messages snap to the top.
+        # Short logs have no scroll anchor; restore their bottom-aligning root margin.
         self._bottom_align_short_message_log()
         self.chat_display.setExtraSelections([])
         self._message_render_job = None
@@ -16174,15 +15966,13 @@ QComboBox::drop-down {
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> int:
-        # Unlike the append-oriented separator helper, this leaves no trailing
-        # empty block: the already-rendered newer content is immediately next.
+        # Leave no trailing empty block when prepending before existing content.
         if cursor.block().text():
             cursor.insertBlock()
         separator_block = QTextBlockFormat()
         separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
         separator_block.setTopMargin(7)
         separator_block.setBottomMargin(7)
-        # Match the append path: paint the translucent stripe only once.
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
         separator_block_number = cursor.block().blockNumber()
@@ -16257,10 +16047,7 @@ QComboBox::drop-down {
                 else None
             )
 
-            # Integer block/character positions do not follow QTextDocument
-            # edits automatically. Preserve the existing newer rows, clear the
-            # live maps to avoid low-number collisions, then shift them by the
-            # exact amount inserted at the front.
+            # Integer positions do not follow document edits; shift newer-row maps after prepend.
             old_message_blocks = dict(self.rendered_message_blocks)
             old_message_last_blocks = dict(
                 self.rendered_message_last_blocks
@@ -16298,10 +16085,7 @@ QComboBox::drop-down {
             cursor = QTextCursor(document)
             cursor.movePosition(QTextCursor.MoveOperation.Start)
             if old_message_blocks:
-                # insertBlock() leaves the cursor in the existing block when
-                # splitting at position zero. Move back into the new blank
-                # block so the prepended sender cannot share or reformat the
-                # first already-rendered message.
+                # At position zero, insertBlock() keeps the old block; move into the new one.
                 cursor.insertBlock()
                 cursor.movePosition(
                     QTextCursor.MoveOperation.PreviousBlock
@@ -16392,12 +16176,7 @@ QComboBox::drop-down {
         }
         self._bottom_align_short_message_log()
         if isinstance(preserve_anchor, dict):
-            # QTextDocument insertion and layout stay on the GUI thread, but
-            # only one displayed group is added per turn. Capture the user's
-            # current viewport immediately before each insertion and restore
-            # that live anchor immediately afterward. Scrolling therefore
-            # remains interactive throughout the page load instead of being
-            # frozen behind one hidden full-document transaction.
+            # Insert one group per GUI turn and restore the current anchor to allow scrolling.
             self.chat_display.document().documentLayout().documentSize()
             self._restore_chat_view_anchor(preserve_anchor)
         if index >= 0:
@@ -16450,12 +16229,9 @@ QComboBox::drop-down {
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
-        # Separator replacement and embedded-media paths can leave the cursor
-        # on a populated block. Enforce the row boundary here so one sender's
-        # username can never continue after another sender's message.
+        # Start a new row if media/separator handling left a populated block.
         if cursor.block().text():
             cursor.insertBlock()
-        # Never allow a previous message's character format to carry over.
         cursor.setCharFormat(QTextCharFormat())
         message_start_position = cursor.position()
 
@@ -16538,11 +16314,7 @@ QComboBox::drop-down {
                 image_url,
                 [],
             ).append(message_start_position)
-        # Every trusted image gets an inline object during its first
-        # message render. Visibility determines whether that object contains
-        # the decoded preview or a 48x48 placeholder; it must never determine
-        # whether the object exists. Otherwise the first decode callback has
-        # no image character to refresh until scrolling rebuilds the row.
+        # Create inline objects before decoding; invisible media still needs a refresh target.
         displayed_image_urls = list(image_urls)
 
         username_color = (
@@ -16727,9 +16499,7 @@ QComboBox::drop-down {
                 self._text_format("#b00020", font_name=font_name),
             )
 
-        # Explicit newlines create additional QTextBlocks. Give every block
-        # the same row color and left edge so continuations align with the
-        # profile icon, or with the username when no icon is present.
+        # Explicit newlines create blocks; preserve row color and sender alignment.
         document = cursor.document()
         block = document.findBlock(message_start_position)
         final_block_number = cursor.block().blockNumber()
@@ -16739,13 +16509,9 @@ QComboBox::drop-down {
             block_format.setLeftMargin(10)
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
-            # Only date/hour separators may contribute vertical margins.
-            # Ordinary message blocks follow the active chat font metrics.
             block_format.setTopMargin(0.0)
             block_format.setBottomMargin(0.0)
-            # The custom full-width painter owns the entire normal stripe.
-            # Clear any inherited QTextBlock background so Qt cannot repaint
-            # the middle with independently rasterized vertical bounds.
+            # Clear inherited block backgrounds; the full-width painter owns the stripe.
             block_format.clearProperty(
                 QTextFormat.Property.BackgroundBrush
             )
@@ -17246,8 +17012,7 @@ QComboBox::drop-down {
         self.stop_event.set()
         self.network_wakeup_event.set()
         self.subscription_refresh_event.set()
-        # Network workers are daemons. Do not block the GUI thread waiting on
-        # a request or streaming response while the application is exiting.
+        # Do not wait for daemon network workers during exit.
         with self._http_session_lock:
             session = self.session
             subscription_session = self.subscription_session

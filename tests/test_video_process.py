@@ -1,4 +1,3 @@
-"""Exercise cold startup, frame transport, controls, cancellation and cleanup."""
 import os
 from pathlib import Path
 import subprocess
@@ -44,7 +43,7 @@ if(command==='volume')state.volume=value;
 if(command==='seek')state.position=value;
 if(command==='mute')state.muted=value;
 };</script>"""
-# The delay stands in for slow Windows DLL/GPU/Chromium initialization.
+# Simulate slow Windows backend initialization.
 code="import sys,time,runpy;time.sleep(0.8)\nimport spritelink_video as V\nV.provider_player_html=lambda info,volume: "+repr(html)+".replace('INITIAL_VOLUME',str(volume))\nsys.argv=['SpriteLink.pyw','--spritelink-video-worker',sys.argv[1]]\nrunpy.run_path('SpriteLink.pyw',run_name='__main__')"
 info=VideoInfo(VideoLink('youtube','M7lc1UVf-VE','https://youtu.be/M7lc1UVf-VE'),'youtube.com')
 with mock.patch.object(P,'worker_arguments',side_effect=lambda name:['-c',code,name]):

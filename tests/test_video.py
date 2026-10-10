@@ -298,8 +298,7 @@ class VideoControlsTests(unittest.TestCase):
         for size in ((480, 240), (100, 250), (640, 360)):
             root.resize(*size)
             layout.activate()
-            # Only the raster display resizes; Chromium's render surface and
-            # the last valid frame remain stable throughout the drag.
+            # Resize only the raster display; retain render geometry and the last frame.
             self.assertEqual(mirror.frame, original)
             self.assertEqual(browser.size(), browser_size)
             result = mirror.grab().toImage()
@@ -417,7 +416,6 @@ mirror.release(); backend.deleteLater(); root.close(); root.deleteLater(); QTest
         player.web.setUrl.assert_not_called()
         player.web.stop.assert_not_called()
         self.assertTrue(player._poll_pending)
-        # A stale callback from a dismissed player cannot resurrect controls.
         callback = player.web.page().runJavaScript.call_args.args[1]
         player.web = None
         player.stop()
@@ -498,7 +496,6 @@ mirror.release(); backend.deleteLater(); root.close(); root.deleteLater(); QTest
     @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the provider bridge")
     def test_youtube_bridge_runs_with_controls_hidden_and_native_commands(self):
         info = V.VideoInfo(V.VideoLink("youtube", "M7lc1UVf-VE", "", 42), "youtube.com")
-        # Execute the generated production JS against a fake official SDK.
         runner = r"""
 const fs=require('fs'), vm=require('vm');
 const html=fs.readFileSync(0,'utf8'), calls=[], intervals=[];
@@ -582,15 +579,13 @@ for(const m of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))vm.runInConte
 const sample=(time,value)=>{now=time;actual=value;snapshots.push(c.window.spriteState().volume);};
 c.onYouTubeIframeAPIReady();sample(0,100);
 options.events.onReady();sample(100,100);
-// An early matching SDK cache entry is not proof that the iframe settled.
+// Early cached matches do not confirm settled volume.
 sample(300,20);sample(900,100);sample(1400,20);sample(2000,20);
-// Regular state updates resume after the confirmation window.
 sample(2200,60);
 c.window.spriteCommand('volume',40);sample(2300,60);
 sample(2600,100);sample(2900,40);sample(4200,40);
-// A different value is reported only if forcing fails and it remains stable.
 c.window.spriteCommand('volume',0);sample(4400,100);sample(6199,100);sample(6200,100);
-// Restarting a request also restarts the window; late mismatches must settle.
+// New requests reset confirmation; late mismatches must settle.
 c.window.spriteCommand('volume',70);sample(6300,70);sample(8100,100);
 sample(8200,100);sample(8599,100);sample(8600,100);
 process.stdout.write(JSON.stringify({snapshots,calls}));

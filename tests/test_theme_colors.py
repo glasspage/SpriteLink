@@ -121,7 +121,6 @@ class ThemeColorTests(unittest.TestCase):
         for position in (15, 90, 240):
             self.client.theme_color_slider.setValue(position)
         self.saved.assert_not_called()
-        # Pausing while holding the thumb must not trigger an expensive commit.
         QTest.qWait(500)
         self.assertEqual(self.app.property("spritelinkThemeHue"), 0)
         self.assertEqual(self.app.styleSheet(), sheet)

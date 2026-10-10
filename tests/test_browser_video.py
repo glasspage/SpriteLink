@@ -1,4 +1,3 @@
-"""Browser regressions run in a fresh Qt process, without external requests."""
 import os
 import subprocess
 import sys
@@ -18,8 +17,7 @@ class BrowserVideoTests(unittest.TestCase):
     def run_browser(self, source):
         env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "QT_QUICK_BACKEND": "software"}
         if hasattr(os, "geteuid") and os.geteuid() == 0:
-            # Chromium cannot sandbox a root test process. Production settings
-            # are unchanged; this applies only to the isolated test child.
+            # Root Chromium needs sandbox disabled in this isolated test child.
             env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
         result = subprocess.run([sys.executable, "-c", source], env=env,
                                 capture_output=True, text=True, timeout=30)
@@ -184,7 +182,7 @@ for provider, factor, extent in [('youtube',0.25,10),('vimeo',1.0,40)]:
     assert abs(viewport['width']*ratio*factor-1920) < 2, viewport
     assert abs(viewport['height']*ratio*factor-1080) < 2, viewport
     if provider == 'youtube':
-        # An initialized renderer rejects values below the documented minimum.
+        # Check minimum zoom after renderer initialization.
         for unsupported in (0.1,0.2,0.249):
             web.setZoomFactor(unsupported); QTest.qWait(50)
             assert web.zoomFactor() == 0.25

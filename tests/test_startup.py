@@ -1,4 +1,3 @@
-"""First-window work, staged UI preparation, and cold-start shutdown."""
 from contextlib import ExitStack
 import os
 import subprocess
@@ -73,7 +72,6 @@ class DeferredStartupTests(unittest.TestCase):
         self.history.assert_not_called()
         self.network.assert_not_called()
         self.updates.assert_not_called()
-        # Room clearing and tray suspension can happen before preparation.
         self.client._clear_visible_room()
         self.client._suspend_for_tray()
 

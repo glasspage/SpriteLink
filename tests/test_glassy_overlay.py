@@ -51,7 +51,7 @@ class GlassyOverlayTests(unittest.TestCase):
         self.overlay.show()
         before = self.overlay.grab().toImage()
         self.parent.setStyleSheet("background-color: rgba(0, 0, 0, 100);")
-        # Do not refresh the snapshot: only the underlying live UI changes.
+        # Leave the snapshot stale while changing the live UI.
         after = self.overlay.grab().toImage()
         self.assertEqual(before, after)
 

@@ -2003,7 +2003,6 @@ class RuntimeOptimizationTests(unittest.TestCase):
             "active",
         )
 
-        # A stream signal cannot make a muted inactive room urgent.
         self.assertEqual(
             SPRITELINK.next_poll_room_id(
                 room_ids=["active", "ordinary", "muted"],
@@ -2021,8 +2020,6 @@ class RuntimeOptimizationTests(unittest.TestCase):
             ),
             "ordinary",
         )
-        # Once its own timer expires, the muted room gets a request slot
-        # without needing a stream signal.
         self.assertEqual(
             SPRITELINK.next_poll_room_id(
                 room_ids=["active", "ordinary", "muted"],
@@ -2557,8 +2554,6 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
         self.assertEqual(
             topic_rooms,
             {
-                # The muted active room remains responsive. The muted
-                # inactive room-b is absent from the subscription.
                 "topic-a": ("room-a", "room-c"),
             },
         )

@@ -1,8 +1,4 @@
-"""Video link metadata and click-to-play players for SpriteLink.
-
-Provider HTML is never executed. Only canonical player URLs are embedded, and
-the caller's trusted-link check also gates metadata and thumbnail requests.
-"""
+"""Trusted video metadata and players; embed only canonical provider URLs."""
 
 from dataclasses import dataclass
 from html import escape
@@ -48,8 +44,7 @@ YOUTUBE_CHROME_SCRIPT = r"""
   const refresh = () => {
     const player = document.getElementById('movie_player');
     if (!player) return;
-    // Follow the actual video layer instead of depending on YouTube's
-    // changing control class names. Keep error messages and ad UI intact.
+    // Follow video-layer siblings; preserve errors and ad controls.
     const video = player.querySelector('video');
     if (!video) return;
     for (let layer = video; layer && layer !== player; layer = layer.parentElement) {
@@ -61,8 +56,7 @@ YOUTUBE_CHROME_SCRIPT = r"""
     video.controls = false;
   };
   window[key] = refresh;
-  // Direct style properties also work when a site's CSP rejects a new
-  // inline stylesheet. Reapply after controls are inserted or restyled.
+  // Direct styles bypass stylesheet CSP; reapply when controls change.
   new MutationObserver(refresh).observe(document, {
     subtree:true, childList:true, attributes:true, attributeFilter:['class','style']
   });
@@ -127,7 +121,6 @@ def _start_time(query: dict) -> int:
 
 
 def video_link(url: str, trusted) -> VideoLink | None:
-    """Recognize videos only after the shared trusted-link gate accepts them."""
     if not trusted(url):
         return None
     try:
@@ -151,7 +144,6 @@ def video_link(url: str, trusted) -> VideoLink | None:
     elif host in ("youtu.be", "www.youtu.be") and len(path) == 1:
         identifier, provider = path[0], "youtube"
     elif host in ("vimeo.com", "www.vimeo.com", "player.vimeo.com"):
-        # Public videos and unlisted links (ID/hash), excluding profiles.
         if path[0].isdigit():
             identifier, provider = path[0], "vimeo"
         elif len(path) >= 2 and path[0] == "video" and path[1].isdigit():
@@ -176,8 +168,7 @@ def video_link(url: str, trusted) -> VideoLink | None:
 
 
 def _read_response(url: str, trusted, *, limit: int, accept: str) -> bytes:
-    # Validate BEFORE each request, including redirects; never follow arbitrary
-    # oEmbed thumbnail URLs or redirects with requests' automatic redirecting.
+    # Validate every request and redirect before following provider metadata URLs.
     for _ in range(4):
         if not trusted(url):
             raise ValueError("Untrusted video metadata URL")
@@ -231,8 +222,7 @@ def fetch_video_info(link: VideoLink, trusted) -> tuple[VideoInfo, bytes]:
         if link.provider == "youtube":
             if not thumbnail:
                 thumbnail = f"https://i.ytimg.com/vi/{link.video_id}/hqdefault.jpg"
-            # YouTube oEmbed omits duration. Read only bounded public metadata;
-            # playback still uses the official player, never an extracted URL.
+            # oEmbed omits duration; read bounded metadata without extracting playback URLs.
             try:
                 page = _read_response(
                     f"https://www.youtube.com/watch?v={link.video_id}", trusted,
@@ -289,14 +279,12 @@ def video_thumbnail(frame: QImage | None, width: int, height: int) -> QImage:
 
 
 def provider_player_html(info: VideoInfo, volume: int = DEFAULT_VIDEO_VOLUME) -> str:
-    """Only constants and JSON-encoded IDs enter executable JavaScript."""
+    """Embed only constants and JSON-encoded IDs in JavaScript."""
     link = info.link
     if link.provider == "youtube":
         script = """
 let player;
-// The SDK can report its default before the iframe applies our command.
-// Preserve the requested slider value until it settles, or until a failed
-// attempt has had two seconds to leave a persistent different value.
+// Hold requested volume until the SDK settles after forcing it.
 let pendingVolume={value:initialVolume, sentAt:null, reported:null, stableAt:null};
 function setYouTubeVolume(value) {
   pendingVolume={value:value, sentAt:Date.now(), reported:null, stableAt:null};
@@ -366,7 +354,6 @@ window.spriteState=readYouTubeState;
         loader = '<script async src="https://www.youtube.com/iframe_api"></script>'
         content = '<div id="player"></div>'
     elif link.provider == "vimeo":
-        # Vimeo's player API supports external controls too.
         params = parse_qs(urlsplit(link.source_url).query)
         path = urlsplit(link.source_url).path.strip("/").split("/")
         video_hash = params.get("h", [""])[0]
@@ -410,8 +397,7 @@ window.spriteCommand = (command, value) => {
         script = "window.spriteCommand=()=>{};"
     script = script.replace("VIDEO_ID", json.dumps(link.video_id)).replace(
         "START_SECONDS", str(link.start_seconds))
-    # YouTube chooses quality automatically: setPlaybackQuality and
-    # suggestedQuality are no-ops. Do not offer a nonfunctional quality control.
+    # YouTube quality setters are no-ops; keep automatic quality.
     pointer_style = "#player{pointer-events:none}" if link.provider == "youtube" else ""
     return ("<!doctype html><html><head><meta charset='utf-8'>"
             "<meta name='referrer' content='strict-origin-when-cross-origin'>"
@@ -426,7 +412,7 @@ window.spriteCommand = (command, value) => {
 
 
 class DirectVideoThumbnail(QObject):
-    """Decode one silent frame, then release the stream and decoder."""
+    """Decode one silent thumbnail frame, then release the decoder."""
     frame_ready = Signal(str, object)
 
     def __init__(self, url, parent):
@@ -445,7 +431,6 @@ class DirectVideoThumbnail(QObject):
         self.sink.videoFrameChanged.connect(self._frame)
         self.player = QMediaPlayer(self)
         self.player.setVideoSink(self.sink)
-        # No audio output: preview decoding cannot make sound.
         self.player.errorOccurred.connect(self.stop)
         self.player.setSource(QUrl(self.url))
         self.timeout.start(10000)
@@ -475,7 +460,7 @@ class DirectVideoThumbnail(QObject):
 
 
 class VideoFrameView(QWidget):
-    """An opaque raster surface that retains the last valid decoded frame."""
+    """Retain the last valid video frame."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.frame = QImage()
@@ -514,19 +499,17 @@ class VideoFrameView(QWidget):
 
 
 class BrowserFrameView(VideoFrameView):
-    """Display browser frames without a GPU child in the chat window."""
+    """Display browser frames without a GPU child in chat."""
     def __init__(self, browser, parent=None):
         super().__init__(parent)
         self.browser = browser
         self._capturing = False
-        # Qt Quick changes its top-level window's compositor even after the
-        # player is removed. Keep Chromium in a separate, opaque render host.
+        # Isolate Chromium: Qt Quick can permanently change its top-level compositor.
         browser.setParent(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
         browser.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
         browser.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         browser.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
-        # A fixed 1080p render surface also avoids Chromium's partially
-        # repainted frames during resize. Only the raster display is resized.
+        # Fixed render geometry avoids partial Chromium resize frames.
         ratio = browser.devicePixelRatioF()
         browser.resize(round(1920 / ratio), round(1080 / ratio))
         browser.show()
@@ -566,7 +549,6 @@ class BrowserFrameView(VideoFrameView):
 
 
 class InteractiveVideoFrame(VideoFrameView):
-    """Forward native provider input without hosting Chromium in chat."""
     def __init__(self, send_input):
         super().__init__()
         self._send_input = send_input
@@ -611,7 +593,7 @@ class InteractiveVideoFrame(VideoFrameView):
         self._mouse(event, "double")
 
     def keyPressEvent(self, event):
-        # Escape still belongs to SpriteLink's fullscreen window.
+        # Let SpriteLink handle fullscreen Escape.
         if event.key() == Qt.Key.Key_Escape:
             super().keyPressEvent(event)
             return
@@ -629,7 +611,6 @@ class InteractiveVideoFrame(VideoFrameView):
 
 
 class VideoCanvas(QWidget):
-    """Center the video over black in every player mode."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(0, 0)
@@ -684,7 +665,6 @@ class VideoWindow(QDialog):
 
 
 class VideoPlayer(QWidget):
-    """Native theme-aware controls shared by direct, YouTube and Vimeo videos."""
     duration_available = Signal(int)
     popup_closed = Signal()
     open_in_browser = Signal()
@@ -761,7 +741,7 @@ class VideoPlayer(QWidget):
         self.volume.setRange(0, 100)
         self.volume.setSingleStep(10)
         self.volume.setPageStep(10)
-        # The player lives for the app session; stop/load retain this value.
+        # Retain volume between videos for this app session.
         self.volume.setValue(DEFAULT_VIDEO_VOLUME)
         self.volume.setFixedWidth(55)
         self.volume.valueChanged.connect(lambda value: self._command("volume", value))
@@ -770,7 +750,6 @@ class VideoPlayer(QWidget):
         self.fullscreen_button = QPushButton()
         self.fullscreen_button.setAccessibleName("Fullscreen")
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
-        # The order remains identical for every theme and playback backend.
         for widget in (self.play_button, self.seek, self.time_label,
                        self.mute_button, self.volume, self.fullscreen_button):
             row.addWidget(widget, 1 if widget is self.seek else 0)
@@ -903,8 +882,6 @@ class VideoPlayer(QWidget):
             "Modern": "QFrame#videoControls {background:#f3f3f3; border:1px solid #dedede;"
                       "border-radius:7px;}",
         }
-        # Buttons and sliders inherit the app's separate Classic, Glassy and
-        # Modern styles, including bevel painting, color variants and density.
         stylesheet = styles.get(theme, styles["Modern"])
         if self._fullscreen is not None and self._fullscreen.property("spritelinkVideoFullscreen"):
             stylesheet += "QFrame#videoControls {border-radius:0px;}"
@@ -967,7 +944,7 @@ class VideoPlayer(QWidget):
         if self._use_process:
             self._load_remote(info)
             return
-        # Lazy: loading chat or creating a thumbnail never starts Chromium.
+        # Start Chromium only on playback.
         try:
             from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
             from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -986,7 +963,7 @@ class VideoPlayer(QWidget):
 
         self.web = QWebEngineView()
         self.web.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        # An off-the-record profile isolates embedded sites from other windows.
+        # Use an off-the-record profile to isolate embedded sites.
         self.profile = QWebEngineProfile(self)
         page = PlayerPage(self.profile, self.web)
         self.web.setPage(page)
@@ -994,14 +971,12 @@ class VideoPlayer(QWidget):
         page.settings().setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
         if info.link.provider == "youtube":
             install_youtube_chrome(self.profile)
-            # Expand the logical viewport so remaining fixed-size YouTube
-            # chrome is four times smaller, without changing video geometry.
+            # Expand the viewport to shrink YouTube chrome without shrinking video.
             self.web.setZoomFactor(YOUTUBE_ZOOM_FACTOR)
         if info.link.provider in ("youtube", "vimeo") or self._mirror_native:
             self.video_widget = BrowserFrameView(self.web)
             self.canvas.set_backend(self.video_widget)
         else:
-            # These providers need genuine pointer input for their native UI.
             self.canvas.set_backend(self.web)
         self.surface.setCurrentWidget(self.canvas)
         self.web.loadFinished.connect(self._hide_youtube_chrome)
@@ -1011,7 +986,7 @@ class VideoPlayer(QWidget):
             generation = self._generation
             QTimer.singleShot(20000, lambda: self._check_ready(generation))
         else:
-            # Providers without a reliable control API retain their own bar.
+            # Keep native controls when no reliable bridge exists.
             for widget in (self.play_button, self.seek, self.time_label, self.mute_button, self.volume):
                 widget.hide()
 
@@ -1031,7 +1006,6 @@ class VideoPlayer(QWidget):
         else:
             self.video_widget = VideoFrameView()
         self.canvas.set_backend(self.video_widget)
-        # Keep Loading... visible until the first complete frame arrives.
         try:
             self._remote_engine.load(info, self.volume.value(), self._generation)
         except (OSError, RuntimeError):
@@ -1048,16 +1022,14 @@ class VideoPlayer(QWidget):
 
     def _check_ready(self, generation: int) -> None:
         if generation == self._generation and self.info and not self._ready:
-            # A slow control bridge is not proof that the video failed. Never
-            # destroy an iframe on a readiness timer; real SDK/page errors are
-            # reported separately, and polling can recover without a reload.
+            # Do not treat slow readiness as failure; SDK/page errors handle real failures.
             self._poll()
 
     def _direct_error(self, error, message: str) -> None:
         self._error("Video playback unavailable. Open in Browser to watch.")
 
     def _error(self, text: str) -> None:
-        # Prevent a late SDK ready callback from autoplaying behind an error.
+        # Ignore late ready callbacks after errors.
         if self._remote_engine is not None:
             self._remote_engine.stop()
         if self.web is not None:
@@ -1092,8 +1064,7 @@ class VideoPlayer(QWidget):
                     return
                 self._poll_pending = False
                 self._update_state(state)
-            # Explicit JSON avoids QVariant/JS-object conversion differences
-            # between PySide versions. Read live SDK state even while paused.
+            # Explicit JSON avoids PySide conversion differences; poll SDK state while paused.
             self.web.page().runJavaScript(
                 "JSON.stringify(window.spriteState ? window.spriteState() : null)", result)
 
@@ -1101,8 +1072,7 @@ class VideoPlayer(QWidget):
         if self.web is None or self.info is None or self.info.link.provider != "youtube":
             return
         page = self.web.page()
-        # Qt 6.8+ exposes frames directly. Refresh the actual embed as well as
-        # installing the profile script, covering late iframe creation.
+        # Refresh late-created embeds through Qt 6.8+ frame access.
         if not isinstance(page, QObject) or not hasattr(page, "mainFrame"):
             return
         pending = [page.mainFrame()]
@@ -1242,7 +1212,7 @@ class VideoPlayer(QWidget):
         self._fullscreen = None
         self._fullscreen_restore_mode = None
         if dialog is not None:
-            # Move the live backend out before destroying its old container.
+            # Reparent the backend before destroying its container.
             self.setParent(self._embedded_parent)
             dialog.blockSignals(True)
             dialog.close()
@@ -1292,7 +1262,7 @@ class VideoPlayer(QWidget):
         self._update_source_label()
 
     def _create_window(self, *, fullscreen: bool) -> None:
-        # Parent to the chat's window, not the previous detached window.
+        # Own detached windows from chat, not another detached window.
         owner = self._embedded_parent.window() if self._embedded_parent else None
         dialog = VideoWindow(owner)
         dialog.setProperty("spritelinkVideoWindow", True)
@@ -1347,8 +1317,7 @@ class VideoPlayer(QWidget):
         self.setParent(self._embedded_parent)
         dialog.deleteLater()
         if was_popout:
-            # Closing a pop-out dismisses playback without reopening the chat
-            # overlay. Explicit mode buttons restore the in-window player.
+            # Closing pop-out dismisses playback; only mode buttons restore it.
             self._mode = "main"
             if self._embedded_parent is not None:
                 self._move_to_host(self._embedded_parent)
@@ -1370,7 +1339,7 @@ class VideoPlayer(QWidget):
         self.setMaximumHeight(height)
 
     def mini_size(self, maximum_width: int, maximum_height: int):
-        """Reserve the controls' height in addition to a 16:9 video surface."""
+        """Reserve controls below a 16:9 video surface."""
         self.layout().activate()
         chrome = self.controls.sizeHint().height() + self.mode_controls.sizeHint().height()
         chrome += self.layout().spacing() * 2
@@ -1416,7 +1385,7 @@ class VideoPlayer(QWidget):
         self.video_widget = self.web = None
         profile = getattr(self, "profile", None)
         if profile is not None:
-            # Defer profile destruction until after its view/page are deleted.
+            # Delete the profile after its view/page.
             profile.deleteLater()
             self.profile = None
         self.surface.setCurrentWidget(self.status)
