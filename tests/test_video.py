@@ -11,10 +11,11 @@ import unittest
 from unittest import mock
 
 from PIL import Image
-from PySide6.QtCore import QPoint, QPointF, Qt, QTimer, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QContextMenuEvent, QImage, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+from shiboken6 import isValid
 
 from test_security import SPRITELINK as S
 import spritelink_video as V
@@ -841,6 +842,69 @@ class VideoModeIntegrationTests(unittest.TestCase):
         self.assertIs(self.player.parentWidget(), self.client.image_preview_panel)
         self.assertTrue(self.player.play_button.isEnabled())
         self.assertEqual(self.player.time_label.text(), "0:35 / 4:05")
+
+    def test_deleted_loop_action_does_not_block_dismissal_or_reopening(self):
+        for delete_after_dismiss in (False, True):
+            with self.subTest(delete_after_dismiss=delete_after_dismiss):
+                if delete_after_dismiss:
+                    self.client._hide_image_preview_popup()
+                old_action = self.player.loop_action
+                old_action.deleteLater()
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                self.assertFalse(isValid(old_action))
+                if not delete_after_dismiss:
+                    self.client._hide_image_preview_popup()
+                self.client._show_image_preview_popup(self.url)
+                self.assertIs(self.client.video_player, self.player)
+                self.assertIsNotNone(self.player.info)
+                self.assertTrue(self.player.loop_action.isEnabled())
+                self.assertFalse(self.player.loop_action.isChecked())
+                self.assertIs(self.player._context_menu.actions()[0], self.player.loop_action)
+                with mock.patch.object(self.player, "_command", wraps=self.player._command) as command:
+                    self.player.loop_action.trigger()
+                    command.assert_called_once_with("loop", True)
+                self.assertTrue(self.player._loop)
+
+    def test_deleted_video_menu_is_rebuilt_without_losing_loop_or_video(self):
+        self.player.loop_action.trigger()
+        old_menu = self.player._context_menu
+        old_menu.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.assertFalse(isValid(old_menu))
+        self.player._show_context_menu(self.player.status.mapToGlobal(QPoint(5, 5)))
+        self.assertTrue(self.player._context_menu.isVisible())
+        self.assertTrue(self.player.loop_action.isChecked())
+        self.assertIs(self.player._context_menu.actions()[0], self.player.loop_action)
+        self.player.loop_action.trigger()
+        self.assertFalse(self.player._loop)
+        self.player.loop_action.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.player._command("loop", True)
+        self.assertTrue(self.player.loop_action.isChecked())
+        self.assertTrue(self.player._loop)
+        self.client._hide_image_preview_popup()
+        self.client._show_image_preview_popup(self.url)
+        self.assertFalse(self.player.loop_action.isChecked())
+
+    def test_cleared_video_menu_and_deferred_window_cleanup_allow_repeated_reopening(self):
+        for mode in ("main", "mini", "popout", "fullscreen"):
+            for _ in range(2):
+                with self.subTest(mode=mode):
+                    if mode == "fullscreen":
+                        self.player.toggle_fullscreen()
+                    else:
+                        self.player.set_mode(mode, self.client.video_mini_panel)
+                    self.player._context_menu.clear()
+                    self.client._hide_image_preview_popup()
+                    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                    self.client._show_image_preview_popup(self.url)
+                    self.assertIs(self.client.video_player, self.player)
+                    self.assertIs(self.player.parentWidget(), self.client.image_preview_panel)
+                    self.assertIs(self.player._context_menu.actions()[0], self.player.loop_action)
+                    self.assertFalse(self.player.loop_action.isChecked())
+                    with mock.patch.object(self.player, "_command", wraps=self.player._command) as command:
+                        self.player.loop_action.trigger()
+                        command.assert_called_once_with("loop", True)
 
     def test_mode_buttons_preserve_playback_remove_overlay_and_anchor_mini(self):
         info, generation, position = self.player.info, self.player._generation, self.player.seek.value()

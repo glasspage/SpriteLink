@@ -9,9 +9,10 @@ import re
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from PIL import Image
+from shiboken6 import isValid
 from spritelink_http import requests
 from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF
 from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QSlider,
@@ -740,11 +741,9 @@ class VideoPlayer(QWidget):
         self.surface.addWidget(self.status)
         self.canvas = VideoCanvas()
         self.surface.addWidget(self.canvas)
-        self._context_menu = QMenu(self)
-        self.loop_action = self._context_menu.addAction("Loop")
-        self.loop_action.setCheckable(True)
-        self.loop_action.setEnabled(False)
-        self.loop_action.toggled.connect(lambda checked: self._command("loop", checked))
+        self._context_menu = None
+        self.loop_action = None
+        self._ensure_context_menu()
         for widget in (self.surface, self.status, self.canvas):
             widget.installEventFilter(self)
         layout.addWidget(self.surface, 1)
@@ -857,9 +856,29 @@ class VideoPlayer(QWidget):
                 return True
         return super().eventFilter(watched, event)
 
+    def _ensure_context_menu(self) -> QMenu:
+        # The reusable player owns actions independently of popup lifetime.
+        if self.loop_action is None or not isValid(self.loop_action):
+            self.loop_action = QAction("Loop", self)
+            self.loop_action.setCheckable(True)
+            self.loop_action.toggled.connect(lambda checked: self._command("loop", checked))
+        if self._context_menu is None or not isValid(self._context_menu):
+            self._context_menu = QMenu(self)
+        actions = self._context_menu.actions()
+        if not actions or actions[0] is not self.loop_action:
+            self._context_menu.removeAction(self.loop_action)
+            self._context_menu.insertAction(actions[0] if actions else None, self.loop_action)
+        blocked = self.loop_action.blockSignals(True)
+        self.loop_action.setChecked(self._loop)
+        self.loop_action.blockSignals(blocked)
+        self.loop_action.setEnabled(self.info is not None)
+        return self._context_menu
+
     def _show_context_menu(self, position) -> None:
-        if self.info is not None and not self._context_menu.isVisible():
-            self._context_menu.popup(position)
+        if self.info is not None:
+            menu = self._ensure_context_menu()
+            if not menu.isVisible():
+                menu.popup(position)
 
     def _dismiss(self) -> None:
         if self._mode == "popout" and self._fullscreen is not None:
@@ -1203,9 +1222,7 @@ class VideoPlayer(QWidget):
             return
         if command == "loop":
             self._loop = bool(value)
-            self.loop_action.blockSignals(True)
-            self.loop_action.setChecked(self._loop)
-            self.loop_action.blockSignals(False)
+            self._ensure_context_menu()
         if self._remote_engine is not None and self._remote_engine.generation == self._generation:
             self._remote_engine.command(command, value)
         elif self.media_player is not None:
@@ -1421,11 +1438,10 @@ class VideoPlayer(QWidget):
         return width, video_height + chrome
 
     def stop(self) -> None:
-        self._context_menu.close()
+        if self._context_menu is not None and isValid(self._context_menu):
+            self._context_menu.close()
         self._loop = False
-        self.loop_action.blockSignals(True)
-        self.loop_action.setChecked(False)
-        self.loop_action.blockSignals(False)
+        self._ensure_context_menu()
         self.loop_action.setEnabled(False)
         if self._remote_engine is not None:
             self._remote_engine.stop()
