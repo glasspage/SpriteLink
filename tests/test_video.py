@@ -12,7 +12,7 @@ from unittest import mock
 
 from PIL import Image
 from PySide6.QtCore import QPoint, QPointF, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QImage, QWheelEvent
+from PySide6.QtGui import QColor, QContextMenuEvent, QImage, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 
@@ -121,6 +121,83 @@ class VideoControlsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_right_click_menu_starts_with_loop_and_intercepts_native_provider_input(self):
+        player = V.VideoPlayer()
+        player.resize(640, 400)
+        player.show()
+        engine = mock.Mock()
+        player._remote_engine = engine
+        engine.load.side_effect = lambda info, volume, generation: setattr(engine, "generation", generation)
+        for provider in ("direct", "youtube", "vimeo", "dailymotion", "streamable"):
+            with self.subTest(provider=provider):
+                player.load(V.VideoInfo(V.VideoLink(provider, "123456", "https://example.org/video.mp4"), "example.org"))
+                image = QImage(160, 90, QImage.Format.Format_RGB32)
+                image.fill(QColor("blue"))
+                player._remote_frame(image)
+                self.app.processEvents()
+                engine.send.reset_mock()
+                QTest.mouseClick(player.video_widget, Qt.MouseButton.RightButton,
+                                 pos=player.video_widget.rect().center())
+                self.assertTrue(player._context_menu.isVisible())
+                self.assertIs(player._context_menu.actions()[0], player.loop_action)
+                self.assertEqual(player.loop_action.text(), "Loop")
+                self.assertTrue(player.loop_action.isCheckable())
+                self.assertFalse(player.loop_action.isChecked())
+                engine.send.assert_not_called()
+                player.loop_action.trigger()
+                self.assertTrue(player._loop)
+                engine.command.assert_called_with("loop", True)
+                player.loop_action.trigger()
+                self.assertFalse(player._loop)
+                engine.command.assert_called_with("loop", False)
+                player._context_menu.close()
+                if provider in ("dailymotion", "streamable"):
+                    QTest.mouseClick(player.video_widget, Qt.MouseButton.LeftButton,
+                                     pos=player.video_widget.rect().center())
+                    self.assertEqual([call.args[0]["value"]["kind"] for call in engine.send.call_args_list],
+                                     ["press", "release"])
+        player.stop()
+        self.assertFalse(player.loop_action.isChecked())
+        self.assertFalse(player.loop_action.isEnabled())
+        player.close()
+
+    def test_context_menu_opens_over_pending_video_and_loop_resets_on_replacement(self):
+        player = V.VideoPlayer()
+        player.show()
+        with mock.patch.object(player, "_load_provider"):
+            info = V.VideoInfo(V.VideoLink("youtube", "123456", ""), "youtube.com")
+            player.load(info)
+            position = player.status.rect().center()
+            QApplication.sendEvent(player.status, QContextMenuEvent(QContextMenuEvent.Reason.Mouse,
+                                                                     position, player.status.mapToGlobal(position)))
+            self.assertTrue(player._context_menu.isVisible())
+            player.loop_action.trigger()
+            self.assertTrue(player._loop)
+            player.load(info)
+            self.assertFalse(player._loop)
+            self.assertFalse(player.loop_action.isChecked())
+            self.assertFalse(player._context_menu.isVisible())
+        player.stop()
+        player.close()
+
+    def test_disabling_loop_or_replacing_video_cancels_queued_direct_restart(self):
+        from PySide6.QtMultimedia import QMediaPlayer
+        player = V.VideoPlayer(use_process=False)
+        player.info = V.VideoInfo(V.VideoLink("direct", "", "https://example.org/video.mp4"), "example.org")
+        player.media_player = mock.Mock()
+        player.media_player.mediaStatus.return_value = QMediaPlayer.MediaStatus.EndOfMedia
+        player._command("loop", True)
+        player._command("loop", False)
+        self.app.processEvents()
+        player.media_player.play.assert_not_called()
+        player._command("loop", True)
+        player._generation += 1
+        self.app.processEvents()
+        player.media_player.play.assert_not_called()
+        player.media_player = None
+        player.stop()
+        player.close()
 
     def test_thumbnail_has_size_limit_blue_border_and_play_symbol(self):
         frame = QImage(1920, 1080, QImage.Format.Format_RGB32)
@@ -541,6 +618,7 @@ c.YT={Player:function(id,o){options=o;return {
 };}};
 c.Vimeo={Player:function(){return {
   ready:()=>new Promise(resolve=>ready=resolve),
+  setLoop:()=>Promise.resolve(),
   on:(event,callback)=>{if(event==='volumechange')callback({volume:1});},
   setVolume:v=>{volume=v*100;calls.push(['volume',volume]);return Promise.resolve();},
   play:()=>{calls.push(['play',volume]);return Promise.resolve();}
@@ -634,6 +712,83 @@ process.stdout.write(JSON.stringify({initialized,paused}));
         self.assertIn("controls=0", page)
         self.assertIn("h=abc123", page)
         self.assertNotIn("evil()", page)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the provider bridge")
+    def test_youtube_loop_restarts_only_after_end_and_can_be_disabled(self):
+        runner = r"""
+const fs=require('fs'),vm=require('vm'),html=fs.readFileSync(0,'utf8'),calls=[];
+let options,status=2;
+const c={window:{},location:{origin:'https://github.com'}};
+c.YT={Player:function(id,o){options=o;return {
+  playVideo:()=>calls.push('play'),seekTo:(position)=>calls.push(position),
+  getPlayerState:()=>status,getCurrentTime:()=>0,getDuration:()=>120,
+  getVolume:()=>20,isMuted:()=>false
+};}};
+vm.createContext(c);
+for(const match of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)) vm.runInContext(match[1],c);
+c.onYouTubeIframeAPIReady();
+options.events.onStateChange({data:0});
+c.window.spriteCommand('loop',true);
+options.events.onStateChange({data:2});
+options.events.onStateChange({data:0});
+c.window.spriteCommand('loop',false);
+options.events.onStateChange({data:0});
+process.stdout.write(JSON.stringify(calls));
+"""
+        info = V.VideoInfo(V.VideoLink("youtube", "123456", ""), "youtube.com")
+        result = subprocess.run([shutil.which("node"), "-e", runner], input=V.provider_player_html(info),
+                                text=True, capture_output=True, check=True)
+        self.assertEqual(json.loads(result.stdout), [0, "play"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the provider bridge")
+    def test_vimeo_loop_requested_before_ready_is_applied_then_toggled_without_restarting(self):
+        runner = r"""
+const fs=require('fs'),vm=require('vm'),html=fs.readFileSync(0,'utf8'),calls=[];
+let ready;
+const c={window:{},document:{getElementById:()=>({})}};
+c.Vimeo={Player:function(){return {
+  ready:()=>new Promise(resolve=>ready=resolve),on:()=>{},
+  setLoop:value=>{calls.push(['loop',value]);return Promise.resolve();},
+  setVolume:()=>Promise.resolve(),play:()=>{calls.push(['play']);return Promise.resolve();}
+};}};
+vm.createContext(c);
+for(const match of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)) vm.runInContext(match[1],c);
+c.window.spriteCommand('loop',true);ready();
+setImmediate(()=>{
+ c.window.spriteCommand('loop',false);
+ process.stdout.write(JSON.stringify(calls));
+});
+"""
+        info = V.VideoInfo(V.VideoLink("vimeo", "123456", ""), "vimeo.com")
+        result = subprocess.run([shutil.which("node"), "-e", runner], input=V.provider_player_html(info),
+                                text=True, capture_output=True, check=True)
+        self.assertEqual(json.loads(result.stdout), [["loop", True], ["play"], ["loop", False]])
+
+    @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the provider bridge")
+    def test_native_provider_loop_updates_only_its_iframe_and_reloads_only_on_changes(self):
+        runner = r"""
+const fs=require('fs'),vm=require('vm'),html=fs.readFileSync(0,'utf8'),changes=[];
+let src=html.match(/<iframe[^>]+src="([^"]+)"/)[1].replace(/&amp;/g,'&');
+const initial=src,iframe={get src(){return src;},set src(value){src=value;changes.push(src);}};
+const c={window:{},URL,document:{getElementById:()=>iframe}};
+vm.createContext(c);
+for(const match of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)) vm.runInContext(match[1],c);
+c.window.spriteCommand('loop',false);
+c.window.spriteCommand('loop',true);
+c.window.spriteCommand('loop',true);
+c.window.spriteCommand('loop',false);
+process.stdout.write(JSON.stringify({initial,changes}));
+"""
+        for provider, off, on in (("dailymotion", "false", "true"), ("streamable", "0", "1")):
+            with self.subTest(provider=provider):
+                info = V.VideoInfo(V.VideoLink(provider, "123456", ""), provider)
+                result = subprocess.run([shutil.which("node"), "-e", runner], input=V.provider_player_html(info),
+                                        text=True, capture_output=True, check=True)
+                result = json.loads(result.stdout)
+                self.assertIn("loop=" + off, result["initial"])
+                self.assertEqual(len(result["changes"]), 2)
+                self.assertIn("loop=" + on, result["changes"][0])
+                self.assertEqual(result["changes"][1], result["initial"])
 
 
 class VideoModeIntegrationTests(unittest.TestCase):
@@ -734,6 +889,34 @@ class VideoModeIntegrationTests(unittest.TestCase):
         self.assertIsNone(self.player.info)
         self.assertIsNone(self.client.current_image_preview_url)
         self.assertFalse(self.client.image_preview_overlay.isVisible())
+
+    def test_fullscreen_hides_footer_and_restores_each_mode_without_resetting_loop(self):
+        for mode in ("main", "mini", "popout"):
+            for theme in ("Classic", "Glassy", "Modern"):
+                with self.subTest(mode=mode, theme=theme):
+                    self.client.theme_var.set(theme)
+                    self.client._apply_theme()
+                    self.player.set_mode(mode, self.client.video_mini_panel)
+                    self.player.loop_action.setChecked(True)
+                    self.player.toggle_fullscreen()
+                    QTest.qWait(20)
+                    self.assertFalse(self.player.mode_controls.isVisible())
+                    self.assertTrue(self.player.controls.isVisible())
+                    for widget in (self.player.source_label, self.player.browser_button,
+                                   self.player.dismiss_button, self.player.popout_button, self.player.mini_button):
+                        self.assertFalse(widget.isVisible())
+                    self.client._apply_theme()
+                    self.assertFalse(self.player.mode_controls.isVisible())
+                    QTest.keyClick(self.player._fullscreen, Qt.Key.Key_Escape)
+                    QTest.qWait(20)
+                    self.assertEqual(self.player._mode, mode)
+                    self.assertTrue(self.player.mode_controls.isVisible())
+                    self.assertTrue(self.player.loop_action.isChecked())
+                    self.assertTrue(self.player._loop)
+                    self.assertEqual(self.player.source_label.isVisible(), mode != "mini")
+                    self.assertEqual(self.player.mini_button.isVisible(), mode != "popout")
+                    self.assertEqual(self.player.popout_button.isVisible(), mode != "mini")
+        self.player.set_mode("main")
 
     def test_fullscreen_uses_entire_screen_and_square_chrome_in_each_theme(self):
         for theme in ("Classic", "Glassy", "Modern"):

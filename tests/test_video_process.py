@@ -199,6 +199,57 @@ with tempfile.TemporaryDirectory() as folder:
 root.close();root.deleteLater();QTest.qWait(50)
 ''')
 
+    @unittest.skipUnless(shutil.which('ffmpeg'), "ffmpeg is needed to create a direct video fixture")
+    def test_direct_loop_set_during_helper_startup_repeats_until_disabled(self):
+        self.run_qt(r'''
+import subprocess,tempfile
+from pathlib import Path
+from PySide6.QtCore import QProcess,QUrl
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication,QWidget,QVBoxLayout
+from spritelink_video import VideoPlayer,VideoInfo,VideoLink
+app=QApplication([]);root=QWidget();root.resize(640,480);QVBoxLayout(root);root.show()
+player=VideoPlayer(root);root.layout().addWidget(player)
+def wait_for(check):
+    for _ in range(300):
+        QTest.qWait(20)
+        if check():return
+    raise AssertionError((player.status.text(),player._loop,player._playing,player._ended,positions[-30:]))
+try:
+    with tempfile.TemporaryDirectory() as folder:
+        video=Path(folder)/'video.avi'
+        subprocess.run(['ffmpeg','-loglevel','error','-f','lavfi','-i','color=c=blue:s=160x90:r=10',
+                        '-t','1','-c:v','mpeg4',str(video)],check=True)
+        info=VideoInfo(VideoLink('direct','',QUrl.fromLocalFile(str(video)).toString()),'localhost')
+        player.load(info)
+        assert not player._ready
+        player.loop_action.trigger()
+        positions=[]
+        engine=player._remote_engine
+        engine.state_ready.connect(lambda state:positions.append(state['position']))
+        wait_for(lambda:player._ready and not player.video_widget.frame.isNull())
+        QTest.qWait(2600)
+        assert player._playing and not player._ended
+        assert sum(b<a-0.3 for a,b in zip(positions,positions[1:]))>=2,positions
+        player.loop_action.trigger()
+        wait_for(lambda:player._ended and not player._playing)
+        assert not player._loop and not player.loop_action.isChecked()
+        player.load(info)
+        assert player._remote_engine is engine
+        assert not player._loop and not player.loop_action.isChecked()
+        wait_for(lambda:player._ready)
+        wait_for(lambda:player._ended and not player._playing)
+finally:
+    engine=player._remote_engine
+    player.stop()
+    if engine is not None:
+        engine.shutdown()
+        for _ in range(100):
+            QTest.qWait(10)
+            if engine.process.state()==QProcess.ProcessState.NotRunning:break
+    root.close();root.deleteLater();QTest.qWait(50)
+''')
+
     def test_native_provider_controls_receive_mouse_input_in_helper(self):
         self.run_qt(r'''
 import sys

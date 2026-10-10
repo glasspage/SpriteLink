@@ -14,7 +14,7 @@ from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, QUrl, Sign
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF
 from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QSlider,
+    QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QSlider,
     QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
@@ -278,7 +278,7 @@ def video_thumbnail(frame: QImage | None, width: int, height: int) -> QImage:
     return result
 
 
-def provider_player_html(info: VideoInfo, volume: int = DEFAULT_VIDEO_VOLUME) -> str:
+def provider_player_html(info: VideoInfo, volume: int = DEFAULT_VIDEO_VOLUME, loop: bool = False) -> str:
     """Embed only constants and JSON-encoded IDs in JavaScript."""
     link = info.link
     if link.provider == "youtube":
@@ -318,6 +318,7 @@ function onYouTubeIframeAPIReady() {
         if ([0,1,2,3,5].includes(e.data)) state.ready=true;
         if (e.data!==3) state.playing=e.data===1;
         state.ended=e.data===0;
+        if (state.ended && state.loop) { player.seekTo(0, true); player.playVideo(); }
         readYouTubeState();
       },
       onAutoplayBlocked:() => { state.playing=false; },
@@ -325,6 +326,7 @@ function onYouTubeIframeAPIReady() {
   });
 }
 window.spriteCommand = (command, value) => {
+  if(command==='loop') { state.loop=Boolean(value); return; }
   if (!state.ready) return;
   if(command==='play') player.playVideo();
   if(command==='pause') player.pauseVideo();
@@ -369,6 +371,7 @@ window.spriteState=readYouTubeState;
 const player = new Vimeo.Player(document.getElementById('player'));
 player.ready().then(() => {
   state.ready=true;
+  player.setLoop(state.loop).catch(() => {});
   return player.setVolume(initialVolume/100).catch(() => {});
 }).then(() => player.play()).catch(() => {state.error='Vimeo playback unavailable';});
 player.on('play', () => {state.playing=true; state.ended=false;});
@@ -378,6 +381,11 @@ player.on('timeupdate', e => {state.position=e.seconds; state.duration=e.duratio
 player.on('volumechange', e => {state.volume=e.volume*100; state.muted=e.volume===0;});
 player.on('error', () => {state.error='Vimeo playback unavailable';});
 window.spriteCommand = (command, value) => {
+  if(command==='loop') {
+    state.loop=Boolean(value);
+    if(state.ready) player.setLoop(state.loop).catch(() => {});
+    return;
+  }
   if (!state.ready) return;
   let result;
   if(command==='play') result=player.play();
@@ -389,12 +397,25 @@ window.spriteCommand = (command, value) => {
 };
 """
     else:
+        loop_value = ("true" if loop else "false") if link.provider == "dailymotion" else ("1" if loop else "0")
         src = (f"https://www.dailymotion.com/embed/video/{link.video_id}?autoplay=1"
                if link.provider == "dailymotion" else
                f"https://streamable.com/e/{link.video_id}?autoplay=1")
+        src += "&loop=" + loop_value
         content = f'<iframe id="player" src="{escape(src, quote=True)}" allow="autoplay; fullscreen" allowfullscreen></iframe>'
         loader = ""
-        script = "window.spriteCommand=()=>{};"
+        script = """
+window.spriteCommand=(command,value)=>{
+  if(command!=='loop') return;
+  state.loop=Boolean(value);
+  const iframe=document.getElementById('player'), url=new URL(iframe.src);
+  const loopValue=LOOP_VALUES[value ? 1 : 0];
+  if(url.searchParams.get('loop')!==loopValue) {
+    url.searchParams.set('loop',loopValue);
+    iframe.src=url.toString();
+  }
+};
+""".replace("LOOP_VALUES", json.dumps(["false", "true"] if link.provider == "dailymotion" else ["0", "1"]))
     script = script.replace("VIDEO_ID", json.dumps(link.video_id)).replace(
         "START_SECONDS", str(link.start_seconds))
     # YouTube quality setters are no-ops; keep automatic quality.
@@ -405,6 +426,7 @@ window.spriteCommand = (command, value) => {
             "#player{display:block;width:100%;height:100%;border:0}" + pointer_style + "</style></head><body>"
             + content + "<script>const initialVolume=" + str(max(0, min(100, int(volume))))
             + ";const state={ready:false,playing:false,ended:false,"
+            "loop:" + ("true" if loop else "false") + ","
             "position:0,duration:" + str(max(0, int(info.duration)))
             + ",volume:initialVolume,muted:false,error:''};"
             "window.spriteState=()=>state;</script>" + loader + "<script>" + script
@@ -687,6 +709,7 @@ class VideoPlayer(QWidget):
         self._playing = False
         self._muted = False
         self._ended = False
+        self._loop = False
         self._duration = 0.0
         self._volume_wheel_delta = 0
         self._fullscreen = None
@@ -717,6 +740,13 @@ class VideoPlayer(QWidget):
         self.surface.addWidget(self.status)
         self.canvas = VideoCanvas()
         self.surface.addWidget(self.canvas)
+        self._context_menu = QMenu(self)
+        self.loop_action = self._context_menu.addAction("Loop")
+        self.loop_action.setCheckable(True)
+        self.loop_action.setEnabled(False)
+        self.loop_action.toggled.connect(lambda checked: self._command("loop", checked))
+        for widget in (self.surface, self.status, self.canvas):
+            widget.installEventFilter(self)
         layout.addWidget(self.surface, 1)
         self.controls = QFrame()
         self.controls.setObjectName("videoControls")
@@ -796,6 +826,16 @@ class VideoPlayer(QWidget):
         self._refresh_icons()
 
     def eventFilter(self, watched, event) -> bool:
+        if watched in (self.surface, self.status, self.canvas, self.video_widget, self.web):
+            if event.type() == QEvent.Type.ContextMenu:
+                self._show_context_menu(event.globalPos())
+                return True
+            if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+                                QEvent.Type.MouseButtonDblClick) and event.button() == Qt.MouseButton.RightButton:
+                if event.type() == QEvent.Type.MouseButtonRelease:
+                    self._show_context_menu(event.globalPosition().toPoint())
+                event.accept()
+                return True
         if event.type() == QEvent.Type.Resize and watched is getattr(self, "source_label", None):
             self._update_source_label()
         if event.type() == QEvent.Type.Wheel:
@@ -816,6 +856,10 @@ class VideoPlayer(QWidget):
                 event.accept()
                 return True
         return super().eventFilter(watched, event)
+
+    def _show_context_menu(self, position) -> None:
+        if self.info is not None and not self._context_menu.isVisible():
+            self._context_menu.popup(position)
 
     def _dismiss(self) -> None:
         if self._mode == "popout" and self._fullscreen is not None:
@@ -904,6 +948,7 @@ class VideoPlayer(QWidget):
     def load(self, info: VideoInfo) -> None:
         self.stop()
         self.info = info
+        self.loop_action.setEnabled(True)
         self.source_label.setToolTip(info.link.source_url)
         self._update_source_label()
         self._ready = self._playing = self._muted = self._ended = False
@@ -921,6 +966,9 @@ class VideoPlayer(QWidget):
             self._load_direct(info)
         else:
             self._load_provider(info)
+        for widget in (self.video_widget, self.web):
+            if widget is not None:
+                widget.installEventFilter(self)
 
     def _load_direct(self, info: VideoInfo) -> None:
         if self._use_process:
@@ -935,6 +983,7 @@ class VideoPlayer(QWidget):
         self.media_player = QMediaPlayer(self)
         self.media_player.setAudioOutput(self.audio)
         self.media_player.setVideoSink(self.video_widget.videoSink())
+        self.media_player.mediaStatusChanged.connect(self._direct_status)
         self.media_player.errorOccurred.connect(self._direct_error)
         self.media_player.setSource(QUrl(info.link.source_url))
         self.media_player.play()
@@ -980,7 +1029,8 @@ class VideoPlayer(QWidget):
             self.canvas.set_backend(self.web)
         self.surface.setCurrentWidget(self.canvas)
         self.web.loadFinished.connect(self._hide_youtube_chrome)
-        self.web.setHtml(provider_player_html(info, self.volume.value()), QUrl(PLAYER_BASE_URL))
+        self.web.loadFinished.connect(lambda ok: self._command("loop", self._loop) if ok else None)
+        self.web.setHtml(provider_player_html(info, self.volume.value(), self._loop), QUrl(PLAYER_BASE_URL))
         if info.link.provider in ("youtube", "vimeo"):
             self.timer.start()
             generation = self._generation
@@ -1027,6 +1077,20 @@ class VideoPlayer(QWidget):
 
     def _direct_error(self, error, message: str) -> None:
         self._error("Video playback unavailable. Open in Browser to watch.")
+
+    def _direct_status(self, status) -> None:
+        from PySide6.QtMultimedia import QMediaPlayer
+        if self._loop and status == QMediaPlayer.MediaStatus.EndOfMedia:
+            generation = self._generation
+            # Finish Qt's end transition before restarting; live setLoops changes can stick.
+            QTimer.singleShot(0, lambda: self._restart_direct_loop(generation))
+
+    def _restart_direct_loop(self, generation) -> None:
+        from PySide6.QtMultimedia import QMediaPlayer
+        if (generation == self._generation and self._loop and self.media_player is not None
+                and self.media_player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia):
+            self.media_player.setPosition(0)
+            self.media_player.play()
 
     def _error(self, text: str) -> None:
         # Ignore late ready callbacks after errors.
@@ -1135,12 +1199,19 @@ class VideoPlayer(QWidget):
             self.volume.blockSignals(False)
 
     def _command(self, command: str, value=0) -> None:
-        if not self.info or not self._ready:
+        if not self.info or (not self._ready and command != "loop"):
             return
+        if command == "loop":
+            self._loop = bool(value)
+            self.loop_action.blockSignals(True)
+            self.loop_action.setChecked(self._loop)
+            self.loop_action.blockSignals(False)
         if self._remote_engine is not None and self._remote_engine.generation == self._generation:
             self._remote_engine.command(command, value)
         elif self.media_player is not None:
-            if command == "play":
+            if command == "loop":
+                self._direct_status(self.media_player.mediaStatus())
+            elif command == "play":
                 self.media_player.play()
             elif command == "pause":
                 self.media_player.pause()
@@ -1245,6 +1316,7 @@ class VideoPlayer(QWidget):
     def _update_mode_controls(self) -> None:
         mini = self._mode == "mini" and self._fullscreen_restore_mode is None
         fullscreen = self._fullscreen is not None and bool(self._fullscreen.property("spritelinkVideoFullscreen"))
+        self.mode_controls.setVisible(not fullscreen)
         margins = (8, 4, 8, 8) if self._mode == "popout" and not fullscreen else (0, 0, 0, 0)
         self.mode_controls.layout().setContentsMargins(*margins)
         self.popout_button.setText("Main window" if self._mode == "popout" else "Pop-out")
@@ -1349,6 +1421,12 @@ class VideoPlayer(QWidget):
         return width, video_height + chrome
 
     def stop(self) -> None:
+        self._context_menu.close()
+        self._loop = False
+        self.loop_action.blockSignals(True)
+        self.loop_action.setChecked(False)
+        self.loop_action.blockSignals(False)
+        self.loop_action.setEnabled(False)
         if self._remote_engine is not None:
             self._remote_engine.stop()
         self.canvas.clear_backend()
