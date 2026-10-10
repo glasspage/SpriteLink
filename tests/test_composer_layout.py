@@ -102,8 +102,7 @@ class ComposerLayoutTests(unittest.TestCase):
 
     def test_wrapping_updates_height_after_window_width_changes(self):
         self.root.resize(1100, 650)
-        # Keep the wide case below the six-line composer cap so this test
-        # measures wrapping rather than comparing two equally capped heights.
+        # Stay below the six-line cap to measure wrapping.
         self.edit.setPlainText("A message with several words to wrap. " * 6)
         QTest.qWait(30)
         wide_height = self.edit.height()

@@ -80,12 +80,64 @@ class GlassyThemeTests(unittest.TestCase):
         self.assertFalse(self.window.property("spritelinkDesktopBlur"))
         self.client._set_windows_legacy_blur.assert_not_called()
 
+    def test_fullscreen_video_disables_rounding_and_backdrop_for_every_theme(self):
+        self.window.setProperty("spritelinkVideoWindow", True)
+        self.window.setProperty("spritelinkVideoFullscreen", True)
+        for theme in ("Glassy", "Modern", "Classic"):
+            self.theme = theme
+            self.calls.clear()
+            self.apply()
+            self.assertIn((33, 1), self.calls)
+            self.assertIn((38, 1), self.calls)
+            self.assertFalse(self.window.property("spritelinkDesktopBlur"))
+        self.window.setProperty("spritelinkVideoFullscreen", False)
+        self.theme = "Glassy"
+        self.calls.clear()
+        self.apply()
+        self.assertIn((33, 2), self.calls)
+        self.assertTrue(self.window.property("spritelinkDesktopBlur"))
+
     def test_message_stripes_are_translucent_only_for_glassy(self):
         self.app.setProperty("spritelinkGlassy", True)
         for color in SPRITELINK.message_row_backgrounds():
             self.assertLess(SPRITELINK.QColor(color).alpha(), 255)
         self.app.setProperty("spritelinkGlassy", False)
         self.assertEqual(SPRITELINK.message_row_backgrounds(), SPRITELINK.MESSAGE_ROW_BACKGROUNDS)
+
+    def test_windows_fullscreen_marker_calls_shell_and_balances_com_lifetime(self):
+        from ctypes import wintypes
+        marks, releases = [], []
+        init = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p)(lambda pointer: 0)
+        release = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p)(lambda pointer: releases.append(pointer) or 0)
+        mark = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, wintypes.HWND, wintypes.BOOL)(
+            lambda pointer, hwnd, fullscreen: marks.append((hwnd, bool(fullscreen))) or 0)
+        table = (ctypes.c_void_p * 9)()
+        table[2] = ctypes.cast(release, ctypes.c_void_p)
+        table[3] = ctypes.cast(init, ctypes.c_void_p)
+        table[8] = ctypes.cast(mark, ctypes.c_void_p)
+        interface = (ctypes.c_void_p * 1)(ctypes.addressof(table))
+
+        def create(clsid, outer, context, iid, result):
+            self.assertEqual(ctypes.string_at(clsid, 16), SPRITELINK.uuid.UUID(
+                "56fdf344-fd6d-11d0-958a-006097c9a090").bytes_le)
+            self.assertEqual(ctypes.string_at(iid, 16), SPRITELINK.uuid.UUID(
+                "602d4995-b13a-429b-a66e-1935e44f4317").bytes_le)
+            ctypes.cast(result, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.addressof(interface)
+            return 0
+
+        ole32 = SimpleNamespace(CoInitializeEx=mock.Mock(return_value=0),
+                                CoUninitialize=mock.Mock(), CoCreateInstance=mock.Mock(side_effect=create))
+        with mock.patch.object(SPRITELINK.os, "name", "nt"), \
+             mock.patch.object(SPRITELINK.ctypes, "windll", SimpleNamespace(ole32=ole32), create=True), \
+             mock.patch.object(SPRITELINK.ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE, create=True):
+            self.assertTrue(SPRITELINK.set_windows_fullscreen_window(1234, True))
+            self.assertTrue(SPRITELINK.set_windows_fullscreen_window(1234, False))
+            ole32.CoCreateInstance.side_effect = None
+            ole32.CoCreateInstance.return_value = -1
+            self.assertFalse(SPRITELINK.set_windows_fullscreen_window(1234, True))
+        self.assertEqual(marks, [(1234, True), (1234, False)])
+        self.assertEqual(len(releases), 2)
+        self.assertEqual(ole32.CoUninitialize.call_count, 3)
 
 
 class GlassyControlRenderingTests(unittest.TestCase):
@@ -154,16 +206,14 @@ class GlassyControlRenderingTests(unittest.TestCase):
                     button.setDown(not checked)
                     self.app.processEvents()
                     pressed = button.grab().toImage()
-                    # The face retains overhead lighting; only the narrow
-                    # bevel reverses into a shadow above and highlight below.
+                    # Invert only the bevel; retain face lighting.
                     self.assertGreater(pressed.pixelColor(x, top).lightnessF(),
                                        pressed.pixelColor(x, bottom).lightnessF())
                     self.assertLess(pressed.pixelColor(x, edge).lightnessF(),
                                     pressed.pixelColor(x, pressed.height() - 1 - edge).lightnessF())
                     self.assertEqual(button.geometry(), geometry)
                     self.assertEqual(button.sizeHint(), hint)
-                    # A single rounded outline keeps all four corners inside
-                    # the normal silhouette, including at fractional scaling.
+                    # Check corner clipping at fractional scaling.
                     for y in range(normal.height()):
                         for px in range(normal.width()):
                             if normal.pixelColor(px, y) == background:
@@ -244,7 +294,6 @@ class GlassyControlRenderingTests(unittest.TestCase):
             images.append(checkbox.grab().toImage().copy(rect))
         self.assertNotEqual(images[0], images[1])
         for image in images:
-            # Indicator frames must be visible against a pale glass surface.
             dark = sum(image.pixelColor(x, y).red() < 100
                        for y in range(image.height()) for x in range(image.width()))
             self.assertGreater(dark, 25)
@@ -357,8 +406,6 @@ class GlassyControlRenderingTests(unittest.TestCase):
             self.app.processEvents()
             popup = combo.view().window()
             image = popup.grab().toImage()
-            # Away from text, every interior row is either the light popup
-            # surface or the blue selection, with no black top/bottom bands.
             for y in range(1, image.height() - 1):
                 color = image.pixelColor(image.width() - 8, y)
                 self.assertEqual(color.alpha(), 255)
@@ -374,8 +421,7 @@ class GlassyControlRenderingTests(unittest.TestCase):
         combo.showPopup()
         self.app.processEvents()
         popup = combo.view().window()
-        # Reproduce the styled-panel frame used by some platform popup styles,
-        # and include real space outside the item view rather than only rows.
+        # Include styled popup padding outside the item rows.
         popup.setFrameShape(QFrame.Shape.StyledPanel)
         popup.layout().setContentsMargins(0, 6, 0, 6)
         popup.resize(popup.width(), popup.height() + 12)

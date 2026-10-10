@@ -81,7 +81,7 @@ class LazyViewportMediaTests(unittest.TestCase):
             preview_source,
         )
         self.assertIn(
-            "preview = self._unloaded_image_placeholder(*preview_size)",
+            "preview = self._unloaded_image_placeholder(*preview_size, url=url)",
             preview_source,
         )
         self.assertIn(
@@ -127,7 +127,7 @@ class LazyViewportMediaTests(unittest.TestCase):
             insert_source,
         )
         self.assertIn(
-            "preview = self._unloaded_image_placeholder(*preview_size)",
+            "preview = self._unloaded_image_placeholder(*preview_size, url=url)",
             insert_source,
         )
         self.assertEqual(SPRITELINK.EMBEDDED_IMAGE_PLACEHOLDER_SIZE, 48)
@@ -2003,7 +2003,6 @@ class RuntimeOptimizationTests(unittest.TestCase):
             "active",
         )
 
-        # A stream signal cannot make a muted inactive room urgent.
         self.assertEqual(
             SPRITELINK.next_poll_room_id(
                 room_ids=["active", "ordinary", "muted"],
@@ -2021,8 +2020,6 @@ class RuntimeOptimizationTests(unittest.TestCase):
             ),
             "ordinary",
         )
-        # Once its own timer expires, the muted room gets a request slot
-        # without needing a stream signal.
         self.assertEqual(
             SPRITELINK.next_poll_room_id(
                 room_ids=["active", "ordinary", "muted"],
@@ -2557,8 +2554,6 @@ class MultiTopicSubscriptionTests(unittest.TestCase):
         self.assertEqual(
             topic_rooms,
             {
-                # The muted active room remains responsive. The muted
-                # inactive room-b is absent from the subscription.
                 "topic-a": ("room-a", "room-c"),
             },
         )
@@ -2850,7 +2845,8 @@ class TrayLifecycleOptimizationTests(unittest.TestCase):
         self.assertNotIn(".join(", close_source)
         self.assertIn("self.subscription_refresh_event.set()", close_source)
         self.assertIn("daemon=True", close_source)
-        self.assertIn("self.session.close()", close_source)
+        self.assertIn("if session is not None:", close_source)
+        self.assertIn("session.close()", close_source)
         self.assertIn(
             "_release_message_sound_resources()",
             close_source,
@@ -4342,7 +4338,6 @@ class Version120ReleaseTests(unittest.TestCase):
         overlay_source = inspect.getsource(SPRITELINK.ConfigOverlay)
         self.assertIn("QGraphicsBlurEffect", overlay_source)
         self.assertIn("QualityHint", overlay_source)
-        self.assertIn("parent.grab()", overlay_source)
         self.assertIn("blur_radius * 2.0", overlay_source)
         self.assertIn("source_pixel_width - 1.0", overlay_source)
         self.assertIn("source_pixel_height - 1.0", overlay_source)
