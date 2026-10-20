@@ -410,9 +410,64 @@ def normalize_theme_colors(value: Any) -> dict[str, int]:
     return result
 
 
-def client_theme_color(client: Any, theme: str) -> int:
+def normalize_room_settings(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    colors = source.get("theme_colors")
+    colors = colors if isinstance(colors, dict) else {}
+    normalized_colors = normalize_theme_colors(colors)
+    volume = source.get("message_sound_volume")
+    try:
+        volume = None if volume is None or isinstance(volume, bool) else max(
+            10, min(100, ((int(volume) + 5) // 10) * 10)
+        )
+    except (TypeError, ValueError, OverflowError):
+        volume = None
+    return {
+        "theme": source.get("theme") if source.get("theme") in THEMES else "Default",
+        "theme_colors": {theme: normalized_colors[theme] for theme in THEMES
+                         if theme in colors and colors[theme] is not None},
+        "message_sound": source.get("message_sound")
+        if source.get("message_sound") in MESSAGE_SOUND_OPTIONS else "Default",
+        "message_sound_volume": volume,
+        "custom_message_sound_path": source.get("custom_message_sound_path", "")
+        if isinstance(source.get("custom_message_sound_path", ""), str) else "",
+    }
+
+
+def client_room_settings(client: Any, room_id: str | None = None) -> dict[str, Any]:
     config = getattr(client, "config_data", {})
+    config = config if isinstance(config, dict) else {}
+    rooms = config.get("room_settings", {})
+    return normalize_room_settings(rooms.get(
+        room_id if room_id is not None else getattr(client, "active_chatroom_id", "")
+    ) if isinstance(rooms, dict) else None)
+
+
+def client_theme_name(client: Any) -> str:
+    theme = client_room_settings(client)["theme"]
+    return str(client.theme_var.get()) if theme == "Default" else theme
+
+
+def client_theme_color(client: Any, theme: str, *, use_room: bool = True) -> int:
+    config = getattr(client, "config_data", {})
+    if use_room:
+        colors = client_room_settings(client)["theme_colors"]
+        if theme in colors:
+            return colors[theme]
     return normalize_theme_colors(config.get("theme_colors") if isinstance(config, dict) else None)[theme]
+
+
+def client_message_sound_settings(client: Any, room_id: str | None = None) -> tuple[str, int, str]:
+    settings = client_room_settings(client, room_id)
+    sound = settings["message_sound"]
+    inherited = sound == "Default"
+    return (
+        str(client.message_sound_var.get()) if inherited else sound,
+        int(client.message_sound_volume_var.get()) if settings["message_sound_volume"] is None
+        else settings["message_sound_volume"],
+        str(client.custom_message_sound_path_var.get()) if inherited
+        else settings["custom_message_sound_path"],
+    )
 
 
 def shift_theme_color(color: Any, degrees: int | None = None) -> QColor:
@@ -3308,6 +3363,7 @@ def default_config() -> dict[str, Any]:
         "identity_private_key": generate_identity_private_key(),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
+        "room_settings": {},
         "room_profiles": {
             GLOBAL_CHATROOM_ID: global_profile,
         },
@@ -3505,6 +3561,13 @@ def load_config() -> dict[str, Any]:
     if active_chatroom_id not in valid_room_ids:
         active_chatroom_id = GLOBAL_CHATROOM_ID
     config["active_chatroom_id"] = active_chatroom_id
+
+    raw_room_settings = config.get("room_settings")
+    raw_room_settings = raw_room_settings if isinstance(raw_room_settings, dict) else {}
+    config["room_settings"] = {
+        room_id: normalize_room_settings(settings)
+        for room_id, settings in raw_room_settings.items() if room_id in valid_room_ids
+    }
 
     raw_profiles = config.get("room_profiles")
     if not isinstance(raw_profiles, dict):
@@ -4732,6 +4795,163 @@ class ChatroomDetailsDialog(QDialog):
 
     def chatroom_key(self) -> str:
         return self.key_entry.text()
+
+
+class EditChatroomDialog(ChatroomDetailsDialog):
+    def __init__(self, client: Any, room_id: str, **kwargs: Any) -> None:
+        super().__init__(client.root, title="Edit Chatroom", submit_label="Save", **kwargs)
+        self.client = client
+        self.settings = client_room_settings(client, room_id)
+        if room_id == GLOBAL_CHATROOM_ID:
+            self.name_entry.setEnabled(False)
+            self.key_entry.setEnabled(False)
+
+        panel = QWidget(self)
+        form = QGridLayout(panel)
+        form.setContentsMargins(0, 8, 0, 8)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(client._config_row_spacing())
+        form.setColumnStretch(1, 1)
+        self.layout().insertWidget(1, panel)
+        form.addWidget(client._heading("Appearance"), 0, 0, 1, 3)
+        form.addWidget(QLabel("Theme"), 1, 0)
+        self.theme_combo = ThemeComboBox()
+        self.theme_combo.addItems(["Default", *THEMES])
+        self.theme_combo.setCurrentText(self.settings["theme"])
+        form.addWidget(self.theme_combo, 1, 1, 1, 2)
+        form.addWidget(QLabel("Color"), 2, 0)
+        self.color_default = QCheckBox("Default")
+        self.color_default.setAccessibleName("Use Config theme color")
+        form.addWidget(self.color_default, 2, 1)
+        self.color_control = QWidget()
+        color_layout = QHBoxLayout(self.color_control)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.setSpacing(6)
+        self.color_label = QLabel()
+        self.color_slider = ThemeSlider(Qt.Orientation.Horizontal)
+        self.color_slider.setAccessibleName("Chatroom theme color")
+        self.color_slider.setMinimumWidth(64)
+        self.color_slider.setMaximumWidth(112)
+        color_layout.addWidget(self.color_label)
+        color_layout.addWidget(self.color_slider, 1)
+        form.addWidget(self.color_control, 2, 2)
+
+        form.addWidget(client._heading("Notifications"), 3, 0, 1, 3)
+        form.addWidget(QLabel("Message Sound"), 4, 0)
+        self.sound_combo = ThemeComboBox()
+        self.sound_combo.addItems(["Default", *MESSAGE_SOUND_OPTIONS])
+        self.sound_combo.setCurrentText(self.settings["message_sound"])
+        form.addWidget(self.sound_combo, 4, 1, 1, 2)
+        form.addWidget(QLabel("Volume"), 5, 0)
+        self.volume_default = QCheckBox("Default")
+        self.volume_default.setAccessibleName("Use Config message sound volume")
+        self.volume_default.setChecked(self.settings["message_sound_volume"] is None)
+        form.addWidget(self.volume_default, 5, 1)
+        volume_control = QWidget()
+        volume_layout = QHBoxLayout(volume_control)
+        volume_layout.setContentsMargins(0, 0, 0, 0)
+        volume_layout.setSpacing(6)
+        self.volume_label = QLabel()
+        self.volume_slider = ThemeSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setAccessibleName("Chatroom message sound volume")
+        self.volume_slider.setRange(1, 10)
+        self.volume_slider.setSingleStep(1)
+        self.volume_slider.setPageStep(1)
+        self.volume_slider.setMinimumWidth(64)
+        self.volume_slider.setMaximumWidth(112)
+        self.volume_slider.setValue(self.sound_settings()[1] // 10)
+        self.volume_slider.setEnabled(not self.volume_default.isChecked())
+        self.volume_label.setText(f"{self.volume_slider.value() * 10}%")
+        volume_layout.addWidget(self.volume_label)
+        volume_layout.addWidget(self.volume_slider, 1)
+        form.addWidget(volume_control, 5, 2)
+
+        self.theme_combo.currentTextChanged.connect(self._sync_color)
+        self.color_default.toggled.connect(self._set_color_default)
+        self.color_slider.valueChanged.connect(self._set_color)
+        self.sound_combo.textActivated.connect(self._select_sound)
+        self.volume_default.toggled.connect(self._set_volume_default)
+        self.volume_slider.valueChanged.connect(self._set_volume)
+        self.finished.connect(client._stop_message_sound)
+        self._sync_color()
+
+    def _theme(self) -> str:
+        theme = self.theme_combo.currentText()
+        return str(self.client.theme_var.get()) if theme == "Default" else theme
+
+    def _sync_color(self, *_args: Any) -> None:
+        self.settings["theme"] = self.theme_combo.currentText()
+        theme = self._theme()
+        colors = self.settings["theme_colors"]
+        position = colors.get(theme, client_theme_color(self.client, theme, use_room=False))
+        classic = theme == "Classic"
+        self.color_default.blockSignals(True)
+        self.color_default.setChecked(theme not in colors)
+        self.color_default.blockSignals(False)
+        slider = self.color_slider
+        slider.blockSignals(True)
+        slider.setRange(0, len(CLASSIC_COLOR_SCHEMES) - 1 if classic else 359)
+        slider.setSingleStep(1)
+        slider.setPageStep(1 if classic else 15)
+        slider.setTickPosition(QSlider.TickPosition.TicksBelow if classic else QSlider.TickPosition.NoTicks)
+        slider.setTickInterval(1 if classic else 0)
+        slider.setValue(position)
+        slider.blockSignals(False)
+        slider.setEnabled(theme in colors)
+        slider.setProperty("spritelinkPreviewHue", None if classic else position)
+        slider.setProperty("spritelinkPreviewClassicColor", position if classic else None)
+        self.color_label.setText(CLASSIC_COLOR_SCHEMES[position]["name"] if classic else "")
+        slider.setToolTip(CLASSIC_COLOR_SCHEMES[position]["name"] if classic else "")
+        slider.update()
+
+    def _set_color_default(self, checked: bool) -> None:
+        theme = self._theme()
+        if checked:
+            self.settings["theme_colors"].pop(theme, None)
+        else:
+            self.settings["theme_colors"][theme] = self.color_slider.value()
+        self._sync_color()
+
+    def _set_color(self, value: int) -> None:
+        self.settings["theme_colors"][self._theme()] = value
+        self._sync_color()
+
+    def sound_settings(self) -> tuple[str, int, str]:
+        settings = self.settings
+        inherited = settings["message_sound"] == "Default"
+        return (
+            str(self.client.message_sound_var.get()) if inherited else settings["message_sound"],
+            int(self.client.message_sound_volume_var.get()) if settings["message_sound_volume"] is None
+            else settings["message_sound_volume"],
+            str(self.client.custom_message_sound_path_var.get()) if inherited
+            else settings["custom_message_sound_path"],
+        )
+
+    def _select_sound(self, value: str) -> None:
+        if value == "Custom":
+            dialog = QFileDialog(self, "Choose message sound")
+            dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+            dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+            dialog.setNameFilter("Audio files (*.wav *.mp3 *.ogg)")
+            if self.client._exec_themed_file_dialog(dialog) != QDialog.DialogCode.Accepted or not dialog.selectedFiles():
+                self.sound_combo.setCurrentText(self.settings["message_sound"])
+                return
+            self.settings["custom_message_sound_path"] = dialog.selectedFiles()[0]
+        self.settings["message_sound"] = value
+        self.client._play_message_sound(report_errors=True, settings=self.sound_settings())
+
+    def _set_volume_default(self, checked: bool) -> None:
+        self.settings["message_sound_volume"] = None if checked else self.volume_slider.value() * 10
+        self.volume_slider.setEnabled(not checked)
+        self.volume_slider.setValue(self.sound_settings()[1] // 10)
+        self.volume_label.setText(f"{self.volume_slider.value() * 10}%")
+        self.client._play_message_sound(report_errors=True, settings=self.sound_settings())
+
+    def _set_volume(self, value: int) -> None:
+        if not self.volume_default.isChecked():
+            self.settings["message_sound_volume"] = value * 10
+        self.volume_label.setText(f"{value * 10}%")
+        self.client._play_message_sound(report_errors=True, settings=self.sound_settings())
 
 
 class JoinChatroomDialog(QDialog):
@@ -6607,6 +6827,7 @@ class EncryptedChatClient(QObject):
         self.active_message_sound_effect: QSoundEffect | None = None
         self.pending_message_sound_effect: QSoundEffect | None = None
         self.pending_message_sound_name = ""
+        self.pending_message_sound_volume = DEFAULT_MESSAGE_SOUND_VOLUME
         self.pending_message_sound_report_errors = False
         self.compressed_message_sound_audio_output: (
             QAudioOutput | None
@@ -7119,10 +7340,10 @@ class EncryptedChatClient(QObject):
         return self._basic_application_font.family()
 
     def _is_windows_classic_theme(self) -> bool:
-        return self.theme_var.get() == "Classic"
+        return client_theme_name(self) == "Classic"
 
     def _is_glassy_theme(self) -> bool:
-        return self.theme_var.get() == "Glassy"
+        return client_theme_name(self) == "Glassy"
 
     def _windows_classic_palette(self) -> QPalette:
         palette = QPalette()
@@ -8727,8 +8948,6 @@ QComboBox::drop-down {
         return room_id
 
     def _edit_chatroom(self, room_id: str) -> None:
-        if room_id == GLOBAL_CHATROOM_ID:
-            return
         room = next(
             (
                 candidate
@@ -8738,15 +8957,16 @@ QComboBox::drop-down {
             ),
             None,
         )
+        if room_id == GLOBAL_CHATROOM_ID:
+            room = self._find_chatroom(room_id)
         if room is None:
             return
 
         old_name = str(room.get("nickname", ""))
         old_key = str(room.get("key", ""))
-        dialog = ChatroomDetailsDialog(
-            self.root,
-            title="Edit Chatroom",
-            submit_label="Save",
+        dialog = EditChatroomDialog(
+            self,
+            room_id,
             name=old_name,
             chatroom_key=old_key,
             history_note=(
@@ -8802,6 +9022,9 @@ QComboBox::drop-down {
             self._persist_local_history()
         room["nickname"] = name
         room["key"] = key
+        room_settings = self.config_data.setdefault("room_settings", {})
+        old_settings = room_settings.get(room_id)
+        room_settings[room_id] = normalize_room_settings(dialog.settings)
         if key_changed:
             self.initial_history_pending_rooms.add(room_id)
         try:
@@ -8809,6 +9032,10 @@ QComboBox::drop-down {
         except Exception as exc:
             room["nickname"] = old_name
             room["key"] = old_key
+            if old_settings is None:
+                room_settings.pop(room_id, None)
+            else:
+                room_settings[room_id] = old_settings
             if not was_initial_history_pending:
                 self.initial_history_pending_rooms.discard(room_id)
             messagebox.showerror(
@@ -8825,6 +9052,8 @@ QComboBox::drop-down {
         else:
             if room_id == self.active_chatroom_id:
                 self._update_window_title()
+                if self._refresh_room_appearance():
+                    self._rerender_preserving_scroll()
             self._refresh_chatroom_list()
 
     def _copy_chatroom_invite_code(self, room_id: str) -> None:
@@ -8855,11 +9084,7 @@ QComboBox::drop-down {
         menu = ClickableSubmenuMenu(self.root)
 
         edit_action = menu.addAction("Edit")
-        edit_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
-        if room_id != GLOBAL_CHATROOM_ID:
-            edit_action.triggered.connect(
-                lambda: self._edit_chatroom(room_id)
-            )
+        edit_action.triggered.connect(lambda: self._edit_chatroom(room_id))
 
         copy_invite_action = menu.addAction("Copy Invite Code")
         copy_invite_action.triggered.connect(
@@ -8998,6 +9223,7 @@ QComboBox::drop-down {
         self.read_divider_visible_seconds.pop(room_id, None)
         self._clear_tray_notification_if_no_unread()
         self.config_data.get("room_profiles", {}).pop(room_id, None)
+        self.config_data.get("room_settings", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
         self.chatroom_drafts.pop(room_id, None)
         self._request_subscription_refresh()
@@ -9072,6 +9298,7 @@ QComboBox::drop-down {
         except Exception:
             pass
         self._clear_visible_room(preserve_detached_video=True)
+        self._refresh_room_appearance()
         self._load_active_room_profile_into_controls()
         self._load_saved_history_for_current_room()
         self.connected = False
@@ -9084,6 +9311,15 @@ QComboBox::drop-down {
             self._request_subscription_refresh()
         self._restore_active_chatroom_draft()
         self._refresh_chatroom_list()
+
+    def _refresh_room_appearance(self) -> bool:
+        theme = client_theme_name(self)
+        if getattr(self, "_applied_theme_color", None) == (theme, client_theme_color(self, theme)):
+            return False
+        self._apply_theme()
+        self._apply_application_font_strategy()
+        self._apply_active_composer_style()
+        return True
 
     def _reset_history_render_window(self) -> None:
         self._set_history_render_updates_suppressed(False)
@@ -10713,7 +10949,7 @@ QComboBox::drop-down {
         player = getattr(self, "video_player", None)
         if player is None:
             return
-        theme = str(self.theme_var.get())
+        theme = client_theme_name(self)
         position = client_theme_color(self, theme)
         transform = (
             (lambda text: classic_theme_stylesheet(text, position))
@@ -11438,7 +11674,7 @@ QComboBox::drop-down {
             slider.setPageStep(1 if classic else 15)
             slider.setTickPosition(QSlider.TickPosition.TicksBelow if classic else QSlider.TickPosition.NoTicks)
             slider.setTickInterval(1 if classic else 0)
-            position = client_theme_color(self, theme)
+            position = client_theme_color(self, theme, use_room=False)
             slider.setValue(position)
             slider.setProperty("spritelinkPreviewHue", None)
             slider.setProperty("spritelinkPreviewClassicColor", position if classic else None)
@@ -11471,7 +11707,7 @@ QComboBox::drop-down {
         app = QApplication.instance()
         if app is None:
             return False
-        theme = str(self.theme_var.get())
+        theme = client_theme_name(self)
         position = client_theme_color(self, theme)
         if getattr(self, "_applied_theme_color", None) == (theme, position):
             self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
@@ -13197,7 +13433,7 @@ QComboBox::drop-down {
                     and not is_muted_notification
                     and duplicate_ordinal <= 2
                 ):
-                    self._play_notification_sound()
+                    self._play_notification_sound(room_id)
             previous_message_id = client_message_id
 
         if not added:
@@ -13310,7 +13546,7 @@ QComboBox::drop-down {
                     self.active_chatroom_id
                 )
             ):
-                self._play_notification_sound()
+                self._play_notification_sound(self.active_chatroom_id)
 
         return True
 
@@ -16656,7 +16892,7 @@ QComboBox::drop-down {
 
     def _should_play_message_sound(self, room_id: str) -> bool:
         return (
-            str(self.message_sound_var.get()) != "Disabled"
+            client_message_sound_settings(self, room_id)[0] != "Disabled"
             and (
                 room_id != self.active_chatroom_id
                 or not self.window_focused_event.is_set()
@@ -16719,11 +16955,9 @@ QComboBox::drop-down {
             ):
                 self.delivered_desktop_notification_rooms.add(room_id)
 
-    def _message_sound_path(self, sound_name: str) -> Path | None:
+    def _message_sound_path(self, sound_name: str, custom_path: str | None = None) -> Path | None:
         if sound_name == "Custom":
-            custom_path = str(
-                self.custom_message_sound_path_var.get()
-            ).strip()
+            custom_path = str(self.custom_message_sound_path_var.get() if custom_path is None else custom_path).strip()
             return Path(custom_path) if custom_path else None
 
         filename = BUILTIN_MESSAGE_SOUND_FILES.get(sound_name)
@@ -16764,10 +16998,11 @@ QComboBox::drop-down {
         self,
         effect: QSoundEffect,
         sound_name: str,
+        volume: int | None = None,
     ) -> None:
         effect.stop()
         effect.setVolume(
-            int(self.message_sound_volume_var.get()) / 100.0
+            int(self.message_sound_volume_var.get() if volume is None else volume) / 100.0
         )
         self.active_message_sound_effect = effect
         effect.play()
@@ -16787,7 +17022,7 @@ QComboBox::drop-down {
             self.pending_message_sound_effect = None
             self.pending_message_sound_name = ""
             self.pending_message_sound_report_errors = False
-            self._start_message_sound_effect(effect, sound_name)
+            self._start_message_sound_effect(effect, sound_name, self.pending_message_sound_volume)
             return
         if effect.status() != QSoundEffect.Status.Error:
             return
@@ -16844,12 +17079,13 @@ QComboBox::drop-down {
         sound_name: str,
         *,
         report_errors: bool,
+        volume: int | None = None,
     ) -> None:
         player, audio_output = (
             self._ensure_compressed_message_sound_player()
         )
         audio_output.setVolume(
-            int(self.message_sound_volume_var.get()) / 100.0
+            int(self.message_sound_volume_var.get() if volume is None else volume) / 100.0
         )
         self.compressed_message_sound_name = sound_name
         self.compressed_message_sound_report_errors = report_errors
@@ -16932,10 +17168,15 @@ QComboBox::drop-down {
         if audio_output is not None:
             audio_output.deleteLater()
 
-    def _play_message_sound(self, *, report_errors: bool = False) -> None:
-        sound_name = str(self.message_sound_var.get())
+    def _play_message_sound(
+        self, *, report_errors: bool = False, settings: tuple[str, int, str] | None = None,
+    ) -> None:
+        sound_name, volume, custom_path = settings if settings is not None else (
+            str(self.message_sound_var.get()), int(self.message_sound_volume_var.get()),
+            str(self.custom_message_sound_path_var.get()),
+        )
         self._stop_message_sound()
-        sound_path = self._message_sound_path(sound_name)
+        sound_path = self._message_sound_path(sound_name, custom_path)
         if sound_path is None:
             return
         try:
@@ -16951,14 +17192,16 @@ QComboBox::drop-down {
                     sound_path,
                     sound_name,
                     report_errors=report_errors,
+                    volume=volume,
                 )
                 return
             effect = self._message_sound_effect_for_path(sound_path)
             if effect.isLoaded():
-                self._start_message_sound_effect(effect, sound_name)
+                self._start_message_sound_effect(effect, sound_name, volume)
             else:
                 self.pending_message_sound_effect = effect
                 self.pending_message_sound_name = sound_name
+                self.pending_message_sound_volume = volume
                 self.pending_message_sound_report_errors = report_errors
                 if effect.status() == QSoundEffect.Status.Error:
                     self._on_message_sound_effect_status_changed(effect)
@@ -16970,7 +17213,7 @@ QComboBox::drop-down {
                     parent=self.root,
                 )
 
-    def _play_notification_sound(self) -> None:
+    def _play_notification_sound(self, room_id: str | None = None) -> None:
         now = time.monotonic()
         if (
             now - self.last_notification_sound_at
@@ -16978,7 +17221,10 @@ QComboBox::drop-down {
         ):
             return
         self.last_notification_sound_at = now
-        self._play_message_sound()
+        if room_id is None:
+            self._play_message_sound()
+        else:
+            self._play_message_sound(settings=client_message_sound_settings(self, room_id))
 
     def _show_minimize_to_tray_notice(self) -> str | None:
         dialog = QMessageBox(self.root)
