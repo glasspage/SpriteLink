@@ -71,6 +71,14 @@ class GlassyThemeTests(unittest.TestCase):
         self.assertTrue(self.window.property("spritelinkDesktopBlur"))
         self.client._set_windows_legacy_blur.assert_not_called()
 
+    def test_dark_glass_retains_acrylic_with_a_dark_caption(self):
+        self.client.theme_var = SPRITELINK.ValueModel("Glassy Dark")
+        self.apply()
+        self.assertIn((20, 1), self.calls)
+        self.assertIn((38, 3), self.calls)
+        self.assertIn((33, 2), self.calls)
+        self.assertTrue(self.window.property("spritelinkDesktopBlur"))
+
     def test_older_windows_uses_legacy_blur_and_clears_it_on_theme_change(self):
         self.fail_backdrop = True
         self.apply()

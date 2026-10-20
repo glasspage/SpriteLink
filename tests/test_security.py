@@ -3275,7 +3275,7 @@ class LinkSafetyTests(unittest.TestCase):
         self.assertIn("look-alike characters", show_source)
         self.assertIn("username section", show_source)
         self.assertIn("before the domain name.", show_source)
-        self.assertIn('"color: #c00000;"', show_source)
+        self.assertIn("message_display_color('#c00000')", show_source)
 
     def test_link_warning_monospace_font_survives_style_refreshes(self) -> None:
         font_source = inspect.getsource(
@@ -4271,7 +4271,7 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertEqual(SPRITELINK.DEFAULT_THEME, "Classic")
         self.assertEqual(
             SPRITELINK.THEMES,
-            ("Classic", "Glassy", "Modern"),
+            ("Classic", "Glassy", "Glassy Dark", "Modern"),
         )
 
         source = inspect.getsource(
@@ -4300,7 +4300,7 @@ class Version120ReleaseTests(unittest.TestCase):
             SPRITELINK.EncryptedChatClient._apply_theme
         )
         self.assertIn("self._glassy_palette()", theme_source)
-        self.assertIn("GLASSY_STYLESHEET", theme_source)
+        self.assertIn("glassy_stylesheet(theme)", theme_source)
         self.assertIn('available_styles.get("fusion", "Fusion")', theme_source)
 
         titlebar_source = inspect.getsource(

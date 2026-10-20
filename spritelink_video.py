@@ -942,6 +942,10 @@ class VideoPlayer(QWidget):
                       "stop:0 rgba(255,255,255,215),stop:0.48 rgba(220,241,255,205),"
                       "stop:0.52 rgba(180,214,238,210),stop:1 rgba(157,200,228,215));"
                       "border:1px solid #648fa9; border-radius:5px;}",
+            "Glassy Dark": "QFrame#videoControls {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                           "stop:0 rgba(94,103,114,240),stop:0.48 rgba(64,74,85,236),"
+                           "stop:0.52 rgba(32,43,55,240),stop:1 rgba(44,57,71,242));"
+                           "color:#e3e8ed; border:1px solid #8293a2; border-radius:5px;}",
             "Modern": "QFrame#videoControls {background:#f3f3f3; border:1px solid #dedede;"
                       "border-radius:7px;}",
         }

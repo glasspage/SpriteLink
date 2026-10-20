@@ -25,7 +25,7 @@ class ThemeColorTests(unittest.TestCase):
         self.previous_font = QFont(self.app.font())
         self.previous_sheet = self.app.styleSheet()
         self.previous_properties = {name: self.app.property(name) for name in (
-            "spritelinkGlassy", "spritelinkModern", "spritelinkWindowsClassic",
+            "spritelinkGlassy", "spritelinkGlassyDark", "spritelinkModern", "spritelinkWindowsClassic",
             "spritelinkTextShadows", "spritelinkThemeHue", "spritelinkClassicColor",
         )}
         self.window = QWidget()
@@ -38,7 +38,7 @@ class ThemeColorTests(unittest.TestCase):
             _apply_titlebar_theme=mock.Mock(), _apply_application_font_strategy=mock.Mock(),
             _apply_active_composer_style=mock.Mock(), _rerender_preserving_scroll=mock.Mock(),
         )
-        self.client._is_glassy_theme = lambda: self.client.theme_var.get() == "Glassy"
+        self.client._is_glassy_theme = lambda: self.client.theme_var.get() in S.GLASSY_THEMES
         self.client._is_windows_classic_theme = lambda: self.client.theme_var.get() == "Classic"
         for name in (
             "_apply_theme", "_windows_classic_palette", "_glassy_palette", "_modern_palette",
@@ -76,16 +76,16 @@ class ThemeColorTests(unittest.TestCase):
         self.app.setFont(self.previous_font)
 
     def test_old_and_malformed_settings_normalize_safely(self):
-        self.assertEqual(S.normalize_theme_colors(None), {"Classic": 0, "Glassy": 0, "Modern": 0})
+        self.assertEqual(S.normalize_theme_colors(None), {"Classic": 0, "Glassy": 0, "Glassy Dark": 0, "Modern": 0})
         self.assertEqual(S.normalize_theme_colors({"Classic": 100, "Glassy": -5, "Modern": "120"}),
-                         {"Classic": 5, "Glassy": 0, "Modern": 120})
+                         {"Classic": 5, "Glassy": 0, "Glassy Dark": 0, "Modern": 120})
         for bad in (None, [], {}, True, "bad", float("inf"), float("nan")):
             self.assertEqual(S.normalize_theme_colors({"Modern": bad})["Modern"], 0)
         self.assertEqual(S.normalize_theme_colors({"Glassy+": 57})["Glassy"], 57)
 
     def test_settings_save_and_reload_per_theme(self):
         saved_config = S.default_config()
-        saved_config["theme_colors"] = {"Classic": 4, "Glassy": 31, "Modern": 289}
+        saved_config["theme_colors"] = {"Classic": 4, "Glassy": 31, "Glassy Dark": 76, "Modern": 289}
         with mock.patch.object(S, "_write_dpapi_json") as write:
             self.original_save_config(saved_config)
         self.assertEqual(write.call_args.args[1]["theme_colors"], saved_config["theme_colors"])

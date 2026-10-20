@@ -23,7 +23,7 @@ class ModernThemeTests(unittest.TestCase):
         self.previous_sheet = self.app.styleSheet()
         self.properties = {
             name: self.app.property(name) for name in (
-                "spritelinkGlassy", "spritelinkModern",
+                "spritelinkGlassy", "spritelinkGlassyDark", "spritelinkModern",
                 "spritelinkWindowsClassic", "spritelinkTextShadows",
             )
         }

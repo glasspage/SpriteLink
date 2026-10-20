@@ -290,6 +290,15 @@ def notification_button_stylesheet(
     glassy: bool = False,
 ) -> str:
     if glassy:
+        app = QApplication.instance()
+        if app is not None and app.property("spritelinkGlassyDark"):
+            return (
+                "QPushButton { color:#f2e3cc; border:1px solid #9b805b; border-radius:5px; padding:4px 10px;"
+                " background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #8d7f6b,stop:0.46 #6f5e47,"
+                " stop:0.50 #473725,stop:1 #655037); }"
+                "QPushButton:hover { background:#7d674b; border-color:#c4ae8d; }"
+                "QPushButton:pressed,QPushButton:checked { background:#463726; border-color:#291e13; }"
+            )
         return GLASSY_NOTIFICATION_BUTTON_STYLESHEET
     return (
         WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET
@@ -363,8 +372,10 @@ DEFAULT_THEME = "Classic"
 THEMES = (
     DEFAULT_THEME,
     "Glassy",
+    "Glassy Dark",
     "Modern",
 )
+GLASSY_THEMES = ("Glassy", "Glassy Dark")
 LEGACY_THEME_NAMES = {
     "Glassy+": "Glassy",
     "Windows Classic": "Classic",
@@ -449,6 +460,33 @@ def client_theme_color(client: Any, theme: str, *, use_room: bool = True) -> int
         if theme in colors:
             return colors[theme]
     return normalize_theme_colors(config.get("theme_colors") if isinstance(config, dict) else None)[theme]
+
+
+def client_glassy_theme(client: Any) -> str:
+    model = getattr(client, "theme_var", None)
+    return "Glassy Dark" if model is not None and model.get() == "Glassy Dark" else "Glassy"
+
+
+def glassy_stylesheet(theme: str) -> str:
+    return GLASSY_DARK_STYLESHEET if theme == "Glassy Dark" else GLASSY_STYLESHEET
+
+
+@lru_cache(maxsize=512)
+def dark_message_color(color: str) -> str:
+    original = QColor(color)
+    if not original.isValid():
+        return color
+    if original.name() == DEFAULT_MESSAGE_TEXT_COLOR:
+        return "#e0e4e8"
+    if original.lightnessF() < 0.65:
+        hue, saturation, _lightness, alpha = original.getHslF()
+        return QColor.fromHslF(max(0.0, hue), saturation, 0.76, alpha).name(QColor.NameFormat.HexArgb)
+    return color
+
+
+def message_display_color(color: str) -> str:
+    app = QApplication.instance()
+    return dark_message_color(color) if app is not None and app.property("spritelinkGlassyDark") else color
 
 
 def client_message_sound_settings(client: Any, room_id: str | None = None) -> tuple[str, int, str]:
@@ -807,6 +845,7 @@ DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
 GLASSY_MESSAGE_ROW_BACKGROUNDS = ("#38ffffff", "#50d7e7f2")
+GLASSY_DARK_MESSAGE_ROW_BACKGROUNDS = ("#8c23262a", "#a42c3035")
 
 
 def message_row_backgrounds() -> tuple[str, str]:
@@ -815,11 +854,13 @@ def message_row_backgrounds() -> tuple[str, str]:
         position = int(app.property("spritelinkClassicColor") or 0)
         return CLASSIC_COLOR_SCHEMES[position].get("chat_backgrounds", MESSAGE_ROW_BACKGROUNDS)
     if app is not None and bool(app.property("spritelinkGlassy")):
+        backgrounds = (GLASSY_DARK_MESSAGE_ROW_BACKGROUNDS if app.property("spritelinkGlassyDark")
+                       else GLASSY_MESSAGE_ROW_BACKGROUNDS)
         degrees = int(app.property("spritelinkThemeHue") or 0)
         if degrees:
             return tuple(shift_theme_color(color, degrees).name(QColor.NameFormat.HexArgb)
-                         for color in GLASSY_MESSAGE_ROW_BACKGROUNDS)
-        return GLASSY_MESSAGE_ROW_BACKGROUNDS
+                         for color in backgrounds)
+        return backgrounds
     return MESSAGE_ROW_BACKGROUNDS
 
 
@@ -1399,6 +1440,108 @@ QFrame[frameShape="4"], QFrame[frameShape="5"] {
     color: rgba(73, 115, 140, 190);
 }
 """.replace("SPRITELINK_SCROLLBAR_ASSETS", (Path(__file__).resolve().parent / "assets").as_posix())
+
+GLASSY_DARK_STYLESHEET = GLASSY_STYLESHEET + """
+QMainWindow, QDialog { background: rgba(34, 38, 43, 246); color: #e3e7eb; }
+QMainWindow { background: transparent; }
+QWidget#glassRoot {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 rgba(53, 58, 65, 206), stop:0.40 rgba(35, 39, 45, 210),
+        stop:1 rgba(24, 27, 32, 220));
+}
+QWidget#chatroomsPanel {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(64, 69, 77, 140), stop:1 rgba(24, 28, 34, 178));
+    border-right: 1px solid rgba(124, 135, 145, 130);
+}
+QLabel { color: #e3e7eb; }
+QPushButton {
+    color: #e9edf0;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(99, 105, 113, 238), stop:0.46 rgba(70, 76, 84, 234),
+        stop:0.50 rgba(39, 44, 51, 238), stop:1 rgba(51, 58, 67, 242));
+    border-color: #151a20;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(118, 130, 141, 245), stop:0.46 rgba(83, 99, 113, 240),
+        stop:0.50 rgba(47, 65, 81, 242), stop:1 rgba(62, 83, 101, 245));
+    border-color: #95a9b9;
+}
+QPushButton:pressed, QPushButton:checked {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(27, 37, 47, 250), stop:0.08 rgba(46, 60, 73, 248),
+        stop:0.92 rgba(55, 70, 84, 248), stop:1 rgba(94, 107, 120, 248));
+    border-color: #0e151c;
+}
+QPushButton:default { border-color: #8a9fae; }
+QPushButton:disabled { color: #858d96; background: rgba(51, 56, 63, 190); border-color: #3b424a; }
+QLabel:disabled, QCheckBox:disabled { color: #87919a; }
+QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
+    color: #e1e6eb; background-color: rgba(22, 26, 31, 224);
+    border-color: #697681; selection-background-color: #586e80; selection-color: #ffffff;
+}
+QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus, QListWidget:focus, QComboBox:focus {
+    border-color: #a4b4c1;
+}
+QComboBox::drop-down {
+    border-left-color: #20272e;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(100, 108, 117, 240), stop:1 rgba(42, 50, 59, 240));
+}
+QTextBrowser#chatViewport { background-color: rgba(22, 25, 30, 112); border-color: #141a20; }
+QFrame#comboPopup, QComboBox QAbstractItemView, QMenu {
+    color: #e3e8ec; background-color: #252b32; border-color: #75818d;
+    selection-background-color: #526779; selection-color: #ffffff;
+}
+QListWidget::item:selected, QMenu::item:selected {
+    color: #ffffff;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #40586c, stop:1 #657c8e);
+}
+QMenu::item:disabled { color: #818a93; }
+QFrame[frameShape="6"] {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(82, 89, 98, 228), stop:1 rgba(34, 40, 48, 232));
+    border-color: #626e79;
+}
+QScrollBar:vertical {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #191e24, stop:0.25 #292f37, stop:1 #343c45);
+}
+QScrollBar:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #191e24, stop:0.25 #292f37, stop:1 #343c45);
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #777f88, stop:0.46 #5d6670, stop:0.50 #3b4551, stop:1 #4f5c69);
+    border-color: #171e26; border-top-color: #96a0aa;
+}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #8b9baa, stop:0.46 #6c8398, stop:0.50 #465f74, stop:1 #617c92);
+    border-color: #a3b1be; border-top-color: #bdc8d2;
+}
+QScrollBar::handle:vertical:pressed, QScrollBar::handle:horizontal:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #5d7183, stop:0.46 #52697c, stop:0.50 #334a5e, stop:1 #4c6479);
+    border-color: #182430;
+}
+QScrollBar::handle:vertical:disabled, QScrollBar::handle:horizontal:disabled {
+    background: #373f48; border-color: #242c34;
+}
+QSlider::groove:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #171e25, stop:1 #667480); border-color: #111820;
+}
+QProgressBar { color: #e1e6eb; background-color: rgba(25, 30, 36, 224); border-color: #697681; }
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #9dabb5, stop:0.48 #748b9c, stop:0.52 #4f6c82, stop:1 #3f5a70);
+}
+QToolTip { color: #e4e9ee; background-color: rgba(32, 39, 47, 250); border-color: #8897a4; }
+QFrame[frameShape="4"], QFrame[frameShape="5"] { color: rgba(140, 152, 163, 150); }
+"""
 
 SAFE_USERNAME_COLORS = (
     "#2f6bff",
@@ -2811,7 +2954,7 @@ def link_warning_url_html(
         should_underline = index in underlined_indices
         if should_underline != underlining:
             output.append(
-                '<span style="color: #c00000;"><u>'
+                f'<span style="color: {message_display_color("#c00000")};"><u>'
                 if should_underline
                 else "</u></span>"
             )
@@ -4467,7 +4610,8 @@ class ConfigOverlay(QWidget):
             return None
 
         # Flatten translucent captures before blur to hide sharp controls beneath.
-        background = shift_theme_color(QColor(224, 240, 250))
+        app = QApplication.instance()
+        background = shift_theme_color(QColor("#262b31") if app is not None and app.property("spritelinkGlassyDark") else QColor(224, 240, 250))
         opaque_source = QPixmap(source.size())
         opaque_source.setDevicePixelRatio(source.devicePixelRatio())
         opaque_source.fill(background)
@@ -4638,7 +4782,8 @@ class ConfigOverlay(QWidget):
         if self._glassy and self._blurred_background is not None:
             painter = QPainter(self)
             painter.drawPixmap(self.rect(), self._blurred_background)
-            painter.fillRect(self.rect(), QColor(20, 54, 76, 82))
+            app = QApplication.instance()
+            painter.fillRect(self.rect(), QColor(7, 11, 16, 82) if app is not None and app.property("spritelinkGlassyDark") else QColor(20, 54, 76, 82))
             painter.end()
             return
         super().paintEvent(event)
@@ -4767,7 +4912,9 @@ class ChatroomDetailsDialog(QDialog):
             + (f" {history_note}" if history_note else "")
         )
         key_hint.setWordWrap(True)
-        key_hint.setStyleSheet("color: #777777; font-size: 8pt;")
+        app = QApplication.instance()
+        hint_color = "#aab4bd" if app is not None and app.property("spritelinkGlassyDark") else "#777777"
+        key_hint.setStyleSheet(f"color: {hint_color}; font-size: 8pt;")
         form.addWidget(key_hint, 2, 1, 1, 2)
         layout.addLayout(form)
 
@@ -5456,11 +5603,12 @@ class TextShadowProxyStyle(QProxyStyle):
             return
         # Preserve checked/mixed glyphs; outline faint translucent frames.
         enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
-        color = shift_theme_color("#496f87" if enabled else "#7391a4")
+        dark = bool(app.property("spritelinkGlassyDark"))
+        color = shift_theme_color(("#8f9ba5" if enabled else "#5e6872") if dark else ("#496f87" if enabled else "#7391a4"))
         if enabled and option.state & (
             QStyle.StateFlag.State_MouseOver | QStyle.StateFlag.State_HasFocus
         ):
-            color = shift_theme_color("#246a92")
+            color = shift_theme_color("#b1beca" if dark else "#246a92")
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setPen(QPen(color, 1.0))
@@ -5582,12 +5730,13 @@ class ThemeSlider(QSlider):
             painter.drawEllipse(rect.center(), radius, radius)
             painter.end()
             return
-        border = shift_theme_color("#496f87" if enabled else "#7391a4", degrees)
+        dark = bool(app.property("spritelinkGlassyDark"))
+        border = shift_theme_color(("#94a1ac" if enabled else "#505c67") if dark else ("#496f87" if enabled else "#7391a4"), degrees)
         if enabled and highlighted:
-            border = shift_theme_color("#246a92", degrees)
+            border = shift_theme_color("#c4d1dc" if dark else "#246a92", degrees)
         gradient = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-        gradient.setColorAt(0, shift_theme_color("#ffffff" if enabled else "#e6eef3", degrees))
-        gradient.setColorAt(1, shift_theme_color("#99c5e1" if enabled else "#dae7ef", degrees))
+        gradient.setColorAt(0, shift_theme_color(("#919ca7" if enabled else "#525b64") if dark else ("#ffffff" if enabled else "#e6eef3"), degrees))
+        gradient.setColorAt(1, shift_theme_color(("#3f5365" if enabled else "#303d49") if dark else ("#99c5e1" if enabled else "#dae7ef"), degrees))
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(border, 1.0))
@@ -5646,7 +5795,7 @@ class ThemeComboBox(QComboBox):
         ])
         painter = QPainter(self)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#000000") if windows_classic else shift_theme_color("#24485f"))
+        painter.setBrush(QColor("#000000") if windows_classic else shift_theme_color("#dce5ed" if app.property("spritelinkGlassyDark") else "#24485f"))
         painter.drawPolygon(arrow)
         painter.end()
 
@@ -5734,7 +5883,7 @@ class IdentityPresetSelector(QPushButton):
             if preset_icon is not None:
                 item.setIcon(preset_icon)
             item.setData(Qt.ItemDataRole.UserRole, preset["id"])
-            item.setForeground(QColor(preset["username_color"]))
+            item.setForeground(QColor(message_display_color(preset["username_color"])))
             self.preset_list.addItem(item)
             if preset["id"] == selected_id:
                 selected_preset = preset
@@ -5753,7 +5902,7 @@ class IdentityPresetSelector(QPushButton):
         )
         self.setIcon(selected_icon or QIcon())
         self.setStyleSheet(
-            f"color: {selected_preset['username_color']};"
+            f"color: {message_display_color(selected_preset['username_color'])};"
         )
         if self.popup.isVisible():
             self._resize_popup_to_contents()
@@ -7195,6 +7344,7 @@ class EncryptedChatClient(QObject):
         app = QApplication.instance()
         if app is not None:
             app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
+        app.setProperty("spritelinkGlassyDark", str(self.theme_var.get()) == "Glassy Dark")
         minimum_width, minimum_height = minimum_window_size(
             self.config_data["ui_size"]
         )
@@ -7329,7 +7479,7 @@ class EncryptedChatClient(QObject):
         return str(self.theme_var.get()) == "Classic"
 
     def _is_glassy_theme(self) -> bool:
-        return str(self.theme_var.get()) == "Glassy"
+        return str(self.theme_var.get()) in GLASSY_THEMES
 
     def _windows_classic_palette(self) -> QPalette:
         palette = QPalette()
@@ -7405,18 +7555,40 @@ class EncryptedChatClient(QObject):
             QPalette.ColorRole.Link: QColor("#006fae"),
             QPalette.ColorRole.LinkVisited: QColor("#5e4b9e"),
         }
-        degrees = client_theme_color(self, "Glassy")
+        dark = client_glassy_theme(self) == "Glassy Dark"
+        if dark:
+            colors.update({
+                QPalette.ColorRole.Window: QColor(33, 37, 42, 0),
+                QPalette.ColorRole.WindowText: QColor("#e3e7eb"),
+                QPalette.ColorRole.Base: QColor(22, 25, 30, 112),
+                QPalette.ColorRole.AlternateBase: QColor(44, 48, 53, 164),
+                QPalette.ColorRole.ToolTipBase: QColor("#222931"),
+                QPalette.ColorRole.ToolTipText: QColor("#e4e9ee"),
+                QPalette.ColorRole.Text: QColor("#e1e6eb"),
+                QPalette.ColorRole.Button: QColor("#424b55"),
+                QPalette.ColorRole.ButtonText: QColor("#e9edf0"),
+                QPalette.ColorRole.Light: QColor("#a4afb9"),
+                QPalette.ColorRole.Midlight: QColor("#6b7885"),
+                QPalette.ColorRole.Mid: QColor("#465360"),
+                QPalette.ColorRole.Dark: QColor("#202a34"),
+                QPalette.ColorRole.Shadow: QColor("#11171e"),
+                QPalette.ColorRole.Highlight: QColor("#586e80"),
+                QPalette.ColorRole.Link: QColor("#b4cadb"),
+                QPalette.ColorRole.LinkVisited: QColor("#b2a4cf"),
+                QPalette.ColorRole.PlaceholderText: QColor("#9aa5af"),
+            })
+        degrees = client_theme_color(self, client_glassy_theme(self))
         for role, color in colors.items():
             palette.setColor(role, color if role == QPalette.ColorRole.LinkVisited else shift_theme_color(color, degrees))
         palette.setColor(
             QPalette.ColorGroup.Disabled,
             QPalette.ColorRole.Text,
-            shift_theme_color(QColor(49, 68, 82, 125), degrees),
+            shift_theme_color(QColor("#87919a") if dark else QColor(49, 68, 82, 125), degrees),
         )
         palette.setColor(
             QPalette.ColorGroup.Disabled,
             QPalette.ColorRole.ButtonText,
-            shift_theme_color(QColor(49, 68, 82, 125), degrees),
+            shift_theme_color(QColor("#87919a") if dark else QColor(49, 68, 82, 125), degrees),
         )
         return palette
 
@@ -7449,6 +7621,13 @@ class EncryptedChatClient(QObject):
         return palette
 
     def _config_panel_stylesheet(self) -> str:
+        if client_glassy_theme(self) == "Glassy Dark":
+            return hue_theme_stylesheet(
+                "QFrame#configPanel { background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+                " stop:0 rgba(79, 86, 95, 245), stop:0.42 rgba(44, 50, 58, 238),"
+                " stop:1 rgba(27, 33, 41, 240)); border: 1px solid #8c98a3; border-radius:9px; }",
+                client_theme_color(self, "Glassy Dark"),
+            )
         if self._is_windows_classic_theme():
             return classic_theme_stylesheet((
                 "QFrame#configPanel { background: #c0c0c0;"
@@ -7468,7 +7647,7 @@ class EncryptedChatClient(QObject):
                 " stop:1 rgba(174, 211, 234, 210));"
                 " border: 1px solid rgba(49, 91, 118, 245);"
                 " border-radius: 9px; }"
-            ), client_theme_color(self, "Glassy"))
+            ), client_theme_color(self, client_glassy_theme(self)))
         return (
             "QFrame#configPanel { background: #fbfbfb; "
             "border: 1px solid #b8b8b8; border-radius: 8px; }"
@@ -7543,7 +7722,7 @@ class EncryptedChatClient(QObject):
                 ))
 
             if not color_only:
-                set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
+                set_attribute(20, int(client_glassy_theme(self) == "Glassy Dark"))  # DWMWA_USE_IMMERSIVE_DARK_MODE
             if video_fullscreen:
                 border, caption, text = "#000000", "#000000", "#ffffff"
                 corner_preference = 1  # DWMWCP_DONOTROUND
@@ -7555,10 +7734,10 @@ class EncryptedChatClient(QObject):
                 corner_preference = 1  # DWMWCP_DONOTROUND
                 backdrop = 1  # DWMSBT_NONE
             elif self._is_glassy_theme():
-                degrees = client_theme_color(self, "Glassy")
-                border = shift_theme_color("#6292af", degrees).name()
+                degrees = client_theme_color(self, client_glassy_theme(self))
+                border = shift_theme_color("#77838e" if client_glassy_theme(self) == "Glassy Dark" else "#6292af", degrees).name()
                 caption = None
-                text = shift_theme_color("#102637", degrees).name()
+                text = shift_theme_color("#dde4eb" if client_glassy_theme(self) == "Glassy Dark" else "#102637", degrees).name()
                 corner_preference = 2  # DWMWCP_ROUND
                 backdrop = 3  # DWMSBT_TRANSIENTWINDOW (acrylic)
             else:
@@ -7992,7 +8171,7 @@ QMenu::separator {
     margin: 2px 5px;
 }
 """
-        elif theme == "Glassy":
+        elif theme in GLASSY_THEMES:
             compact = """
 QPushButton {
     padding: 2px 7px;
@@ -8048,11 +8227,12 @@ QComboBox::drop-down {
         if app is None:
             return
 
-        theme = "Classic" if self._is_windows_classic_theme() else "Glassy" if self._is_glassy_theme() else "Modern"
+        theme = "Classic" if self._is_windows_classic_theme() else client_glassy_theme(self) if self._is_glassy_theme() else "Modern"
         position = client_theme_color(self, theme)
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
         app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
+        app.setProperty("spritelinkGlassyDark", theme == "Glassy Dark")
 
         available_styles = {
             name.casefold(): name for name in QStyleFactory.keys()
@@ -8071,7 +8251,7 @@ QComboBox::drop-down {
             style_name = available_styles.get("fusion", "Fusion")
             app.setPalette(self._glassy_palette())
             app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
-                hue_theme_stylesheet(GLASSY_STYLESHEET, position),
+                hue_theme_stylesheet(glassy_stylesheet(theme), position),
                 theme,
             ) + self._config_panel_stylesheet())
         else:
@@ -10140,7 +10320,7 @@ QComboBox::drop-down {
         room_name = self._active_chatroom()["nickname"]
         self.message_entry.setPlaceholderText(f"Chat in {room_name}")
         placeholder_color = QColor(
-            self._active_room_profile()["text_color"]
+            message_display_color(self._active_room_profile()["text_color"])
         )
         placeholder_color.setAlpha(140)
         palette = self.message_entry.palette()
@@ -10162,7 +10342,7 @@ QComboBox::drop-down {
         self.message_entry.document().setDefaultFont(composer_font)
         self.message_entry.viewport().setFont(composer_font)
         self.message_entry.setStyleSheet(
-            f"color: {profile['text_color']};"
+            f"color: {message_display_color(profile['text_color'])};"
         )
         self._update_message_entry_placeholder()
         self._resize_message_entry()
@@ -10596,7 +10776,7 @@ QComboBox::drop-down {
             bool(suspicious_messages)
         )
         self.link_warning_go_button.setStyleSheet(
-            "color: #c00000;" if analysis.suspicious else ""
+            f"color: {message_display_color('#c00000')};" if analysis.suspicious else ""
         )
         self._sync_link_warning_overlay_geometry()
         self.link_warning_overlay.show()
@@ -11669,12 +11849,13 @@ QComboBox::drop-down {
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
         app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
+        app.setProperty("spritelinkGlassyDark", theme == "Glassy Dark")
         if theme == "Classic":
             palette = self._windows_classic_palette()
             stylesheet = classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position)
-        elif theme == "Glassy":
+        elif theme in GLASSY_THEMES:
             palette = self._glassy_palette()
-            stylesheet = hue_theme_stylesheet(GLASSY_STYLESHEET, position)
+            stylesheet = hue_theme_stylesheet(glassy_stylesheet(theme), position)
         else:
             palette = self._modern_palette()
             stylesheet = hue_theme_stylesheet(MODERN_STYLESHEET, position)
@@ -11784,6 +11965,8 @@ QComboBox::drop-down {
         self._apply_theme()
         self._apply_application_font_strategy()
         self._apply_active_composer_style()
+        if hasattr(self, "identity_preset_selector"):
+            self._refresh_identity_preset_selector()
         if hasattr(self, "chat_display"):
             self._rerender_preserving_scroll()
 
@@ -12134,10 +12317,20 @@ QComboBox::drop-down {
                 + "; border-radius: 3px; }"
             )
 
+        if client_glassy_theme(self) == "Glassy Dark":
+            stylesheet = (
+                "QProgressBar { color:#e1e6eb; background:rgba(25,30,36,224);"
+                " border:1px solid #697681; border-radius:4px; text-align:center; }"
+                "QProgressBar::chunk { border-radius:3px; background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                + ("stop:0 #bb9393,stop:0.48 #946464,stop:0.52 #743d3d,stop:1 #5e3131"
+                   if at_or_over_limit else "stop:0 #9dabb5,stop:0.48 #748b9c,stop:0.52 #4f6c82,stop:1 #3f5a70")
+                + "); }"
+            )
+
         if self._is_windows_classic_theme():
             stylesheet = classic_theme_stylesheet(stylesheet, client_theme_color(self, "Classic"))
         elif self._is_glassy_theme():
-            stylesheet = hue_theme_stylesheet(stylesheet, client_theme_color(self, "Glassy"))
+            stylesheet = hue_theme_stylesheet(stylesheet, client_theme_color(self, client_glassy_theme(self)))
 
         if self.message_size_bar.styleSheet() != stylesheet:
             self.message_size_bar.setStyleSheet(stylesheet)
@@ -15233,7 +15426,7 @@ QComboBox::drop-down {
         amount: float = 1.0 - MUTED_CONTENT_OPACITY,
     ) -> str:
         amount = max(0.0, min(1.0, amount))
-        foreground = QColor(color)
+        foreground = QColor(message_display_color(color))
         background = self.chat_display.palette().color(
             self.chat_display.backgroundRole()
         )
@@ -15468,7 +15661,7 @@ QComboBox::drop-down {
         top_align_height: int = 0,
     ) -> QTextCharFormat:
         formatting = QTextCharFormat()
-        formatting.setForeground(QColor(color))
+        formatting.setForeground(QColor(color if ui_font else message_display_color(color)))
         formatting.setFont(
             self._make_ui_font(
                 bold=bold,
@@ -16852,7 +17045,7 @@ QComboBox::drop-down {
         if not self.chat_display.document().isEmpty():
             cursor.insertBlock()
         system_block = cursor.blockFormat()
-        system_block.setBackground(QColor("#ffffff"))
+        system_block.setBackground(QColor("#252a30" if QApplication.instance().property("spritelinkGlassyDark") else "#ffffff"))
         system_block.setLeftMargin(10)
         system_block.setRightMargin(10)
         cursor.setBlockFormat(system_block)

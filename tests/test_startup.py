@@ -24,7 +24,7 @@ class DeferredStartupTests(unittest.TestCase):
         self.font = QFont(self.app.font())
         self.sheet = self.app.styleSheet()
         self.properties = {name: self.app.property(name) for name in (
-            "spritelinkGlassy", "spritelinkModern", "spritelinkWindowsClassic",
+            "spritelinkGlassy", "spritelinkGlassyDark", "spritelinkModern", "spritelinkWindowsClassic",
             "spritelinkTextShadows", "spritelinkThemeHue", "spritelinkClassicColor",
         )}
         self.stack = ExitStack()
