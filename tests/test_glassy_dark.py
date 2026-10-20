@@ -5,7 +5,7 @@ from unittest import mock
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QPushButton, QStyle, QStyleOptionButton, QWidget
 from test_security import SPRITELINK as S
 import test_chatroom_preferences
 import spritelink_video as V
@@ -126,6 +126,69 @@ class GlassyDarkTests(unittest.TestCase):
             self.assertEqual(color.alpha(), 255)
             self.assertLess(color.lightnessF(), 0.4)
         self.assertTrue(overlay.isVisible())
+
+    def test_glass_layers_leave_the_backdrop_visible(self):
+        self._dark()
+        panel = QWidget()
+        panel.setObjectName("glassRoot")
+        panel.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        panel.resize(200, 100)
+        panel.show()
+        QTest.qWait(20)
+        try:
+            image = panel.grab().toImage()
+            ratio = image.devicePixelRatio()
+            for x, y in ((20, 20), (100, 50), (180, 80)):
+                self.assertLess(image.pixelColor(round(x * ratio), round(y * ratio)).alpha(), 105)
+            # Chat stripes and the viewport must not hide the lighter root tint.
+            base_alpha = self.app.palette().color(QPalette.ColorRole.Base).alphaF()
+            for stripe in S.message_row_backgrounds():
+                combined = 1 - (1 - 92 / 255) * (1 - base_alpha) * (1 - QColor(stripe).alphaF())
+                self.assertLess(combined, 0.65)
+        finally:
+            panel.close()
+            panel.deleteLater()
+
+    def test_button_dropdown_and_checkbox_outlines_stay_black_in_every_state(self):
+        self._dark()
+        button = QPushButton("Test", self.root)
+        combo = S.ThemeComboBox(self.root)
+        combo.addItems(["One", "Two"])
+        check = QCheckBox("Test", self.root)
+        for i, widget in enumerate((button, combo, check)):
+            widget.setGeometry(20, 20 + i * 50, 180, 32)
+            widget.show()
+        try:
+            for hue in (0, 120, 240):
+                self.client.theme_color_slider.setValue(hue)
+                self.client._finish_theme_color_change()
+                for state in ("normal", "hover", "focus", "pressed", "disabled"):
+                    for widget in (button, combo, check):
+                        widget.setEnabled(state != "disabled")
+                        widget.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, state == "hover")
+                        if state == "focus":
+                            widget.setFocus()
+                        else:
+                            widget.clearFocus()
+                    button.setDown(state == "pressed")
+                    check.setChecked(state == "pressed")
+                    QTest.qWait(5)
+                    for widget in (button, combo, check):
+                        image = widget.grab().toImage()
+                        ratio = image.devicePixelRatio()
+                        x, y = widget.width() // 2, 0
+                        if widget is check:
+                            option = QStyleOptionButton()
+                            check.initStyleOption(option)
+                            rect = check.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, option, check)
+                            x, y = rect.center().x(), rect.top()
+                        color = image.pixelColor(round(x * ratio), round(y * ratio))
+                        self.assertEqual(color, QColor("#000000"), (hue, state, type(widget).__name__, color.name()))
+        finally:
+            for widget in (button, combo, check):
+                widget.close()
+                widget.deleteLater()
 
     def test_video_controls_follow_dark_glass_in_main_mini_and_fullscreen(self):
         self._dark()
