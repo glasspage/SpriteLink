@@ -476,8 +476,8 @@ def dark_message_color(color: str) -> str:
     original = QColor(color)
     if not original.isValid():
         return color
-    if original.name() == DEFAULT_MESSAGE_TEXT_COLOR:
-        return "#e0e4e8"
+    if original.name() in (DEFAULT_MESSAGE_TEXT_COLOR, "#000000"):
+        return "#ffffff"
     if original.lightnessF() < 0.65:
         hue, saturation, _lightness, alpha = original.getHslF()
         return QColor.fromHslF(max(0.0, hue), saturation, 0.76, alpha).name(QColor.NameFormat.HexArgb)
@@ -10474,9 +10474,8 @@ QComboBox::drop-down {
         self._schedule_profile_save()
 
     def _choose_message_text_color(self) -> None:
-        profile = self._active_room_profile()
         dialog = QColorDialog(
-            QColor(profile["text_color"]),
+            QColor(self._active_room_profile()["text_color"]),
             self.root,
         )
         dialog.setWindowTitle("Choose message text color")
@@ -10490,7 +10489,8 @@ QComboBox::drop-down {
         selected = dialog.currentColor()
         if not selected.isValid():
             return
-        profile["text_color"] = selected.name()
+        # Modal events can replace the normalized room profile.
+        self._active_room_profile()["text_color"] = selected.name()
         self._set_color_preview(
             self.message_text_color_preview,
             selected.name(),

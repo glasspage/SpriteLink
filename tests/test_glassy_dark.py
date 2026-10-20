@@ -77,7 +77,7 @@ class GlassyDarkTests(unittest.TestCase):
         c = self.client
         self._dark()
         original = copy.deepcopy(self.config["room_profiles"])
-        self.assertIn("#e0e4e8", c.message_entry.styleSheet())
+        self.assertIn("#ffffff", c.message_entry.styleSheet())
         self.assertGreater(c._text_format("#202020").foreground().color().lightnessF(), 0.75)
         self.assertGreater(c._text_format("#000000").foreground().color().lightnessF(), 0.7)
         self.assertEqual(S.message_display_color("#ffff80"), "#ffff80")
