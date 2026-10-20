@@ -9324,9 +9324,8 @@ QComboBox::drop-down {
                 overlay.schedule_background_refresh()
 
     def _on_chat_history_scrolled(self, _value: int) -> None:
-        self.viewport_media_timer.start(
-            VIEWPORT_MEDIA_UPDATE_DELAY_MS
-        )
+        if not self.viewport_media_timer.isActive():
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
 
     def _on_chat_history_scroll_action(self, _action: int) -> None:
         # Coalesce requests in the oldest 20%; actionTriggered precedes value() updates.
@@ -9619,9 +9618,8 @@ QComboBox::drop-down {
             self._loading_older_history_page = False
             return
         self._loading_older_history_page = False
-        self.viewport_media_timer.start(
-            VIEWPORT_MEDIA_UPDATE_DELAY_MS
-        )
+        if not self.viewport_media_timer.isActive():
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
         self._flush_pending_live_message_render()
 
     def _build_chat_tab(self) -> None:
@@ -13797,7 +13795,8 @@ QComboBox::drop-down {
         self.chat_display.horizontalScrollBar().setValue(0)
         scrollbar = self.chat_display.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
-        self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
+        if not self.viewport_media_timer.isActive():
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
         self.chat_display.viewport().update()
         return True
 
@@ -14193,6 +14192,9 @@ QComboBox::drop-down {
         cursor = self.chat_display.cursorForPosition(QPoint(0, 0))
         block = cursor.block()
         while block.isValid():
+            if document.documentLayout().blockBoundingRect(block).bottom() <= value:
+                block = block.next()
+                continue
             message_id = self.rendered_message_blocks.get(
                 block.blockNumber()
             )
@@ -14479,16 +14481,6 @@ QComboBox::drop-down {
             or not hasattr(self, "chat_display")
         ):
             return
-        if (
-            self._rendering_message_log
-            or self._loading_older_history_page
-            or self._history_render_updates_suppressed
-            or self._media_rerender_in_progress
-        ):
-            self.viewport_media_timer.start(
-                VIEWPORT_MEDIA_UPDATE_DELAY_MS
-            )
-            return
         viewport = self.chat_display.viewport()
         viewport_height = max(1, viewport.height())
         document = self.chat_display.document()
@@ -14513,6 +14505,10 @@ QComboBox::drop-down {
         self.viewport_embedded_image_urls = desired_urls
         for url in desired_urls:
             self._schedule_image_preview_fetch(url)
+
+        if self._history_render_updates_suppressed or self._media_rerender_in_progress:
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
+            return
 
         cached_desired_urls = {
             url
@@ -14662,8 +14658,13 @@ QComboBox::drop-down {
         anchor = self._capture_chat_view_anchor()
         generation = self._history_render_generation
         room_id = self.active_chatroom_id
-        self._media_rerender_in_progress = True
-        self._set_history_render_updates_suppressed(True)
+        rendering_history = self._rendering_message_log or self._loading_older_history_page
+        updates_enabled = self.chat_display.updatesEnabled()
+        if rendering_history:
+            self.chat_display.setUpdatesEnabled(False)
+        else:
+            self._media_rerender_in_progress = True
+            self._set_history_render_updates_suppressed(True)
 
         for url in urls_to_unload:
             preview_size = self.embedded_image_preview_sizes.get(url)
@@ -14701,11 +14702,13 @@ QComboBox::drop-down {
             if not is_likely_nsfw_image_url(url):
                 self._ensure_animated_media_controller(url, media)
 
-        self._finish_preserving_scroll_rerender(
-            generation,
-            room_id,
-            anchor,
-        )
+        if rendering_history:
+            # Finish before the next prepend can move this row or its scroll anchor.
+            self.chat_display.document().documentLayout().documentSize()
+            self._restore_chat_view_anchor(anchor)
+            self.chat_display.setUpdatesEnabled(updates_enabled)
+        else:
+            self._finish_preserving_scroll_rerender(generation, room_id, anchor)
 
     def _schedule_image_preview_fetch(self, url: str) -> None:
         if (
@@ -16242,9 +16245,8 @@ QComboBox::drop-down {
             controller.deleteLater()
             self.last_inline_animation_frame_at.pop(url, None)
 
-        self.viewport_media_timer.start(
-            VIEWPORT_MEDIA_UPDATE_DELAY_MS
-        )
+        if not self.viewport_media_timer.isActive():
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
         on_finished = job.get("on_finished")
         if callable(on_finished):
             on_finished()
@@ -16501,9 +16503,8 @@ QComboBox::drop-down {
         if bool(job["scroll_to_bottom"]):
             scrollbar = self.chat_display.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
-        self.viewport_media_timer.start(
-            VIEWPORT_MEDIA_UPDATE_DELAY_MS
-        )
+        if not self.viewport_media_timer.isActive():
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
         on_finished = job.get("on_finished")
         if callable(on_finished):
             on_finished()
@@ -16837,6 +16838,8 @@ QComboBox::drop-down {
                 self.chat_display.collapsed_fade_blocks[
                     collapsed_block.blockNumber()
                 ] = QColor(background_color)
+        if displayed_image_urls:
+            self.viewport_media_timer.start(0)
 
     def _append_system_message(
         self,
