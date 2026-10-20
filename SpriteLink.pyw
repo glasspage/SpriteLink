@@ -423,7 +423,6 @@ def normalize_room_settings(value: Any) -> dict[str, Any]:
     except (TypeError, ValueError, OverflowError):
         volume = None
     return {
-        "theme": source.get("theme") if source.get("theme") in THEMES else "Default",
         "theme_colors": {theme: normalized_colors[theme] for theme in THEMES
                          if theme in colors and colors[theme] is not None},
         "message_sound": source.get("message_sound")
@@ -441,11 +440,6 @@ def client_room_settings(client: Any, room_id: str | None = None) -> dict[str, A
     return normalize_room_settings(rooms.get(
         room_id if room_id is not None else getattr(client, "active_chatroom_id", "")
     ) if isinstance(rooms, dict) else None)
-
-
-def client_theme_name(client: Any) -> str:
-    theme = client_room_settings(client)["theme"]
-    return str(client.theme_var.get()) if theme == "Default" else theme
 
 
 def client_theme_color(client: Any, theme: str, *, use_room: bool = True) -> int:
@@ -4814,15 +4808,10 @@ class EditChatroomDialog(ChatroomDetailsDialog):
         form.setColumnStretch(1, 1)
         self.layout().insertWidget(1, panel)
         form.addWidget(client._heading("Appearance"), 0, 0, 1, 3)
-        form.addWidget(QLabel("Theme"), 1, 0)
-        self.theme_combo = ThemeComboBox()
-        self.theme_combo.addItems(["Default", *THEMES])
-        self.theme_combo.setCurrentText(self.settings["theme"])
-        form.addWidget(self.theme_combo, 1, 1, 1, 2)
-        form.addWidget(QLabel("Color"), 2, 0)
+        form.addWidget(QLabel("Color"), 1, 0)
         self.color_default = QCheckBox("Default")
         self.color_default.setAccessibleName("Use Config theme color")
-        form.addWidget(self.color_default, 2, 1)
+        form.addWidget(self.color_default, 1, 1)
         self.color_control = QWidget()
         color_layout = QHBoxLayout(self.color_control)
         color_layout.setContentsMargins(0, 0, 0, 0)
@@ -4834,19 +4823,19 @@ class EditChatroomDialog(ChatroomDetailsDialog):
         self.color_slider.setMaximumWidth(112)
         color_layout.addWidget(self.color_label)
         color_layout.addWidget(self.color_slider, 1)
-        form.addWidget(self.color_control, 2, 2)
+        form.addWidget(self.color_control, 1, 2)
 
-        form.addWidget(client._heading("Notifications"), 3, 0, 1, 3)
-        form.addWidget(QLabel("Message Sound"), 4, 0)
+        form.addWidget(client._heading("Notifications"), 2, 0, 1, 3)
+        form.addWidget(QLabel("Message Sound"), 3, 0)
         self.sound_combo = ThemeComboBox()
         self.sound_combo.addItems(["Default", *MESSAGE_SOUND_OPTIONS])
         self.sound_combo.setCurrentText(self.settings["message_sound"])
-        form.addWidget(self.sound_combo, 4, 1, 1, 2)
-        form.addWidget(QLabel("Volume"), 5, 0)
+        form.addWidget(self.sound_combo, 3, 1, 1, 2)
+        form.addWidget(QLabel("Volume"), 4, 0)
         self.volume_default = QCheckBox("Default")
         self.volume_default.setAccessibleName("Use Config message sound volume")
         self.volume_default.setChecked(self.settings["message_sound_volume"] is None)
-        form.addWidget(self.volume_default, 5, 1)
+        form.addWidget(self.volume_default, 4, 1)
         volume_control = QWidget()
         volume_layout = QHBoxLayout(volume_control)
         volume_layout.setContentsMargins(0, 0, 0, 0)
@@ -4864,9 +4853,8 @@ class EditChatroomDialog(ChatroomDetailsDialog):
         self.volume_label.setText(f"{self.volume_slider.value() * 10}%")
         volume_layout.addWidget(self.volume_label)
         volume_layout.addWidget(self.volume_slider, 1)
-        form.addWidget(volume_control, 5, 2)
+        form.addWidget(volume_control, 4, 2)
 
-        self.theme_combo.currentTextChanged.connect(self._sync_color)
         self.color_default.toggled.connect(self._set_color_default)
         self.color_slider.valueChanged.connect(self._set_color)
         self.sound_combo.textActivated.connect(self._select_sound)
@@ -4876,11 +4864,9 @@ class EditChatroomDialog(ChatroomDetailsDialog):
         self._sync_color()
 
     def _theme(self) -> str:
-        theme = self.theme_combo.currentText()
-        return str(self.client.theme_var.get()) if theme == "Default" else theme
+        return str(self.client.theme_var.get())
 
     def _sync_color(self, *_args: Any) -> None:
-        self.settings["theme"] = self.theme_combo.currentText()
         theme = self._theme()
         colors = self.settings["theme_colors"]
         position = colors.get(theme, client_theme_color(self.client, theme, use_room=False))
@@ -7340,10 +7326,10 @@ class EncryptedChatClient(QObject):
         return self._basic_application_font.family()
 
     def _is_windows_classic_theme(self) -> bool:
-        return client_theme_name(self) == "Classic"
+        return str(self.theme_var.get()) == "Classic"
 
     def _is_glassy_theme(self) -> bool:
-        return client_theme_name(self) == "Glassy"
+        return str(self.theme_var.get()) == "Glassy"
 
     def _windows_classic_palette(self) -> QPalette:
         palette = QPalette()
@@ -9313,7 +9299,7 @@ QComboBox::drop-down {
         self._refresh_chatroom_list()
 
     def _refresh_room_appearance(self) -> bool:
-        theme = client_theme_name(self)
+        theme = str(self.theme_var.get())
         if getattr(self, "_applied_theme_color", None) == (theme, client_theme_color(self, theme)):
             return False
         self._apply_theme()
@@ -10949,7 +10935,7 @@ QComboBox::drop-down {
         player = getattr(self, "video_player", None)
         if player is None:
             return
-        theme = client_theme_name(self)
+        theme = str(self.theme_var.get())
         position = client_theme_color(self, theme)
         transform = (
             (lambda text: classic_theme_stylesheet(text, position))
@@ -11707,7 +11693,7 @@ QComboBox::drop-down {
         app = QApplication.instance()
         if app is None:
             return False
-        theme = client_theme_name(self)
+        theme = str(self.theme_var.get())
         position = client_theme_color(self, theme)
         if getattr(self, "_applied_theme_color", None) == (theme, position):
             self.theme_color_slider.setProperty("spritelinkPreviewHue", None)

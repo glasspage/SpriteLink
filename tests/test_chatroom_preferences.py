@@ -42,13 +42,14 @@ class ChatroomPreferenceTests(unittest.TestCase):
     def test_defaults_follow_config_and_are_not_copied(self):
         self.client.active_chatroom_id = "room-a"
         d = self.dialog()
-        self.assertEqual((d.theme_combo.currentText(), d.sound_combo.currentText()), ("Default", "Default"))
+        self.assertFalse(hasattr(d, "theme_combo"))
+        self.assertEqual(d.sound_combo.currentText(), "Default")
         self.assertTrue(d.color_default.isChecked())
         self.assertTrue(d.volume_default.isChecked())
         self.assertEqual(self.config["room_settings"], {})
         for theme in S.THEMES:
             self.client._on_theme_changed(theme)
-            self.assertEqual(S.client_theme_name(self.client), theme)
+            self.assertEqual(self.client._applied_theme_color[0], theme)
         self.client.message_sound_var.set("Custom")
         self.client.custom_message_sound_path_var.set("global.wav")
         self.client.message_sound_volume_var.set(30)
@@ -56,30 +57,30 @@ class ChatroomPreferenceTests(unittest.TestCase):
         self.client.message_sound_volume_var.set(80)
         self.assertEqual(S.client_message_sound_settings(self.client, "room-a")[1], 80)
 
-    def test_theme_switches_rooms_and_config_still_edits_defaults(self):
+    def test_rooms_follow_config_theme_ignoring_legacy_overrides(self):
         self.config["room_settings"] = {
-            "room-a": {"theme": "Classic", "theme_colors": {"Classic": 3}},
+            "room-a": {"theme": "Classic", "theme_colors": {"Glassy": 70, "Modern": 120}},
             "room-b": {"theme": "Modern", "theme_colors": {"Modern": 175}},
         }
         self.client._ensure_popup("config")
-        for room_id, theme, position in (("room-a", "Classic", 3), ("room-b", "Modern", 175),
-                                          (S.GLOBAL_CHATROOM_ID, "Glassy", 0)):
+        for room_id, position in (("room-a", 70), ("room-b", 0), (S.GLOBAL_CHATROOM_ID, 0)):
             self.client._activate_chatroom(room_id)
-            self.assertEqual(self.client._applied_theme_color, (theme, position))
-            self.assertEqual(S.client_theme_name(self.client), theme)
+            self.assertEqual(self.client._applied_theme_color, ("Glassy", position))
             self.assertEqual(self.client.theme_combo.currentText(), "Glassy")
         self.client._activate_chatroom("room-a")
         self.client._on_theme_changed("Modern")
         self.client.theme_color_slider.setValue(210)
         self.client._finish_theme_color_change()
-        self.assertEqual(self.client._applied_theme_color, ("Classic", 3))
+        self.assertEqual(self.client._applied_theme_color, ("Modern", 120))
         self.assertEqual(self.config["theme_colors"]["Modern"], 210)
         self.assertEqual(self.client.theme_color_slider.value(), 210)
         self.client._activate_chatroom(S.GLOBAL_CHATROOM_ID)
         self.assertEqual(self.client._applied_theme_color, ("Modern", 210))
+        self.client._activate_chatroom("room-b")
+        self.assertEqual(self.client._applied_theme_color, ("Modern", 175))
 
     def test_default_color_follows_config_for_selected_theme(self):
-        self.config["room_settings"] = {"room-a": {"theme": "Classic"}}
+        self.client._on_theme_changed("Classic")
         self.client.active_chatroom_id = "room-a"
         self.config["theme_colors"]["Classic"] = 4
         self.assertEqual(S.client_theme_color(self.client, "Classic"), 4)
@@ -91,13 +92,15 @@ class ChatroomPreferenceTests(unittest.TestCase):
         self.assertEqual(d.color_label.text(), "Spruce")
 
     def test_dialog_retains_per_theme_colors_and_resets_to_default(self):
-        d = self.dialog()
         for theme, position, maximum in (("Classic", 3, 5), ("Glassy", 70, 359), ("Modern", 210, 359)):
-            d.theme_combo.setCurrentText(theme)
+            self.client._on_theme_changed(theme)
+            d = self.dialog()
             self.assertEqual(d.color_slider.maximum(), maximum)
             d.color_default.setChecked(False)
             d.color_slider.setValue(position)
-        d.theme_combo.setCurrentText("Classic")
+            self.config["room_settings"]["room-a"] = copy.deepcopy(d.settings)
+        self.client._on_theme_changed("Classic")
+        d = self.dialog()
         self.assertEqual(d.color_slider.value(), 3)
         self.assertEqual(d.color_label.text(), "Slate")
         d.color_default.setChecked(True)
@@ -131,42 +134,42 @@ class ChatroomPreferenceTests(unittest.TestCase):
 
     def test_edit_save_cancel_failure_and_inactive_room(self):
         d = self.dialog()
-        d.settings.update(theme="Modern", message_sound="Disabled")
+        d.settings.update(theme_colors={"Glassy": 70}, message_sound="Disabled")
         d.exec = mock.Mock(return_value=QDialog.DialogCode.Accepted)
         with mock.patch.object(S, "EditChatroomDialog", return_value=d):
             self.client._edit_chatroom("room-a")
-        self.assertEqual(self.config["room_settings"]["room-a"]["theme"], "Modern")
+        self.assertEqual(self.config["room_settings"]["room-a"]["theme_colors"], {"Glassy": 70})
         self.assertEqual(self.client._applied_theme_color[0], "Glassy")
-        d.settings["theme"] = "Classic"
+        d.settings["theme_colors"] = {"Glassy": 120}
         d.exec.return_value = QDialog.DialogCode.Rejected
         with mock.patch.object(S, "EditChatroomDialog", return_value=d):
             self.client._edit_chatroom("room-a")
-        self.assertEqual(self.config["room_settings"]["room-a"]["theme"], "Modern")
+        self.assertEqual(self.config["room_settings"]["room-a"]["theme_colors"], {"Glassy": 70})
         d.exec.return_value = QDialog.DialogCode.Accepted
         with mock.patch.object(S, "EditChatroomDialog", return_value=d), \
              mock.patch.object(S, "save_config", side_effect=OSError("disk full")), \
              mock.patch.object(S.messagebox, "showerror") as error:
             self.client._edit_chatroom("room-a")
         error.assert_called_once()
-        self.assertEqual(self.config["room_settings"]["room-a"]["theme"], "Modern")
+        self.assertEqual(self.config["room_settings"]["room-a"]["theme_colors"], {"Glassy": 70})
 
     def test_active_edit_applies_and_global_can_override(self):
         self.client._activate_chatroom("room-a")
         d = self.dialog()
-        d.settings.update(theme="Classic", theme_colors={"Classic": 2})
+        d.settings.update(theme_colors={"Glassy": 120})
         with mock.patch.object(S, "EditChatroomDialog", return_value=d), \
              mock.patch.object(d, "exec", return_value=QDialog.DialogCode.Accepted):
             self.client._edit_chatroom("room-a")
-        self.assertEqual(self.client._applied_theme_color, ("Classic", 2))
+        self.assertEqual(self.client._applied_theme_color, ("Glassy", 120))
         d = self.dialog(S.GLOBAL_CHATROOM_ID)
         self.assertFalse(d.name_entry.isEnabled())
         self.assertFalse(d.key_entry.isEnabled())
-        d.settings["theme"] = "Modern"
+        d.settings["theme_colors"] = {"Glassy": 210}
         with mock.patch.object(S, "EditChatroomDialog", return_value=d), \
              mock.patch.object(d, "exec", return_value=QDialog.DialogCode.Accepted):
             self.client._edit_chatroom(S.GLOBAL_CHATROOM_ID)
         self.client._activate_chatroom(S.GLOBAL_CHATROOM_ID)
-        self.assertEqual(self.client._applied_theme_color, ("Modern", 0))
+        self.assertEqual(self.client._applied_theme_color, ("Glassy", 210))
 
     def test_sound_uses_receiving_room_and_global_preview_remains_global(self):
         self.config["room_settings"] = {
@@ -218,6 +221,8 @@ class ChatroomPreferenceTests(unittest.TestCase):
              mock.patch.object(S, "_load_dpapi_config", return_value=copy.deepcopy(self.config)):
             loaded = LOAD_CONFIG()
         self.assertNotIn("removed", loaded["room_settings"])
+        self.assertNotIn("theme", loaded["room_settings"]["room-a"])
+        self.assertEqual(loaded["room_settings"]["room-a"]["theme_colors"], {"Classic": 3})
         self.assertEqual(loaded["room_settings"]["room-a"]["message_sound_volume"], 20)
         self.assertEqual(loaded["room_settings"]["room-b"], S.normalize_room_settings(None))
         with mock.patch.object(S, "_write_dpapi_json") as write:
