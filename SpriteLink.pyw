@@ -845,7 +845,7 @@ DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
 GLASSY_MESSAGE_ROW_BACKGROUNDS = ("#38ffffff", "#50d7e7f2")
-GLASSY_DARK_MESSAGE_ROW_BACKGROUNDS = ("#3023262a", "#482c3035")
+GLASSY_DARK_MESSAGE_ROW_BACKGROUNDS = ("#4023262a", "#582c3035")
 
 
 def message_row_backgrounds() -> tuple[str, str]:
@@ -1446,12 +1446,12 @@ QMainWindow, QDialog { background: rgba(34, 38, 43, 140); color: #e3e7eb; }
 QMainWindow { background: transparent; }
 QWidget#glassRoot {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 rgba(53, 58, 65, 62), stop:0.40 rgba(35, 39, 45, 72),
-        stop:1 rgba(24, 27, 32, 92));
+        stop:0 rgba(53, 58, 65, 100), stop:0.40 rgba(35, 39, 45, 112),
+        stop:1 rgba(24, 27, 32, 128));
 }
 QWidget#chatroomsPanel {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 rgba(64, 69, 77, 44), stop:1 rgba(24, 28, 34, 64));
+        stop:0 rgba(64, 69, 77, 60), stop:1 rgba(24, 28, 34, 80));
     border-right: 1px solid #000000;
 }
 QLabel { color: #e3e7eb; }
@@ -1478,7 +1478,7 @@ QPushButton:default { border-color: #000000; }
 QPushButton:disabled { color: #858d96; background: rgba(51, 56, 63, 104); border-color: #000000; }
 QLabel:disabled, QCheckBox:disabled { color: #87919a; }
 QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
-    color: #e1e6eb; background-color: rgba(22, 26, 31, 112);
+    color: #e1e6eb; background-color: rgba(22, 26, 31, 136);
     border-color: #000000; selection-background-color: #586e80; selection-color: #ffffff;
 }
 QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus, QListWidget:focus, QComboBox:focus {
@@ -1489,7 +1489,7 @@ QComboBox::drop-down {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
         stop:0 rgba(100, 108, 117, 152), stop:1 rgba(42, 50, 59, 174));
 }
-QTextBrowser#chatViewport { background-color: rgba(22, 25, 30, 36); border-color: #000000; }
+QTextBrowser#chatViewport { background-color: rgba(22, 25, 30, 48); border-color: #000000; }
 QFrame#comboPopup, QComboBox QAbstractItemView, QMenu {
     color: #e3e8ec; background-color: #252b32; border-color: #000000;
     selection-background-color: #526779; selection-color: #ffffff;
@@ -4782,8 +4782,6 @@ class ConfigOverlay(QWidget):
         if self._glassy and self._blurred_background is not None:
             painter = QPainter(self)
             painter.drawPixmap(self.rect(), self._blurred_background)
-            app = QApplication.instance()
-            painter.fillRect(self.rect(), QColor(7, 11, 16, 32) if app is not None and app.property("spritelinkGlassyDark") else QColor(20, 54, 76, 82))
             painter.end()
             return
         super().paintEvent(event)
@@ -7560,8 +7558,8 @@ class EncryptedChatClient(QObject):
             colors.update({
                 QPalette.ColorRole.Window: QColor(33, 37, 42, 0),
                 QPalette.ColorRole.WindowText: QColor("#e3e7eb"),
-                QPalette.ColorRole.Base: QColor(22, 25, 30, 36),
-                QPalette.ColorRole.AlternateBase: QColor(44, 48, 53, 72),
+                QPalette.ColorRole.Base: QColor(22, 25, 30, 48),
+                QPalette.ColorRole.AlternateBase: QColor(44, 48, 53, 88),
                 QPalette.ColorRole.ToolTipBase: QColor("#222931"),
                 QPalette.ColorRole.ToolTipText: QColor("#e4e9ee"),
                 QPalette.ColorRole.Text: QColor("#e1e6eb"),
@@ -7624,8 +7622,8 @@ class EncryptedChatClient(QObject):
         if client_glassy_theme(self) == "Glassy Dark":
             return hue_theme_stylesheet(
                 "QFrame#configPanel { background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
-                " stop:0 rgba(79, 86, 95, 150), stop:0.42 rgba(44, 50, 58, 142),"
-                " stop:1 rgba(27, 33, 41, 160)); border: 1px solid #000000; border-radius:9px; }",
+                " stop:0 rgba(79, 86, 95, 172), stop:0.42 rgba(44, 50, 58, 164),"
+                " stop:1 rgba(27, 33, 41, 180)); border: 1px solid #000000; border-radius:9px; }",
                 client_theme_color(self, "Glassy Dark"),
             )
         if self._is_windows_classic_theme():

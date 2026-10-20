@@ -140,12 +140,12 @@ class GlassyDarkTests(unittest.TestCase):
             image = panel.grab().toImage()
             ratio = image.devicePixelRatio()
             for x, y in ((20, 20), (100, 50), (180, 80)):
-                self.assertLess(image.pixelColor(round(x * ratio), round(y * ratio)).alpha(), 105)
-            # Chat stripes and the viewport must not hide the lighter root tint.
+                self.assertLess(image.pixelColor(round(x * ratio), round(y * ratio)).alpha(), 140)
+            # Keep the combined glass layers translucent.
             base_alpha = self.app.palette().color(QPalette.ColorRole.Base).alphaF()
             for stripe in S.message_row_backgrounds():
-                combined = 1 - (1 - 92 / 255) * (1 - base_alpha) * (1 - QColor(stripe).alphaF())
-                self.assertLess(combined, 0.65)
+                combined = 1 - (1 - 128 / 255) * (1 - base_alpha) * (1 - QColor(stripe).alphaF())
+                self.assertLess(combined, 0.75)
         finally:
             panel.close()
             panel.deleteLater()

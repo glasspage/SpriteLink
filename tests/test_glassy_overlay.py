@@ -55,6 +55,23 @@ class GlassyOverlayTests(unittest.TestCase):
         after = self.overlay.grab().toImage()
         self.assertEqual(before, after)
 
+    def test_frosted_overlay_preserves_background_brightness(self) -> None:
+        app = self.app
+        previous = app.property("spritelinkGlassyDark")
+        try:
+            for dark in (False, True):
+                with self.subTest(dark=dark):
+                    app.setProperty("spritelinkGlassyDark", dark)
+                    self.overlay.show()
+                    app.processEvents()
+                    image = self.overlay.grab().toImage()
+                    color = image.pixelColor(image.width() // 2, image.height() // 2)
+                    for channel in (color.red(), color.green(), color.blue()):
+                        self.assertAlmostEqual(channel, 240, delta=2)
+                    self.overlay.hide()
+        finally:
+            app.setProperty("spritelinkGlassyDark", previous)
+
     def test_high_dpi_blur_keeps_the_entire_source(self) -> None:
         for ratio in (1.0, 1.5, 2.0):
             with self.subTest(ratio=ratio):
