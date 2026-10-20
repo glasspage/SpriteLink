@@ -42,13 +42,28 @@ class GlassyThemeTests(unittest.TestCase):
         self.window.deleteLater()
         self.app.processEvents()
 
-    def apply(self):
+    def apply(self, **kwargs):
         with mock.patch.object(SPRITELINK.os, "name", "nt"), mock.patch.object(
             SPRITELINK.ctypes, "windll", SimpleNamespace(dwmapi=self.dwm), create=True
         ):
             SPRITELINK.EncryptedChatClient._apply_window_titlebar_theme(
-                self.client, self.window
+                self.client, self.window, **kwargs
             )
+
+    def test_color_change_keeps_native_and_legacy_acrylic_active(self):
+        for legacy in (False, True):
+            self.fail_backdrop = legacy
+            self.apply()
+            self.assertTrue(self.window.property("spritelinkDesktopBlur"))
+            self.calls.clear()
+            self.dwm.DwmExtendFrameIntoClientArea.reset_mock()
+            self.client._set_windows_legacy_blur.reset_mock()
+            self.apply(color_only=True)
+            self.assertEqual({attribute for attribute, _ in self.calls}, {34, 35, 36})
+            self.dwm.DwmExtendFrameIntoClientArea.assert_not_called()
+            self.client._set_windows_legacy_blur.assert_not_called()
+            self.assertTrue(self.window.property("spritelinkDesktopBlur"))
+            self.assertEqual(bool(self.window.property("spritelinkLegacyBlur")), legacy)
 
     def test_native_acrylic_enables_live_backdrop(self):
         self.apply()

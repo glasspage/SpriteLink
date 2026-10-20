@@ -7514,7 +7514,7 @@ class EncryptedChatClient(QObject):
         except (AttributeError, OSError):
             return False
 
-    def _apply_window_titlebar_theme(self, window: QWidget) -> None:
+    def _apply_window_titlebar_theme(self, window: QWidget, *, color_only: bool = False) -> None:
         if os.name != "nt" or not hasattr(ctypes, "windll"):
             return
 
@@ -7542,7 +7542,8 @@ class EncryptedChatClient(QObject):
                     ctypes.sizeof(data),
                 ))
 
-            set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
+            if not color_only:
+                set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
             if video_fullscreen:
                 border, caption, text = "#000000", "#000000", "#ffffff"
                 corner_preference = 1  # DWMWCP_DONOTROUND
@@ -7567,7 +7568,8 @@ class EncryptedChatClient(QObject):
                 corner_preference = 2  # DWMWCP_ROUND
                 backdrop = 1  # DWMSBT_NONE
 
-            set_attribute(33, corner_preference)  # DWMWA_WINDOW_CORNER_PREFERENCE
+            if not color_only:
+                set_attribute(33, corner_preference)  # DWMWA_WINDOW_CORNER_PREFERENCE
             set_attribute(34, self._windows_colorref(border))
             set_attribute(
                 35,
@@ -7576,6 +7578,9 @@ class EncryptedChatClient(QObject):
                 else self._windows_colorref(caption),
             )
             set_attribute(36, self._windows_colorref(text))
+            if color_only:
+                window.update()
+                return
             backdrop_result = set_attribute(38, backdrop)  # DWMWA_SYSTEMBACKDROP_TYPE
 
             class Margins(ctypes.Structure):
@@ -7937,8 +7942,8 @@ class EncryptedChatClient(QObject):
         if app is not None:
             app.quit()
 
-    def _apply_titlebar_theme(self) -> None:
-        self._apply_window_titlebar_theme(self.root)
+    def _apply_titlebar_theme(self, *, color_only: bool = False) -> None:
+        self._apply_window_titlebar_theme(self.root, color_only=color_only)
 
     def _ui_density_stylesheet(
         self,
@@ -8061,14 +8066,14 @@ QComboBox::drop-down {
             app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
                 classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position),
                 theme,
-            ))
+            ) + self._config_panel_stylesheet())
         elif self._is_glassy_theme():
             style_name = available_styles.get("fusion", "Fusion")
             app.setPalette(self._glassy_palette())
             app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
                 hue_theme_stylesheet(GLASSY_STYLESHEET, position),
                 theme,
-            ))
+            ) + self._config_panel_stylesheet())
         else:
             style_name = next(
                 (available_styles[name] for name in (
@@ -8080,7 +8085,7 @@ QComboBox::drop-down {
             app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
                 hue_theme_stylesheet(MODERN_STYLESHEET, position),
                 theme,
-            ))
+            ) + self._config_panel_stylesheet())
 
         text_shadows_enabled = bool(self.text_shadows_var.get())
         app.setProperty("spritelinkTextShadows", text_shadows_enabled)
@@ -8108,23 +8113,7 @@ QComboBox::drop-down {
             if panel is not None and isinstance(panel.layout(), QGridLayout):
                 panel.layout().setVerticalSpacing(self._config_row_spacing())
 
-        if hasattr(self, "config_panel"):
-            self.config_panel.setStyleSheet(
-                self._config_panel_stylesheet()
-            )
-        if hasattr(self, "message_limit_panel"):
-            self.message_limit_panel.setStyleSheet(
-                self._config_panel_stylesheet()
-            )
-        if hasattr(self, "image_preview_panel"):
-            self.image_preview_panel.setStyleSheet(
-                self._config_panel_stylesheet()
-            )
         EncryptedChatClient._apply_video_player_theme(self)
-        if hasattr(self, "link_warning_panel"):
-            self.link_warning_panel.setStyleSheet(
-                self._config_panel_stylesheet()
-            )
         for overlay_name in (
             "config_overlay",
             "message_limit_overlay",
@@ -9038,8 +9027,7 @@ QComboBox::drop-down {
         else:
             if room_id == self.active_chatroom_id:
                 self._update_window_title()
-                if self._refresh_room_appearance():
-                    self._rerender_preserving_scroll()
+                self._refresh_room_appearance()
             self._refresh_chatroom_list()
 
     def _copy_chatroom_invite_code(self, room_id: str) -> None:
@@ -9299,13 +9287,7 @@ QComboBox::drop-down {
         self._refresh_chatroom_list()
 
     def _refresh_room_appearance(self) -> bool:
-        theme = str(self.theme_var.get())
-        if getattr(self, "_applied_theme_color", None) == (theme, client_theme_color(self, theme)):
-            return False
-        self._apply_theme()
-        self._apply_application_font_strategy()
-        self._apply_active_composer_style()
-        return True
+        return self._apply_theme_colors()
 
     def _reset_history_render_window(self) -> None:
         self._set_history_render_updates_suppressed(False)
@@ -10355,7 +10337,6 @@ QComboBox::drop-down {
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        self.config_panel.setStyleSheet(self._config_panel_stylesheet())
         panel_row.addWidget(self.config_panel, 10)
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row, 1)
@@ -10394,9 +10375,6 @@ QComboBox::drop-down {
         self.message_limit_panel.setObjectName("configPanel")
         self.message_limit_panel.setMinimumWidth(430)
         self.message_limit_panel.setMaximumWidth(520)
-        self.message_limit_panel.setStyleSheet(
-            self._config_panel_stylesheet()
-        )
         panel_row.addWidget(self.message_limit_panel)
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row)
@@ -10471,9 +10449,6 @@ QComboBox::drop-down {
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
         )
-        self.image_preview_panel.setStyleSheet(
-            self._config_panel_stylesheet()
-        )
         panel_row.addWidget(self.image_preview_panel, 8)
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row)
@@ -10491,7 +10466,6 @@ QComboBox::drop-down {
         # Keep native video surfaces outside QAbstractScrollArea viewport ownership.
         self.video_mini_panel = QFrame(self.chat_display.parentWidget())
         self.video_mini_panel.setObjectName("configPanel")
-        self.video_mini_panel.setStyleSheet(self._config_panel_stylesheet())
         mini_layout = QVBoxLayout(self.video_mini_panel)
         mini_layout.setContentsMargins(4, 4, 4, 4)
         mini_layout.setSpacing(0)
@@ -10538,9 +10512,6 @@ QComboBox::drop-down {
         self.link_warning_panel.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
-        )
-        self.link_warning_panel.setStyleSheet(
-            self._config_panel_stylesheet()
         )
         panel_row.addWidget(self.link_warning_panel, 8)
         panel_row.addStretch(1)
@@ -10929,9 +10900,6 @@ QComboBox::drop-down {
         panel.setGeometry(position.x(), position.y(), width, height)
 
     def _apply_video_player_theme(self) -> None:
-        mini_panel = getattr(self, "video_mini_panel", None)
-        if mini_panel is not None:
-            mini_panel.setStyleSheet(self._config_panel_stylesheet())
         player = getattr(self, "video_player", None)
         if player is None:
             return
@@ -11696,8 +11664,10 @@ QComboBox::drop-down {
         theme = str(self.theme_var.get())
         position = client_theme_color(self, theme)
         if getattr(self, "_applied_theme_color", None) == (theme, position):
-            self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
+            if hasattr(self, "theme_color_slider"):
+                self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
             return False
+        old_backgrounds = message_row_backgrounds()
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
         app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
@@ -11710,11 +11680,14 @@ QComboBox::drop-down {
         else:
             palette = self._modern_palette()
             stylesheet = hue_theme_stylesheet(MODERN_STYLESHEET, position)
-        stylesheet = EncryptedChatClient._ui_density_stylesheet(self, stylesheet, theme)
+        stylesheet = EncryptedChatClient._ui_density_stylesheet(self, stylesheet, theme) + self._config_panel_stylesheet()
         # Repolish can reset font families and NoAntialias; restore explicit fonts.
         application_font = QFont(app.font())
         fonts = [(widget, QFont(widget.font())) for widget in app.allWidgets()
                  if widget.testAttribute(Qt.WidgetAttribute.WA_SetFont)]
+        documents = [(widget.document(), QFont(widget.document().defaultFont()))
+                     for name in ("chat_display", "message_entry")
+                     if (widget := getattr(self, name, None)) is not None]
         root = getattr(self, "root", None)
         updates_enabled = root is not None and root.updatesEnabled()
         if updates_enabled:
@@ -11722,16 +11695,23 @@ QComboBox::drop-down {
         try:
             app.setPalette(palette)
             app.setStyleSheet(stylesheet)
-            panel_stylesheet = self._config_panel_stylesheet()
-            for name in ("config_panel", "message_limit_panel", "image_preview_panel", "link_warning_panel"):
-                panel = getattr(self, name, None)
-                if panel is not None and panel.styleSheet() != panel_stylesheet:
-                    panel.setStyleSheet(panel_stylesheet)
             if app.font() != application_font:
                 app.setFont(application_font)
             for widget, font in fonts:
                 if widget.font() != font:
                     widget.setFont(font)
+            for document, font in documents:
+                if document.defaultFont() != font:
+                    document.setDefaultFont(font)
+            EncryptedChatClient._recolor_chat_rows(self, old_backgrounds)
+            display = getattr(self, "chat_display", None)
+            if display is not None and display.document().isEmpty():
+                frame = display.document().rootFrame()
+                formatting = frame.frameFormat()
+                if formatting.topMargin() != 0.0:
+                    formatting.setTopMargin(0.0)
+                    frame.setFrameFormat(formatting)
+                display.document().markContentsDirty(0, display.document().characterCount())
             if hasattr(self, "message_size_bar"):
                 self._draw_message_size_bar()
         finally:
@@ -11740,19 +11720,48 @@ QComboBox::drop-down {
         for name in ("config_overlay", "message_limit_overlay", "image_preview_overlay", "link_warning_overlay"):
             overlay = getattr(self, name, None)
             if isinstance(overlay, ConfigOverlay):
-                overlay.apply_theme(theme == "Glassy")
-        self._apply_titlebar_theme()
+                overlay.schedule_background_refresh()
+        self._apply_titlebar_theme(color_only=True)
         self._applied_theme_color = (theme, position)
-        self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
+        if hasattr(self, "theme_color_slider"):
+            self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
         EncryptedChatClient._apply_video_player_theme(self)
         return True
+
+    def _recolor_chat_rows(self, old_backgrounds: tuple[str, str]) -> None:
+        display = getattr(self, "chat_display", None)
+        new_backgrounds = message_row_backgrounds()
+        if display is None or old_backgrounds == new_backgrounds:
+            return
+        replacements = {QColor(old).rgba(): QColor(new)
+                        for old, new in zip(old_backgrounds, new_backgrounds)}
+
+        def recolor(color: QColor) -> QColor:
+            return replacements.get(color.rgba(), color)
+
+        # Repaint stripes without rebuilding text, media, selection, or scroll state.
+        for name in ("row_background_blocks", "collapsed_fade_blocks"):
+            colors = getattr(display, name, {})
+            colors.update({block: recolor(color) for block, color in colors.items()})
+        padding = getattr(display, "row_background_padding_blocks", {})
+        padding.update({block: (recolor(color), top, bottom)
+                        for block, (color, top, bottom) in padding.items()})
+        job = getattr(self, "_message_render_job", None)
+        if isinstance(job, dict):
+            for selection in job.get("row_selections", []):
+                selection.format.setBackground(recolor(selection.format.background().color()))
+            for step in job.get("render_steps", []):
+                step["background_color"] = recolor(QColor(step["background_color"])).name(QColor.NameFormat.HexArgb)
+                step["separators_after"] = [
+                    (text, recolor(QColor(color)).name(QColor.NameFormat.HexArgb))
+                    for text, color in step["separators_after"]
+                ]
+        display.viewport().update()
 
     def _save_theme_colors(self) -> None:
         if self.theme_color_slider.isSliderDown():
             return
-        changed = self._apply_theme_colors()
-        if changed and hasattr(self, "chat_display"):
-            self._rerender_preserving_scroll()
+        self._apply_theme_colors()
         colors = normalize_theme_colors(self.config_data.get("theme_colors"))
         if getattr(self, "_saved_theme_colors", None) == colors:
             return
@@ -12084,7 +12093,7 @@ QComboBox::drop-down {
             min(packet_size, NTFY_MAX_BODY_BYTES)
         )
         if self._is_windows_classic_theme():
-            self.message_size_bar.setStyleSheet(
+            stylesheet = (
                 "QProgressBar { background-color: #ffffff;"
                 " border-top: 2px solid #808080;"
                 " border-left: 2px solid #808080;"
@@ -12098,7 +12107,7 @@ QComboBox::drop-down {
                 + "; }"
             )
         elif self._is_glassy_theme():
-            self.message_size_bar.setStyleSheet(
+            stylesheet = (
                 "QProgressBar { background-color: rgba(255,255,255,188);"
                 " border: 1px solid #6f9bb5; border-radius: 4px; color: "
                 + ("#ffffff" if at_or_over_limit else "#172532")
@@ -12117,7 +12126,7 @@ QComboBox::drop-down {
                 + "); border-radius: 3px; }"
             )
         else:
-            self.message_size_bar.setStyleSheet(
+            stylesheet = (
                 "QProgressBar { background-color: #eeeeee; "
                 "border: 1px solid #a8a8a8; color: "
                 + ("#ffffff" if at_or_over_limit else "#202020")
@@ -12128,13 +12137,12 @@ QComboBox::drop-down {
             )
 
         if self._is_windows_classic_theme():
-            self.message_size_bar.setStyleSheet(classic_theme_stylesheet(
-                self.message_size_bar.styleSheet(), client_theme_color(self, "Classic")
-            ))
+            stylesheet = classic_theme_stylesheet(stylesheet, client_theme_color(self, "Classic"))
         elif self._is_glassy_theme():
-            self.message_size_bar.setStyleSheet(hue_theme_stylesheet(
-                self.message_size_bar.styleSheet(), client_theme_color(self, "Glassy")
-            ))
+            stylesheet = hue_theme_stylesheet(stylesheet, client_theme_color(self, "Glassy"))
+
+        if self.message_size_bar.styleSheet() != stylesheet:
+            self.message_size_bar.setStyleSheet(stylesheet)
 
         messages_left = self._messages_left_today()
         message_limit_suffix = (
@@ -14921,11 +14929,30 @@ QComboBox::drop-down {
                 },
             ))
 
+    _ui_event_types = frozenset((
+        QEvent.Type.Show,
+        QEvent.Type.WindowActivate,
+        QEvent.Type.WindowDeactivate,
+        QEvent.Type.WindowStateChange,
+        QEvent.Type.Hide,
+        QEvent.Type.Resize,
+        QEvent.Type.Wheel,
+        QEvent.Type.MouseMove,
+        QEvent.Type.Leave,
+        QEvent.Type.MouseButtonPress,
+        QEvent.Type.MouseButtonRelease,
+        QEvent.Type.MouseButtonDblClick,
+        QEvent.Type.ContextMenu,
+    ))
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        event_type = event.type()
+        if event_type not in EncryptedChatClient._ui_event_types:
+            return False
         if (
             isinstance(watched, QDialog)
             and not isinstance(watched, QFileDialog)
-            and event.type() in (
+            and event_type in (
                 QEvent.Type.Show,
                 QEvent.Type.WindowActivate,
                 QEvent.Type.WindowStateChange,
@@ -14935,27 +14962,27 @@ QComboBox::drop-down {
             self._apply_ui_size_to_widget_tree(watched)
 
         if (isinstance(watched, QDialog) and watched.property("spritelinkVideoWindow")
-                and event.type() == QEvent.Type.Hide and watched.windowHandle() is not None):
+                and event_type == QEvent.Type.Hide and watched.windowHandle() is not None):
             set_windows_fullscreen_window(int(watched.winId()), False)
 
         if (
             watched is self.root
             and hasattr(self, "window_focused_event")
         ):
-            if event.type() == QEvent.Type.WindowActivate:
+            if event_type == QEvent.Type.WindowActivate:
                 self.window_focused_event.set()
                 self._sync_connection_error_timer()
                 if hasattr(self, "tray_icon"):
                     self._mark_chatroom_read(self.active_chatroom_id)
-            elif event.type() == QEvent.Type.WindowDeactivate:
+            elif event_type == QEvent.Type.WindowDeactivate:
                 self.window_focused_event.clear()
                 self._sync_connection_error_timer()
-            elif event.type() == QEvent.Type.WindowStateChange:
+            elif event_type == QEvent.Type.WindowStateChange:
                 QTimer.singleShot(0, self._sync_window_activity)
 
         if (
             watched is getattr(self, "chat_content", None)
-            and event.type() == QEvent.Type.Resize
+            and event_type == QEvent.Type.Resize
         ):
             if hasattr(self, "config_overlay"):
                 self._sync_config_overlay_geometry()
@@ -14972,14 +14999,14 @@ QComboBox::drop-down {
             hasattr(self, "chat_display")
             and watched is self.chat_display.viewport()
         ):
-            if event.type() == QEvent.Type.Resize:
+            if event_type == QEvent.Type.Resize:
                 self._sync_video_mini_geometry()
                 self.viewport_media_timer.start(
                     VIEWPORT_MEDIA_UPDATE_DELAY_MS
                 )
 
             elif (
-                event.type() == QEvent.Type.Wheel
+                event_type == QEvent.Type.Wheel
                 and event.angleDelta().y() > 0
                 and self.chat_display.verticalScrollBar().value()
                 <= self.chat_display.verticalScrollBar().minimum()
@@ -14988,7 +15015,7 @@ QComboBox::drop-down {
                 # Use the coalesced entry point so generation/room tokens are supplied.
                 self._on_chat_history_scroll_action(0)
 
-            elif event.type() == QEvent.Type.MouseMove:
+            elif event_type == QEvent.Type.MouseMove:
                 anchor = self.chat_display.anchorAt(event.position().toPoint())
                 message_id = self._message_id_from_anchor(anchor)
                 spoiler_id = self._spoiler_id_at_position(
@@ -15016,10 +15043,10 @@ QComboBox::drop-down {
                     )
                     self._hide_chat_tooltip()
 
-            elif event.type() == QEvent.Type.Leave:
+            elif event_type == QEvent.Type.Leave:
                 self._hide_chat_tooltip()
 
-            elif event.type() in (
+            elif event_type in (
                 QEvent.Type.MouseButtonPress,
                 QEvent.Type.MouseButtonRelease,
                 QEvent.Type.MouseButtonDblClick,
@@ -15029,7 +15056,7 @@ QComboBox::drop-down {
                         event.position().toPoint()
                     )
                     if spoiler_id:
-                        if event.type() == QEvent.Type.MouseButtonRelease:
+                        if event_type == QEvent.Type.MouseButtonRelease:
                             self._toggle_rendered_spoiler(spoiler_id)
                         return True
                     anchor = self.chat_display.anchorAt(
@@ -15040,7 +15067,7 @@ QComboBox::drop-down {
                         return True
                     image_url = self._image_url_from_anchor(anchor)
                     if image_url:
-                        if event.type() == QEvent.Type.MouseButtonRelease:
+                        if event_type == QEvent.Type.MouseButtonRelease:
                             client_id = (
                                 self.rendered_link_senders.get(anchor)
                                 or self._sender_at_position(
@@ -15054,7 +15081,7 @@ QComboBox::drop-down {
                         return True
                     link_target = self._link_target_from_anchor(anchor)
                     if link_target:
-                        if event.type() == QEvent.Type.MouseButtonRelease:
+                        if event_type == QEvent.Type.MouseButtonRelease:
                             link_url, anchored_client_id = link_target
                             client_id = (
                                 anchored_client_id
@@ -15068,7 +15095,7 @@ QComboBox::drop-down {
                             )
                         return True
 
-            elif event.type() == QEvent.Type.ContextMenu:
+            elif event_type == QEvent.Type.ContextMenu:
                 anchor = self.chat_display.anchorAt(event.pos())
                 message_id = self._message_id_from_anchor(anchor)
                 item = self.rendered_message_items.get(message_id or "")

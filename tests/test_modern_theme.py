@@ -37,7 +37,7 @@ class ModernThemeTests(unittest.TestCase):
             text_shadows_var=SimpleNamespace(get=lambda: False),
             _apply_titlebar_theme=mock.Mock(),
         )
-        for name in ("_modern_palette", "_glassy_palette", "_windows_classic_palette"):
+        for name in ("_modern_palette", "_glassy_palette", "_windows_classic_palette", "_config_panel_stylesheet"):
             setattr(self.client, name, lambda name=name: getattr(
                 SPRITELINK.EncryptedChatClient, name
             )(self.client))
@@ -87,13 +87,13 @@ class ModernThemeTests(unittest.TestCase):
         self.apply()
         checkbox = QCheckBox("Theme change", self.window)
         self.assertTrue(self.app.property("spritelinkModern"))
-        self.assertEqual(self.app.styleSheet(), SPRITELINK.MODERN_STYLESHEET)
+        self.assertEqual(self.app.styleSheet(), SPRITELINK.MODERN_STYLESHEET + self.client._config_panel_stylesheet())
         for theme, sheet in (("Glassy", SPRITELINK.GLASSY_STYLESHEET),
                              ("Classic", SPRITELINK.WINDOWS_CLASSIC_STYLESHEET)):
             self.theme = theme
             self.apply()
             self.assertFalse(self.app.property("spritelinkModern"))
-            self.assertEqual(self.app.styleSheet(), sheet)
+            self.assertEqual(self.app.styleSheet(), sheet + self.client._config_panel_stylesheet())
         self.theme = "Modern"
         self.apply()
         self.assertFalse(self.app.property("spritelinkGlassy"))

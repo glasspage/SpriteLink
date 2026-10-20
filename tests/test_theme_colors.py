@@ -130,7 +130,7 @@ class ThemeColorTests(unittest.TestCase):
         self.client.theme_color_slider.setSliderDown(False)
         self.assertEqual(self.app.property("spritelinkThemeHue"), 240)
         self.saved.assert_called_once()
-        self.client._rerender_preserving_scroll.assert_called_once()
+        self.client._rerender_preserving_scroll.assert_not_called()
         self.assertEqual(self.saved.call_args.args[0]["theme_colors"]["Modern"], 240)
         self.assertFalse(self.client.theme_color_save_timer.isActive())
         self.client._apply_application_font_strategy.assert_not_called()
@@ -223,7 +223,7 @@ class ThemeColorTests(unittest.TestCase):
         slider.setSliderDown(False)
         self.assertEqual(self.app.palette().color(QPalette.ColorRole.Window), QColor(scheme["face"]))
         self.saved.assert_called_once()
-        self.client._rerender_preserving_scroll.assert_called_once()
+        self.client._rerender_preserving_scroll.assert_not_called()
         self.client._on_theme_changed("Modern")
         self.assertIsNone(slider.property("spritelinkPreviewClassicColor"))
 
@@ -329,7 +329,7 @@ class ThemeColorTests(unittest.TestCase):
         self.assertNotEqual(before[1], after[1])
         for original, shifted in zip(before, after):
             self.assertEqual(QColor(original).alpha(), QColor(shifted).alpha())
-        self.client._rerender_preserving_scroll.assert_called_once()
+        self.client._rerender_preserving_scroll.assert_not_called()
 
     def test_native_classic_titlebar_uses_selected_scheme(self):
         calls = []
