@@ -61,6 +61,7 @@ try:
         QFont,
         QFontDatabase,
         QFontMetrics,
+        QFontMetricsF,
         QIcon,
         QImage,
         QLinearGradient,
@@ -7243,6 +7244,42 @@ class EncryptedChatClient(QObject):
     def _is_tiny_ui(self) -> bool:
         return client_is_tiny_ui(self)
 
+    @staticmethod
+    def _fit_message_font_height(font: QFont, reference: QFont, preferred_size: float) -> QFont:
+        # Ink height excludes each font's different leading and line-box padding.
+        target = QFontMetricsF(reference).tightBoundingRect("Hg").height()
+        candidate = QFont(font)
+        candidate.setPointSizeF(max(TEXT_SIZE_MIN_PT, min(TEXT_SIZE_MAX_PT, preferred_size)))
+        height = QFontMetricsF(candidate).tightBoundingRect("Hg").height()
+        if target <= 0 or height <= 0:
+            return candidate
+        if abs(height - target) < 0.01:
+            return candidate
+        candidate.setPointSizeF(max(
+            TEXT_SIZE_MIN_PT,
+            min(TEXT_SIZE_MAX_PT, candidate.pointSizeF() * target / height),
+        ))
+        height = QFontMetricsF(candidate).tightBoundingRect("Hg").height()
+        best = QFont(candidate)
+        best_error = abs(height - target)
+        if best_error < 0.01:
+            return best
+        low, high = float(TEXT_SIZE_MIN_PT), float(TEXT_SIZE_MAX_PT)
+        for _ in range(9):
+            size = (low + high) / 2
+            candidate.setPointSizeF(size)
+            height = QFontMetricsF(candidate).tightBoundingRect("Hg").height()
+            error = abs(height - target)
+            if error < best_error:
+                best, best_error = QFont(candidate), error
+            if error < 0.01:
+                break
+            if height < target:
+                low = size
+            else:
+                high = size
+        return best
+
     def _make_message_font(
         self,
         font_name: str,
@@ -7282,6 +7319,14 @@ class EncryptedChatClient(QObject):
                 point_size,
                 bold=bold,
             )
+            if configured_point_size != DEFAULT_TEXT_SIZES[role] and font_name != DEFAULT_MESSAGE_FONT:
+                reference = self._make_font(
+                    self._resolved_font_family(DEFAULT_MESSAGE_FONT), configured_point_size, bold=bold,
+                )
+                cached = self._fit_message_font_height(
+                    cached, reference,
+                    base_point_size * configured_point_size / DEFAULT_TEXT_SIZES[role],
+                )
             self._message_font_cache[cache_key] = cached
         return cached
 
