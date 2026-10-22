@@ -38,6 +38,7 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 try:
     from PySide6.QtCore import (
         QBuffer,
+        QTextBoundaryFinder,
         QByteArray,
         QEvent,
         QIODevice,
@@ -73,6 +74,7 @@ try:
         QPolygon,
         QRegion,
         QTextBlockFormat,
+        QTextBlockUserData,
         QTextCharFormat,
         QTextCursor,
         QTextDocument,
@@ -5999,6 +6001,18 @@ class IdentityPresetSelector(QPushButton):
         self.newRequested.emit()
 
 
+class CollapsedTextFade(QTextBlockUserData):
+    def __init__(self, width: int, layout: QTextLayout) -> None:
+        super().__init__()
+        self.width = width
+        self.layout = layout
+        self.left = layout.position().x()
+        self.dirty = False
+        self.source_formats: list[tuple[str, QTextCharFormat]] = []
+        self.formats: list[QTextLayout.FormatRange] = []
+        self.shadow_formats: list[QTextLayout.FormatRange] = []
+
+
 class MessageLogBrowser(QTextBrowser):
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -6008,7 +6022,12 @@ class MessageLogBrowser(QTextBrowser):
             int,
             tuple[QColor, int, int],
         ] = {}
-        self.collapsed_fade_blocks: dict[int, QColor] = {}
+        self.collapsed_fade_blocks: set[int] = set()
+        self._fade_opacity_width = -1
+        self._fade_opacities: tuple[int, ...] = ()
+        self._has_collapsed_fades = False
+        self._fade_document = self.document()
+        self._fade_document.contentsChange.connect(self._invalidate_collapsed_text_fades)
         self.unread_divider_block_number: int | None = None
         self.unread_divider_alpha = 255
         self.horizontalScrollBar().rangeChanged.connect(
@@ -6025,6 +6044,27 @@ class MessageLogBrowser(QTextBrowser):
         scrollbar.setRange(0, 0)
         scrollbar.setValue(0)
         scrollbar.blockSignals(signals_were_blocked)
+
+    def setDocument(self, document: QTextDocument) -> None:
+        previous = getattr(self, "_fade_document", None)
+        if previous is not None:
+            previous.contentsChange.disconnect(self._invalidate_collapsed_text_fades)
+        self._has_collapsed_fades = False
+        super().setDocument(document)
+        self._fade_document = document
+        document.contentsChange.connect(self._invalidate_collapsed_text_fades)
+
+    def _invalidate_collapsed_text_fades(self, position: int, _removed: int, added: int) -> None:
+        if not self._has_collapsed_fades:
+            return
+        document = self.document()
+        block = document.findBlock(position)
+        end = position + added
+        while block.isValid() and block.position() <= end:
+            cache = block.userData()
+            if isinstance(cache, CollapsedTextFade):
+                cache.dirty = True
+            block = block.next()
 
     def _block_content_vertical_bounds(
         self,
@@ -6123,6 +6163,117 @@ class MessageLogBrowser(QTextBrowser):
         self._lock_horizontal_scroll()
         super().scrollContentsBy(0, dy)
 
+    @staticmethod
+    def _append_fade_format(
+        ranges: list[QTextLayout.FormatRange], start: int, length: int, color: QColor,
+    ) -> None:
+        if (ranges and ranges[-1].start + ranges[-1].length == start
+                and ranges[-1].format.foreground().color() == color):
+            ranges[-1].length += length
+            return
+        item = QTextLayout.FormatRange()
+        item.start = start
+        item.length = length
+        item.format.setForeground(color)
+        ranges.append(item)
+
+    def _build_collapsed_text_fade(self, block: Any, width: int) -> CollapsedTextFade:
+        layout = block.layout()
+        cache = CollapsedTextFade(width, layout)
+        simple_line = layout.lineCount() == 1 and block.text().isascii()
+        iterator = block.begin()
+        while not iterator.atEnd():
+            fragment = iterator.fragment()
+            if fragment.isValid():
+                cache.source_formats.append((fragment.text(), fragment.charFormat()))
+                original = fragment.charFormat().foreground().color()
+                finder = QTextBoundaryFinder(
+                    QTextBoundaryFinder.BoundaryType.Grapheme, fragment.text(),
+                )
+                start = 0
+                end = finder.toNextBoundary()
+                while end >= 0:
+                    position = fragment.position() - block.position() + start
+                    line = layout.lineForTextPosition(position)
+                    if line.isValid():
+                        center = cache.left + (
+                            line.cursorToX(position)[0]
+                            + line.cursorToX(position + end - start)[0]
+                        ) / 2
+                        opacity = self._fade_opacities[max(0, min(width - 1, round(center)))]
+                        color = QColor(original)
+                        color.setAlpha(round(original.alpha() * opacity / 255))
+                        if simple_line and opacity == 0:
+                            # The rest of a left-to-right ASCII line is also invisible.
+                            length = fragment.length() - start
+                            self._append_fade_format(cache.formats, position, length, color)
+                            self._append_fade_format(
+                                cache.shadow_formats, position, length, QColor(0, 0, 0, 0),
+                            )
+                            break
+                        if opacity < 255:
+                            self._append_fade_format(cache.formats, position, end - start, color)
+                        shadow = QColor(0, 0, 0, color.alpha())
+                        self._append_fade_format(cache.shadow_formats, position, end - start, shadow)
+                    start = end
+                    end = finder.toNextBoundary()
+            iterator += 1
+        return cache
+
+    def _ensure_collapsed_text_fades(self, event: Any) -> None:
+        if not self.collapsed_fade_blocks and not self._has_collapsed_fades:
+            return
+        width = self.viewport().width()
+        if width <= 0:
+            return
+        if self._fade_opacity_width != width:
+            start = round(width * 0.55)
+            end = max(start + 1, round(width * 0.98))
+            self._fade_opacities = tuple(
+                round(255 * max(0.0, min(1.0, (end - x) / (end - start))))
+                for x in range(width)
+            )
+            self._fade_opacity_width = width
+        document = self.document()
+        first = self.cursorForPosition(QPoint(
+            0, max(0, event.rect().top()),
+        )).block().blockNumber()
+        last = self.cursorForPosition(QPoint(
+            width - 1, min(self.viewport().height() - 1, event.rect().bottom()),
+        )).block().blockNumber()
+        for number in range(max(0, first - 1), min(document.blockCount(), last + 2)):
+            block = document.findBlockByNumber(number)
+            cache = block.userData()
+            if number not in self.collapsed_fade_blocks:
+                if isinstance(cache, CollapsedTextFade):
+                    block.layout().clearFormats()
+                    block.setUserData(None)
+                    document.markContentsDirty(block.position(), block.length())
+                continue
+            document.documentLayout().blockBoundingRect(block)
+            layout = block.layout()
+            if (isinstance(cache, CollapsedTextFade) and cache.width == width
+                    and cache.layout is layout
+                    and cache.left == layout.position().x()):
+                if not cache.dirty:
+                    continue
+                source_formats = []
+                iterator = block.begin()
+                while not iterator.atEnd():
+                    fragment = iterator.fragment()
+                    if fragment.isValid():
+                        source_formats.append((fragment.text(), fragment.charFormat()))
+                    iterator += 1
+                if source_formats == cache.source_formats:
+                    cache.dirty = False
+                    continue
+            cache = self._build_collapsed_text_fade(block, width)
+            self._has_collapsed_fades = True
+            block.setUserData(cache)
+            layout.setFormats(cache.formats)
+            # Additional formats invalidate layout; alpha leaves geometry unchanged.
+            document.markContentsDirty(block.position(), block.length())
+
     def _paint_text_shadows(self, event: Any) -> None:
         app = QApplication.instance()
         if (
@@ -6196,6 +6347,10 @@ class MessageLogBrowser(QTextBrowser):
                     )
                     shadow_ranges.append(shadow_range)
                 iterator += 1
+
+            fade = block.userData()
+            if block_number in self.collapsed_fade_blocks and isinstance(fade, CollapsedTextFade):
+                shadow_ranges = fade.shadow_formats
 
             if not shadow_ranges:
                 continue
@@ -6435,6 +6590,7 @@ class MessageLogBrowser(QTextBrowser):
         painter.end()
 
     def paintEvent(self, event: Any) -> None:
+        self._ensure_collapsed_text_fades(event)
         self._paint_row_backgrounds(event)
         super().paintEvent(event)
         # Extend the last stripe over QTextBrowser's trailing margin.
@@ -6444,81 +6600,6 @@ class MessageLogBrowser(QTextBrowser):
         self._paint_text_shadows(event)
         # Style changes can drop character backgrounds; repaint spoilers in every mode.
         self._paint_spoilers(event)
-        if not self.collapsed_fade_blocks:
-            self._paint_unread_divider(event)
-            return
-
-        viewport = self.viewport()
-        viewport_width = viewport.width()
-        viewport_height = viewport.height()
-        if viewport_width <= 0 or viewport_height <= 0:
-            return
-
-        paint_rect = event.rect()
-        first_block = self.cursorForPosition(QPoint(
-            0,
-            max(0, paint_rect.top()),
-        )).block().blockNumber()
-        last_block = self.cursorForPosition(QPoint(
-            max(0, viewport_width - 1),
-            min(viewport_height - 1, paint_rect.bottom()),
-        )).block().blockNumber()
-        first_block = max(0, first_block - 1)
-        last_block = min(
-            self.document().blockCount() - 1,
-            last_block + 1,
-        )
-
-        painter = QPainter(viewport)
-        painter.setClipRegion(event.region())
-        document_layout = self.document().documentLayout()
-        fade_start = round(viewport_width * 0.55)
-        fade_end = max(fade_start + 1, round(viewport_width * 0.98))
-        fade_brushes: dict[int, QBrush] = {}
-
-        for block_number in range(first_block, last_block + 1):
-            fade_background = self.collapsed_fade_blocks.get(block_number)
-            if fade_background is None:
-                continue
-
-            block = self.document().findBlockByNumber(block_number)
-            if not block.isValid():
-                continue
-            block_cursor = QTextCursor(block)
-            cursor_rect = self.cursorRect(block_cursor)
-            top = cursor_rect.top()
-            height = max(
-                1,
-                round(document_layout.blockBoundingRect(block).height()),
-            )
-            if top > paint_rect.bottom() or top + height < paint_rect.top():
-                continue
-
-            color_key = int(fade_background.rgba())
-            fade_brush = fade_brushes.get(color_key)
-            if fade_brush is None:
-                transparent = QColor(fade_background)
-                transparent.setAlpha(0)
-                opaque = QColor(fade_background)
-                opaque.setAlpha(255)
-                gradient = QLinearGradient(
-                    fade_start,
-                    0,
-                    fade_end,
-                    0,
-                )
-                gradient.setColorAt(0.0, transparent)
-                gradient.setColorAt(1.0, opaque)
-                fade_brush = QBrush(gradient)
-                fade_brushes[color_key] = fade_brush
-            painter.fillRect(
-                fade_start,
-                top,
-                max(0, viewport_width - fade_start),
-                height + 1,
-                fade_brush,
-            )
-        painter.end()
         self._paint_unread_divider(event)
 
 
@@ -11942,9 +12023,8 @@ QComboBox::drop-down {
             return replacements.get(color.rgba(), color)
 
         # Repaint stripes without rebuilding text, media, selection, or scroll state.
-        for name in ("row_background_blocks", "collapsed_fade_blocks"):
-            colors = getattr(display, name, {})
-            colors.update({block: recolor(color) for block, color in colors.items()})
+        colors = getattr(display, "row_background_blocks", {})
+        colors.update({block: recolor(color) for block, color in colors.items()})
         padding = getattr(display, "row_background_padding_blocks", {})
         padding.update({block: (recolor(color), top, bottom)
                         for block, (color, top, bottom) in padding.items()})
@@ -16572,7 +16652,7 @@ QComboBox::drop-down {
             old_padding_blocks = dict(
                 self.chat_display.row_background_padding_blocks
             )
-            old_collapsed_blocks = dict(
+            old_collapsed_blocks = set(
                 self.chat_display.collapsed_fade_blocks
             )
             old_row_selections = [
@@ -16649,10 +16729,9 @@ QComboBox::drop-down {
                 block_number + block_delta: value
                 for block_number, value in old_padding_blocks.items()
             })
-            self.chat_display.collapsed_fade_blocks.update({
-                block_number + block_delta: value
-                for block_number, value in old_collapsed_blocks.items()
-            })
+            self.chat_display.collapsed_fade_blocks.update(
+                block_number + block_delta for block_number in old_collapsed_blocks
+            )
             for position, formatting in old_row_selections:
                 selection = QTextEdit.ExtraSelection()
                 selection.cursor = QTextCursor(document)
@@ -17051,9 +17130,7 @@ QComboBox::drop-down {
         if is_collapsed:
             collapsed_block = document.findBlock(message_start_position)
             if collapsed_block.isValid():
-                self.chat_display.collapsed_fade_blocks[
-                    collapsed_block.blockNumber()
-                ] = QColor(background_color)
+                self.chat_display.collapsed_fade_blocks.add(collapsed_block.blockNumber())
         if displayed_image_urls:
             self.viewport_media_timer.start(0)
 

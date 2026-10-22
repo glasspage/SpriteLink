@@ -111,8 +111,7 @@ class ColorUpdateTests(unittest.TestCase):
         self.assertTrue(c.chat_display.row_background_padding_blocks)
         for color in c.chat_display.row_background_blocks.values():
             self.assertIn(color.rgba(), colors)
-        for color in c.chat_display.collapsed_fade_blocks.values():
-            self.assertIn(color.rgba(), colors)
+        self.assertTrue(c.chat_display.collapsed_fade_blocks.issubset(c.chat_display.row_background_blocks))
         c._rerender_preserving_scroll()
         self._finish_render()
         self.assertEqual(fast, c.chat_display.grab().toImage())
