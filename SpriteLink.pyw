@@ -316,7 +316,7 @@ def chatroom_connection_label(
     return f"{room_name}{suffix}"
 
 
-DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
+DEFAULT_SERVER_PRESET = "ntfy.sh (default)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
 GLOBAL_CHATROOM_ID = "global"
 UNREAD_FROM_START_MARKER = "__start__"
@@ -364,7 +364,9 @@ MINIMIZE_TO_TRAY_NOTICE_KEY = "minimize_to_tray_notice_shown"
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
-    "Local ntfy server": "http://127.0.0.1:8080",
+    "ntfy.envs.net": "https://ntfy.envs.net",
+    "ntfy.adminforge.de": "https://ntfy.adminforge.de",
+    "ntfy.hostux.net": "https://ntfy.hostux.net",
     "Custom ntfy server": "",
 }
 
@@ -1005,6 +1007,7 @@ QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
     selection-background-color: #007f82;
     selection-color: #000000;
 }
+QLineEdit#serverUrl:disabled { background-color: #c0c0c0; color: #808080; }
 QComboBox {
     padding: 2px 4px;
 }
@@ -1240,6 +1243,10 @@ QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
     border-radius: 4px;
     selection-background-color: #5ba7d5;
     selection-color: #ffffff;
+}
+QLineEdit#serverUrl:disabled {
+    color: rgba(49, 68, 82, 125); background-color: rgba(216, 226, 233, 156);
+    border-color: rgba(99, 132, 151, 110);
 }
 QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus,
 QListWidget:focus, QComboBox:focus {
@@ -1480,6 +1487,9 @@ QLabel:disabled, QCheckBox:disabled { color: #87919a; }
 QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
     color: #e1e6eb; background-color: rgba(22, 26, 31, 136);
     border-color: #000000; selection-background-color: #586e80; selection-color: #ffffff;
+}
+QLineEdit#serverUrl:disabled {
+    color: #858d96; background-color: rgba(51, 56, 63, 104); border-color: #000000;
 }
 QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus, QListWidget:focus, QComboBox:focus {
     border-color: #000000;
@@ -3546,6 +3556,15 @@ def load_config() -> dict[str, Any]:
             config.update(loaded)
         except Exception:
             return config
+
+    server_preset = str(config.get("server_preset", DEFAULT_SERVER_PRESET))
+    if server_preset == "ntfy.sh (public)":
+        server_preset = DEFAULT_SERVER_PRESET
+    elif server_preset not in SERVER_PRESETS:
+        server_preset = "Custom ntfy server"
+    config["server_preset"] = server_preset
+    if server_preset != "Custom ntfy server":
+        config["server_url"] = SERVER_PRESETS[server_preset]
 
     message_sound = str(
         config.get("message_sound", DEFAULT_MESSAGE_SOUND)
@@ -11433,6 +11452,7 @@ QComboBox::drop-down {
 
         advanced_layout.addWidget(QLabel("Server URL"), advanced_row, 0)
         self.server_url_entry = QLineEdit()
+        self.server_url_entry.setObjectName("serverUrl")
         self.server_url_entry.setText(str(self.server_url_var.get()))
         self.server_url_entry.textChanged.connect(self.server_url_var.set)
         self.server_url_var.bind(self.server_url_entry.setText)
@@ -11771,6 +11791,7 @@ QComboBox::drop-down {
         if not hasattr(self, "server_url_entry"):
             return
         preset = str(self.server_preset_var.get())
+        self.server_url_entry.setEnabled(preset == "Custom ntfy server")
         self.server_url_entry.setReadOnly(
             preset != "Custom ntfy server"
         )
