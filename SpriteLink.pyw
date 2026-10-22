@@ -81,6 +81,7 @@ try:
         QTextLayout,
         QTextOption,
     )
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -207,6 +208,7 @@ WINDOWS_SINGLE_INSTANCE_MUTEX_NAME = (
     r"Local\SpriteLink-{D2EB08B2-F3E3-4F88-8D9E-51DC7A8754A0}"
 )
 _SINGLE_INSTANCE_MUTEX_HANDLE: Any = None
+SINGLE_INSTANCE_SERVER_NAME = "SpriteLink-D2EB08B2-F3E3-4F88-8D9E-51DC7A8754A0"
 
 try:
     from spritelink_build_version import VERSION as RUNNING_VERSION
@@ -17597,6 +17599,126 @@ def acquire_single_instance_lock(kernel32: Any | None = None) -> bool:
     return True
 
 
+class SingleInstanceControl(QObject):
+    def __init__(self, on_restart: Any, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._on_restart = on_restart
+        self._restart_requested = False
+        self.server = QLocalServer(self)
+        self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        self.server.newConnection.connect(self._accept_connections)
+        self.server.listen(SINGLE_INSTANCE_SERVER_NAME)
+
+    def _accept_connections(self) -> None:
+        while self.server.hasPendingConnections():
+            socket = self.server.nextPendingConnection()
+            socket.readyRead.connect(lambda socket=socket: self._read_command(socket))
+            socket.disconnected.connect(socket.deleteLater)
+            self._read_command(socket)
+
+    def _read_command(self, socket: QLocalSocket) -> None:
+        if not socket.canReadLine():
+            return
+        command = bytes(socket.readLine(32))
+        socket.disconnectFromServer()
+        if command == b"restart\n" and not self._restart_requested:
+            self._restart_requested = True
+            QTimer.singleShot(0, self._on_restart)
+
+
+def request_instance_restart() -> bool:
+    socket = QLocalSocket()
+    socket.connectToServer(SINGLE_INSTANCE_SERVER_NAME)
+    if not socket.waitForConnected(1000):
+        return False
+    socket.write(b"restart\n")
+    sent = not socket.bytesToWrite() or socket.waitForBytesWritten(1000)
+    socket.disconnectFromServer()
+    return bool(sent)
+
+
+def show_already_running_dialog() -> bool:
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    previous_quit_on_close = app.quitOnLastWindowClosed()
+    app.setQuitOnLastWindowClosed(False)
+    dialog = QDialog()
+    dialog.setWindowTitle(APP_NAME)
+    dialog.setWindowIcon(QIcon(str(WINDOW_ICON_PATH)))
+    layout = QVBoxLayout(dialog)
+    message_row = QHBoxLayout()
+    icon = QLabel()
+    icon.setPixmap(dialog.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation).pixmap(32, 32))
+    message_row.addWidget(icon)
+    message = QLabel("SpriteLink is already running.")
+    message.setWordWrap(True)
+    message_row.addWidget(message, 1)
+    layout.addLayout(message_row)
+    buttons = QHBoxLayout()
+    buttons.addStretch(1)
+    restart = QPushButton("Restart")
+    ok = QPushButton("OK")
+    ok.setDefault(True)
+    buttons.addWidget(restart)
+    buttons.addWidget(ok)
+    layout.addLayout(buttons)
+    ok.clicked.connect(dialog.reject)
+    timer = QTimer(dialog)
+    timer.setInterval(100)
+    lock_acquired = False
+    deadline = 0.0
+
+    def failed() -> None:
+        timer.stop()
+        message.setText("Could not restart SpriteLink. Close the existing instance and try again.")
+        restart.setEnabled(True)
+        ok.setEnabled(True)
+
+    def check_lock() -> None:
+        nonlocal lock_acquired
+        try:
+            lock_acquired = acquire_single_instance_lock()
+        except Exception:
+            failed()
+            return
+        if lock_acquired:
+            timer.stop()
+            dialog.accept()
+        elif time.monotonic() >= deadline:
+            failed()
+
+    def begin_restart() -> None:
+        nonlocal deadline
+        restart.setEnabled(False)
+        ok.setEnabled(False)
+        message.setText("Restarting SpriteLink...")
+        deadline = time.monotonic() + 10.0
+        # The first instance may have exited while the popup was open.
+        check_lock()
+        if lock_acquired or restart.isEnabled():
+            return
+        try:
+            requested = request_instance_restart()
+        except Exception:
+            requested = False
+        if not requested:
+            check_lock()
+            if not lock_acquired:
+                failed()
+            return
+        timer.start()
+
+    restart.clicked.connect(begin_restart)
+    timer.timeout.connect(check_lock)
+    dialog.finished.connect(timer.stop)
+    try:
+        dialog.exec()
+    finally:
+        app.setQuitOnLastWindowClosed(previous_quit_on_close)
+        dialog.deleteLater()
+    return lock_acquired
+
+
 def _write_crash_log(error_text: str) -> Path | None:
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -17617,19 +17739,15 @@ def main() -> None:
     )
     if os.name == "nt":
         try:
-            if not acquire_single_instance_lock():
-                if notification_room_id is not None:
-                    write_notification_activation(notification_room_id)
-                    return
-                ctypes.windll.user32.MessageBoxW(
-                    None,
-                    "SpriteLink is already running.",
-                    APP_NAME,
-                    0x40,
-                )
-                return
+            already_running = not acquire_single_instance_lock()
         except Exception:
-            pass
+            already_running = False
+        if already_running:
+            if notification_room_id is not None:
+                write_notification_activation(notification_room_id)
+                return
+            if not show_already_running_dialog():
+                return
 
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
@@ -17697,6 +17815,7 @@ def main() -> None:
         )
         return
 
+    instance_control = SingleInstanceControl(client._quit_from_tray, root)
     root.show()
     QTimer.singleShot(50, client.prepare_after_show)
     if notification_room_id is not None:
