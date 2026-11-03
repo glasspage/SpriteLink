@@ -10778,6 +10778,11 @@ QComboBox::drop-down {
         self.image_menu.canvas.replace(size, pixels, palette=palette)
         self._close_drawing_import()
 
+    def _import_chat_drawing(self, size: int, pixels: bytes, palette: int) -> None:
+        self._apply_drawing_import(size, pixels, palette)
+        self.image_menu_button.setChecked(True)
+        self.image_menu.canvas.setFocus()
+
     def _close_drawing_import(self) -> None:
         overlay = getattr(self, "drawing_import_overlay", None)
         if overlay is not None:
@@ -17010,13 +17015,18 @@ QComboBox::drop-down {
         menu = QMenu(self.root)
         if "drawing" in message:
             copy_action = menu.addAction("Copy Image")
+            import_action = menu.addAction("Import Image")
             try:
                 size, pixels, palette = decode_drawing(message["drawing"])
             except ValueError:
                 copy_action.setEnabled(False)
+                import_action.setEnabled(False)
             else:
                 copy_action.triggered.connect(
                     lambda: QApplication.clipboard().setImage(drawing_image(size, pixels, palette))
+                )
+                import_action.triggered.connect(
+                    lambda: self._import_chat_drawing(size, pixels, palette)
                 )
         else:
             copy_action = menu.addAction("Copy Message")
