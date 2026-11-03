@@ -16554,11 +16554,19 @@ QComboBox::drop-down {
                 self._on_chat_history_scroll_action(0)
 
             elif event_type == QEvent.Type.MouseMove:
-                anchor = self.chat_display.anchorAt(event.position().toPoint())
+                position = event.position().toPoint()
+                anchor = self.chat_display.anchorAt(position)
                 message_id = self._message_id_from_anchor(anchor)
-                spoiler_id = self._spoiler_id_at_position(
-                    event.position().toPoint()
-                )
+                item = self.rendered_message_items.get(message_id or "")
+                if item is not None and "drawing" in item["message"]:
+                    cursor = self.chat_display.cursorForPosition(position)
+                    cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                    top = self.chat_display.cursorRect(cursor).top()
+                    font = str(item["message"].get("f", DEFAULT_MESSAGE_FONT))
+                    if position.y() >= top + self._chat_line_height(font):
+                        anchor = ""
+                        message_id = None
+                spoiler_id = self._spoiler_id_at_position(position)
 
                 if anchor or spoiler_id:
                     self.chat_display.viewport().setCursor(
