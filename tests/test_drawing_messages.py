@@ -21,7 +21,7 @@ class DrawingMessageTests(unittest.TestCase):
                     encoded = encode_drawing(size, pixels)
                     self.assertEqual(bool(base64.b64decode(encoded)[0] & 4), compressed)
                     self.assertEqual(decode_drawing(encoded), (size, pixels, 0))
-                    for palette in (1, 2, 3):
+                    for palette in (1, 2, 3, 4):
                         colored = encode_drawing(size, pixels, palette)
                         self.assertEqual(len(colored), len(encoded))
                         self.assertEqual(decode_drawing(colored), (size, pixels, palette))

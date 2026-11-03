@@ -13,19 +13,20 @@ from PySide6.QtWidgets import (
 from spritelink_image_codec import IMAGE_PALETTES, IMAGE_SIZES
 
 
-PALETTE_ORDER = (0, 3, 2, 1)
-PALETTE_NAMES = ("Basic", "Grayscale", "Nature", "Pastel")
+PALETTE_ORDER = (0, 3, 2, 4, 1)
+PALETTE_NAMES = ("Basic", "Grayscale", "Nature", "Pastel", "Sunset")
 BASIC_SWATCH_ORDER = (0, 7, 1, 2, 3, 4, 5, 6)
-SWATCH_ORDERS = (BASIC_SWATCH_ORDER, (0, 2, 3, 4, 5, 6, 7, 1), tuple(range(8)), BASIC_SWATCH_ORDER)
+SWATCH_ORDERS = (BASIC_SWATCH_ORDER, (0, 2, 3, 4, 5, 6, 7, 1), tuple(range(8)), BASIC_SWATCH_ORDER, tuple(range(8)))
 # Shared color slots preserve the shadow and highlight across palettes.
-PALETTE_SLOTS = (tuple(range(8)), tuple(range(8)), (7, 0, 1, 2, 3, 4, 5, 6), tuple(range(8)))
-PALETTE_BACKGROUNDS = (1, 1, 0, 1)
+PALETTE_SLOTS = (tuple(range(8)), tuple(range(8)), (7, 0, 1, 2, 3, 4, 5, 6), tuple(range(8)), (7, 0, 1, 2, 3, 4, 5, 6))
+PALETTE_BACKGROUNDS = (1, 1, 0, 1, 0)
 COLOR_TABLES = [[QColor(color).rgb() for color in palette] for palette in IMAGE_PALETTES]
 BACKGROUND_NAMES = (
     ("Black", "White", "Red", "Yellow", "Green", "Blue", "Purple", "Gray"),
     ("Black", "White", "14% gray", "29% gray", "43% gray", "57% gray", "71% gray", "86% gray"),
     ("Cream", "Sky blue", "Blue", "Light green", "Green", "Tan", "Brown", "Dark green"),
     ("Charcoal", "White", "Pink", "Yellow", "Green", "Blue", "Lavender", "Gray"),
+    ("Pale yellow", "Amber", "Coral", "Rose", "Lavender", "Slate blue", "Indigo", "Midnight blue"),
 )
 def palette_translation(source: int, target: int) -> bytes:
     old_slots = PALETTE_SLOTS[source]

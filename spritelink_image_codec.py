@@ -19,8 +19,12 @@ IMAGE_PALETTES = (
         "#61586B", "#FFFFFF", "#F69AAB", "#FFE29A",
         "#A0D9AA", "#98C7F6", "#C8A8EF", "#BDBBC6",
     ),
+    (
+        "#FFE7A0", "#F8B65E", "#E77D57", "#D3698B",
+        "#A17CB4", "#60749F", "#394A78", "#272D4C",
+    ),
 )
-PALETTE_HEADERS = (0x10, 0x18, 0x20, 0x28)
+PALETTE_HEADERS = (0x10, 0x18, 0x20, 0x28, 0x30)
 
 
 def encode_drawing(size: int, pixels: bytes, palette: int = 0) -> str:
