@@ -160,6 +160,41 @@ class ChatSearchTests(unittest.TestCase):
                          if rendered.pixelColor(x, y) == QColor("#0000ff"))
         self.assertLess(abs(text_top - image_top), 20)
 
+    def test_media_shadows_preserve_preview_position_and_shadow_username(self):
+        client = self.client
+        for kind in ("static_image", "video"):
+            with self.subTest(kind=kind):
+                url = "https://i.imgur.com/example.png"
+                image = QImage(120, 100, QImage.Format.Format_RGB32)
+                image.fill(QColor("blue"))
+                client.image_preview_cache[url] = S.RemoteMediaPreview(url, b"", kind, image)
+                message = client._build_draft_message(url)
+                message.update(u="Username", k="#ff0000")
+                body = S.SearchResultMessage()
+                body.setHtml(client._search_result_html(message, [url]))
+                body.resize(380, body.heightForWidth(380))
+                body.show()
+                self.app.processEvents()
+                self.app.setProperty("spritelinkTextShadows", False)
+                without = body.viewport().grab().toImage()
+                self.app.setProperty("spritelinkTextShadows", True)
+                with_shadow = body.viewport().grab().toImage()
+                blue = QColor("blue")
+
+                def blue_pixels(rendered):
+                    return {
+                        (x, y) for y in range(rendered.height()) for x in range(rendered.width())
+                        if rendered.pixelColor(x, y) == blue
+                    }
+
+                original_pixels = blue_pixels(without)
+                self.assertTrue(original_pixels)
+                self.assertEqual(blue_pixels(with_shadow), original_pixels)
+                preview_left = min(x for x, _ in original_pixels)
+                self.assertNotEqual(without.copy(0, 0, preview_left, 30),
+                                    with_shadow.copy(0, 0, preview_left, 30))
+                body.close()
+
     def test_saved_history_search_pagination_and_jump(self):
         client = self.client
         self.root.resize(800, 600)

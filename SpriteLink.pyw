@@ -6735,9 +6735,10 @@ class MessageLogBrowser(QTextBrowser):
         self._paint_unread_divider(event)
 
 
-class SearchResultMessage(MessageLogBrowser):
+class SearchResultMessage(QTextBrowser):
     def __init__(self) -> None:
         super().__init__()
+        self._shadow_document: QTextDocument | None = None
         self.setReadOnly(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -6749,6 +6750,58 @@ class SearchResultMessage(MessageLogBrowser):
         policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         policy.setHeightForWidth(True)
         self.setSizePolicy(policy)
+
+    def setHtml(self, text: str) -> None:
+        if self._shadow_document is not None:
+            self._shadow_document.deleteLater()
+            self._shadow_document = None
+        super().setHtml(text)
+
+    def _make_shadow_document(self) -> QTextDocument:
+        shadow = self.document().clone(self)
+        transparent_image = QImage(1, 1, QImage.Format.Format_ARGB32)
+        transparent_image.fill(Qt.GlobalColor.transparent)
+        image_url = QUrl("spritelink-search-shadow:transparent")
+        shadow.addResource(QTextDocument.ResourceType.ImageResource, image_url, transparent_image)
+        fragments = []
+        block = shadow.begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    fragments.append((fragment.position(), fragment.length(), fragment.charFormat()))
+                iterator += 1
+            block = block.next()
+
+        cursor = QTextCursor(shadow)
+        for position, length, formatting in fragments:
+            if formatting.isImageFormat():
+                formatting = formatting.toImageFormat()
+                formatting.setName(image_url.toString())
+            else:
+                hidden = formatting.hasProperty(QTextFormat.Property.BackgroundBrush)
+                formatting.clearBackground()
+                formatting.setForeground(QColor(Qt.GlobalColor.transparent if hidden else Qt.GlobalColor.black))
+            cursor.setPosition(position)
+            cursor.setPosition(position + length, QTextCursor.MoveMode.KeepAnchor)
+            cursor.setCharFormat(formatting)
+        return shadow
+
+    def paintEvent(self, event: Any) -> None:
+        app = QApplication.instance()
+        if app is not None and app.property("spritelinkTextShadows") and not self.textCursor().hasSelection():
+            if self._shadow_document is None:
+                self._shadow_document = self._make_shadow_document()
+            shadow = self._shadow_document
+            shadow.setTextWidth(self.document().textWidth())
+            painter = QPainter(self.viewport())
+            painter.setClipRegion(event.region())
+            painter.translate(1 - self.horizontalScrollBar().value(), 1 - self.verticalScrollBar().value())
+            painter.setOpacity(0.15)
+            shadow.drawContents(painter)
+            painter.end()
+        super().paintEvent(event)
 
     def heightForWidth(self, width: int) -> int:
         self.ensurePolished()
