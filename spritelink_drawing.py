@@ -404,6 +404,7 @@ class DrawingMenu(QFrame):
         palette.addLayout(patterns)
         palette.addStretch()
         row.addLayout(palette)
+        row.addSpacing(5)
 
         controls = QVBoxLayout()
         controls.addWidget(QLabel("Image Size"))
@@ -428,6 +429,8 @@ class DrawingMenu(QFrame):
         import_button.clicked.connect(self.importRequested)
         clear = QPushButton("Clear")
         clear.clicked.connect(self._clear)
+        for button in (import_button, clear):
+            button.setStyleSheet("QPushButton { padding-left: 6px; padding-right: 6px; }")
         controls.addStretch()
         buttons = QHBoxLayout()
         buttons.setSpacing(3)
