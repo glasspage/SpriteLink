@@ -4,7 +4,7 @@ import math
 
 from PIL import Image, ImageOps
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QPushButton, QVBoxLayout, QWidget,
@@ -382,6 +382,10 @@ class DrawingMenu(QFrame):
         self.redo = QPushButton("Redo")
         self.undo.clicked.connect(lambda: self.canvas.step_history(self.canvas.undo_stack, self.canvas.redo_stack))
         self.redo.clicked.connect(lambda: self.canvas.step_history(self.canvas.redo_stack, self.canvas.undo_stack))
+        for keys, button in (("Ctrl+Z", self.undo), ("Ctrl+Y", self.redo)):
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(button.click)
         import_button = QPushButton("Import...")
         import_button.clicked.connect(self.importRequested)
         clear = QPushButton("Clear")
