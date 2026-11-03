@@ -11011,13 +11011,10 @@ QComboBox::drop-down {
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(0)
-        results = QWidget()
-        self.search_results_layout = QVBoxLayout(results)
-        content_layout.addWidget(results)
-        content_layout.addStretch(1)
+        self.search_results_layout = QVBoxLayout(content)
+        self.search_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        # Grow the scroll content instead of squeezing the gaps between fixed-height cards.
+        self.search_results_layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
         self._search_media_updates: dict[str, list[Callable[[], None]]] = {}
         scroll.setWidget(content)
         panel_layout.addWidget(scroll, 1)

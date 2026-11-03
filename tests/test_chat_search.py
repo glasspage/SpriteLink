@@ -269,9 +269,22 @@ class ChatSearchTests(unittest.TestCase):
             first_lines = document.begin().layout().lineCount()
             self.assertEqual(first_lines, 1)
             self.assertTrue(document.toPlainText().endswith("[...]"))
+
+            def assert_card_spacing(count: int) -> None:
+                layout = client.search_results_layout
+                for index in range(1, count):
+                    previous = layout.itemAt(index - 1).widget()
+                    card = layout.itemAt(index).widget()
+                    gap = card.y() - previous.y() - previous.height()
+                    self.assertEqual(gap, layout.spacing(), f"before card {index + 1}")
+
             for count in (2, 3, 5, 10, 15, 20, 25):
-                self.wait_for(lambda: client.search_results_layout.count() >= count)
+                self.wait_for(lambda: (
+                    client.search_results_layout.count() >= count
+                    and client.search_results_layout.itemAt(count - 1).widget().y() > first_card.y()
+                ))
                 self.assertEqual(first_card.size(), first_size, f"after {count} cards")
+                assert_card_spacing(count)
                 self.assertGreaterEqual(first_body.viewport().height(), document.size().height())
             self.wait_for(lambda: client.search_status.text() == "25+ results found")
             self.assertEqual(client.search_results_layout.count(), 25)
@@ -282,6 +295,7 @@ class ChatSearchTests(unittest.TestCase):
             self.assertEqual(first_card.size(), first_size)
             self.assertEqual(document.begin().layout().lineCount(), first_lines)
             self.assertEqual(client.search_results_layout.count(), 30)
+            assert_card_spacing(30)
             frame = client.search_results_layout.itemAt(24).widget()
             frame.findChild(QPushButton).click()
             self.wait_for(lambda: not client._rendering_message_log)
