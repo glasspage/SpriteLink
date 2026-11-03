@@ -3,6 +3,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
+from PySide6.QtCore import QUrl
 from PySide6.QtGui import QColor, QTextDocument
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QPushButton
@@ -54,6 +55,24 @@ class ChatSearchTests(unittest.TestCase):
         self.assertNotIn("secret", document.toPlainText())
         self.assertIn(max(S.message_row_backgrounds(), key=lambda color: QColor(color).lightness()),
                       body.styleSheet())
+
+    def test_search_message_contains_a_loadable_inline_profile_icon(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.png"
+            S.Image.new("RGB", (16, 16), (20, 100, 180)).save(path)
+            icon = S.encode_profile_icon(S.optimize_profile_icon(str(path)))
+        message = self.client._build_draft_message("Hello")
+        message["p"] = icon
+        body = self.client._search_result_message(message)
+        document = QTextDocument()
+        document.setHtml(body.text())
+        image_format = document.begin().begin().fragment().charFormat().toImageFormat()
+        self.assertEqual(image_format.width(), S.PROFILE_ICON_SIZE)
+        image = document.resource(QTextDocument.ResourceType.ImageResource,
+                                  QUrl(image_format.name()))
+        self.assertFalse(image.isNull())
+        self.client.config_data["ui_size"] = "Tiny"
+        self.assertNotIn("<img", self.client._search_result_message(message).text())
 
     def test_saved_history_search_pagination_and_jump(self):
         client = self.client

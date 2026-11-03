@@ -10987,6 +10987,14 @@ QComboBox::drop-down {
         cursor = QTextCursor(document)
         font_name = str(message.get("f", DEFAULT_MESSAGE_FONT))
         body_color = str(message.get("o", DEFAULT_MESSAGE_TEXT_COLOR))
+        if self._chat_icons_visible() and self._insert_profile_icon(
+            cursor,
+            str(message.get("p", "")),
+            str(message["i"]),
+            line_height_px=self._chat_line_height(font_name),
+            inline_html=True,
+        ):
+            cursor.insertText(" ", self._text_format(body_color, font_name=font_name))
         cursor.insertText(
             str(message["u"]),
             self._text_format(str(message["k"]), font_name=font_name),
@@ -16140,6 +16148,7 @@ QComboBox::drop-down {
         align_top: bool = False,
         opacity: float = 1.0,
         line_height_px: int = DEFAULT_MESSAGE_LINE_HEIGHT_PX,
+        inline_html: bool = False,
     ) -> bool:
         if not encoded_icon:
             return False
@@ -16213,23 +16222,31 @@ QComboBox::drop-down {
             displayed_image = faded_image
             resource_suffix += f"-opacity-{round(opacity * 100)}"
 
-        resource_name = (
-            "spritelink-profile-icon:"
-            + hashlib.sha256(gif_data).hexdigest()
-            + resource_suffix
-        )
-        resource_url = QUrl(resource_name)
-        cursor.document().addResource(
-            QTextDocument.ResourceType.ImageResource,
-            resource_url,
-            displayed_image,
-        )
         image_format = QTextImageFormat()
-        image_format.setName(resource_url.toString())
+        if inline_html:
+            # The search label receives HTML rather than this document's resources.
+            buffer = QBuffer()
+            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+            if not displayed_image.save(buffer, "PNG"):
+                return False
+            encoded = base64.b64encode(bytes(buffer.data())).decode("ascii")
+            image_format.setName(f"data:image/png;base64,{encoded}")
+        else:
+            resource_url = QUrl(
+                "spritelink-profile-icon:"
+                + hashlib.sha256(gif_data).hexdigest()
+                + resource_suffix
+            )
+            cursor.document().addResource(
+                QTextDocument.ResourceType.ImageResource,
+                resource_url,
+                displayed_image,
+            )
+            image_format.setName(resource_url.toString())
+            image_format.setAnchor(True)
+            image_format.setAnchorHref(f"spritelink:{message_id}")
         image_format.setWidth(displayed_image.width())
         image_format.setHeight(displayed_image.height())
-        image_format.setAnchor(True)
-        image_format.setAnchorHref(f"spritelink:{message_id}")
         # Keep the optical offset; AlignTop avoids half-pixel AlignMiddle rounding.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
