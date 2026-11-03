@@ -7195,6 +7195,7 @@ class EncryptedChatClient(QObject):
         ] = {}
         self.last_inline_animation_frame_at: dict[str, float] = {}
         self.current_image_preview_url: str | None = None
+        self.current_drawing_preview: QImage | None = None
         self.current_image_preview_client_id: str | None = None
         self.recent_chatroom_switch_times: list[float] = []
         self.rendered_history_message_limit = (
@@ -11756,6 +11757,11 @@ QComboBox::drop-down {
         open_button = QPushButton("Open in Browser")
         open_button.clicked.connect(self._open_current_image_in_browser)
         button_row.addWidget(open_button)
+        self.image_preview_open_button = open_button
+        self.image_preview_copy_button = QPushButton("Copy")
+        self.image_preview_copy_button.clicked.connect(self._copy_current_drawing)
+        button_row.addWidget(self.image_preview_copy_button)
+        self.image_preview_copy_button.hide()
         dismiss_button = QPushButton("Dismiss")
         dismiss_button.clicked.connect(self._hide_image_preview_popup)
         button_row.addWidget(dismiss_button)
@@ -11988,7 +11994,7 @@ QComboBox::drop-down {
             document.markContentsDirty(position, 1)
         self.chat_display.viewport().update()
 
-    def _set_large_image_preview_frame(self, image: QImage) -> None:
+    def _set_large_image_preview_frame(self, image: QImage, *, pixel_art: bool = False) -> None:
         overlay_layout = self.image_preview_overlay.layout()
         panel_layout = self.image_preview_panel.layout()
         overlay_margins = overlay_layout.contentsMargins()
@@ -12024,7 +12030,8 @@ QComboBox::drop-down {
             available_width,
             available_height,
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation if pixel_art
+            else Qt.TransformationMode.SmoothTransformation,
         )
         self.image_preview_label.clear()
         self.image_preview_label.setPixmap(QPixmap.fromImage(preview))
@@ -12042,6 +12049,7 @@ QComboBox::drop-down {
             self.video_player.stop()
             self.video_player.hide()
         self._hide_chat_tooltip()
+        self.current_drawing_preview = None
         self.current_image_preview_url = url
         self.current_image_preview_client_id = client_id
         self._ensure_animated_media_controller(url, media)
@@ -12073,7 +12081,37 @@ QComboBox::drop-down {
         self._update_image_preview_popup()
         QTimer.singleShot(0, self._update_image_preview_popup)
 
+    def _show_drawing_preview(self, encoded: str) -> None:
+        try:
+            image = drawing_image(*decode_drawing(encoded))
+        except ValueError:
+            return
+        self._ensure_popup("image_preview")
+        self._hide_image_preview_popup()
+        self._hide_chat_tooltip()
+        self.current_drawing_preview = image
+        self.image_preview_footer.show()
+        self.image_preview_panel_row.setStretch(0, 1)
+        self.image_preview_panel_row.setStretch(2, 1)
+        self._sync_image_preview_overlay_geometry()
+        self.image_preview_overlay.show()
+        self.image_preview_overlay.raise_()
+        self._update_image_preview_popup()
+        QTimer.singleShot(0, self._update_image_preview_popup)
+
+    def _copy_current_drawing(self) -> None:
+        if self.current_drawing_preview is not None:
+            QApplication.clipboard().setImage(self.current_drawing_preview)
+
     def _update_image_preview_popup(self) -> None:
+        drawing = self.current_drawing_preview
+        self.image_preview_open_button.setVisible(drawing is None)
+        self.image_preview_copy_button.setVisible(drawing is not None)
+        if drawing is not None:
+            self.image_preview_url_label.clear()
+            self.image_preview_url_label.setToolTip("")
+            self._set_large_image_preview_frame(drawing, pixel_art=True)
+            return
         url = self.current_image_preview_url
         media = self.image_preview_cache.get(url or "")
         if not isinstance(media, RemoteMediaPreview):
@@ -12115,6 +12153,7 @@ QComboBox::drop-down {
             self.video_player.hide()
         self.image_preview_label.show()
         self.current_image_preview_url = None
+        self.current_drawing_preview = None
         self.current_image_preview_client_id = None
         self.image_preview_label.clear()
         self.image_preview_url_label.clear()
@@ -15945,8 +15984,17 @@ QComboBox::drop-down {
         self,
         url: str,
         global_position: QPoint,
+        *,
+        embedded_image: bool = False,
     ) -> None:
         menu = QMenu(self.root)
+        if embedded_image:
+            media = self.image_preview_cache.get(url)
+            if isinstance(media, RemoteMediaPreview) and media.kind != "video":
+                frame = media.frame
+                if isinstance(frame, QImage) and not frame.isNull():
+                    copy_image = menu.addAction("Copy Image")
+                    copy_image.triggered.connect(lambda: QApplication.clipboard().setImage(frame))
         copy_action = menu.addAction("Copy Link")
         copy_action.triggered.connect(
             lambda: QApplication.clipboard().setText(url)
@@ -16551,6 +16599,12 @@ QComboBox::drop-down {
                     if self._message_id_from_anchor(anchor):
                         # Consume user-link clicks to prevent navigation and Qt focus outlines.
                         return True
+                    if anchor.startswith("spritelink-drawing:"):
+                        if event_type == QEvent.Type.MouseButtonRelease:
+                            item = self.rendered_message_items.get(anchor.removeprefix("spritelink-drawing:"))
+                            if item is not None:
+                                self._show_drawing_preview(item["message"]["drawing"])
+                        return True
                     image_url = self._image_url_from_anchor(anchor)
                     if image_url:
                         if event_type == QEvent.Type.MouseButtonRelease:
@@ -16597,6 +16651,7 @@ QComboBox::drop-down {
                         self._show_link_context_menu(
                             link_url,
                             event.globalPos(),
+                            embedded_image=self._image_url_from_anchor(anchor) is not None,
                         )
                     else:
                         clicked_message_id = self._message_id_at_position(
@@ -16761,7 +16816,9 @@ QComboBox::drop-down {
         formatting.setName(f"data:image/png;base64,{encoded}")
         return True
 
-    def _insert_inline_drawing(self, cursor: QTextCursor, encoded: str) -> None:
+    def _insert_inline_drawing(
+        self, cursor: QTextCursor, encoded: str, *, message_id: str = "",
+    ) -> None:
         try:
             size, pixels, palette = decode_drawing(encoded)
         except ValueError:
@@ -16774,6 +16831,9 @@ QComboBox::drop-down {
             formatting.setWidth(image.width())
             formatting.setHeight(image.height())
             formatting.setProperty(QTextFormat.Property.ImageAltText, "Drawing")
+            if message_id:
+                formatting.setAnchor(True)
+                formatting.setAnchorHref(f"spritelink-drawing:{message_id}")
             cursor.insertImage(formatting)
 
     def _insert_profile_icon(
@@ -18290,7 +18350,7 @@ QComboBox::drop-down {
             )
         elif drawing:
             cursor.insertBlock()
-            self._insert_inline_drawing(cursor, drawing)
+            self._insert_inline_drawing(cursor, drawing, message_id=message_id)
             embedded_media_block_numbers.add(cursor.block().blockNumber())
         else:
             self._insert_message_text_with_links(
