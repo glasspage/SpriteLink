@@ -7169,7 +7169,7 @@ class EncryptedChatClient(QObject):
         self.pending_history_entries: list[dict[str, Any]] = []
         self.draft_message_id = uuid.uuid4().hex
         self.chatroom_drafts: dict[str, str] = {}
-        self.drawing_drafts: dict[str, tuple[int, bytes, bool]] = {}
+        self.drawing_drafts: dict[str, tuple[int, bytes, bool, int]] = {}
         self.read_divider_message_ids: dict[str, str] = {}
         self.read_divider_visible_seconds: dict[str, float] = {}
         self._read_divider_last_tick = time.monotonic()
@@ -10770,8 +10770,8 @@ QComboBox::drop-down {
         panel.show()
         panel.size_combo.setFocus()
 
-    def _apply_drawing_import(self, size: int, pixels: bytes) -> None:
-        self.image_menu.canvas.replace(size, pixels)
+    def _apply_drawing_import(self, size: int, pixels: bytes, palette: int) -> None:
+        self.image_menu.canvas.replace(size, pixels, palette=palette)
         self._close_drawing_import()
 
     def _close_drawing_import(self) -> None:
@@ -13242,6 +13242,7 @@ QComboBox::drop-down {
         canvas.redo_stack.clear()
         if state is None:
             canvas.canvas_size = 0
+            canvas.palette_index = 0
             canvas.reset()
         else:
             canvas.restore(state)
@@ -13321,7 +13322,7 @@ QComboBox::drop-down {
     def _drawing_payload(self) -> str:
         canvas = self.image_menu.canvas
         if self.image_menu_button.isChecked() and canvas.edited:
-            return encode_drawing(canvas.canvas_size, bytes(canvas.pixels))
+            return encode_drawing(canvas.canvas_size, bytes(canvas.pixels), canvas.palette_index)
         return ""
 
     def _run_message_size_check(self) -> None:
@@ -14523,8 +14524,8 @@ QComboBox::drop-down {
                     if "drawing" in message:
                         canvas = self.image_menu.canvas
                         if not canvas.edited:
-                            size, pixels = decode_drawing(message["drawing"])
-                            canvas.replace(size, pixels)
+                            size, pixels, palette = decode_drawing(message["drawing"])
+                            canvas.replace(size, pixels, palette=palette)
                         continue
                     self._append_system_message(
                         "Unsent text from "
@@ -16759,11 +16760,11 @@ QComboBox::drop-down {
 
     def _insert_inline_drawing(self, cursor: QTextCursor, encoded: str) -> None:
         try:
-            size, pixels = decode_drawing(encoded)
+            size, pixels, palette = decode_drawing(encoded)
         except ValueError:
             cursor.insertText("[Image unavailable]")
             return
-        image = drawing_image(size, pixels)
+        image = drawing_image(size, pixels, palette)
         image = image.scaled(image.width() * 2, image.height() * 2)
         formatting = QTextImageFormat()
         if self._set_inline_html_image(formatting, image):
@@ -16943,12 +16944,12 @@ QComboBox::drop-down {
         if "drawing" in message:
             copy_action = menu.addAction("Copy Image")
             try:
-                size, pixels = decode_drawing(message["drawing"])
+                size, pixels, palette = decode_drawing(message["drawing"])
             except ValueError:
                 copy_action.setEnabled(False)
             else:
                 copy_action.triggered.connect(
-                    lambda: QApplication.clipboard().setImage(drawing_image(size, pixels))
+                    lambda: QApplication.clipboard().setImage(drawing_image(size, pixels, palette))
                 )
         else:
             copy_action = menu.addAction("Copy Message")

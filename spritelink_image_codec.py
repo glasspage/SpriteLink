@@ -4,16 +4,24 @@ import binascii
 import zlib
 
 IMAGE_SIZES = ((90, 60), (60, 60), (60, 90))
-IMAGE_PALETTE = (
-    "#000000", "#FFFFFF", "#E85154", "#F4CB4E",
-    "#55B265", "#438FE0", "#975BCC", "#85878C",
+IMAGE_PALETTES = (
+    (
+        "#000000", "#FFFFFF", "#E85154", "#F4CB4E",
+        "#55B265", "#438FE0", "#975BCC", "#85878C",
+    ),
+    (
+        "#000000", "#FFFFFF", "#242424", "#494949",
+        "#6D6D6D", "#929292", "#B6B6B6", "#DBDBDB",
+    ),
 )
 
 
-def encode_drawing(size: int, pixels: bytes) -> str:
+def encode_drawing(size: int, pixels: bytes, palette: int = 0) -> str:
     width, height = IMAGE_SIZES[size]
     if len(pixels) != width * height or any(pixel > 7 for pixel in pixels):
         raise ValueError("Invalid drawing pixels.")
+    if not 0 <= palette < len(IMAGE_PALETTES):
+        raise ValueError("Invalid drawing palette.")
     packed = bytearray()
     for start in range(0, len(pixels), 8):
         word = 0
@@ -21,15 +29,16 @@ def encode_drawing(size: int, pixels: bytes) -> str:
             word = (word << 3) | pixel
         packed.extend(word.to_bytes(3, "big"))
     compressed = zlib.compress(packed, level=9)
-    # One byte stores format version, canvas size, and whether DEFLATE saved space.
+    # The low nibble stores palette, compression flag, and canvas size.
+    header = 0x10 | (palette << 3) | size
     if len(compressed) < len(packed):
-        data = bytes([0x10 | size | 4]) + compressed
+        data = bytes([header | 4]) + compressed
     else:
-        data = bytes([0x10 | size]) + packed
+        data = bytes([header]) + packed
     return base64.b64encode(data).decode("ascii")
 
 
-def decode_drawing(encoded: str) -> tuple[int, bytes]:
+def decode_drawing(encoded: str) -> tuple[int, bytes, int]:
     if not isinstance(encoded, str) or not 4 <= len(encoded) <= 2704:
         raise ValueError("Invalid drawing length.")
     try:
@@ -38,7 +47,7 @@ def decode_drawing(encoded: str) -> tuple[int, bytes]:
     except (binascii.Error, IndexError, ValueError) as exc:
         raise ValueError("Invalid drawing encoding.") from exc
     size = header & 3
-    if header & 0xF8 != 0x10 or size >= len(IMAGE_SIZES):
+    if header & 0xF0 != 0x10 or size >= len(IMAGE_SIZES):
         raise ValueError("Unsupported drawing format.")
     width, height = IMAGE_SIZES[size]
     expected = width * height * 3 // 8
@@ -57,4 +66,4 @@ def decode_drawing(encoded: str) -> tuple[int, bytes]:
     for start in range(0, expected, 3):
         word = int.from_bytes(packed[start:start + 3], "big")
         pixels.extend((word >> shift) & 7 for shift in range(21, -1, -3))
-    return size, bytes(pixels)
+    return size, bytes(pixels), (header >> 3) & 1

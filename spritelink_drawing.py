@@ -10,10 +10,14 @@ from PySide6.QtWidgets import (
     QPushButton, QVBoxLayout, QWidget,
 )
 
-from spritelink_image_codec import IMAGE_PALETTE, IMAGE_SIZES
+from spritelink_image_codec import IMAGE_PALETTES, IMAGE_SIZES
 
 
-COLORS = [QColor(color).rgb() for color in IMAGE_PALETTE]
+COLOR_TABLES = [[QColor(color).rgb() for color in palette] for palette in IMAGE_PALETTES]
+BACKGROUND_NAMES = (
+    ("Black", "White", "Red", "Yellow", "Green", "Blue", "Purple", "Gray"),
+    ("Black", "White", "14% gray", "29% gray", "43% gray", "57% gray", "71% gray", "86% gray"),
+)
 SIZE_LABELS = [f"{width} × {height}" for width, height in IMAGE_SIZES]
 PATTERNS = (
     lambda x, y: False,
@@ -29,14 +33,14 @@ PATTERNS = (
 )
 
 
-def drawing_image(size: int, pixels: bytes) -> QImage:
+def drawing_image(size: int, pixels: bytes, palette: int = 0) -> QImage:
     width, height = IMAGE_SIZES[size]
     # Qt pads indexed rows to four-byte boundaries.
     stride = (width + 3) & ~3
     data = b"".join(pixels[i:i + width].ljust(stride, b"\0")
                     for i in range(0, len(pixels), width))
     image = QImage(data, width, height, stride, QImage.Format.Format_Indexed8)
-    image.setColorTable(COLORS)
+    image.setColorTable(COLOR_TABLES[palette])
     return image.copy()
 
 
@@ -44,6 +48,7 @@ class PixelView(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.canvas_size = 0
+        self.palette_index = 0
         self.pixels = bytearray()
         self.grid = False
         self.selection = QRect()
@@ -67,7 +72,7 @@ class PixelView(QWidget):
         width, height = IMAGE_SIZES[self.canvas_size]
         scale = rect.width() / width
         painter = QPainter(self)
-        painter.drawImage(rect, drawing_image(self.canvas_size, self.pixels))
+        painter.drawImage(rect, drawing_image(self.canvas_size, self.pixels, self.palette_index))
         painter.setPen(self.palette().mid().color())
         painter.drawRect(rect.adjusted(-1, -1, 0, 0))
         if self.grid and scale >= 2:
@@ -127,11 +132,11 @@ class DrawingCanvas(PixelView):
         super().resizeEvent(event)
         self.resized.emit()
 
-    def snapshot(self) -> tuple[int, bytes, bool]:
-        return self.canvas_size, bytes(self.pixels), self.edited
+    def snapshot(self) -> tuple[int, bytes, bool, int]:
+        return self.canvas_size, bytes(self.pixels), self.edited, self.palette_index
 
     def restore(self, state) -> None:
-        self.canvas_size, pixels, self.edited = state
+        self.canvas_size, pixels, self.edited, self.palette_index = state
         self.pixels = bytearray(pixels)
         self.selection = QRect()
         self._before = None
@@ -143,12 +148,12 @@ class DrawingCanvas(PixelView):
         self.redo_stack.clear()
         self._before = None
         width, height = IMAGE_SIZES[self.canvas_size]
-        self.restore((self.canvas_size, bytes([1]) * (width * height), False))
+        self.restore((self.canvas_size, bytes([1]) * (width * height), False, self.palette_index))
 
-    def replace(self, size: int, pixels: bytes, *, edited: bool = True) -> None:
+    def replace(self, size: int, pixels: bytes, *, edited: bool = True, palette: int | None = None) -> None:
         self.undo_stack.append(self.snapshot())
         self.redo_stack.clear()
-        self.restore((size, pixels, edited))
+        self.restore((size, pixels, edited, self.palette_index if palette is None else palette))
 
     def resize_canvas(self, size: int) -> None:
         if size == self.canvas_size:
@@ -281,9 +286,9 @@ class ColorButton(QPushButton):
             super().mousePressEvent(event)
 
 
-def preview_icon(pixels: bytes, width: int = 16, height: int = 16) -> QIcon:
-    image = QImage(pixels, width, height, width, QImage.Format.Format_Indexed8)
-    image.setColorTable(COLORS)
+def preview_icon(pixels: bytes, palette: int) -> QIcon:
+    image = QImage(pixels, 16, 16, 16, QImage.Format.Format_Indexed8)
+    image.setColorTable(COLOR_TABLES[palette])
     return QIcon(QPixmap.fromImage(image))
 
 
@@ -337,16 +342,21 @@ class DrawingMenu(QFrame):
         palette.addLayout(slots)
         swatches = QGridLayout()
         swatches.setSpacing(2)
-        for index, color in enumerate(IMAGE_PALETTE):
+        self._shown_palette = None
+        self.swatch_buttons = []
+        for index in range(8):
             button = ColorButton()
             button.setFixedSize(25, 24)
-            button.setToolTip(color)
-            button.setAccessibleName(color)
-            button.setIcon(preview_icon(bytes([index]) * 256))
             button.clicked.connect(lambda _checked, value=index: self._pick_color(self.active_color, value))
             button.colorPicked.connect(lambda slot, value=index: self._pick_color(slot, value))
             swatches.addWidget(button, index // 4, index % 4)
+            self.swatch_buttons.append(button)
         palette.addLayout(swatches)
+        self.palette_combo = combo_type()
+        self.palette_combo.setAccessibleName("Color palette")
+        self.palette_combo.addItems(("Basic", "Grayscale"))
+        self.palette_combo.currentIndexChanged.connect(self._select_palette)
+        palette.addWidget(self.palette_combo)
         palette.addWidget(QLabel("Pattern"))
         patterns = QGridLayout()
         patterns.setSpacing(2)
@@ -366,7 +376,6 @@ class DrawingMenu(QFrame):
         palette.addLayout(patterns)
         palette.addStretch()
         row.addLayout(palette)
-        self._update_colors()
 
         controls = QVBoxLayout()
         controls.addWidget(QLabel("Image Size"))
@@ -439,7 +448,17 @@ class DrawingMenu(QFrame):
                 self.canvas.canvas_size, bytes([1]) * len(self.canvas.pixels), edited=False,
             )
 
+    def _select_palette(self, index: int) -> None:
+        canvas = self.canvas
+        if index != canvas.palette_index:
+            canvas.replace(canvas.canvas_size, bytes(canvas.pixels), edited=canvas.edited, palette=index)
+
     def _canvas_changed(self) -> None:
+        previous = self.palette_combo.blockSignals(True)
+        self.palette_combo.setCurrentIndex(self.canvas.palette_index)
+        self.palette_combo.blockSignals(previous)
+        if self._shown_palette != self.canvas.palette_index:
+            self._update_colors()
         previous = self.size_combo.blockSignals(True)
         self.size_combo.setCurrentIndex(self.canvas.canvas_size)
         self.size_combo.blockSignals(previous)
@@ -457,13 +476,21 @@ class DrawingMenu(QFrame):
         self._update_colors()
 
     def _update_colors(self) -> None:
+        palette = self.canvas.palette_index
+        if self._shown_palette != palette:
+            self._shown_palette = palette
+            for index, button in enumerate(self.swatch_buttons):
+                color = IMAGE_PALETTES[palette][index]
+                button.setToolTip(color)
+                button.setAccessibleName(color)
+                button.setIcon(preview_icon(bytes([index]) * 256, palette))
         for button, color in zip(self.slots, self.canvas.colors):
-            button.setIcon(preview_icon(bytes([color]) * 256))
+            button.setIcon(preview_icon(bytes([color]) * 256, palette))
         first, second = self.canvas.colors
         for button, pattern in zip(self.pattern_buttons, PATTERNS):
             button.setIcon(preview_icon(bytes(
                 second if pattern(x, y) else first for y in range(16) for x in range(16)
-            )))
+            ), palette))
 
 
 class ImportPreview(PixelView):
@@ -510,7 +537,7 @@ def load_import_image(path: str) -> Image.Image:
 
 
 class DrawingImportPanel(QFrame):
-    accepted = Signal(int, bytes)
+    accepted = Signal(int, bytes, int)
     dismissed = Signal()
 
     def __init__(self, source: Image.Image, combo_type) -> None:
@@ -545,7 +572,7 @@ class DrawingImportPanel(QFrame):
         settings.addWidget(self.dither)
         self.background = combo_type()
         self.background.setAccessibleName("Background")
-        names = ("Black", "White", "Red", "Yellow", "Green", "Blue", "Purple", "Gray")
+        names = BACKGROUND_NAMES[0]
         self.background.addItems([f"{name} background" for name in names])
         self.background.setCurrentIndex(1)
         settings.addWidget(self.background)
@@ -566,15 +593,20 @@ class DrawingImportPanel(QFrame):
         cancel.clicked.connect(self.dismissed)
         buttons.addWidget(cancel)
         accept = QPushButton("Use Image")
-        accept.clicked.connect(lambda: self.accepted.emit(self.preview.canvas_size, bytes(self.preview.pixels)))
+        accept.clicked.connect(lambda: self.accepted.emit(self.preview.canvas_size, bytes(self.preview.pixels), self.preview.palette_index))
         buttons.addWidget(accept)
         layout.addLayout(buttons)
         self.preset = "Fill"
         self.size_combo.currentIndexChanged.connect(lambda _index: self.set_zoom(self.preset))
-        self.mode.currentIndexChanged.connect(self.refresh)
+        self.mode.currentIndexChanged.connect(self._update_import_palette)
         self.dither.toggled.connect(self.refresh)
         self.background.currentIndexChanged.connect(self.refresh)
         self.set_zoom("Fill")
+
+    def _update_import_palette(self, index: int) -> None:
+        for position, name in enumerate(BACKGROUND_NAMES[index]):
+            self.background.setItemText(position, f"{name} background")
+        self.refresh()
 
     def set_zoom(self, preset: str) -> None:
         self.preset = preset
@@ -610,15 +642,15 @@ class DrawingImportPanel(QFrame):
             fillcolor=(0, 0, 0, 0),
         )
         background = self.background.currentIndex()
+        palette_index = self.mode.currentIndex()
+        swatches = IMAGE_PALETTES[palette_index]
         alpha = image.getchannel("A")
-        rgb = Image.new("RGB", image.size, IMAGE_PALETTE[background])
+        rgb = Image.new("RGB", image.size, swatches[background])
         rgb.paste(image.convert("RGB"), mask=alpha)
-        grayscale = self.mode.currentIndex() == 1
-        indices = (0, 1, 7) if grayscale else tuple(range(len(COLORS)))
-        if grayscale:
+        if palette_index == 1:
             rgb = ImageOps.grayscale(rgb).convert("RGB")
         palette = Image.new("P", (1, 1))
-        colors = [QColor(IMAGE_PALETTE[index]).getRgb()[:3] for index in indices]
+        colors = [QColor(color).getRgb()[:3] for color in swatches]
         palette.putpalette([channel for color in colors for channel in color])
         converted = rgb.quantize(palette=palette, dither=Image.Dither.NONE)
         if self.dither.isChecked():
@@ -626,8 +658,9 @@ class DrawingImportPanel(QFrame):
             softened = Image.blend(rgb, converted.convert("RGB"), 0.25)
             converted = softened.quantize(palette=palette, dither=Image.Dither.FLOYDSTEINBERG)
         self.preview.canvas_size = size
+        self.preview.palette_index = palette_index
         self.preview.pixels = bytes(
-            indices[index] if opacity else background
+            index if opacity else background
             for index, opacity in zip(converted.tobytes(), alpha.tobytes())
         )
         self.preview.update()
