@@ -621,7 +621,6 @@ class BehaviorSettingsTests(unittest.TestCase):
         self.assertIn('"history_chunk_loaded"', worker_source)
         self.assertIn('"history_chunk_loaded"', queue_source)
         self.assertIn("range(UI_EVENT_BATCH_LIMIT)", queue_source)
-        self.assertIn("self.message_log[0:0] = accepted_items", queue_source)
         self.assertIn("_queue_live_message_render(", queue_source)
         self.assertNotIn(
             "_render_message_log(scroll_to_bottom=True)",

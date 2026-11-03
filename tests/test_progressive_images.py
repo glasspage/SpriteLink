@@ -77,6 +77,20 @@ class ProgressiveImageTests(unittest.TestCase):
             self.assertEqual((formatting.width(), formatting.height()), (96, 64))
             self.assertEqual(resource.pixelColor(10, 10).name(), "#ff0000")
 
+    def test_overlapping_history_chunk_preserves_order_and_limit(self):
+        c = self.client
+        items = self._items(6)
+        c.message_log = [items[1], items[3], items[5]]
+        c.ui_queue.put(("history_chunk_loaded", {
+            "generation": c._history_render_generation,
+            "room_id": c.active_chatroom_id,
+            "initial": False,
+            "items": [items[0], items[2], items[4]],
+        }))
+        with mock.patch.object(c, "_chatroom_history_limit", return_value=5):
+            c._process_ui_queue()
+        self.assertEqual(c.message_log, items[1:])
+
     def test_first_visible_image_downloads_and_displays_before_initial_render_finishes(self):
         c = self.client
         with mock.patch.object(S, "MESSAGE_RENDER_STEP_DELAY_MS", 40), \

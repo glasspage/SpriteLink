@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from bisect import bisect_right, insort_right
 import ctypes
 from contextlib import closing
 from ctypes import wintypes
@@ -13593,7 +13594,6 @@ QComboBox::drop-down {
                             )
 
                     if added_message_ids:
-                        self.message_log.sort(key=self._message_sort_key)
                         self._persist_local_history()
                         self._queue_live_message_render(
                             added_message_ids
@@ -13657,8 +13657,20 @@ QComboBox::drop-down {
                         self.message_log.extend(accepted_items)
                         self.message_log.sort(key=self._message_sort_key)
                     elif accepted_items:
-                        # Prepend newest-first history chunks without repeatedly sorting the log.
-                        self.message_log[0:0] = accepted_items
+                        # A delayed live message can overlap this older page.
+                        overlap = bisect_right(
+                            self.message_log,
+                            self._message_sort_key(accepted_items[-1]),
+                            key=self._message_sort_key,
+                        )
+                        self.message_log[:overlap] = sorted(
+                            accepted_items + self.message_log[:overlap],
+                            key=self._message_sort_key,
+                        )
+                    if accepted_items:
+                        history_limit = self._chatroom_history_limit()
+                        if len(self.message_log) > history_limit:
+                            del self.message_log[:-history_limit]
                     if initial_chunk:
                         if self.message_log and not self._tray_ui_suspended:
                             self._render_message_log(
@@ -14039,10 +14051,9 @@ QComboBox::drop-down {
                 int(item["ntfy_time"]),
                 newest_received_time + 1,
             )
-        self.message_log.append(item)
+        insort_right(self.message_log, item, key=self._message_sort_key)
         self.pending_history_entries.append(item)
 
-        self.message_log.sort(key=self._message_sort_key)
         history_limit = self._chatroom_history_limit()
         if len(self.message_log) > history_limit:
             del self.message_log[:-history_limit]
