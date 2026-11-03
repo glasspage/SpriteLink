@@ -134,7 +134,7 @@ except ImportError as exc:
         "Missing dependency: PySide6\n\nInstall it with:\n"
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 QAudioOutput: Any = None
 QMediaPlayer: Any = None
@@ -10833,7 +10833,7 @@ QComboBox::drop-down {
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         results = QWidget()
         self.search_results_layout = QVBoxLayout(results)
-        self._search_media_labels: dict[str, list[QLabel]] = {}
+        self._search_media_updates: dict[str, list[Callable[[], None]]] = {}
         self.search_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(results)
         panel_layout.addWidget(scroll, 1)
@@ -10863,7 +10863,7 @@ QComboBox::drop-down {
                 self._search_generation += 1
                 self._pending_search_jump = None
                 self.search_timer.stop()
-                self._search_media_labels.clear()
+                self._search_media_updates.clear()
                 self.search_overlay.hide()
                 self.message_entry.setFocus()
             return
@@ -10883,7 +10883,7 @@ QComboBox::drop-down {
         self._pending_search_jump = None
         self._search_before = None
         self._search_running = False
-        self._search_media_labels.clear()
+        self._search_media_updates.clear()
         while self.search_results_layout.count():
             self.search_results_layout.takeAt(0).widget().deleteLater()
         self.search_more_button.hide()
@@ -10979,46 +10979,22 @@ QComboBox::drop-down {
             header.addWidget(jump)
             layout.addLayout(header)
             layout.addWidget(self._search_result_message(message))
-            self._add_search_media_previews(layout, message)
             self.search_results_layout.addWidget(frame)
             self._apply_ui_size_to_widget_tree(frame)
         self._search_before = next_page
         self.search_more_button.setVisible(next_page is not None)
         self.search_status.setText("" if self.search_results_layout.count() else "No matches.")
 
-    def _add_search_media_previews(
-        self, layout: QVBoxLayout, message: dict[str, Any],
-    ) -> None:
-        client_id = str(message["c"])
-        is_local = client_id == self._authenticated_client_id()
-        trusted = self._room_preference_ids("trusted_link_and_image_users")
-        text = message_plain_text_with_spoilers_redacted(str(message["m"]))
-        for url in direct_image_urls_in_message(text):
-            if not is_image_url_trusted_for_sender(url, client_id, is_local, trusted):
-                continue
-            label = QLabel()
-            label.setObjectName("searchMediaPreview")
-            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            layout.addWidget(label, 0, Qt.AlignmentFlag.AlignLeft)
-            label.hide()
-            self._search_media_labels.setdefault(url, []).append(label)
-            if url in self.image_preview_cache:
-                self._update_search_media_preview(url, self.image_preview_cache[url])
-            else:
-                self._schedule_image_preview_fetch(url)
-
     def _update_search_media_preview(
         self, url: str, media: RemoteMediaPreview | None,
     ) -> None:
-        labels = getattr(self, "_search_media_labels", {}).get(url)
-        if not labels or media is None:
+        updates = getattr(self, "_search_media_updates", {}).get(url)
+        if not updates:
             return
-        if media.frame is None and not is_likely_nsfw_image_url(url):
+        if media is not None and media.frame is None and not is_likely_nsfw_image_url(url):
             self._ensure_animated_media_controller(url, media)
-        pixmap = QPixmap.fromImage(self._embedded_media_preview(url, media))
-        for label in labels:
-            label.setPixmap(pixmap)
-            label.show()
+        for update in updates:
+            update()
 
     def _stop_search_preview_loop(self, url: str) -> None:
         if url in self.viewport_embedded_image_urls or url == self.current_image_preview_url:
@@ -11029,6 +11005,48 @@ QComboBox::drop-down {
             controller.deleteLater()
 
     def _search_result_message(self, message: dict[str, Any]) -> QLabel:
+        body = QLabel()
+        body.setObjectName("searchResultMessage")
+        body.setTextFormat(Qt.TextFormat.RichText)
+        body.setWordWrap(True)
+        body.setMargin(6)
+        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        background = max(
+            message_row_backgrounds(), key=lambda color: QColor(color).lightness(),
+        )
+        body.setStyleSheet(
+            f"QLabel#searchResultMessage {{ background-color: {background}; }}"
+        )
+        client_id = str(message["c"])
+        is_local = client_id == self._authenticated_client_id()
+        trusted = self._room_preference_ids("trusted_link_and_image_users")
+        text = message_plain_text_with_spoilers_redacted(str(message["m"]))
+        media_urls = [
+            url for url in direct_image_urls_in_message(text)
+            if is_image_url_trusted_for_sender(url, client_id, is_local, trusted)
+        ]
+
+        def update() -> None:
+            body.setText(self._search_result_html(message, media_urls))
+
+        update()
+        for url in media_urls:
+            self._search_media_updates.setdefault(url, []).append(update)
+            if url in self.image_preview_cache:
+                media = self.image_preview_cache[url]
+                if media is not None and media.frame is None and not is_likely_nsfw_image_url(url):
+                    self._ensure_animated_media_controller(url, media)
+            else:
+                self._schedule_image_preview_fetch(url)
+        return body
+
+    def _search_result_html(
+        self, message: dict[str, Any], media_urls: list[str],
+    ) -> str:
+        embedded_urls = [
+            url for url in media_urls
+            if url not in self.image_preview_cache or self.image_preview_cache[url] is not None
+        ]
         document = QTextDocument()
         cursor = QTextCursor(document)
         font_name = str(message.get("f", DEFAULT_MESSAGE_FONT))
@@ -11049,23 +11067,28 @@ QComboBox::drop-down {
         self._insert_message_text_with_links(
             cursor, str(message["m"]), body_color, font_name,
             str(message["c"]), str(message["i"]),
-            muted=False, ui_font=False, embedded_image_urls=set(),
+            muted=False, ui_font=False, embedded_image_urls=set(embedded_urls),
             align_top=False, top_align_height=0, preview=True,
         )
-        body = QLabel()
-        body.setObjectName("searchResultMessage")
-        body.setTextFormat(Qt.TextFormat.RichText)
-        body.setText(document.toHtml())
-        body.setWordWrap(True)
-        body.setMargin(6)
-        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        background = max(
-            message_row_backgrounds(), key=lambda color: QColor(color).lightness(),
-        )
-        body.setStyleSheet(
-            f"QLabel#searchResultMessage {{ background-color: {background}; }}"
-        )
-        return body
+        plain_text = message_plain_text(str(message["m"]))
+        visible_text = message_text_without_image_links(plain_text, set(embedded_urls))
+        if embedded_urls and visible_text.strip() and not visible_text.rstrip(" \t").endswith(("\n", "\r")):
+            cursor.insertBlock()
+        for url in embedded_urls:
+            media = self.image_preview_cache.get(url)
+            image = (
+                self._embedded_media_preview(url, media)
+                if isinstance(media, RemoteMediaPreview)
+                else self._unloaded_image_placeholder(
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE, EMBEDDED_IMAGE_PLACEHOLDER_SIZE, url=url,
+                )
+            )
+            formatting = QTextImageFormat()
+            if self._set_inline_html_image(formatting, image):
+                formatting.setWidth(image.width())
+                formatting.setHeight(image.height())
+                cursor.insertImage(formatting)
+        return document.toHtml()
 
     def _jump_to_search_result(self, message_id: str, order: tuple[int, int, str]) -> None:
         index = bisect_right(self.message_log, order, key=self._message_sort_key) - 1
@@ -11492,7 +11515,7 @@ QComboBox::drop-down {
         media.frame = frame_value
         if not had_frame:
             self._update_search_media_preview(url, media)
-            if media.kind == "looping_video" and url in getattr(self, "_search_media_labels", {}):
+            if media.kind == "looping_video" and url in getattr(self, "_search_media_updates", {}):
                 QTimer.singleShot(0, lambda: self._stop_search_preview_loop(url))
         if media.kind == "video" and media.video_info is not None:
             controller = self.animated_media_controllers.get(url)
@@ -16191,6 +16214,16 @@ QComboBox::drop-down {
 
         return normalized
 
+    @staticmethod
+    def _set_inline_html_image(formatting: QTextImageFormat, image: QImage) -> bool:
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not image.save(buffer, "PNG"):
+            return False
+        encoded = base64.b64encode(bytes(buffer.data())).decode("ascii")
+        formatting.setName(f"data:image/png;base64,{encoded}")
+        return True
+
     def _insert_profile_icon(
         self,
         cursor: QTextCursor,
@@ -16277,12 +16310,8 @@ QComboBox::drop-down {
         image_format = QTextImageFormat()
         if inline_html:
             # The search label receives HTML rather than this document's resources.
-            buffer = QBuffer()
-            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-            if not displayed_image.save(buffer, "PNG"):
+            if not self._set_inline_html_image(image_format, displayed_image):
                 return False
-            encoded = base64.b64encode(bytes(buffer.data())).decode("ascii")
-            image_format.setName(f"data:image/png;base64,{encoded}")
         else:
             resource_url = QUrl(
                 "spritelink-profile-icon:"
