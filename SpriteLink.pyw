@@ -13119,7 +13119,7 @@ QComboBox::drop-down {
         if counts is not None:
             self._last_recently_online_counts[topic] = counts.get(topic, 0)
         count = self._last_recently_online_counts.get(topic)
-        if count is None:
+        if not count:
             label.clear()
             label.hide()
             return
