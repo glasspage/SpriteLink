@@ -6975,6 +6975,7 @@ class EncryptedChatClient(QObject):
         self._message_render_job: dict[str, Any] | None = None
         self._rendering_message_log = False
         self._pending_live_render_message_ids: list[str] = []
+        self._history_render_pruned = False
         self._media_rerender_in_progress = False
         self.embedded_image_preview_sizes: dict[str, tuple[int, int]] = {}
         self.history_load_executor = DaemonTaskPool(
@@ -9724,6 +9725,7 @@ QComboBox::drop-down {
         self._message_render_job = None
         self._rendering_message_log = False
         self._pending_live_render_message_ids.clear()
+        self._history_render_pruned = False
         self._media_rerender_in_progress = False
         self.rendered_history_message_limit = (
             INITIAL_HISTORY_RENDER_MESSAGES
@@ -10069,9 +10071,9 @@ QComboBox::drop-down {
         )
         self.status_var.bind(self._on_connection_status_changed)
         status_layout.addWidget(self.status_label)
-        status_layout.addStretch(1)
+        status_layout.addSpacing(6)
 
-        self.recently_online_label = QLabel("Recently online: …")
+        self.recently_online_label = QLabel("… recently online")
         self.recently_online_label.setFont(
             self._make_font(self._ui_font_family(), 9)
         )
@@ -10079,6 +10081,7 @@ QComboBox::drop-down {
         opacity.setOpacity(0.6)
         self.recently_online_label.setGraphicsEffect(opacity)
         status_layout.addWidget(self.recently_online_label)
+        status_layout.addStretch(1)
         self._update_recently_online_label()
 
         self.config_toggle = QPushButton("Config")
@@ -13118,9 +13121,9 @@ QComboBox::drop-down {
             self._last_recently_online_counts[topic] = counts.get(topic, 0)
         count = self._last_recently_online_counts.get(topic)
         if count is None:
-            label.setText("Recently online: …")
+            label.setText("… recently online")
             return
-        label.setText(f"Recently online: {count}")
+        label.setText(f"{count} recently online")
 
     def _network_recently_online_step(self, *, now: float) -> bool:
         server = normalize_server_url(self.config_data.get("server_url", ""))
@@ -13668,9 +13671,9 @@ QComboBox::drop-down {
                             key=self._message_sort_key,
                         )
                     if accepted_items:
-                        history_limit = self._chatroom_history_limit()
-                        if len(self.message_log) > history_limit:
-                            del self.message_log[:-history_limit]
+                        self._trim_message_log(self._chatroom_history_limit())
+                        if not initial_chunk and self._history_render_pruned:
+                            self._flush_pending_live_message_render()
                     if initial_chunk:
                         if self.message_log and not self._tray_ui_suspended:
                             self._render_message_log(
@@ -14054,9 +14057,7 @@ QComboBox::drop-down {
         insort_right(self.message_log, item, key=self._message_sort_key)
         self.pending_history_entries.append(item)
 
-        history_limit = self._chatroom_history_limit()
-        if len(self.message_log) > history_limit:
-            del self.message_log[:-history_limit]
+        self._trim_message_log(self._chatroom_history_limit())
         # Live arrivals extend the visible history suffix without evicting loaded rows.
         self.rendered_history_message_limit = min(
             len(self.message_log),
@@ -14082,12 +14083,17 @@ QComboBox::drop-down {
 
     def _flush_pending_live_message_render(self) -> None:
         if (
-            not self._pending_live_render_message_ids
+            not (self._pending_live_render_message_ids or self._history_render_pruned)
             or self._tray_ui_suspended
+            or self._loading_older_history_page
             or self._rendering_message_log
             or self._history_render_updates_suppressed
             or self._media_rerender_in_progress
         ):
+            return
+
+        if self._history_render_pruned:
+            self._rerender_preserving_scroll()
             return
 
         pending_ids = list(self._pending_live_render_message_ids)
@@ -14461,13 +14467,25 @@ QComboBox::drop-down {
         )
         return normalize_chatroom_history_limit(value)
 
+    def _trim_message_log(self, limit: int) -> None:
+        excess = len(self.message_log) - limit
+        if excess <= 0:
+            return
+        if self._rendering_message_log or self._loading_older_history_page or any(
+            self._message_id_from_log_item(item) in self.rendered_message_last_blocks
+            for item in self.message_log[:excess]
+        ):
+            self._history_render_pruned = True
+        del self.message_log[:excess]
+        self.rendered_history_message_limit = min(
+            self.rendered_history_message_limit, len(self.message_log)
+        )
+
     def _apply_chatroom_history_limit(self) -> None:
         history_limit = self._chatroom_history_limit()
         self.config_data["chatroom_history_limit"] = history_limit
-        if len(self.message_log) > history_limit:
-            del self.message_log[:-history_limit]
-            if hasattr(self, "chat_display"):
-                self._render_message_log(scroll_to_bottom=True)
+        self._trim_message_log(history_limit)
+        self._flush_pending_live_message_render()
         self._persist_local_history()
         self._prune_background_local_histories()
 
@@ -16427,6 +16445,7 @@ QComboBox::drop-down {
         self._message_render_generation += 1
         generation = self._message_render_generation
         self._rendering_message_log = True
+        self._history_render_pruned = False
         self._hide_chat_tooltip()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()

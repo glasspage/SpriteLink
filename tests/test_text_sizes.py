@@ -110,17 +110,17 @@ class UiSizePresetTests(unittest.TestCase):
                 S.derive_ntfy_topic(S.GLOBAL_CHATROOM_KEY): 2,
             })))
             self.client._process_ui_queue()
-            self.assertEqual(self.client.recently_online_label.text(), "Recently online: 2")
+            self.assertEqual(self.client.recently_online_label.text(), "2 recently online")
             self.client.config_data["server_url"] = "https://other.example"
             self.client._update_recently_online_label()
-            self.assertEqual(self.client.recently_online_label.text(), "Recently online: 2")
+            self.assertEqual(self.client.recently_online_label.text(), "2 recently online")
             self.client.config_data["server_url"] = server
         with mock.patch.object(S.time, "time", return_value=60_000):
             self.client._update_recently_online_label()
-        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 2")
+        self.assertEqual(self.client.recently_online_label.text(), "2 recently online")
         self.client.ui_queue.put(("recently_online", (server, {})))
         self.client._process_ui_queue()
-        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 0")
+        self.assertEqual(self.client.recently_online_label.text(), "0 recently online")
 
     def test_tray_restore_requests_fresh_tally_and_preserves_visible_count(self):
         server = S.normalize_server_url(self.client.config_data["server_url"])
@@ -136,9 +136,9 @@ class UiSizePresetTests(unittest.TestCase):
         self.assertTrue(self.root.isVisible())
         self.assertTrue(self.client.recently_online_refresh_event.is_set())
         self.assertTrue(self.client.network_wakeup_event.is_set())
-        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 1")
+        self.assertEqual(self.client.recently_online_label.text(), "1 recently online")
         self.client._request_network_refresh(poll_immediately=False)
-        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 1")
+        self.assertEqual(self.client.recently_online_label.text(), "1 recently online")
 
     def test_recently_online_publish_counts_toward_relay_allowance_only(self):
         before = self.client._messages_left_today()
@@ -147,7 +147,7 @@ class UiSizePresetTests(unittest.TestCase):
             self.client._process_ui_queue()
         self.assertEqual(self.client._messages_left_today(), before - 1)
         append.assert_not_called()
-        self.assertEqual(self.client.recently_online_label.text(), "Recently online: …")
+        self.assertEqual(self.client.recently_online_label.text(), "… recently online")
 
     def test_recently_online_matches_room_topics_instead_of_names_or_local_ids(self):
         server = S.normalize_server_url(self.client.config_data["server_url"])
@@ -170,11 +170,11 @@ class UiSizePresetTests(unittest.TestCase):
             with self.subTest(room=room):
                 self.client._activate_chatroom(room)
                 self.assertFalse(self.client.recently_online_label.isHidden())
-                self.assertEqual(self.client.recently_online_label.text(), f"Recently online: {count}")
+                self.assertEqual(self.client.recently_online_label.text(), f"{count} recently online")
         self.client.ui_queue.put(("recently_online", (server, {})))
         self.client._process_ui_queue()
         self.client._activate_chatroom("local-a")
-        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 0")
+        self.assertEqual(self.client.recently_online_label.text(), "0 recently online")
 
     def test_recently_online_keeps_room_specific_fallback_without_cross_room_leaks(self):
         server = S.normalize_server_url(self.client.config_data["server_url"])
@@ -187,15 +187,15 @@ class UiSizePresetTests(unittest.TestCase):
         })))
         self.client._process_ui_queue()
         self.client._activate_chatroom("private")
-        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 2")
+        self.assertEqual(self.client.recently_online_label.text(), "2 recently online")
         self.client.config_data["server_url"] = "https://new.example"
         self.client._update_recently_online_label()
-        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 2")
+        self.assertEqual(self.client.recently_online_label.text(), "2 recently online")
         self.client._activate_chatroom(S.GLOBAL_CHATROOM_ID)
-        self.assertEqual(self.client.recently_online_label.text(), "Recently online: 7")
+        self.assertEqual(self.client.recently_online_label.text(), "7 recently online")
         self.client.config_data["chatrooms"][0]["key"] = "replacement-key"
         self.client._activate_chatroom("private")
-        self.assertEqual(self.client.recently_online_label.text(), "Recently online: …")
+        self.assertEqual(self.client.recently_online_label.text(), "… recently online")
 
     def test_small_is_default_and_presets_match_requested_sizes(self):
         self.assertEqual(S.DEFAULT_UI_SIZE, "Small (Default)")
