@@ -657,6 +657,7 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "cdn.donmai.*",
     "pbs.twimg.com",
     "i.imgur.com",
+    "i.kym-cdn.com",
     "images.unsplash.com",
     "images.pexels.com",
     "cdn.bsky.app",
@@ -788,6 +789,7 @@ TRUSTED_LINK_DOMAINS = (
     "myanimelist.net",
 )
 TRUSTED_LINK_EXACT_HOSTS = (
+    "i.kym-cdn.com",
     "adriansblinkiecollection.neocities.org",
     "steamuserimages-a.akamaihd.net",
     "ak.picdn.net",
