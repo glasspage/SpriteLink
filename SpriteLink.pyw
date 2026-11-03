@@ -10956,11 +10956,17 @@ QComboBox::drop-down {
     def _show_chat_search_results(self, generation: int, matches: Any, next_page: Any) -> None:
         if generation != self._search_generation:
             return
-        self._search_running = False
         if matches is None:
+            self._search_running = False
             self.search_status.setText("Could not read chat history.")
             return
-        for sort_key, message_id, timestamp, message in matches:
+        def append_next(index: int) -> None:
+            if generation != self._search_generation or self._closing:
+                return
+            if index == len(matches):
+                self._finish_chat_search_page(next_page)
+                return
+            sort_key, message_id, timestamp, message = matches[index]
             frame = QFrame()
             frame.setFrameShape(QFrame.Shape.StyledPanel)
             frame.setFrameShadow(QFrame.Shadow.Sunken)
@@ -10978,6 +10984,13 @@ QComboBox::drop-down {
             layout.addWidget(self._search_result_message(message))
             self.search_results_layout.addWidget(frame)
             self._apply_ui_size_to_widget_tree(frame)
+            # Yield to scroll, paint and media events between result cards.
+            QTimer.singleShot(24, lambda: append_next(index + 1))
+
+        append_next(0)
+
+    def _finish_chat_search_page(self, next_page: Any) -> None:
+        self._search_running = False
         self._search_before = next_page
         if next_page is not None:
             self._start_chat_search()
