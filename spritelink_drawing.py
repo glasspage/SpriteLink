@@ -96,6 +96,7 @@ class PixelView(QWidget):
 class DrawingCanvas(PixelView):
     changed = Signal()
     resized = Signal()
+    selectionFinished = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -231,7 +232,7 @@ class DrawingCanvas(PixelView):
         self._primary = int(event.button() == Qt.MouseButton.RightButton)
         self._start = self._last = point
         self._move_rect = QRect(self.selection)
-        if self.tool == "Pencil":
+        if self.tool in ("Pencil", "Line"):
             self._line(point, point)
         elif self.tool == "Bucket":
             self._fill(point)
@@ -245,6 +246,9 @@ class DrawingCanvas(PixelView):
         point = self._point(event.position())
         if self.tool == "Pencil":
             self._line(self._last, point)
+        elif self.tool == "Line":
+            self.pixels[:] = self._before[1]
+            self._line(self._start, point)
         elif self.tool == "Select":
             self.selection = QRect(self._start, point).normalized()
         elif self.tool == "Move":
@@ -261,6 +265,8 @@ class DrawingCanvas(PixelView):
             self.redo_stack.clear()
             self.edited = True
         self._before = None
+        if self.tool == "Select":
+            self.selectionFinished.emit()
         self.changed.emit()
 
 
@@ -294,14 +300,17 @@ class DrawingMenu(QFrame):
         tools = QVBoxLayout()
         tool_group = QButtonGroup(self)
         self.canvas = DrawingCanvas()
-        for label in ("Pencil", "Bucket", "Select", "Move"):
+        for label in ("Pencil", "Line", "Bucket", "Select", "Move"):
+            if label == "Select":
+                tools.addStretch()
             button = QPushButton(label)
             button.setCheckable(True)
             button.setChecked(label == "Pencil")
             button.clicked.connect(lambda _checked, name=label: setattr(self.canvas, "tool", name))
             tool_group.addButton(button)
             tools.addWidget(button)
-        tools.addStretch()
+            if label == "Move":
+                self.canvas.selectionFinished.connect(button.click)
         row.addLayout(tools)
         row.addWidget(self.canvas, 1)
 
