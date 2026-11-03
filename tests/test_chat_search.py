@@ -3,10 +3,11 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
-from PySide6.QtCore import QUrl
-from PySide6.QtGui import QColor, QTextDocument
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QColor, QImage, QTextDocument
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QPushButton
+from PySide6.QtWidgets import QLabel, QPushButton
+from spritelink_video import VideoInfo
 from test_startup import DeferredStartupTests
 from test_security import SPRITELINK as S
 
@@ -73,6 +74,49 @@ class ChatSearchTests(unittest.TestCase):
         self.assertFalse(image.isNull())
         self.client.config_data["ui_size"] = "Tiny"
         self.assertNotIn("<img", self.client._search_result_message(message).text())
+
+    def test_search_embeds_noninteractive_media_and_clears_query_on_room_change(self):
+        client = self.client
+        self.root.show()
+        client.search_toggle.click()
+        client.search_entry.setText("find me")
+        client.search_timer.stop()
+        image_url = "https://i.imgur.com/example.png"
+        video_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        image = QImage(40, 30, QImage.Format.Format_RGB32)
+        image.fill(QColor("blue"))
+        link = S.video_link(video_url, lambda _: True)
+        client.image_preview_cache[video_url] = S.RemoteMediaPreview(
+            video_url, b"", "video", image, VideoInfo(link, "youtube.com"),
+        )
+        message = client._build_draft_message(f"find me {image_url} {video_url}")
+        with mock.patch.object(client, "_schedule_image_preview_fetch") as fetch:
+            client._show_chat_search_results(client._search_generation, [
+                ((1, 1, message["i"]), message["i"], 1, message),
+            ], None)
+            fetch.assert_called_once_with(image_url)
+        frame = client.search_results_layout.itemAt(0).widget()
+        previews = frame.findChildren(QLabel, "searchMediaPreview")
+        self.assertEqual(len(previews), 2)
+        self.assertTrue(previews[0].isHidden())
+        self.assertFalse(previews[1].pixmap().isNull())
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "preview.png"
+            image.save(str(path))
+            client.ui_queue.put(("image_preview_loaded", {
+                "url": image_url, "kind": "static_image", "data": path.read_bytes(),
+            }))
+            client._process_ui_queue()
+        self.assertFalse(previews[0].pixmap().isNull())
+        for preview in previews:
+            self.assertTrue(preview.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents))
+        client.config_data["chatrooms"] = [
+            {"id": "room-b", "nickname": "Room B", "key": "b" * 32},
+        ]
+        client._activate_chatroom("room-b")
+        self.assertTrue(client.search_overlay.isHidden())
+        self.assertEqual(client.search_entry.text(), "")
+        self.assertFalse(client._search_media_labels)
 
     def test_saved_history_search_pagination_and_jump(self):
         client = self.client

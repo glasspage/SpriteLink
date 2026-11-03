@@ -10833,6 +10833,7 @@ QComboBox::drop-down {
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         results = QWidget()
         self.search_results_layout = QVBoxLayout(results)
+        self._search_media_labels: dict[str, list[QLabel]] = {}
         self.search_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(results)
         panel_layout.addWidget(scroll, 1)
@@ -10862,6 +10863,7 @@ QComboBox::drop-down {
                 self._search_generation += 1
                 self._pending_search_jump = None
                 self.search_timer.stop()
+                self._search_media_labels.clear()
                 self.search_overlay.hide()
                 self.message_entry.setFocus()
             return
@@ -10881,6 +10883,7 @@ QComboBox::drop-down {
         self._pending_search_jump = None
         self._search_before = None
         self._search_running = False
+        self._search_media_labels.clear()
         while self.search_results_layout.count():
             self.search_results_layout.takeAt(0).widget().deleteLater()
         self.search_more_button.hide()
@@ -10976,11 +10979,54 @@ QComboBox::drop-down {
             header.addWidget(jump)
             layout.addLayout(header)
             layout.addWidget(self._search_result_message(message))
+            self._add_search_media_previews(layout, message)
             self.search_results_layout.addWidget(frame)
             self._apply_ui_size_to_widget_tree(frame)
         self._search_before = next_page
         self.search_more_button.setVisible(next_page is not None)
         self.search_status.setText("" if self.search_results_layout.count() else "No matches.")
+
+    def _add_search_media_previews(
+        self, layout: QVBoxLayout, message: dict[str, Any],
+    ) -> None:
+        client_id = str(message["c"])
+        is_local = client_id == self._authenticated_client_id()
+        trusted = self._room_preference_ids("trusted_link_and_image_users")
+        text = message_plain_text_with_spoilers_redacted(str(message["m"]))
+        for url in direct_image_urls_in_message(text):
+            if not is_image_url_trusted_for_sender(url, client_id, is_local, trusted):
+                continue
+            label = QLabel()
+            label.setObjectName("searchMediaPreview")
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            layout.addWidget(label, 0, Qt.AlignmentFlag.AlignLeft)
+            label.hide()
+            self._search_media_labels.setdefault(url, []).append(label)
+            if url in self.image_preview_cache:
+                self._update_search_media_preview(url, self.image_preview_cache[url])
+            else:
+                self._schedule_image_preview_fetch(url)
+
+    def _update_search_media_preview(
+        self, url: str, media: RemoteMediaPreview | None,
+    ) -> None:
+        labels = getattr(self, "_search_media_labels", {}).get(url)
+        if not labels or media is None:
+            return
+        if media.frame is None and not is_likely_nsfw_image_url(url):
+            self._ensure_animated_media_controller(url, media)
+        pixmap = QPixmap.fromImage(self._embedded_media_preview(url, media))
+        for label in labels:
+            label.setPixmap(pixmap)
+            label.show()
+
+    def _stop_search_preview_loop(self, url: str) -> None:
+        if url in self.viewport_embedded_image_urls or url == self.current_image_preview_url:
+            return
+        controller = self.animated_media_controllers.pop(url, None)
+        if controller is not None:
+            controller.stop()
+            controller.deleteLater()
 
     def _search_result_message(self, message: dict[str, Any]) -> QLabel:
         document = QTextDocument()
@@ -11442,7 +11488,12 @@ QComboBox::drop-down {
         media = self.image_preview_cache.get(url)
         if not isinstance(media, RemoteMediaPreview):
             return
+        had_frame = media.frame is not None
         media.frame = frame_value
+        if not had_frame:
+            self._update_search_media_preview(url, media)
+            if media.kind == "looping_video" and url in getattr(self, "_search_media_labels", {}):
+                QTimer.singleShot(0, lambda: self._stop_search_preview_loop(url))
         if media.kind == "video" and media.video_info is not None:
             controller = self.animated_media_controllers.get(url)
             if isinstance(controller, DirectVideoThumbnail) and controller.duration:
@@ -14088,6 +14139,7 @@ QComboBox::drop-down {
                                     candidate,
                                 )
                     self.image_preview_cache[url] = media
+                    self._update_search_media_preview(url, media)
                     while (
                         len(self.image_preview_cache)
                         > IMAGE_PREVIEW_CACHE_LIMIT
@@ -17753,6 +17805,9 @@ QComboBox::drop-down {
 
     def _clear_visible_room(self, *, preserve_detached_video: bool = False) -> None:
         self.search_toggle.setChecked(False)
+        if hasattr(self, "search_entry"):
+            self.search_entry.clear()
+            self.search_timer.stop()
         self._reset_history_render_window()
         self._hide_chat_tooltip()
         if hasattr(self, "link_warning_overlay") and self.link_warning_overlay.isVisible():
