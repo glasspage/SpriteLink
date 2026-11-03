@@ -3099,8 +3099,6 @@ def message_text_for_search(
     if not filters:
         return text
     for _start, _end, url in message_url_spans(text):
-        if "Links" in filters:
-            return text
         try:
             parsed = urlsplit(url)
         except ValueError:
@@ -3111,11 +3109,13 @@ def message_text_for_search(
             or _url_has_video_extension(parsed)
             or parsed.hostname in ("redgifs.com", "www.redgifs.com")
         )
-        if "Videos" in filters and video:
-            return text
-        if "Images" in filters and not video and (
-            is_direct_image_url(url) or is_supported_media_page_url(url)
-        ):
+        if video:
+            category = "Videos"
+        elif is_direct_image_url(url) or is_supported_media_page_url(url):
+            category = "Images"
+        else:
+            category = "Links"
+        if category in filters:
             return text
     return None
 
