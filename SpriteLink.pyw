@@ -6751,11 +6751,13 @@ class SearchResultMessage(MessageLogBrowser):
         self.setSizePolicy(policy)
 
     def heightForWidth(self, width: int) -> int:
-        self.document().setTextWidth(max(1, width))
-        return math.ceil(self.document().size().height())
+        self.ensurePolished()
+        viewport = self.maximumViewportSize()
+        self.document().setTextWidth(max(1, width - (self.width() - viewport.width())))
+        return math.ceil(self.document().size().height()) + self.height() - viewport.height()
 
     def sizeHint(self) -> QSize:
-        return QSize(0, self.heightForWidth(self.viewport().width()))
+        return QSize(0, self.heightForWidth(self.width()))
 
     def minimumSizeHint(self) -> QSize:
         return QSize(0, 0)
