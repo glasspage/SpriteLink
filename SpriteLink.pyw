@@ -3142,9 +3142,9 @@ def message_text_for_search(
             or parsed.hostname in ("redgifs.com", "www.redgifs.com")
         )
         if video:
-            category = "Videos"
+            category = "Embedded Videos"
         elif is_direct_image_url(url) or is_supported_media_page_url(url):
-            category = "Images"
+            category = "Embedded Images"
         else:
             category = "Links"
         if category in filters:
@@ -11206,7 +11206,8 @@ QComboBox::drop-down {
         panel_layout.addWidget(self.search_entry)
         filters = QHBoxLayout()
         self.search_filters = {
-            name: QCheckBox(name) for name in ("Links", "Images", "Videos")
+            name: QCheckBox(name)
+            for name in ("Images", "Links", "Embedded Images", "Embedded Videos")
         }
         for checkbox in self.search_filters.values():
             filters.addWidget(checkbox)

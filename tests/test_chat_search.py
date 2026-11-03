@@ -79,13 +79,17 @@ class ChatSearchTests(unittest.TestCase):
         self.assertIsNone(find("https://i.imgur.com/example.png", "", "Links"))
         self.assertIsNone(find("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "", "Links"))
         self.assertIsNotNone(find("https://i.imgur.com/example.png https://example.org", "", "Links"))
-        self.assertIsNotNone(find("https://i.imgur.com/example.png", "", "Links", "Images"))
-        self.assertIsNotNone(find("https://i.imgur.com/example.png", "", "Images"))
-        self.assertIsNotNone(find("https://example.org/example.mp4", "", "Videos"))
-        self.assertIsNotNone(find("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "", "Videos"))
-        self.assertIsNone(find("https://example.org/example.mp4", "", "Images"))
-        self.assertIsNone(find("https://i.imgur.com/example.png", "unrelated", "Images"))
-        self.assertIsNotNone(find("https://example.org/example.mp4", "", "Images", "Videos"))
+        self.assertIsNotNone(find("https://i.imgur.com/example.png", "", "Links", "Embedded Images"))
+        self.assertIsNotNone(find("https://i.imgur.com/example.png", "", "Embedded Images"))
+        self.assertIsNone(find("https://i.imgur.com/example.png", "", "Images"))
+        drawing = {"message": {"m": "", "drawing": S.encode_drawing(0, bytes(5400))}}
+        self.assertEqual(S.message_text_for_search(drawing, "", {"Images"}), "")
+        self.assertIsNone(S.message_text_for_search(drawing, "", {"Embedded Images", "Embedded Videos"}))
+        self.assertIsNotNone(find("https://example.org/example.mp4", "", "Embedded Videos"))
+        self.assertIsNotNone(find("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "", "Embedded Videos"))
+        self.assertIsNone(find("https://example.org/example.mp4", "", "Embedded Images"))
+        self.assertIsNone(find("https://i.imgur.com/example.png", "unrelated", "Embedded Images"))
+        self.assertIsNotNone(find("https://example.org/example.mp4", "", "Embedded Images", "Embedded Videos"))
 
     def test_search_message_uses_chat_formatting_and_lighter_background(self):
         client = self.client
