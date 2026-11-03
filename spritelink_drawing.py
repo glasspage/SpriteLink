@@ -16,9 +16,18 @@ from spritelink_image_codec import IMAGE_PALETTES, IMAGE_SIZES
 PALETTE_ORDER = (0, 3, 2, 4, 1)
 PALETTE_NAMES = ("Basic", "Grayscale", "Nature", "Pastel", "Sunset")
 BASIC_SWATCH_ORDER = (0, 7, 1, 2, 3, 4, 5, 6)
-SWATCH_ORDERS = (BASIC_SWATCH_ORDER, (0, 2, 3, 4, 5, 6, 7, 1), tuple(range(8)), BASIC_SWATCH_ORDER, tuple(range(8)))
-# Shared color slots preserve the shadow and highlight across palettes.
-PALETTE_SLOTS = (tuple(range(8)), tuple(range(8)), (7, 0, 1, 2, 3, 4, 5, 6), tuple(range(8)), (7, 0, 1, 2, 3, 4, 5, 6))
+GRAYSCALE_SWATCH_ORDER = (0, 2, 3, 4, 5, 6, 7, 1)
+REVERSED_SWATCH_ORDER = tuple(range(7, -1, -1))
+SWATCH_ORDERS = (
+    BASIC_SWATCH_ORDER, GRAYSCALE_SWATCH_ORDER, REVERSED_SWATCH_ORDER,
+    BASIC_SWATCH_ORDER, REVERSED_SWATCH_ORDER,
+)
+# Shared slots start with shadow and highlight, then the six middle shades.
+REVERSED_PALETTE_SLOTS = (7, 0, 6, 5, 4, 3, 2, 1)
+PALETTE_SLOTS = (
+    tuple(range(8)), tuple(range(8)), REVERSED_PALETTE_SLOTS,
+    tuple(range(8)), REVERSED_PALETTE_SLOTS,
+)
 PALETTE_BACKGROUNDS = (1, 1, 0, 1, 0)
 COLOR_TABLES = [[QColor(color).rgb() for color in palette] for palette in IMAGE_PALETTES]
 BACKGROUND_NAMES = (
