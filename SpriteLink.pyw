@@ -10573,7 +10573,7 @@ QComboBox::drop-down {
         self.image_menu.changed.connect(self._on_drawing_changed)
         self.image_menu.importRequested.connect(self._open_drawing_import)
         self.image_menu.hide()
-        content_layout.addWidget(self.image_menu, 1)
+        content_layout.addWidget(self.image_menu, 2)
         content_layout.addLayout(composer_actions)
 
         compose_layout = QGridLayout()

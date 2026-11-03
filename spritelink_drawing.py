@@ -487,10 +487,7 @@ def load_import_image(path: str) -> Image.Image:
     with Image.open(path) as source:
         if source.width * source.height > 24_000_000:
             raise ValueError("Choose an image under 24 megapixels.")
-        image = ImageOps.exif_transpose(source).convert("RGBA")
-    background = Image.new("RGB", image.size, "white")
-    background.paste(image, mask=image.getchannel("A"))
-    return background
+        return ImageOps.exif_transpose(source).convert("RGBA")
 
 
 class DrawingImportPanel(QFrame):
@@ -527,6 +524,15 @@ class DrawingImportPanel(QFrame):
         settings.addWidget(self.mode)
         self.dither = QCheckBox("Dither")
         settings.addWidget(self.dither)
+        settings.addWidget(QLabel("Background"))
+        self.background = combo_type()
+        self.background.setAccessibleName("Background")
+        for index, color in enumerate(IMAGE_PALETTE):
+            self.background.addItem(preview_icon(bytes([index]) * 256), "")
+            self.background.setItemData(index, color, Qt.ItemDataRole.ToolTipRole)
+            self.background.setItemData(index, color, Qt.ItemDataRole.AccessibleTextRole)
+        self.background.setCurrentIndex(1)
+        settings.addWidget(self.background)
         settings.addStretch()
         layout.addLayout(settings)
 
@@ -551,6 +557,7 @@ class DrawingImportPanel(QFrame):
         self.size_combo.currentIndexChanged.connect(lambda _index: self.set_zoom(self.preset))
         self.mode.currentIndexChanged.connect(self.refresh)
         self.dither.toggled.connect(self.refresh)
+        self.background.currentIndexChanged.connect(self.refresh)
         self.set_zoom("Fill")
 
     def set_zoom(self, preset: str) -> None:
@@ -582,16 +589,27 @@ class DrawingImportPanel(QFrame):
             (inv / reduction, 0, ((self.source.width - width * inv) / 2 - pan.x() * inv) / reduction,
              0, inv / reduction, ((self.source.height - height * inv) / 2 - pan.y() * inv) / reduction),
             resample=Image.Resampling.NEAREST if self.zoom == 1 else Image.Resampling.BICUBIC,
-            fillcolor=(255, 255, 255),
+            fillcolor=(0, 0, 0, 0),
         )
-        indices = (0, 1, 7) if self.mode.currentIndex() else tuple(range(len(COLORS)))
-        if self.mode.currentIndex():
-            image = ImageOps.grayscale(image).convert("RGB")
+        background = self.background.currentIndex()
+        alpha = image.getchannel("A")
+        rgb = Image.new("RGB", image.size, IMAGE_PALETTE[background])
+        rgb.paste(image.convert("RGB"), mask=alpha)
+        grayscale = self.mode.currentIndex() == 1
+        indices = (0, 1, 7) if grayscale else tuple(range(len(COLORS)))
+        if grayscale:
+            rgb = ImageOps.grayscale(rgb).convert("RGB")
         palette = Image.new("P", (1, 1))
-        rgb = [QColor(IMAGE_PALETTE[index]).getRgb()[:3] for index in indices]
-        palette.putpalette([channel for color in rgb for channel in color])
-        dither = Image.Dither.FLOYDSTEINBERG if self.dither.isChecked() else Image.Dither.NONE
-        converted = image.quantize(palette=palette, dither=dither)
+        colors = [QColor(IMAGE_PALETTE[index]).getRgb()[:3] for index in indices]
+        palette.putpalette([channel for color in colors for channel in color])
+        converted = rgb.quantize(palette=palette, dither=Image.Dither.NONE)
+        if self.dither.isChecked():
+            # Pull colors toward their nearest swatch before diffusing the residual.
+            softened = Image.blend(rgb, converted.convert("RGB"), 0.25)
+            converted = softened.quantize(palette=palette, dither=Image.Dither.FLOYDSTEINBERG)
         self.preview.canvas_size = size
-        self.preview.pixels = bytes(indices[index] for index in converted.tobytes())
+        self.preview.pixels = bytes(
+            indices[index] if opacity else background
+            for index, opacity in zip(converted.tobytes(), alpha.tobytes())
+        )
         self.preview.update()
