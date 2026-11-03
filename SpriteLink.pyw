@@ -77,6 +77,7 @@ try:
         QPixmapCache,
         QPolygon,
         QRegion,
+        QShortcut,
         QTextBlockFormat,
         QTextBlockUserData,
         QTextCharFormat,
@@ -200,6 +201,11 @@ except ImportError as exc:
         "Missing dependency: Pillow\n\nInstall it with:\n"
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
+
+from spritelink_drawing import (
+    DrawingImportPanel, DrawingMenu, drawing_image, load_import_image,
+)
+from spritelink_image_codec import decode_drawing, encode_drawing
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
@@ -2321,6 +2327,8 @@ def group_messages_for_display(
         )
         should_combine = (
             same_remote_user
+            and "drawing" not in message
+            and "drawing" not in previous_message
             and message_items_are_contiguous(previous_item, item)
             and (
                 client_id in muted_user_ids
@@ -2368,6 +2376,8 @@ def consecutive_duplicate_message_ordinal(
     ntfy_time: int,
     ntfy_id: str | None = None,
 ) -> int:
+    if "drawing" in message:
+        return 1
     current_item = {
         "message": message,
         "is_local": False,
@@ -2387,6 +2397,7 @@ def consecutive_duplicate_message_ordinal(
         if (
             str(previous_message.get("c", ""))
             != str(message.get("c", ""))
+            or "drawing" in previous_message
             or str(previous_message.get("m", ""))
             != str(message.get("m", ""))
             or not message_items_are_contiguous(
@@ -3092,6 +3103,8 @@ def is_likely_nsfw_image_url(url: str) -> bool:
 def message_text_for_search(
     item: dict[str, Any], query: str, filters: set[str],
 ) -> str | None:
+    if "drawing" in item["message"]:
+        return "" if not query and (not filters or "Images" in filters) else None
     raw_text = item["message"].get("m")
     if not isinstance(raw_text, str):
         return None
@@ -3346,6 +3359,8 @@ def _signed_message_payload(
         message["t"],
         message["m"],
     ]
+    if "drawing" in message:
+        values.append(message["drawing"])
     return json.dumps(
         values,
         ensure_ascii=False,
@@ -7154,6 +7169,7 @@ class EncryptedChatClient(QObject):
         self.pending_history_entries: list[dict[str, Any]] = []
         self.draft_message_id = uuid.uuid4().hex
         self.chatroom_drafts: dict[str, str] = {}
+        self.drawing_drafts: dict[str, tuple[int, bytes, bool]] = {}
         self.read_divider_message_ids: dict[str, str] = {}
         self.read_divider_visible_seconds: dict[str, float] = {}
         self._read_divider_last_tick = time.monotonic()
@@ -8765,6 +8781,7 @@ QComboBox::drop-down {
         for overlay_name in (
             "config_overlay",
             "search_overlay",
+            "drawing_import_overlay",
             "message_limit_overlay",
             "image_preview_overlay",
             "link_warning_overlay",
@@ -9875,6 +9892,7 @@ QComboBox::drop-down {
         self.config_data.get("room_settings", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
         self.chatroom_drafts.pop(room_id, None)
+        self.drawing_drafts.pop(room_id, None)
         self._request_subscription_refresh()
 
         if self.active_chatroom_id == room_id:
@@ -10416,6 +10434,10 @@ QComboBox::drop-down {
             self._on_formatting_menu_toggled
         )
         composer_actions.addWidget(self.formatting_menu_button)
+        self.image_menu_button = QPushButton("Image")
+        self.image_menu_button.setCheckable(True)
+        self.image_menu_button.toggled.connect(self._on_image_menu_toggled)
+        composer_actions.addWidget(self.image_menu_button)
         composer_actions.addStretch(1)
 
         self.identity_menu = QFrame()
@@ -10547,6 +10569,11 @@ QComboBox::drop-down {
         formatting_layout.addStretch(1)
         self.formatting_menu.hide()
         content_layout.addWidget(self.formatting_menu)
+        self.image_menu = DrawingMenu(ThemeComboBox)
+        self.image_menu.changed.connect(self._on_drawing_changed)
+        self.image_menu.importRequested.connect(self._open_drawing_import)
+        self.image_menu.hide()
+        content_layout.addWidget(self.image_menu)
         content_layout.addLayout(composer_actions)
 
         compose_layout = QGridLayout()
@@ -10579,6 +10606,10 @@ QComboBox::drop-down {
             self._toggle_composer_formatting_shortcut
         )
         compose_layout.addWidget(self.message_entry, 0, 0)
+        self.image_composer_label = QLabel("Image message")
+        self.image_composer_label.setIndent(5)
+        self.image_composer_label.hide()
+        compose_layout.addWidget(self.image_composer_label, 0, 0)
 
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self._send_current_message)
@@ -10638,6 +10669,66 @@ QComboBox::drop-down {
             self._sync_formatting_buttons()
         self._restore_chat_bottom_after_layout_change(keep_at_bottom)
 
+    def _on_image_menu_toggled(self, checked: bool) -> None:
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
+        self._set_composer_menu_visibility(self.image_menu if checked else None)
+        if checked:
+            self.image_menu.canvas.setFocus()
+        else:
+            self.message_entry.setFocus()
+        self._restore_chat_bottom_after_layout_change(keep_at_bottom)
+
+    def _on_drawing_changed(self) -> None:
+        self.drawing_drafts[self.active_chatroom_id] = self.image_menu.canvas.snapshot()
+        if self.image_menu_button.isChecked():
+            self.message_size_check_pending = True
+            self.message_size_timer.start(MESSAGE_SIZE_DEBOUNCE_MS)
+            self._draw_message_size_bar()
+
+    def _open_drawing_import(self) -> None:
+        self._close_drawing_import()
+        path, _ = QFileDialog.getOpenFileName(
+            self.root, "Import image", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            source = load_import_image(path)
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
+            messagebox.showerror("Cannot import image", str(exc), parent=self.root)
+            return
+
+        overlay = ConfigOverlay(self.chat_content)
+        self.drawing_import_overlay = overlay
+        panel = DrawingImportPanel(source, ThemeComboBox)
+        overlay.panel = panel
+        layout = QVBoxLayout(overlay)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.addWidget(panel)
+        overlay.dismissed.connect(self._close_drawing_import)
+        escape = QShortcut(Qt.Key.Key_Escape, overlay)
+        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        escape.activated.connect(self._close_drawing_import)
+        panel.dismissed.connect(self._close_drawing_import)
+        panel.accepted.connect(self._apply_drawing_import)
+        self._apply_ui_size_to_widget_tree(overlay)
+        overlay.setGeometry(self.chat_content.rect())
+        overlay.show()
+        overlay.raise_()
+        panel.size_combo.setFocus()
+
+    def _apply_drawing_import(self, size: int, pixels: bytes) -> None:
+        self.image_menu.canvas.replace(size, pixels)
+        self._close_drawing_import()
+
+    def _close_drawing_import(self) -> None:
+        overlay = getattr(self, "drawing_import_overlay", None)
+        if overlay is not None:
+            self.drawing_import_overlay = None
+            overlay.hide()
+            overlay.deleteLater()
+
     def _set_composer_menu_visibility(
         self,
         visible_menu: QWidget | None,
@@ -10649,10 +10740,18 @@ QComboBox::drop-down {
                 (self.identity_menu, self.identity_menu_button),
                 (self.font_menu, self.font_menu_button),
                 (self.formatting_menu, self.formatting_menu_button),
+                (self.image_menu, self.image_menu_button),
             ):
                 should_show = menu is visible_menu
                 self._set_button_checked(button, should_show)
                 menu.setVisible(should_show)
+            drawing = visible_menu is self.image_menu
+            self.message_entry.setVisible(not drawing)
+            self.image_composer_label.setVisible(drawing)
+            if not drawing:
+                self._close_drawing_import()
+            self._cancel_pending_message_size_check()
+            self._run_message_size_check()
             content_layout = self.chat_content.layout()
             if content_layout is not None:
                 content_layout.activate()
@@ -11092,6 +11191,7 @@ QComboBox::drop-down {
         if not self._dismiss_config_popup():
             self.search_toggle.setChecked(False)
             return
+        self._close_drawing_import()
         if not hasattr(self, "search_overlay"):
             self._build_search_popup()
         self.search_heading.setText(f"Search in {self._active_chatroom()['nickname']}")
@@ -11362,6 +11462,9 @@ QComboBox::drop-down {
                 formatting.setWidth(image.width())
                 formatting.setHeight(image.height())
                 cursor.insertImage(formatting)
+        if "drawing" in message:
+            cursor.insertBlock()
+            self._insert_inline_drawing(cursor, message["drawing"])
         return document.toHtml()
 
     def _jump_to_search_result(self, message_id: str, order: tuple[int, int, str]) -> None:
@@ -12692,6 +12795,7 @@ QComboBox::drop-down {
 
     def _on_config_toggled(self, checked: bool) -> None:
         if checked:
+            self._close_drawing_import()
             self.search_toggle.setChecked(False)
             self._ensure_popup("config")
             self._config_snapshot_at_open = self._config_ui_snapshot()
@@ -13054,7 +13158,7 @@ QComboBox::drop-down {
         self._request_network_refresh(poll_immediately=True)
         return True
 
-    def _build_draft_message(self, text: str) -> dict[str, Any]:
+    def _build_draft_message(self, text: str, drawing: str = "") -> dict[str, Any]:
         profile = self._active_room_profile()
         text = trim_message_text(text)
 
@@ -13068,6 +13172,9 @@ QComboBox::drop-down {
             "t": int(time.time()),
             "m": text,
         }
+        if drawing:
+            message["m"] = ""
+            message["drawing"] = drawing
         if profile["profile_icon"]:
             message["p"] = profile["profile_icon"]
         return sign_message_identity(
@@ -13077,6 +13184,15 @@ QComboBox::drop-down {
         )
 
     def _restore_active_chatroom_draft(self) -> None:
+        canvas = self.image_menu.canvas
+        state = self.drawing_drafts.get(self.active_chatroom_id)
+        canvas.undo_stack.clear()
+        canvas.redo_stack.clear()
+        if state is None:
+            canvas.canvas_size = 0
+            canvas.reset()
+        else:
+            canvas.restore(state)
         self._cancel_pending_message_size_check()
         signals_were_blocked = self.message_entry.blockSignals(True)
         try:
@@ -13150,12 +13266,21 @@ QComboBox::drop-down {
         self.message_size_timer.stop()
         self.message_size_check_pending = False
 
+    def _drawing_payload(self) -> str:
+        canvas = self.image_menu.canvas
+        if self.image_menu_button.isChecked() and canvas.edited:
+            return encode_drawing(canvas.canvas_size, bytes(canvas.pixels))
+        return ""
+
     def _run_message_size_check(self) -> None:
         self.message_size_check_pending = False
         text = trim_message_text(self.message_entry.to_message_text())
 
         try:
-            draft_message = self._build_draft_message(text)
+            draft_message = self._build_draft_message(
+                "" if self.image_menu_button.isChecked() else text,
+                self._drawing_payload(),
+            )
             self.current_estimated_packet_size = estimate_opaque_packet_size(
                 draft_message
             )
@@ -13321,15 +13446,21 @@ QComboBox::drop-down {
             )
 
         self.send_button.setEnabled(
-            self.message_size_check_pending or not at_or_over_limit
+            (self.message_size_check_pending or not at_or_over_limit)
+            and (not self.image_menu_button.isChecked() or self.image_menu.canvas.edited)
         )
 
     def _send_current_message(self) -> None:
-        text = trim_message_text(self.message_entry.to_message_text())
-        plain_text = message_plain_text(text)
-
-        if not plain_text:
-            return
+        image_mode = self.image_menu_button.isChecked()
+        drawing = self._drawing_payload()
+        if image_mode:
+            if not drawing:
+                return
+            text = ""
+        else:
+            text = trim_message_text(self.message_entry.to_message_text())
+            if not message_plain_text(text):
+                return
 
         if len(text) > MAX_MESSAGE_CHARS:
             messagebox.showwarning(
@@ -13351,7 +13482,7 @@ QComboBox::drop-down {
 
         encryption_key = self._active_chatroom()["key"]
 
-        message = self._build_draft_message(text)
+        message = self._build_draft_message(text, drawing)
         (
             message["i"],
             self._last_outbound_message_order,
@@ -13419,9 +13550,12 @@ QComboBox::drop-down {
         })
         self.network_wakeup_event.set()
 
-        self.message_entry.clear()
-        self.message_entry.clear_formatting_state()
-        self._sync_formatting_buttons()
+        if image_mode:
+            self.image_menu.canvas.reset()
+        else:
+            self.message_entry.clear()
+            self.message_entry.clear_formatting_state()
+            self._sync_formatting_buttons()
         self.draft_message_id = uuid.uuid4().hex
         self._resize_message_entry()
         self._run_message_size_check()
@@ -14226,6 +14360,10 @@ QComboBox::drop-down {
             raise ValueError("Username contains unsupported characters.")
         if len(message["m"]) > MAX_MESSAGE_CHARS:
             raise ValueError("Message text is too long.")
+        if "drawing" in message:
+            if message["m"]:
+                raise ValueError("Drawings cannot contain message text.")
+            decode_drawing(message["drawing"])
         if not QColor(message["k"]).isValid():
             raise ValueError("Username color is invalid.")
 
@@ -14330,6 +14468,12 @@ QComboBox::drop-down {
                         f"Message could not be uploaded: {payload['error']}",
                         warning=True,
                     )
+                    if "drawing" in message:
+                        canvas = self.image_menu.canvas
+                        if not canvas.edited:
+                            size, pixels = decode_drawing(message["drawing"])
+                            canvas.replace(size, pixels)
+                        continue
                     self._append_system_message(
                         "Unsent text from "
                         f"{message['u']}: "
@@ -16270,6 +16414,8 @@ QComboBox::drop-down {
                 self._sync_config_overlay_geometry()
             if hasattr(self, "search_overlay"):
                 self.search_overlay.setGeometry(self.chat_content.rect())
+            if getattr(self, "drawing_import_overlay", None) is not None:
+                self.drawing_import_overlay.setGeometry(self.chat_content.rect())
             if hasattr(self, "message_limit_overlay"):
                 self._sync_message_limit_overlay_geometry()
             if hasattr(self, "image_preview_overlay"):
@@ -16559,6 +16705,21 @@ QComboBox::drop-down {
         formatting.setName(f"data:image/png;base64,{encoded}")
         return True
 
+    def _insert_inline_drawing(self, cursor: QTextCursor, encoded: str) -> None:
+        try:
+            size, pixels = decode_drawing(encoded)
+        except ValueError:
+            cursor.insertText("[Image unavailable]")
+            return
+        image = drawing_image(size, pixels)
+        image = image.scaled(image.width() * 2, image.height() * 2)
+        formatting = QTextImageFormat()
+        if self._set_inline_html_image(formatting, image):
+            formatting.setWidth(image.width())
+            formatting.setHeight(image.height())
+            formatting.setProperty(QTextFormat.Property.ImageAltText, "Drawing")
+            cursor.insertImage(formatting)
+
     def _insert_profile_icon(
         self,
         cursor: QTextCursor,
@@ -16727,12 +16888,23 @@ QComboBox::drop-down {
         )
 
         menu = QMenu(self.root)
-        copy_action = menu.addAction("Copy Message")
-        copy_action.triggered.connect(
-            lambda: QApplication.clipboard().setText(
-                message_plain_text(str(message["m"]))
+        if "drawing" in message:
+            copy_action = menu.addAction("Copy Image")
+            try:
+                size, pixels = decode_drawing(message["drawing"])
+            except ValueError:
+                copy_action.setEnabled(False)
+            else:
+                copy_action.triggered.connect(
+                    lambda: QApplication.clipboard().setImage(drawing_image(size, pixels))
+                )
+        else:
+            copy_action = menu.addAction("Copy Message")
+            copy_action.triggered.connect(
+                lambda: QApplication.clipboard().setText(
+                    message_plain_text(str(message["m"]))
+                )
             )
-        )
 
         collapse_action = menu.addAction(
             "Expand Message"
@@ -17838,7 +18010,8 @@ QComboBox::drop-down {
             message.get("o", DEFAULT_MESSAGE_TEXT_COLOR)
         )
         profile_icon = str(message.get("p", ""))
-        text = str(message["m"])
+        drawing = message.get("drawing")
+        text = "[Image]" if drawing else str(message["m"])
         message_id = str(message["i"])
         client_id = str(message["c"])
         user_id_preview = visible_user_id(client_id)
@@ -18059,6 +18232,10 @@ QComboBox::drop-down {
                     top_align_height=top_align_height,
                 ),
             )
+        elif drawing:
+            cursor.insertBlock()
+            self._insert_inline_drawing(cursor, drawing)
+            embedded_media_block_numbers.add(cursor.block().blockNumber())
         else:
             self._insert_message_text_with_links(
                 cursor,
@@ -18168,6 +18345,7 @@ QComboBox::drop-down {
         scrollbar.setValue(scrollbar.maximum())
 
     def _clear_visible_room(self, *, preserve_detached_video: bool = False) -> None:
+        self._close_drawing_import()
         self.search_toggle.setChecked(False)
         if hasattr(self, "search_entry"):
             self.search_entry.clear()
@@ -18235,10 +18413,10 @@ QComboBox::drop-down {
         room = self._find_chatroom(room_id)
         if room is None:
             return
-        body = (
-            f"{str(message.get('u', 'Unknown'))}: "
-            f"{message_plain_text(str(message.get('m', '')))}"
+        preview = "[Image]" if "drawing" in message else message_plain_text(
+            str(message.get("m", ""))
         )
+        body = f"{message.get('u', 'Unknown')}: {preview}"
         if len(body) > 1024:
             body = body[:1023] + "…"
         notification = (
