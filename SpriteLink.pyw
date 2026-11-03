@@ -11466,7 +11466,7 @@ QComboBox::drop-down {
         visible_text = message_text_without_image_links(plain_text, set(embedded_urls))
         icon = str(message.get("p", "")) if self._chat_icons_visible() else ""
         media_row = None
-        if embedded_urls and not visible_text.strip():
+        if "drawing" in message or (embedded_urls and not visible_text.strip()):
             # Separate cells keep the username at the top regardless of preview height.
             width = (
                 QFontMetrics(username_format.font()).horizontalAdvance(username)
@@ -11519,8 +11519,7 @@ QComboBox::drop-down {
                 formatting.setHeight(image.height())
                 cursor.insertImage(formatting)
         if "drawing" in message:
-            cursor.insertBlock()
-            self._insert_inline_drawing(cursor, message["drawing"])
+            self._insert_inline_drawing(cursor, self._inline_drawing_image(message["drawing"]))
         return document.toHtml()
 
     def _jump_to_search_result(self, message_id: str, order: tuple[int, int, str]) -> None:
@@ -16816,21 +16815,26 @@ QComboBox::drop-down {
         formatting.setName(f"data:image/png;base64,{encoded}")
         return True
 
-    def _insert_inline_drawing(
-        self, cursor: QTextCursor, encoded: str, *, message_id: str = "",
-    ) -> None:
+    @staticmethod
+    def _inline_drawing_image(encoded: str) -> QImage | None:
         try:
-            size, pixels, palette = decode_drawing(encoded)
+            image = drawing_image(*decode_drawing(encoded))
         except ValueError:
+            return None
+        return image.scaled(image.width() * 2, image.height() * 2)
+
+    def _insert_inline_drawing(
+        self, cursor: QTextCursor, image: QImage | None, *, message_id: str = "",
+    ) -> None:
+        if image is None:
             cursor.insertText("[Image unavailable]")
             return
-        image = drawing_image(size, pixels, palette)
-        image = image.scaled(image.width() * 2, image.height() * 2)
         formatting = QTextImageFormat()
         if self._set_inline_html_image(formatting, image):
             formatting.setWidth(image.width())
             formatting.setHeight(image.height())
             formatting.setProperty(QTextFormat.Property.ImageAltText, "Drawing")
+            formatting.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignTop)
             if message_id:
                 formatting.setAnchor(True)
                 formatting.setAnchorHref(f"spritelink-drawing:{message_id}")
@@ -18232,7 +18236,8 @@ QComboBox::drop-down {
         )
 
         self.rendered_message_items[message_id] = item
-        top_align_height = 0
+        drawing_preview = self._inline_drawing_image(drawing) if drawing and not is_collapsed else None
+        top_align_height = drawing_preview.height() if drawing_preview is not None else 0
         if (
             not is_collapsed
             and bool(displayed_image_urls)
@@ -18349,9 +18354,9 @@ QComboBox::drop-down {
                 ),
             )
         elif drawing:
-            cursor.insertBlock()
-            self._insert_inline_drawing(cursor, drawing, message_id=message_id)
-            embedded_media_block_numbers.add(cursor.block().blockNumber())
+            self._insert_inline_drawing(cursor, drawing_preview, message_id=message_id)
+            if drawing_preview is not None:
+                embedded_media_block_numbers.add(cursor.block().blockNumber())
         else:
             self._insert_message_text_with_links(
                 cursor,
