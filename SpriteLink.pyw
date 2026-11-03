@@ -10832,12 +10832,20 @@ QComboBox::drop-down {
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        # Reserve the gutter before the first card so overflow cannot rewrap results.
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
         results = QWidget()
         self.search_results_layout = QVBoxLayout(results)
+        content_layout.addWidget(results)
+        content_layout.addStretch(1)
         self._search_media_updates: dict[str, list[Callable[[], None]]] = {}
-        self.search_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        scroll.setWidget(results)
+        scroll.setWidget(content)
         panel_layout.addWidget(scroll, 1)
         footer = QHBoxLayout()
         self.search_status = QLabel()
@@ -10982,8 +10990,8 @@ QComboBox::drop-down {
             header.addWidget(jump)
             layout.addLayout(header)
             layout.addWidget(self._search_result_message(message))
-            self.search_results_layout.addWidget(frame)
             self._apply_ui_size_to_widget_tree(frame)
+            self.search_results_layout.addWidget(frame)
             # Yield to scroll, paint and media events between result cards.
             QTimer.singleShot(24, lambda: append_next(index + 1))
 
@@ -11044,7 +11052,9 @@ QComboBox::drop-down {
         ]
 
         def update() -> None:
-            body.setText(self._search_result_html(message, media_urls))
+            html = self._search_result_html(message, media_urls)
+            if html != body.text():
+                body.setText(html)
 
         update()
         for url in media_urls:
