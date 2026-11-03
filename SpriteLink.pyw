@@ -11525,7 +11525,7 @@ QComboBox::drop-down {
         self.chatroom_history_combo = ThemeComboBox()
         for index, option in enumerate(CHATROOM_HISTORY_OPTIONS):
             self.chatroom_history_combo.addItem(str(option))
-            megabytes = round(option * 4096 / 1_000_000)
+            megabytes = option * 4 // 1000
             self.chatroom_history_combo.setItemData(
                 index,
                 f"Chatroom max storage: ~{megabytes} MB",
@@ -18137,6 +18137,17 @@ def main() -> None:
             parent=root,
         )
         return
+    if pending and client._chatroom_history_limit() < DEFAULT_CHATROOM_HISTORY_LIMIT:
+        client.chatroom_history_limit_var.set(DEFAULT_CHATROOM_HISTORY_LIMIT)
+        client.config_data["chatroom_history_limit"] = DEFAULT_CHATROOM_HISTORY_LIMIT
+        try:
+            save_config(client.config_data)
+        except OSError:
+            messagebox.showerror(
+                "Chatroom History",
+                "Chat history was upgraded, but the new history limit could not be saved.",
+                parent=root,
+            )
     QTimer.singleShot(50, client.prepare_after_show)
     if notification_room_id is not None:
         QTimer.singleShot(
