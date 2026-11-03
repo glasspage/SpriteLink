@@ -15,6 +15,9 @@ from spritelink_image_codec import IMAGE_PALETTES, IMAGE_SIZES
 
 PALETTE_ORDER = (0, 2, 1)
 PALETTE_NAMES = ("Basic", "Grayscale", "Nature")
+SWATCH_ORDERS = ((0, 7, 1, 2, 3, 4, 5, 6), (0, 2, 3, 4, 5, 6, 7, 1), tuple(range(8)))
+# Shared color slots preserve the shadow and highlight across palettes.
+PALETTE_SLOTS = (tuple(range(8)), tuple(range(8)), (7, 0, 1, 2, 3, 4, 5, 6))
 PALETTE_BACKGROUNDS = (1, 1, 0)
 COLOR_TABLES = [[QColor(color).rgb() for color in palette] for palette in IMAGE_PALETTES]
 BACKGROUND_NAMES = (
@@ -22,6 +25,12 @@ BACKGROUND_NAMES = (
     ("Black", "White", "14% gray", "29% gray", "43% gray", "57% gray", "71% gray", "86% gray"),
     ("Cream", "Sky blue", "Blue", "Light green", "Green", "Tan", "Brown", "Dark green"),
 )
+def palette_translation(source: int, target: int) -> bytes:
+    old_slots = PALETTE_SLOTS[source]
+    new_slots = PALETTE_SLOTS[target]
+    return bytes(new_slots[old_slots.index(index)] for index in range(8)) + bytes(range(8, 256))
+
+
 SIZE_LABELS = [f"{width} × {height}" for width, height in IMAGE_SIZES]
 PATTERNS = (
     lambda x, y: False,
@@ -186,7 +195,8 @@ class DrawingCanvas(PixelView):
         )
 
     def _color(self, x: int, y: int) -> int:
-        return self.colors[self._primary ^ bool(PATTERNS[self.pattern](x, y))]
+        slot = self.colors[self._primary ^ bool(PATTERNS[self.pattern](x, y))]
+        return PALETTE_SLOTS[self.palette_index][slot]
 
     def _line(self, start: QPoint, end: QPoint) -> None:
         width, _ = IMAGE_SIZES[self.canvas_size]
@@ -456,9 +466,8 @@ class DrawingMenu(QFrame):
         index = PALETTE_ORDER[choice]
         canvas = self.canvas
         if index != canvas.palette_index:
-            pixels = bytes(canvas.pixels) if canvas.edited else (
-                bytes([PALETTE_BACKGROUNDS[index]]) * len(canvas.pixels)
-            )
+            translation = palette_translation(canvas.palette_index, index)
+            pixels = bytes(canvas.pixels).translate(translation)
             canvas.replace(canvas.canvas_size, pixels, edited=canvas.edited, palette=index)
 
     def _canvas_changed(self) -> None:
@@ -480,21 +489,24 @@ class DrawingMenu(QFrame):
         self._update_colors()
 
     def _pick_color(self, slot: int, value: int) -> None:
-        self.canvas.colors[slot] = value
+        palette = self.canvas.palette_index
+        color = SWATCH_ORDERS[palette][value]
+        self.canvas.colors[slot] = PALETTE_SLOTS[palette].index(color)
         self._update_colors()
 
     def _update_colors(self) -> None:
         palette = self.canvas.palette_index
         if self._shown_palette != palette:
             self._shown_palette = palette
-            for index, button in enumerate(self.swatch_buttons):
+            for index, button in zip(SWATCH_ORDERS[palette], self.swatch_buttons):
                 color = IMAGE_PALETTES[palette][index]
                 button.setToolTip(color)
                 button.setAccessibleName(color)
                 button.setIcon(preview_icon(bytes([index]) * 256, palette))
-        for button, color in zip(self.slots, self.canvas.colors):
+        active_colors = [PALETTE_SLOTS[palette][slot] for slot in self.canvas.colors]
+        for button, color in zip(self.slots, active_colors):
             button.setIcon(preview_icon(bytes([color]) * 256, palette))
-        first, second = self.canvas.colors
+        first, second = active_colors
         for button, pattern in zip(self.pattern_buttons, PATTERNS):
             button.setIcon(preview_icon(bytes(
                 second if pattern(x, y) else first for y in range(16) for x in range(16)
@@ -580,9 +592,9 @@ class DrawingImportPanel(QFrame):
         settings.addWidget(self.dither)
         self.background = combo_type()
         self.background.setAccessibleName("Background")
-        names = BACKGROUND_NAMES[0]
-        self.background.addItems([f"{name} background" for name in names])
-        self.background.setCurrentIndex(1)
+        order = SWATCH_ORDERS[0]
+        self.background.addItems([f"{BACKGROUND_NAMES[0][index]} background" for index in order])
+        self.background.setCurrentIndex(order.index(PALETTE_BACKGROUNDS[0]))
         settings.addWidget(self.background)
         settings.addStretch()
         layout.addLayout(settings)
@@ -614,12 +626,14 @@ class DrawingImportPanel(QFrame):
 
     def _update_import_palette(self, choice: int) -> None:
         index = PALETTE_ORDER[choice]
-        old_default = PALETTE_BACKGROUNDS[self.preview.palette_index]
+        old_palette = self.preview.palette_index
+        old_background = SWATCH_ORDERS[old_palette][self.background.currentIndex()]
+        background = palette_translation(old_palette, index)[old_background]
+        order = SWATCH_ORDERS[index]
         blocked = self.background.blockSignals(True)
-        for position, name in enumerate(BACKGROUND_NAMES[index]):
-            self.background.setItemText(position, f"{name} background")
-        if self.background.currentIndex() == old_default:
-            self.background.setCurrentIndex(PALETTE_BACKGROUNDS[index])
+        for position, color in enumerate(order):
+            self.background.setItemText(position, f"{BACKGROUND_NAMES[index][color]} background")
+        self.background.setCurrentIndex(order.index(background))
         self.background.blockSignals(blocked)
         self.refresh()
 
@@ -687,8 +701,8 @@ class DrawingImportPanel(QFrame):
 
     def refresh(self) -> None:
         image = self._sample_image()
-        background = self.background.currentIndex()
         palette_index = PALETTE_ORDER[self.mode.currentIndex()]
+        background = SWATCH_ORDERS[palette_index][self.background.currentIndex()]
         alpha = image.getchannel("A")
         rgb = Image.new("RGB", image.size, IMAGE_PALETTES[palette_index][background])
         rgb.paste(image.convert("RGB"), mask=alpha)
