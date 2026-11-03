@@ -11376,7 +11376,7 @@ QComboBox::drop-down {
         if block.isValid():
             scrollbar = self.chat_display.verticalScrollBar()
             top = document.documentLayout().blockBoundingRect(block).top()
-            scrollbar.setValue(round(top - self.chat_display.viewport().height() / 3))
+            scrollbar.setValue(round(top))
 
     def _show_latest_history(self) -> None:
         self._search_history_end = None

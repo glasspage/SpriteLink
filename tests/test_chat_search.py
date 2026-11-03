@@ -282,11 +282,24 @@ class ChatSearchTests(unittest.TestCase):
             self.assertEqual(first_card.size(), first_size)
             self.assertEqual(document.begin().layout().lineCount(), first_lines)
             self.assertEqual(client.search_results_layout.count(), 30)
-            frame = client.search_results_layout.itemAt(29).widget()
+            frame = client.search_results_layout.itemAt(24).widget()
             frame.findChild(QPushButton).click()
             self.wait_for(lambda: not client._rendering_message_log)
             self.assertTrue(client.search_overlay.isHidden())
             self.assertIn("item-000", client.rendered_message_last_blocks)
+            display = client.chat_display
+            document = display.document()
+            block_number = next(
+                number for number, message_id in client.rendered_message_blocks.items()
+                if message_id == "item-005"
+            )
+            target_top = document.documentLayout().blockBoundingRect(
+                document.findBlockByNumber(block_number)
+            ).top()
+            scrollbar = display.verticalScrollBar()
+            self.assertGreater(round(target_top), scrollbar.minimum())
+            self.assertLessEqual(round(target_top), scrollbar.maximum())
+            self.assertEqual(scrollbar.value(), round(target_top))
             self.assertNotIn("item-099", client.rendered_message_last_blocks)
             self.assertTrue(client.latest_history_button.isVisible())
             client.latest_history_button.click()
