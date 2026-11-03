@@ -360,15 +360,13 @@ class DrawingMenu(QFrame):
         self._update_colors()
 
         controls = QVBoxLayout()
+        controls.addWidget(QLabel("Image Size"))
         self.size_combo = combo_type()
         self.size_combo.addItems(SIZE_LABELS)
         self.size_combo.setAccessibleName("Canvas size")
         self.size_combo.currentIndexChanged.connect(self.canvas.resize_canvas)
         controls.addWidget(self.size_combo)
-        grid = QCheckBox("Grid")
-        grid.setChecked(self.canvas.grid)
-        grid.toggled.connect(self._set_grid)
-        controls.addWidget(grid)
+        controls.addWidget(QLabel("View"))
         self.preview_scale_combo = combo_type()
         self.preview_scale_combo.setAccessibleName("Preview scale")
         self.preview_scale_combo.setToolTip("Preview scale")
@@ -376,6 +374,10 @@ class DrawingMenu(QFrame):
         self._preferred_preview_scale = None
         self.canvas.resized.connect(self._update_preview_scales)
         controls.addWidget(self.preview_scale_combo)
+        grid = QCheckBox("Grid")
+        grid.setChecked(self.canvas.grid)
+        grid.toggled.connect(self._set_grid)
+        controls.addWidget(grid)
         self.undo = QPushButton("Undo")
         self.redo = QPushButton("Redo")
         self.undo.clicked.connect(lambda: self.canvas.step_history(self.canvas.undo_stack, self.canvas.redo_stack))
@@ -400,17 +402,21 @@ class DrawingMenu(QFrame):
         self.canvas.update()
 
     def _select_preview_scale(self, index: int) -> None:
-        self._preferred_preview_scale = index + 1
+        self._preferred_preview_scale = (
+            None if self.preview_scale_combo.itemText(index) == "Max" else index + 1
+        )
         self._update_preview_scales()
 
     def _update_preview_scales(self) -> None:
         maximum = self.canvas.maximum_scale()
+        numeric_count = min(maximum, 3)
         combo = self.preview_scale_combo
-        if combo.count() != maximum:
+        if combo.count() != numeric_count + 1:
             combo.clear()
-            combo.addItems([f"{scale}x" for scale in range(1, maximum + 1)])
-        scale = min(self._preferred_preview_scale or maximum, maximum)
-        combo.setCurrentIndex(scale - 1)
+            combo.addItems([f"{scale}x" for scale in range(1, numeric_count + 1)] + ["Max"])
+        preferred = self._preferred_preview_scale
+        scale = min(preferred, maximum) if preferred is not None else maximum
+        combo.setCurrentIndex(scale - 1 if preferred is not None else numeric_count)
         self.canvas.preview_scale = scale
         self.canvas.update()
 
