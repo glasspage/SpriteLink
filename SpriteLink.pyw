@@ -10073,7 +10073,7 @@ QComboBox::drop-down {
         status_layout.addWidget(self.status_label)
         status_layout.addSpacing(6)
 
-        self.recently_online_label = QLabel("… recently online")
+        self.recently_online_label = QLabel()
         self.recently_online_label.setFont(
             self._make_font(self._ui_font_family(), 9)
         )
@@ -13113,7 +13113,6 @@ QComboBox::drop-down {
         label = getattr(self, "recently_online_label", None)
         if label is None:
             return
-        label.setVisible(True)
         server = normalize_server_url(self.config_data.get("server_url", ""))
         topic = derive_ntfy_topic(self._active_chatroom()["key"])
         counts = self.recently_online_counts.get(server)
@@ -13121,9 +13120,11 @@ QComboBox::drop-down {
             self._last_recently_online_counts[topic] = counts.get(topic, 0)
         count = self._last_recently_online_counts.get(topic)
         if count is None:
-            label.setText("… recently online")
+            label.clear()
+            label.hide()
             return
         label.setText(f"{count} recently online")
+        label.show()
 
     def _network_recently_online_step(self, *, now: float) -> bool:
         server = normalize_server_url(self.config_data.get("server_url", ""))

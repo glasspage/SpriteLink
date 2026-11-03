@@ -84,6 +84,11 @@ class UiSizePresetTests(unittest.TestCase):
 
     def test_recently_online_visibility_opacity_and_ui_sizes(self):
         label = self.client.recently_online_label
+        self.assertTrue(label.isHidden())
+        server = S.normalize_server_url(self.client.config_data["server_url"])
+        self.client.ui_queue.put(("recently_online", (server, {})))
+        self.client._process_ui_queue()
+        self.assertEqual(label.text(), "0 recently online")
         for theme in S.THEMES:
             self.client.theme_combo.setCurrentText(theme)
             for size in S.UI_SIZE_PRESETS:
@@ -147,7 +152,7 @@ class UiSizePresetTests(unittest.TestCase):
             self.client._process_ui_queue()
         self.assertEqual(self.client._messages_left_today(), before - 1)
         append.assert_not_called()
-        self.assertEqual(self.client.recently_online_label.text(), "… recently online")
+        self.assertTrue(self.client.recently_online_label.isHidden())
 
     def test_recently_online_matches_room_topics_instead_of_names_or_local_ids(self):
         server = S.normalize_server_url(self.client.config_data["server_url"])
@@ -195,7 +200,7 @@ class UiSizePresetTests(unittest.TestCase):
         self.assertEqual(self.client.recently_online_label.text(), "7 recently online")
         self.client.config_data["chatrooms"][0]["key"] = "replacement-key"
         self.client._activate_chatroom("private")
-        self.assertEqual(self.client.recently_online_label.text(), "… recently online")
+        self.assertTrue(self.client.recently_online_label.isHidden())
 
     def test_small_is_default_and_presets_match_requested_sizes(self):
         self.assertEqual(S.DEFAULT_UI_SIZE, "Small (Default)")
