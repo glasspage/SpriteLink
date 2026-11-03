@@ -6738,6 +6738,8 @@ class MessageLogBrowser(QTextBrowser):
 class SearchResultMessage(QTextBrowser):
     def __init__(self) -> None:
         super().__init__()
+        self._source_html = ""
+        self._preview_width = -1
         self._shadow_document: QTextDocument | None = None
         self._height_measurement: tuple[tuple[int, int, str], int] | None = None
         self.setReadOnly(True)
@@ -6751,35 +6753,68 @@ class SearchResultMessage(QTextBrowser):
         policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         policy.setHeightForWidth(True)
         self.setSizePolicy(policy)
-        self._fit_height_timer = QTimer(self)
-        self._fit_height_timer.setSingleShot(True)
-        self._fit_height_timer.timeout.connect(self._fit_live_document_height)
-        self.document().documentLayout().documentSizeChanged.connect(
-            self._schedule_height_fit
-        )
 
-    def _schedule_height_fit(self) -> None:
-        if not self._fit_height_timer.isActive():
-            self._fit_height_timer.start(0)
+    def setHtml(self, text: str) -> None:
+        self._source_html = text
+        self._preview_width = -1
+        self._update_preview()
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
-        self._schedule_height_fit()
+        self._update_preview()
 
-    def _fit_live_document_height(self) -> None:
-        # The layout's provisional height can be shorter than the live viewport needs.
-        viewport = self.maximumViewportSize()
-        height = math.ceil(self.document().size().height()) + self.height() - viewport.height()
-        if height != self.minimumHeight():
-            self.setMinimumHeight(height)
-        self.verticalScrollBar().setValue(0)
+    @staticmethod
+    def _elide_preview(document: QTextDocument, width: int) -> None:
+        document.setTextWidth(width)
+        document.size()
+        first = document.begin()
+        layout = first.layout()
+        if not layout.lineCount():
+            return
 
-    def setHtml(self, text: str) -> None:
+        # Keep the separate media block (or media cell) after the text preview.
+        cursor = QTextCursor(document)
+        block = first.next()
+        while block.isValid():
+            cursor.setPosition(block.position())
+            if cursor.currentTable() or block.text().startswith("\ufffc"):
+                break
+            block = block.next()
+
+        line_end = first.position() + layout.lineAt(0).textLength()
+        end = block.position() - 1 if block.isValid() else document.characterCount() - 1
+        if line_end >= end:
+            return
+
+        cursor.setPosition(line_end)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        # Keep the marker outside any link or concealed spoiler formatting.
+        marker_format = QTextCharFormat()
+        marker_format.setFont(cursor.charFormat().font())
+        cursor.insertText("[...]", marker_format)
+        document.size()
+        while first.layout().lineCount() > 1:
+            cut = QTextCursor(document)
+            cut.setPosition(cursor.position() - len("[...]"))
+            if cut.atBlockStart():
+                break
+            cut.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor)
+            cut.removeSelectedText()
+            document.size()
+
+    def _update_preview(self) -> None:
+        width = max(1, self.maximumViewportSize().width())
+        if width == self._preview_width:
+            return
+        self._preview_width = width
         self._height_measurement = None
         if self._shadow_document is not None:
             self._shadow_document.deleteLater()
             self._shadow_document = None
-        super().setHtml(text)
+        super().setHtml(self._source_html)
+        self._elide_preview(self.document(), width)
+        self.updateGeometry()
 
     def _make_shadow_document(self) -> QTextDocument:
         shadow = self.document().clone(self)
@@ -6835,8 +6870,11 @@ class SearchResultMessage(QTextBrowser):
         key = (text_width, document.revision(), document.defaultFont().key())
         if self._height_measurement is None or self._height_measurement[0] != key:
             # Qt can ask about provisional widths without actually resizing the card.
-            measurement = document.clone()
-            measurement.setTextWidth(text_width)
+            measurement = QTextDocument()
+            measurement.setDocumentMargin(document.documentMargin())
+            measurement.setDefaultFont(document.defaultFont())
+            measurement.setHtml(self._source_html)
+            self._elide_preview(measurement, text_width)
             self._height_measurement = key, math.ceil(measurement.size().height())
         return self._height_measurement[1] + self.height() - viewport.height()
 
