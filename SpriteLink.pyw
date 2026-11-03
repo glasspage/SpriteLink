@@ -3085,6 +3085,39 @@ def is_likely_nsfw_image_url(url: str) -> bool:
     )
 
 
+def message_text_for_search(
+    item: dict[str, Any], query: str, filters: set[str],
+) -> str | None:
+    raw_text = item["message"].get("m")
+    if not isinstance(raw_text, str):
+        return None
+    text = message_plain_text_with_spoilers_redacted(raw_text)
+    if query and query not in text.casefold():
+        return None
+    if not filters:
+        return text
+    for _start, _end, url in message_url_spans(text):
+        if "Links" in filters:
+            return text
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        video = (
+            is_click_to_play_video_url(url)
+            or is_trusted_looping_video_url(url)
+            or _url_has_video_extension(parsed)
+            or parsed.hostname in ("redgifs.com", "www.redgifs.com")
+        )
+        if "Videos" in filters and video:
+            return text
+        if "Images" in filters and not video and (
+            is_direct_image_url(url) or is_supported_media_page_url(url)
+        ):
+            return text
+    return None
+
+
 def message_contains_only_image_links(text: str) -> bool:
     return (
         bool(direct_image_urls_in_message(text))
@@ -6976,6 +7009,10 @@ class EncryptedChatClient(QObject):
         self._rendering_message_log = False
         self._pending_live_render_message_ids: list[str] = []
         self._history_render_pruned = False
+        self._search_generation = 0
+        self._history_load_complete = True
+        self._search_history_end: tuple[int, int, str] | None = None
+        self._pending_search_jump: tuple[str, tuple[int, int, str]] | None = None
         self._media_rerender_in_progress = False
         self.embedded_image_preview_sizes: dict[str, tuple[int, int]] = {}
         self.history_load_executor = DaemonTaskPool(
@@ -8541,6 +8578,7 @@ QComboBox::drop-down {
         EncryptedChatClient._apply_video_player_theme(self)
         for overlay_name in (
             "config_overlay",
+            "search_overlay",
             "message_limit_overlay",
             "image_preview_overlay",
             "link_warning_overlay",
@@ -9717,6 +9755,7 @@ QComboBox::drop-down {
     def _reset_history_render_window(self) -> None:
         self._set_history_render_updates_suppressed(False)
         self._history_render_generation += 1
+        self._history_load_complete = True
         self._older_history_page_scheduled = False
         self._loading_older_history_page = False
         self._history_initial_render_complete = False
@@ -9725,6 +9764,8 @@ QComboBox::drop-down {
         self._message_render_job = None
         self._rendering_message_log = False
         self._pending_live_render_message_ids.clear()
+        self._search_history_end = None
+        self.latest_history_button.hide()
         self._history_render_pruned = False
         self._media_rerender_in_progress = False
         self.rendered_history_message_limit = (
@@ -9814,7 +9855,7 @@ QComboBox::drop-down {
             self._older_history_page_scheduled
             or self._loading_older_history_page
             or self._tray_ui_suspended
-            or self.rendered_history_message_limit >= len(self.message_log)
+            or self.rendered_history_message_limit >= self._history_view_end()
         ):
             return
         self._older_history_page_scheduled = True
@@ -9842,16 +9883,17 @@ QComboBox::drop-down {
         self._older_history_page_scheduled = False
         if (
             self._loading_older_history_page
-            or self.rendered_history_message_limit >= len(self.message_log)
+            or self._rendering_message_log
+            or self.rendered_history_message_limit >= self._history_view_end()
         ):
             return
 
         previous_limit = min(
-            len(self.message_log),
+            self._history_view_end(),
             self.rendered_history_message_limit,
         )
         next_limit = min(
-            len(self.message_log),
+            self._history_view_end(),
             previous_limit + HISTORY_RENDER_PAGE_MESSAGES,
         )
         self._loading_older_history_page = True
@@ -9877,7 +9919,8 @@ QComboBox::drop-down {
             self._loading_older_history_page = False
             return
 
-        new_items = self.message_log[-next_limit:-previous_limit]
+        end = self._history_view_end()
+        new_items = self.message_log[end - next_limit:end - previous_limit]
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
         trusted_user_ids = self._room_preference_ids(
@@ -9913,7 +9956,7 @@ QComboBox::drop-down {
 
         following_timestamp = (
             self._display_timestamp_for_item(
-                self.message_log[-previous_limit]
+                self.message_log[end - previous_limit]
             )
             if previous_limit > 0
             else None
@@ -9946,7 +9989,7 @@ QComboBox::drop-down {
         following_background_index = 0
         if previous_limit > 0:
             following_message_id = self._message_id_from_log_item(
-                self.message_log[-previous_limit]
+                self.message_log[end - previous_limit]
             )
             following_block_number = self.rendered_message_last_blocks.get(
                 following_message_id
@@ -10083,6 +10126,16 @@ QComboBox::drop-down {
         status_layout.addWidget(self.recently_online_label)
         status_layout.addStretch(1)
         self._update_recently_online_label()
+
+        self.latest_history_button = QPushButton("Latest")
+        self.latest_history_button.clicked.connect(self._show_latest_history)
+        status_layout.addWidget(self.latest_history_button)
+        self.latest_history_button.hide()
+
+        self.search_toggle = QPushButton("Search")
+        self.search_toggle.setCheckable(True)
+        self.search_toggle.toggled.connect(self._on_search_toggled)
+        status_layout.addWidget(self.search_toggle)
 
         self.config_toggle = QPushButton("Config")
         self.config_toggle.setCheckable(True)
@@ -10744,6 +10797,259 @@ QComboBox::drop-down {
         )
         self._apply_active_composer_style()
         self._schedule_profile_save()
+
+    def _build_search_popup(self) -> None:
+        self.search_overlay = ConfigOverlay(self.chat_content)
+        self.search_overlay.dismissed.connect(self.search_toggle.click)
+        overlay_layout = QVBoxLayout(self.search_overlay)
+        overlay_layout.setContentsMargins(24, 24, 24, 24)
+        panel = QFrame()
+        panel.setObjectName("configPanel")
+        panel.setMaximumWidth(CONFIG_PANEL_MAX_WIDTH)
+        self.search_overlay.panel = panel
+        overlay_layout.addWidget(panel, 1, Qt.AlignmentFlag.AlignHCenter)
+        panel.setMinimumWidth(min(440, max(0, self.chat_content.width() - 48)))
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.addWidget(self._heading("Search"))
+        self.search_entry = QLineEdit()
+        self.search_entry.setPlaceholderText("Find words or phrases")
+        panel_layout.addWidget(self.search_entry)
+        filters = QHBoxLayout()
+        self.search_filters = {
+            name: QCheckBox(name) for name in ("Links", "Images", "Videos")
+        }
+        for checkbox in self.search_filters.values():
+            filters.addWidget(checkbox)
+            checkbox.toggled.connect(self._reset_chat_search)
+        filters.addStretch()
+        panel_layout.addLayout(filters)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        results = QWidget()
+        self.search_results_layout = QVBoxLayout(results)
+        self.search_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        scroll.setWidget(results)
+        panel_layout.addWidget(scroll, 1)
+        footer = QHBoxLayout()
+        self.search_status = QLabel()
+        footer.addWidget(self.search_status, 1)
+        self.search_more_button = QPushButton("More")
+        self.search_more_button.clicked.connect(self._start_chat_search)
+        footer.addWidget(self.search_more_button)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.search_toggle.click)
+        footer.addWidget(close_button)
+        panel_layout.addLayout(footer)
+
+        self.search_timer = QTimer(self.search_overlay)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(200)
+        self.search_timer.timeout.connect(self._start_chat_search)
+        self.search_entry.textChanged.connect(self._reset_chat_search)
+        self.search_entry.returnPressed.connect(self._start_chat_search)
+        self.chat_content.installEventFilter(self)
+        self._apply_ui_size_to_widget_tree(self.search_overlay)
+
+    def _on_search_toggled(self, checked: bool) -> None:
+        if not checked:
+            if hasattr(self, "search_overlay"):
+                self._search_generation += 1
+                self._pending_search_jump = None
+                self.search_timer.stop()
+                self.search_overlay.hide()
+                self.message_entry.setFocus()
+            return
+        if not self._dismiss_config_popup():
+            self.search_toggle.setChecked(False)
+            return
+        if not hasattr(self, "search_overlay"):
+            self._build_search_popup()
+        self.search_overlay.setGeometry(self.chat_content.rect())
+        self.search_overlay.show()
+        self.search_overlay.raise_()
+        self.search_entry.setFocus()
+        self._reset_chat_search()
+
+    def _reset_chat_search(self) -> None:
+        self._search_generation += 1
+        self._pending_search_jump = None
+        self._search_before = None
+        self._search_running = False
+        while self.search_results_layout.count():
+            self.search_results_layout.takeAt(0).widget().deleteLater()
+        self.search_more_button.hide()
+        self.search_status.setText("Enter text or select a filter.")
+        self.search_timer.start()
+
+    def _start_chat_search(self) -> None:
+        self.search_timer.stop()
+        if self._search_running or not self.search_overlay.isVisible():
+            return
+        query = self.search_entry.text().strip().casefold()
+        filters = {name for name, box in self.search_filters.items() if box.isChecked()}
+        if not query and not filters:
+            return
+        if self.search_results_layout.count() and not self.search_more_button.isVisible():
+            return
+        self._search_running = True
+        self.search_more_button.hide()
+        self.search_status.setText("Searching…")
+        self.history_load_executor.submit(
+            self._chat_search_worker,
+            self._search_generation,
+            normalize_server_url(self.config_data["server_url"]),
+            self._active_chatroom()["key"],
+            query,
+            filters,
+            self._search_before,
+        )
+
+    def _chat_search_worker(
+        self,
+        generation: int,
+        server: str,
+        key: str,
+        query: str,
+        filters: set[str],
+        before: tuple[int, int, str] | None,
+    ) -> None:
+        matches = []
+        next_page = None
+        try:
+            while not self._closing and generation == self._search_generation:
+                batch = load_chatroom_history(server, key, limit=200, before=before)
+                if not batch:
+                    break
+                for item in reversed(batch):
+                    text = message_text_for_search(item, query, filters)
+                    if text is None:
+                        continue
+                    message = item["message"]
+                    try:
+                        timestamp = self._display_timestamp_for_item(item)
+                        self._validate_decrypted_message(
+                            message, key, ntfy_time=timestamp or None,
+                        )
+                    except Exception:
+                        continue
+                    if len(matches) == 25:
+                        next_page = matches[-1][0]
+                        break
+                    matches.append((
+                        self._message_sort_key(item), str(message["i"]),
+                        timestamp, str(message["u"]), text,
+                    ))
+                if next_page is not None:
+                    break
+                before = self._message_sort_key(batch[0])
+        except Exception:
+            matches = None
+        if not self._closing and generation == self._search_generation:
+            self._queue_ui_event(("chat_search_results", (generation, matches, next_page)))
+
+    def _show_chat_search_results(self, generation: int, matches: Any, next_page: Any) -> None:
+        if generation != self._search_generation:
+            return
+        self._search_running = False
+        if matches is None:
+            self.search_status.setText("Could not read chat history.")
+            return
+        for sort_key, message_id, timestamp, sender, text in matches:
+            frame = QFrame()
+            frame.setFrameShape(QFrame.Shape.StyledPanel)
+            frame.setFrameShadow(QFrame.Shadow.Sunken)
+            layout = QVBoxLayout(frame)
+            header = QHBoxLayout()
+            date = QLabel(datetime.fromtimestamp(timestamp).strftime("%b %d, %Y  %H:%M"))
+            header.addWidget(date, 1)
+            jump = QPushButton("Jump")
+            jump.clicked.connect(
+                lambda checked=False, target=message_id, order=sort_key:
+                self._jump_to_search_result(target, order)
+            )
+            header.addWidget(jump)
+            layout.addLayout(header)
+            body = QLabel(f"{sender}: {text}")
+            body.setTextFormat(Qt.TextFormat.PlainText)
+            body.setWordWrap(True)
+            body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            layout.addWidget(body)
+            self.search_results_layout.addWidget(frame)
+            self._apply_ui_size_to_widget_tree(frame)
+        self._search_before = next_page
+        self.search_more_button.setVisible(next_page is not None)
+        self.search_status.setText("" if self.search_results_layout.count() else "No matches.")
+
+    def _jump_to_search_result(self, message_id: str, order: tuple[int, int, str]) -> None:
+        index = bisect_right(self.message_log, order, key=self._message_sort_key) - 1
+        if index < 0 or self._message_id_from_log_item(self.message_log[index]) != message_id:
+            if self._history_load_complete:
+                self.search_status.setText("Message is no longer in history.")
+            else:
+                self._pending_search_jump = message_id, order
+                self.search_status.setText("Loading message…")
+            return
+        self.search_toggle.setChecked(False)
+        if (
+            message_id in self.rendered_message_last_blocks
+            and not self._rendering_message_log
+            and not self._loading_older_history_page
+        ):
+            self._scroll_to_search_result(message_id)
+            return
+        self._older_history_user_request = None
+        self._loading_older_history_page = False
+        self._media_rerender_in_progress = False
+        self.rendered_history_message_limit = INITIAL_HISTORY_RENDER_MESSAGES
+        end = min(len(self.message_log), index + 1 + INITIAL_HISTORY_RENDER_MESSAGES // 2)
+        self._search_history_end = (
+            self._message_sort_key(self.message_log[end - 1])
+            if end < len(self.message_log) else None
+        )
+        self.latest_history_button.setVisible(self._search_history_end is not None)
+        self._set_history_render_updates_suppressed(True)
+        self._render_message_log(
+            scroll_to_bottom=False,
+            on_finished=lambda: self._finish_search_jump(message_id),
+        )
+
+    def _finish_search_jump(self, message_id: str) -> None:
+        self._scroll_to_search_result(message_id)
+        self._history_initial_render_complete = True
+        self._set_history_render_updates_suppressed(False)
+
+    def _scroll_to_search_result(self, message_id: str) -> None:
+        block_number = next(
+            (number for number, value in self.rendered_message_blocks.items() if value == message_id),
+            self.rendered_message_last_blocks.get(message_id),
+        )
+        if block_number is None:
+            return
+        document = self.chat_display.document()
+        block = document.findBlockByNumber(block_number)
+        if block.isValid():
+            scrollbar = self.chat_display.verticalScrollBar()
+            top = document.documentLayout().blockBoundingRect(block).top()
+            scrollbar.setValue(round(top - self.chat_display.viewport().height() / 3))
+
+    def _show_latest_history(self) -> None:
+        self._search_history_end = None
+        self.latest_history_button.hide()
+        self._older_history_user_request = None
+        self._loading_older_history_page = False
+        self._media_rerender_in_progress = False
+        self.rendered_history_message_limit = INITIAL_HISTORY_RENDER_MESSAGES
+        self._set_history_render_updates_suppressed(False)
+        self._render_message_log(scroll_to_bottom=True)
+
+    def _history_view_end(self) -> int:
+        if self._search_history_end is None:
+            return len(self.message_log)
+        return bisect_right(
+            self.message_log, self._search_history_end, key=self._message_sort_key,
+        )
 
     def _build_config_popup(self) -> None:
         self.config_overlay = ConfigOverlay(self.chat_content)
@@ -11978,6 +12284,7 @@ QComboBox::drop-down {
 
     def _on_config_toggled(self, checked: bool) -> None:
         if checked:
+            self.search_toggle.setChecked(False)
             self._ensure_popup("config")
             self._config_snapshot_at_open = self._config_ui_snapshot()
             self._sync_config_overlay_geometry()
@@ -13622,6 +13929,17 @@ QComboBox::drop-down {
                         warning=True,
                     )
 
+                elif event_type == "chat_search_results":
+                    self._show_chat_search_results(*payload)
+
+                elif event_type == "history_load_finished":
+                    if payload == (self._history_render_generation, self.active_chatroom_id):
+                        self._history_load_complete = True
+                        if self._pending_search_jump is not None:
+                            target, order = self._pending_search_jump
+                            self._pending_search_jump = None
+                            self._jump_to_search_result(target, order)
+
                 elif event_type == "history_load_error":
                     if payload == (self._history_render_generation, self.active_chatroom_id):
                         messagebox.showerror(
@@ -13691,6 +14009,11 @@ QComboBox::drop-down {
                                 generation,
                                 room_id,
                             )
+                    if self._pending_search_jump is not None:
+                        target, order = self._pending_search_jump
+                        if any(self._message_id_from_log_item(item) == target for item in accepted_items):
+                            self._jump_to_search_result(target, order)
+
                 elif event_type == "image_preview_loaded":
                     url = str(payload.get("url", ""))
                     data = payload.get("data")
@@ -14059,11 +14382,12 @@ QComboBox::drop-down {
         self.pending_history_entries.append(item)
 
         self._trim_message_log(self._chatroom_history_limit())
-        # Live arrivals extend the visible history suffix without evicting loaded rows.
-        self.rendered_history_message_limit = min(
-            len(self.message_log),
-            self.rendered_history_message_limit + 1,
-        )
+        if self._search_history_end is None:
+            # Live arrivals extend the visible suffix without evicting loaded rows.
+            self.rendered_history_message_limit = min(
+                len(self.message_log),
+                self.rendered_history_message_limit + 1,
+            )
         if persist:
             self._persist_local_history()
         if render:
@@ -14095,6 +14419,10 @@ QComboBox::drop-down {
 
         if self._history_render_pruned:
             self._rerender_preserving_scroll()
+            return
+
+        if self._search_history_end is not None:
+            self._pending_live_render_message_ids.clear()
             return
 
         pending_ids = list(self._pending_live_render_message_ids)
@@ -14294,6 +14622,7 @@ QComboBox::drop-down {
         generation = self._history_render_generation
         room_id = self.active_chatroom_id
         history_limit = self._chatroom_history_limit()
+        self._history_load_complete = False
         try:
             self.history_load_executor.submit(
                 self._load_saved_history_worker,
@@ -14304,7 +14633,7 @@ QComboBox::drop-down {
                 history_limit,
             )
         except RuntimeError:
-            pass
+            self._history_load_complete = True
 
     def _load_saved_history_worker(
         self,
@@ -14399,6 +14728,9 @@ QComboBox::drop-down {
                 },
             ))
 
+        if not self._closing and generation == self._history_render_generation:
+            self._queue_ui_event(("history_load_finished", (generation, room_id)))
+
     def _finish_initial_history_render(
         self,
         generation: int,
@@ -14478,8 +14810,12 @@ QComboBox::drop-down {
         ):
             self._history_render_pruned = True
         del self.message_log[:excess]
+        if self._search_history_end is not None and not self._history_view_end():
+            self._search_history_end = None
+            self.latest_history_button.hide()
+            self.rendered_history_message_limit = INITIAL_HISTORY_RENDER_MESSAGES
         self.rendered_history_message_limit = min(
-            self.rendered_history_message_limit, len(self.message_log)
+            self.rendered_history_message_limit, self._history_view_end()
         )
 
     def _apply_chatroom_history_limit(self) -> None:
@@ -15483,6 +15819,11 @@ QComboBox::drop-down {
         ):
             if hasattr(self, "config_overlay"):
                 self._sync_config_overlay_geometry()
+            if hasattr(self, "search_overlay"):
+                self.search_overlay.setGeometry(self.chat_content.rect())
+                self.search_overlay.panel.setMinimumWidth(
+                    min(440, max(0, self.chat_content.width() - 48))
+                )
             if hasattr(self, "message_limit_overlay"):
                 self._sync_message_limit_overlay_geometry()
             if hasattr(self, "image_preview_overlay"):
@@ -16474,7 +16815,8 @@ QComboBox::drop-down {
             INITIAL_HISTORY_RENDER_MESSAGES,
             int(self.rendered_history_message_limit),
         )
-        visible_message_items = self.message_log[-visible_message_limit:]
+        end = self._history_view_end()
+        visible_message_items = self.message_log[max(0, end - visible_message_limit):end]
         display_groups = group_messages_for_display(
             visible_message_items,
             muted_ids,
@@ -17360,6 +17702,7 @@ QComboBox::drop-down {
         scrollbar.setValue(scrollbar.maximum())
 
     def _clear_visible_room(self, *, preserve_detached_video: bool = False) -> None:
+        self.search_toggle.setChecked(False)
         self._reset_history_render_window()
         self._hide_chat_tooltip()
         if hasattr(self, "link_warning_overlay") and self.link_warning_overlay.isVisible():

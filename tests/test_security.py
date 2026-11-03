@@ -635,7 +635,7 @@ class BehaviorSettingsTests(unittest.TestCase):
         )
         self.assertIn(
             "visible_message_items = "
-            "self.message_log[-visible_message_limit:]",
+            "self.message_log[max(0, end - visible_message_limit):end]",
             render_source,
         )
         self.assertIn("previous_message_backgrounds", render_source)
