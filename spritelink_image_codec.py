@@ -13,7 +13,10 @@ IMAGE_PALETTES = (
         "#000000", "#FFFFFF", "#242424", "#494949",
         "#6D6D6D", "#929292", "#B6B6B6", "#DBDBDB",
     ),
+    ("#F3E7C9", "#8FC7E8", "#4F8FC7", "#8EBB5A",
+     "#4F7A3E", "#A77A4D", "#6B4A2E", "#2F3E2F"),
 )
+PALETTE_HEADERS = (0x10, 0x18, 0x20)
 
 
 def encode_drawing(size: int, pixels: bytes, palette: int = 0) -> str:
@@ -29,8 +32,8 @@ def encode_drawing(size: int, pixels: bytes, palette: int = 0) -> str:
             word = (word << 3) | pixel
         packed.extend(word.to_bytes(3, "big"))
     compressed = zlib.compress(packed, level=9)
-    # The low nibble stores palette, compression flag, and canvas size.
-    header = 0x10 | (palette << 3) | size
+    # Keep the original Basic and Grayscale header values.
+    header = PALETTE_HEADERS[palette] | size
     if len(compressed) < len(packed):
         data = bytes([header | 4]) + compressed
     else:
@@ -47,7 +50,8 @@ def decode_drawing(encoded: str) -> tuple[int, bytes, int]:
     except (binascii.Error, IndexError, ValueError) as exc:
         raise ValueError("Invalid drawing encoding.") from exc
     size = header & 3
-    if header & 0xF0 != 0x10 or size >= len(IMAGE_SIZES):
+    palette_header = header & 0xF8
+    if palette_header not in PALETTE_HEADERS or size >= len(IMAGE_SIZES):
         raise ValueError("Unsupported drawing format.")
     width, height = IMAGE_SIZES[size]
     expected = width * height * 3 // 8
@@ -66,4 +70,4 @@ def decode_drawing(encoded: str) -> tuple[int, bytes, int]:
     for start in range(0, expected, 3):
         word = int.from_bytes(packed[start:start + 3], "big")
         pixels.extend((word >> shift) & 7 for shift in range(21, -1, -3))
-    return size, bytes(pixels), (header >> 3) & 1
+    return size, bytes(pixels), PALETTE_HEADERS.index(palette_header)

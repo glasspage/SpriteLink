@@ -2,7 +2,7 @@
 from collections import deque
 import math
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageOps
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
@@ -13,10 +13,14 @@ from PySide6.QtWidgets import (
 from spritelink_image_codec import IMAGE_PALETTES, IMAGE_SIZES
 
 
+PALETTE_ORDER = (0, 2, 1)
+PALETTE_NAMES = ("Basic", "Grayscale", "Nature")
+PALETTE_BACKGROUNDS = (1, 1, 0)
 COLOR_TABLES = [[QColor(color).rgb() for color in palette] for palette in IMAGE_PALETTES]
 BACKGROUND_NAMES = (
     ("Black", "White", "Red", "Yellow", "Green", "Blue", "Purple", "Gray"),
     ("Black", "White", "14% gray", "29% gray", "43% gray", "57% gray", "71% gray", "86% gray"),
+    ("Cream", "Sky blue", "Blue", "Light green", "Green", "Tan", "Brown", "Dark green"),
 )
 SIZE_LABELS = [f"{width} × {height}" for width, height in IMAGE_SIZES]
 PATTERNS = (
@@ -148,7 +152,7 @@ class DrawingCanvas(PixelView):
         self.redo_stack.clear()
         self._before = None
         width, height = IMAGE_SIZES[self.canvas_size]
-        self.restore((self.canvas_size, bytes([1]) * (width * height), False, self.palette_index))
+        self.restore((self.canvas_size, bytes([PALETTE_BACKGROUNDS[self.palette_index]]) * (width * height), False, self.palette_index))
 
     def replace(self, size: int, pixels: bytes, *, edited: bool = True, palette: int | None = None) -> None:
         self.undo_stack.append(self.snapshot())
@@ -163,7 +167,7 @@ class DrawingCanvas(PixelView):
         dx, dy = (width - old_width) // 2, (height - old_height) // 2
         pixels = bytes(
             self.pixels[(y - dy) * old_width + x - dx]
-            if 0 <= x - dx < old_width and 0 <= y - dy < old_height else 1
+            if 0 <= x - dx < old_width and 0 <= y - dy < old_height else PALETTE_BACKGROUNDS[self.palette_index]
             for y in range(height) for x in range(width)
         )
         self.replace(size, pixels, edited=self.edited)
@@ -218,7 +222,7 @@ class DrawingCanvas(PixelView):
         self.pixels[:] = original
         for y in range(rect.top(), rect.bottom() + 1):
             start = y * width + rect.x()
-            self.pixels[start:start + rect.width()] = bytes([1]) * rect.width()
+            self.pixels[start:start + rect.width()] = bytes([PALETTE_BACKGROUNDS[self.palette_index]]) * rect.width()
         for y in range(rect.top(), rect.bottom() + 1):
             start = y * width + rect.x()
             moved = start + dy * width + dx
@@ -354,7 +358,7 @@ class DrawingMenu(QFrame):
         palette.addLayout(swatches)
         self.palette_combo = combo_type()
         self.palette_combo.setAccessibleName("Color palette")
-        self.palette_combo.addItems(("Basic", "Grayscale"))
+        self.palette_combo.addItems([PALETTE_NAMES[index] for index in PALETTE_ORDER])
         self.palette_combo.currentIndexChanged.connect(self._select_palette)
         palette.addWidget(self.palette_combo)
         palette.addWidget(QLabel("Pattern"))
@@ -445,17 +449,21 @@ class DrawingMenu(QFrame):
     def _clear(self) -> None:
         if self.canvas.edited:
             self.canvas.replace(
-                self.canvas.canvas_size, bytes([1]) * len(self.canvas.pixels), edited=False,
+                self.canvas.canvas_size, bytes([PALETTE_BACKGROUNDS[self.canvas.palette_index]]) * len(self.canvas.pixels), edited=False,
             )
 
-    def _select_palette(self, index: int) -> None:
+    def _select_palette(self, choice: int) -> None:
+        index = PALETTE_ORDER[choice]
         canvas = self.canvas
         if index != canvas.palette_index:
-            canvas.replace(canvas.canvas_size, bytes(canvas.pixels), edited=canvas.edited, palette=index)
+            pixels = bytes(canvas.pixels) if canvas.edited else (
+                bytes([PALETTE_BACKGROUNDS[index]]) * len(canvas.pixels)
+            )
+            canvas.replace(canvas.canvas_size, pixels, edited=canvas.edited, palette=index)
 
     def _canvas_changed(self) -> None:
         previous = self.palette_combo.blockSignals(True)
-        self.palette_combo.setCurrentIndex(self.canvas.palette_index)
+        self.palette_combo.setCurrentIndex(PALETTE_ORDER.index(self.canvas.palette_index))
         self.palette_combo.blockSignals(previous)
         if self._shown_palette != self.canvas.palette_index:
             self._update_colors()
@@ -565,7 +573,7 @@ class DrawingImportPanel(QFrame):
         ))
         settings.addWidget(self.size_combo)
         self.mode = combo_type()
-        self.mode.addItems(("Color", "Grayscale"))
+        self.mode.addItems([f"{PALETTE_NAMES[index]} Color" for index in PALETTE_ORDER])
         self.mode.setAccessibleName("Conversion")
         settings.addWidget(self.mode)
         self.dither = QCheckBox("Dither")
@@ -602,10 +610,17 @@ class DrawingImportPanel(QFrame):
         self.dither.toggled.connect(self.refresh)
         self.background.currentIndexChanged.connect(self.refresh)
         self.set_zoom("Fill")
+        self.mode.setCurrentIndex(PALETTE_ORDER.index(self._best_palette()))
 
-    def _update_import_palette(self, index: int) -> None:
+    def _update_import_palette(self, choice: int) -> None:
+        index = PALETTE_ORDER[choice]
+        old_default = PALETTE_BACKGROUNDS[self.preview.palette_index]
+        blocked = self.background.blockSignals(True)
         for position, name in enumerate(BACKGROUND_NAMES[index]):
             self.background.setItemText(position, f"{name} background")
+        if self.background.currentIndex() == old_default:
+            self.background.setCurrentIndex(PALETTE_BACKGROUNDS[index])
+        self.background.blockSignals(blocked)
         self.refresh()
 
     def set_zoom(self, preset: str) -> None:
@@ -624,9 +639,8 @@ class DrawingImportPanel(QFrame):
         self.zoom = zoom
         self.refresh()
 
-    def refresh(self) -> None:
-        size = self.size_combo.currentIndex()
-        width, height = IMAGE_SIZES[size]
+    def _sample_image(self) -> Image.Image:
+        width, height = IMAGE_SIZES[self.size_combo.currentIndex()]
         # Prefilter large downscales before sampling the cropped preview.
         reduction = max(1, min(min(self.source.size), int(0.5 / self.zoom)))
         if reduction != self._reduction:
@@ -634,30 +648,52 @@ class DrawingImportPanel(QFrame):
             self._reduced_source = self.source.reduce(reduction) if reduction > 1 else self.source
         inv = 1 / self.zoom
         pan = self.preview.pan
-        image = self._reduced_source.transform(
+        return self._reduced_source.transform(
             (width, height), Image.Transform.AFFINE,
             (inv / reduction, 0, ((self.source.width - width * inv) / 2 - pan.x() * inv) / reduction,
              0, inv / reduction, ((self.source.height - height * inv) / 2 - pan.y() * inv) / reduction),
             resample=Image.Resampling.NEAREST if self.zoom == 1 else Image.Resampling.BICUBIC,
             fillcolor=(0, 0, 0, 0),
         )
-        background = self.background.currentIndex()
-        palette_index = self.mode.currentIndex()
-        swatches = IMAGE_PALETTES[palette_index]
-        alpha = image.getchannel("A")
-        rgb = Image.new("RGB", image.size, swatches[background])
-        rgb.paste(image.convert("RGB"), mask=alpha)
-        if palette_index == 1:
+
+    @staticmethod
+    def _quantize(rgb: Image.Image, index: int, dither: bool = False) -> Image.Image:
+        if index == 1:
             rgb = ImageOps.grayscale(rgb).convert("RGB")
         palette = Image.new("P", (1, 1))
-        colors = [QColor(color).getRgb()[:3] for color in swatches]
+        colors = [QColor(color).getRgb()[:3] for color in IMAGE_PALETTES[index]]
         palette.putpalette([channel for color in colors for channel in color])
         converted = rgb.quantize(palette=palette, dither=Image.Dither.NONE)
-        if self.dither.isChecked():
+        if dither:
             # Pull colors toward their nearest swatch before diffusing the residual.
             softened = Image.blend(rgb, converted.convert("RGB"), 0.25)
             converted = softened.quantize(palette=palette, dither=Image.Dither.FLOYDSTEINBERG)
-        self.preview.canvas_size = size
+        return converted
+
+    def _best_palette(self) -> int:
+        image = self._sample_image()
+        rgb = image.convert("RGB")
+        alpha = image.getchannel("A")
+
+        def error(index: int) -> int:
+            converted = self._quantize(rgb, index).convert("RGB")
+            difference = ImageChops.difference(rgb, converted)
+            return sum(
+                (level % 256) ** 2 * count
+                for level, count in enumerate(difference.histogram(mask=alpha))
+            )
+
+        return min(PALETTE_ORDER, key=error)
+
+    def refresh(self) -> None:
+        image = self._sample_image()
+        background = self.background.currentIndex()
+        palette_index = PALETTE_ORDER[self.mode.currentIndex()]
+        alpha = image.getchannel("A")
+        rgb = Image.new("RGB", image.size, IMAGE_PALETTES[palette_index][background])
+        rgb.paste(image.convert("RGB"), mask=alpha)
+        converted = self._quantize(rgb, palette_index, self.dither.isChecked())
+        self.preview.canvas_size = self.size_combo.currentIndex()
         self.preview.palette_index = palette_index
         self.preview.pixels = bytes(
             index if opacity else background

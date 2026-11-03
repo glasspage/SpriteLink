@@ -21,9 +21,10 @@ class DrawingMessageTests(unittest.TestCase):
                     encoded = encode_drawing(size, pixels)
                     self.assertEqual(bool(base64.b64decode(encoded)[0] & 4), compressed)
                     self.assertEqual(decode_drawing(encoded), (size, pixels, 0))
-                    grayscale = encode_drawing(size, pixels, 1)
-                    self.assertEqual(len(grayscale), len(encoded))
-                    self.assertEqual(decode_drawing(grayscale), (size, pixels, 1))
+                    for palette in (1, 2):
+                        colored = encode_drawing(size, pixels, palette)
+                        self.assertEqual(len(colored), len(encoded))
+                        self.assertEqual(decode_drawing(colored), (size, pixels, palette))
 
     def test_invalid_packed_or_compressed_images_are_rejected(self):
         compressed = zlib.compress(bytes(2025))
