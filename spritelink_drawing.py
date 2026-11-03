@@ -699,7 +699,17 @@ class DrawingImportPanel(QFrame):
                 for level, count in enumerate(difference.histogram(mask=alpha))
             )
 
-        return min(PALETTE_ORDER, key=error)
+        # A dense gray ramp can win on shade accuracy while losing visible color.
+        chroma_squared = 0
+        visible_weight = 0
+        channels = (channel.tobytes() for channel in rgb.split())
+        for red, green, blue, opacity in zip(*channels, alpha.tobytes()):
+            spread = max(red, green, blue) - min(red, green, blue)
+            chroma_squared += opacity * spread ** 2
+            visible_weight += opacity
+        near_grayscale = chroma_squared <= visible_weight * 16 ** 2
+        candidates = (index for index in PALETTE_ORDER if index != 1 or near_grayscale)
+        return min(candidates, key=error)
 
     def refresh(self) -> None:
         image = self._sample_image()
