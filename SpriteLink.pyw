@@ -6162,6 +6162,7 @@ class MessageLogBrowser(QTextBrowser):
         self._fade_document.contentsChange.connect(self._invalidate_collapsed_text_fades)
         self.unread_divider_block_number: int | None = None
         self.unread_divider_alpha = 255
+        self.show_unread_bottom_edge = False
         self.horizontalScrollBar().rangeChanged.connect(
             self._lock_horizontal_scroll
         )
@@ -6733,6 +6734,12 @@ class MessageLogBrowser(QTextBrowser):
         # Style changes can drop character backgrounds; repaint spoilers in every mode.
         self._paint_spoilers(event)
         self._paint_unread_divider(event)
+        if self.show_unread_bottom_edge:
+            viewport = self.viewport()
+            painter = QPainter(viewport)
+            painter.setClipRegion(event.region())
+            painter.fillRect(0, viewport.height() - 2, viewport.width(), 2, QColor("#ff8a00"))
+            painter.end()
 
 
 class SearchResultCard(QFrame):
@@ -7188,6 +7195,7 @@ class EncryptedChatClient(QObject):
         self._search_generation = 0
         self._history_load_complete = True
         self._search_history_end: tuple[int, int, str] | None = None
+        self._unseen_live_message: tuple[tuple[int, int, str], str] | None = None
         self._pending_search_jump: tuple[str, tuple[int, int, str]] | None = None
         self._media_rerender_in_progress = False
         self.embedded_image_preview_sizes: dict[str, tuple[int, int]] = {}
@@ -9340,7 +9348,33 @@ QComboBox::drop-down {
         )
         self.chat_display.viewport().update()
 
+    def _update_live_unread_edge(self) -> None:
+        if self._rendering_message_log or self._history_render_updates_suppressed:
+            return
+        display = self.chat_display
+        pending = self._unseen_live_message
+        if (
+            pending is not None
+            and self.window_focused_event.is_set()
+            and self.root.isVisible()
+            and not self.root.isMinimized()
+            and not self.search_toggle.isChecked()
+            and not self.config_toggle.isChecked()
+        ):
+            block_number = self.rendered_message_last_blocks.get(pending[1])
+            if block_number is not None:
+                document = display.document()
+                block = document.findBlockByNumber(block_number)
+                bottom = display.verticalScrollBar().value() + display.viewport().height()
+                if block.isValid() and document.documentLayout().blockBoundingRect(block).bottom() <= bottom + 1:
+                    self._unseen_live_message = None
+        visible = self._unseen_live_message is not None
+        if display.show_unread_bottom_edge != visible:
+            display.show_unread_bottom_edge = visible
+            display.viewport().update()
+
     def _update_unread_divider_fade(self) -> None:
+        self._update_live_unread_edge()
         now = time.monotonic()
         elapsed_since_tick = max(0.0, now - self._read_divider_last_tick)
         self._read_divider_last_tick = now
@@ -9929,6 +9963,8 @@ QComboBox::drop-down {
         return self._apply_theme_colors()
 
     def _reset_history_render_window(self) -> None:
+        self._unseen_live_message = None
+        self.chat_display.show_unread_bottom_edge = False
         self._set_history_render_updates_suppressed(False)
         self._history_render_generation += 1
         self._history_load_complete = True
@@ -14635,6 +14671,11 @@ QComboBox::drop-down {
             ntfy_id=str(ntfy_id),
         )
 
+        if play_chime and not is_local and self.root.isVisible() and not self.root.isMinimized():
+            pending = self._message_sort_key(item), str(client_message_id)
+            if self._unseen_live_message is None or pending > self._unseen_live_message:
+                self._unseen_live_message = pending
+
         self._add_message_to_log(
             message,
             is_local=is_local,
@@ -14787,7 +14828,10 @@ QComboBox::drop-down {
 
         if not self._append_live_message_items(items):
             # Delayed messages may belong inside an existing group; use the rebuild fallback.
-            self._render_message_log(scroll_to_bottom=True)
+            if self._unseen_live_message is not None and not any(item["is_local"] for item in items):
+                self._rerender_preserving_scroll()
+            else:
+                self._render_message_log(scroll_to_bottom=True)
 
     def _append_live_message_items(
         self,
@@ -14885,6 +14929,13 @@ QComboBox::drop-down {
                     + 1
                 ) % len(message_row_backgrounds())
 
+        preserve_view = (
+            self._unseen_live_message is not None
+            and previous_item is not None
+            and not any(item["is_local"] for item in items)
+        )
+        scrollbar = self.chat_display.verticalScrollBar()
+        previous_scroll = scrollbar.value()
         self._hide_chat_tooltip()
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -14946,12 +14997,13 @@ QComboBox::drop-down {
             for selection in row_selections
             if selection.cursor.block().isValid()
         })
-        self._bottom_align_short_message_log()
+        if not preserve_view:
+            self._bottom_align_short_message_log()
         self.chat_display.setExtraSelections([])
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
-        scrollbar = self.chat_display.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        scrollbar.setValue(previous_scroll if preserve_view else scrollbar.maximum())
+        self._update_live_unread_edge()
         if not self.viewport_media_timer.isActive():
             self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
         self.chat_display.viewport().update()
@@ -15156,6 +15208,11 @@ QComboBox::drop-down {
             for item in self.message_log[:excess]
         ):
             self._history_render_pruned = True
+        if self._unseen_live_message is not None and any(
+            self._message_id_from_log_item(item) == self._unseen_live_message[1]
+            for item in self.message_log[:excess]
+        ):
+            self._unseen_live_message = None
         del self.message_log[:excess]
         if self._search_history_end is not None and not self._history_view_end():
             self._search_history_end = None
@@ -15342,6 +15399,10 @@ QComboBox::drop-down {
             )
             return
         anchor = self._capture_chat_view_anchor()
+        if self._unseen_live_message is not None:
+            anchor["at_bottom"] = False
+            anchor["live_top_margin"] = self.chat_display.document().rootFrame().frameFormat().topMargin()
+            anchor["fallback_scroll"] = self.chat_display.verticalScrollBar().value()
         generation = self._history_render_generation
         room_id = self.active_chatroom_id
         self._media_rerender_in_progress = True
@@ -15376,6 +15437,13 @@ QComboBox::drop-down {
                 block.blockNumber()
             )
             if message_id:
+                previous = block.previous()
+                while (
+                    previous.isValid()
+                    and self.rendered_message_blocks.get(previous.blockNumber()) == message_id
+                ):
+                    block = previous
+                    previous = block.previous()
                 block_top = (
                     document.documentLayout()
                     .blockBoundingRect(block)
@@ -15420,9 +15488,15 @@ QComboBox::drop-down {
         ):
             return
 
+        if "live_top_margin" in anchor:
+            frame = self.chat_display.document().rootFrame()
+            formatting = frame.frameFormat()
+            formatting.setTopMargin(anchor["live_top_margin"])
+            frame.setFrameFormat(formatting)
         self._restore_chat_view_anchor(anchor)
         self._media_rerender_in_progress = False
         self._set_history_render_updates_suppressed(False)
+        self._update_live_unread_edge()
         self._flush_pending_live_message_render()
 
     def _restore_chat_view_anchor(
@@ -15453,6 +15527,8 @@ QComboBox::drop-down {
                 scrollbar.setValue(round(
                     block_top - float(anchor.get("viewport_offset", 0.0))
                 ))
+            elif "fallback_scroll" in anchor:
+                scrollbar.setValue(anchor["fallback_scroll"])
             else:
                 scrollbar.setValue(max(
                     scrollbar.minimum(),

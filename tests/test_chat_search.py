@@ -24,6 +24,51 @@ class ChatSearchTests(unittest.TestCase):
             QTest.qWait(5)
         self.fail("Timed out waiting for chat search")
 
+    def test_live_messages_preserve_view_until_scrolled_into_view(self):
+        client = self.client
+        self.root.resize(800, 600)
+        self.root.show()
+
+        def receive(index: int, text: str, *, live: bool = True) -> None:
+            timestamp = 1_730_000_000 + index
+            message = client._build_draft_message(text)
+            message.update(i=f"live-{index}", t=timestamp, c="remote-user")
+            self.assertTrue(client._accept_network_message(
+                {"message": message, "ntfy_id": f"ntfy-{index}", "ntfy_time": timestamp},
+                persist=False, play_chime=live,
+            ))
+
+        display = client.chat_display
+        scrollbar = display.verticalScrollBar()
+        client.window_focused_event.set()
+        with mock.patch.object(client, "_show_desktop_notification"), mock.patch.object(
+            client, "_play_notification_sound",
+        ):
+            receive(0, "First message", live=False)
+            original = client._capture_chat_view_anchor()
+            receive(1, "New message")
+            receive(2, "Another new message")
+            self.assertEqual(client._capture_chat_view_anchor()["viewport_offset"], original["viewport_offset"])
+            self.assertTrue(display.show_unread_bottom_edge)
+            image = display.viewport().grab().toImage()
+            for offset in (1, 2):
+                self.assertEqual(image.pixelColor(5, image.height() - offset), QColor("#ff8a00"))
+            scrollbar.setValue(scrollbar.maximum())
+            self.wait_for(lambda: not display.show_unread_bottom_edge)
+
+            for index in range(3, 25):
+                receive(index, f"History message {index}", live=False)
+            original = client._capture_chat_view_anchor()
+            receive(25, "Newest message")
+            receive(26, "Newest message")  # Repeated messages rebuild the shared row.
+            self.wait_for(lambda: not client._media_rerender_in_progress)
+            self.assertLess(scrollbar.value(), scrollbar.maximum())
+            self.assertEqual(client._capture_chat_view_anchor()["message_id"], original["message_id"])
+            self.assertEqual(client._capture_chat_view_anchor()["viewport_offset"], original["viewport_offset"])
+            self.assertTrue(display.show_unread_bottom_edge)
+            scrollbar.setValue(scrollbar.maximum())
+            self.wait_for(lambda: not display.show_unread_bottom_edge)
+
     def test_text_and_media_filters(self):
         def find(text, query="", *filters):
             return S.message_text_for_search({"message": {"m": text}}, query, set(filters))
