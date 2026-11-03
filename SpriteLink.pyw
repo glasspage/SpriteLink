@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import binascii
 import ctypes
+from contextlib import closing
 from ctypes import wintypes
 from dataclasses import dataclass
 from functools import lru_cache
@@ -19,6 +20,7 @@ from pathlib import Path
 import queue
 import re
 import secrets
+import sqlite3
 import subprocess
 import threading
 import time
@@ -131,7 +133,7 @@ except ImportError as exc:
         "Missing dependency: PySide6\n\nInstall it with:\n"
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
-from typing import Any
+from typing import Any, Iterable
 
 QAudioOutput: Any = None
 QMediaPlayer: Any = None
@@ -350,8 +352,8 @@ CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
 MESSAGE_SOUND_COOLDOWN_SECONDS = 2.0
 COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
 DESKTOP_NOTIFICATION_DEBOUNCE_MS = 250
-CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
-DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
+CHATROOM_HISTORY_OPTIONS = (1000, 5000, 10000, 50000)
+DEFAULT_CHATROOM_HISTORY_LIMIT = 10000
 INITIAL_HISTORY_RENDER_MESSAGES = 50
 HISTORY_RENDER_PAGE_MESSAGES = 50
 HISTORY_PREFETCH_SCROLL_FRACTION = 0.20
@@ -3373,6 +3375,8 @@ def normalize_chatroom_history_limit(value: Any) -> int:
         candidate = int(value)
     except (TypeError, ValueError):
         candidate = DEFAULT_CHATROOM_HISTORY_LIMIT
+    if candidate in (100, 500):
+        return CHATROOM_HISTORY_OPTIONS[0]
     return (
         candidate
         if candidate in CHATROOM_HISTORY_OPTIONS
@@ -3407,7 +3411,7 @@ def _load_dpapi_config(encrypted: bytes) -> dict[str, Any]:
 
 def chatroom_history_path(server_url: str, encryption_key: str) -> Path:
     scope_id = room_scope_id(server_url, encryption_key)
-    return CHATROOM_HISTORY_DIRECTORY / f"{scope_id}.bin"
+    return CHATROOM_HISTORY_DIRECTORY / f"{scope_id}.sqlite3"
 
 
 def _load_chatroom_history_file(path: Path) -> list[dict[str, Any]]:
@@ -3420,36 +3424,133 @@ def _load_chatroom_history_file(path: Path) -> list[dict[str, Any]]:
     return [entry for entry in loaded if isinstance(entry, dict)]
 
 
+def _open_chatroom_history(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                message_id TEXT PRIMARY KEY NOT NULL,
+                ntfy_id TEXT,
+                sort_time INTEGER NOT NULL,
+                sent_time INTEGER NOT NULL,
+                payload BLOB NOT NULL
+            )
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS messages_by_time
+            ON messages (sort_time, sent_time, message_id)
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS messages_by_ntfy_id
+            ON messages (ntfy_id) WHERE ntfy_id IS NOT NULL
+        """)
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
+
+def _history_rows(entries: Iterable[dict[str, Any]]) -> Iterable[tuple]:
+    for item in entries:
+        message = item.get("message")
+        if not isinstance(message, dict) or not message.get("i"):
+            continue
+        sort_time, sent_time, message_id = message_item_sort_key(item)
+        entry = {key: value for key, value in item.items() if key != "is_local"}
+        raw = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+        payload = dpapi_encrypt(
+            zlib.compress(raw.encode("utf-8"), level=1),
+            CHATROOM_HISTORY_DPAPI_ENTROPY,
+        )
+        yield message_id, item.get("ntfy_id"), sort_time, sent_time, payload
+
+
+def _insert_chatroom_history(
+    connection: sqlite3.Connection,
+    entries: Iterable[dict[str, Any]],
+) -> None:
+    connection.executemany("""
+        INSERT INTO messages (message_id, ntfy_id, sort_time, sent_time, payload)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO NOTHING
+    """, _history_rows(entries))
+
+
+def _pending_history_upgrades() -> list[Path]:
+    pending = []
+    for legacy_path in sorted(CHATROOM_HISTORY_DIRECTORY.glob("*.bin")):
+        path = legacy_path.with_suffix(".sqlite3")
+        if path.exists():
+            with closing(sqlite3.connect(path)) as connection:
+                if connection.execute("PRAGMA user_version").fetchone()[0] >= 1:
+                    continue
+        pending.append(legacy_path)
+    return pending
+
+
+def _upgrade_chatroom_history(legacy_path: Path) -> None:
+    entries = _load_chatroom_history_file(legacy_path)
+    with closing(_open_chatroom_history(legacy_path.with_suffix(".sqlite3"))) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("PRAGMA user_version").fetchone()[0] < 1:
+                _insert_chatroom_history(connection, entries)
+                connection.execute("PRAGMA user_version = 1")
+
+
 def load_chatroom_history(
     server_url: str,
     encryption_key: str,
+    *,
+    limit: int = -1,
+    before: tuple[int, int, str] | None = None,
 ) -> list[dict[str, Any]]:
-    try:
-        path = chatroom_history_path(server_url, encryption_key)
-        if not path.exists():
-            return []
-        return _load_chatroom_history_file(path)
-    except Exception:
+    path = chatroom_history_path(server_url, encryption_key)
+    if not path.exists():
         return []
+    with closing(sqlite3.connect(path)) as connection:
+        query = "SELECT payload FROM messages"
+        params = ()
+        if before is not None:
+            query += " WHERE (sort_time, sent_time, message_id) < (?, ?, ?)"
+            params = before
+        query += " ORDER BY sort_time DESC, sent_time DESC, message_id DESC LIMIT ?"
+        rows = connection.execute(query, (*params, limit)).fetchall()
+    return [
+        json.loads(zlib.decompress(dpapi_decrypt(payload, CHATROOM_HISTORY_DPAPI_ENTROPY)))
+        for (payload,) in reversed(rows)
+    ]
 
 
 def save_chatroom_history(
     server_url: str,
     encryption_key: str,
     entries: list[dict[str, Any]],
+    maximum_messages: int | None = None,
 ) -> None:
     path = chatroom_history_path(server_url, encryption_key)
-    if not entries:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+    if not entries and not path.exists():
         return
-    _write_dpapi_json(
-        path,
-        entries,
-        CHATROOM_HISTORY_DPAPI_ENTROPY,
-    )
+    with closing(_open_chatroom_history(path)) as connection:
+        with connection:
+            _insert_chatroom_history(connection, entries)
+            if maximum_messages is not None:
+                _prune_history_rows(connection, maximum_messages)
+
+
+def _prune_history_rows(connection: sqlite3.Connection, limit: int) -> bool:
+    boundary = connection.execute("""
+        SELECT sort_time, sent_time, message_id FROM messages
+        ORDER BY sort_time DESC, sent_time DESC, message_id DESC
+        LIMIT 1 OFFSET ?
+    """, (limit - 1,)).fetchone()
+    if boundary is None:
+        return False
+    return connection.execute("""
+        DELETE FROM messages WHERE (sort_time, sent_time, message_id) < (?, ?, ?)
+    """, boundary).rowcount > 0
 
 
 def prune_chatroom_history(
@@ -3457,36 +3558,30 @@ def prune_chatroom_history(
     encryption_key: str,
     maximum_messages: int,
 ) -> bool:
-    try:
-        path = chatroom_history_path(server_url, encryption_key)
-        if not path.exists():
-            return False
-        entries = _load_chatroom_history_file(path)
-    except Exception:
+    path = chatroom_history_path(server_url, encryption_key)
+    if not path.exists():
         return False
-
-    limit = normalize_chatroom_history_limit(maximum_messages)
-    if len(entries) <= limit:
-        return False
-    save_chatroom_history(
-        server_url,
-        encryption_key,
-        entries[-limit:],
-    )
-    return True
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            pruned = _prune_history_rows(connection, maximum_messages)
+        if pruned:
+            connection.execute("PRAGMA incremental_vacuum(256)")
+    return pruned
 
 
 def delete_local_chatroom_history(
     server_url: str,
     encryption_key: str,
 ) -> bool:
+    path = chatroom_history_path(server_url, encryption_key)
+    existed = path.exists() or path.with_suffix(".bin").exists()
     try:
-        chatroom_history_path(server_url, encryption_key).unlink()
-        return True
-    except FileNotFoundError:
+        path.with_suffix(".bin").unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+    except OSError:
         return False
-    except Exception:
-        return False
+    return existed
 
 
 def default_config() -> dict[str, Any]:
@@ -6837,6 +6932,7 @@ class EncryptedChatClient(QObject):
         self.seen_client_message_ids: set[str] = set()
         self.seen_ntfy_message_ids: set[str] = set()
         self.message_log: list[dict[str, Any]] = []
+        self.pending_history_entries: list[dict[str, Any]] = []
         self.draft_message_id = uuid.uuid4().hex
         self.chatroom_drafts: dict[str, str] = {}
         self.read_divider_message_ids: dict[str, str] = {}
@@ -11427,9 +11523,14 @@ QComboBox::drop-down {
 
         layout.addWidget(QLabel("Chatroom History"), row, 0)
         self.chatroom_history_combo = ThemeComboBox()
-        self.chatroom_history_combo.addItems([
-            str(option) for option in CHATROOM_HISTORY_OPTIONS
-        ])
+        for index, option in enumerate(CHATROOM_HISTORY_OPTIONS):
+            self.chatroom_history_combo.addItem(str(option))
+            megabytes = round(option * 4096 / 1_000_000)
+            self.chatroom_history_combo.setItemData(
+                index,
+                f"Chatroom max storage: ~{megabytes} MB",
+                Qt.ItemDataRole.ToolTipRole,
+            )
         self.chatroom_history_combo.setCurrentText(
             str(self.chatroom_history_limit_var.get())
         )
@@ -13517,6 +13618,14 @@ QComboBox::drop-down {
                         warning=True,
                     )
 
+                elif event_type == "history_load_error":
+                    if payload == (self._history_render_generation, self.active_chatroom_id):
+                        messagebox.showerror(
+                            "Chat history",
+                            "Could not read saved chat history.",
+                            parent=self.root,
+                        )
+
                 elif event_type == "history_chunk_loaded":
                     generation = int(payload.get("generation", -1))
                     room_id = str(payload.get("room_id", ""))
@@ -13672,19 +13781,30 @@ QComboBox::drop-down {
         if not server_url or not encryption_key:
             return
 
-        history = load_chatroom_history(server_url, encryption_key)
-        seen_ntfy_ids = {
-            str(entry.get("ntfy_id"))
-            for entry in history
-            if isinstance(entry.get("ntfy_id"), str)
-            and entry.get("ntfy_id")
-        }
-        seen_client_message_ids = {
-            str(entry["message"].get("i"))
-            for entry in history
-            if isinstance(entry.get("message"), dict)
-            and isinstance(entry["message"].get("i"), str)
-        }
+        history = load_chatroom_history(server_url, encryption_key, limit=2)
+        path = chatroom_history_path(server_url, encryption_key)
+        seen_client_message_ids = set()
+        seen_ntfy_ids = set()
+        if path.exists():
+            with closing(sqlite3.connect(path)) as connection:
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    message = item.get("message")
+                    if not isinstance(message, dict):
+                        continue
+                    message_id = message.get("i")
+                    ntfy_id = item.get("ntfy_id")
+                    if not isinstance(message_id, str) or not isinstance(ntfy_id, str):
+                        continue
+                    match = connection.execute(
+                        "SELECT 1 FROM messages WHERE message_id = ? OR ntfy_id = ?",
+                        (message_id, ntfy_id),
+                    ).fetchone()
+                    if match:
+                        seen_client_message_ids.add(message_id)
+                        seen_ntfy_ids.add(ntfy_id)
+        new_entries = []
         muted_user_ids = self._room_preference_ids_for_key(
             "muted_users",
             encryption_key,
@@ -13723,12 +13843,14 @@ QComboBox::drop-down {
                 ntfy_time=message_ntfy_time,
                 ntfy_id=ntfy_id,
             )
-            history.append({
+            entry = {
                 "message": message,
                 "warning": None,
                 "ntfy_id": ntfy_id,
                 "ntfy_time": message_ntfy_time,
-            })
+            }
+            new_entries.append(entry)
+            history.append(entry)
             added += 1
 
             should_notify = poll_message_should_notify(
@@ -13772,12 +13894,12 @@ QComboBox::drop-down {
         if not added:
             return
 
-        history.sort(key=self._message_sort_key)
         try:
             save_chatroom_history(
                 server_url,
                 encryption_key,
-                history,
+                new_entries,
+                self._chatroom_history_limit(),
             )
         except Exception:
             pass
@@ -13918,6 +14040,7 @@ QComboBox::drop-down {
                 newest_received_time + 1,
             )
         self.message_log.append(item)
+        self.pending_history_entries.append(item)
 
         self.message_log.sort(key=self._message_sort_key)
         history_limit = self._chatroom_history_limit()
@@ -14173,18 +14296,31 @@ QComboBox::drop-down {
         encryption_key: str,
         history_limit: int,
     ) -> None:
-        entries = load_chatroom_history(server_url, encryption_key)[
-            -history_limit:
-        ]
         first_chunk = True
-        chunk_end = len(entries)
-        while chunk_end > 0 and not self._closing:
-            chunk_start = max(
-                0,
-                chunk_end - INITIAL_HISTORY_RENDER_MESSAGES,
-            )
+        remaining = history_limit
+        before = None
+        while (
+            remaining > 0 and not self._closing
+            and generation == self._history_render_generation
+        ):
+            try:
+                entries = load_chatroom_history(
+                    server_url,
+                    encryption_key,
+                    limit=min(remaining, INITIAL_HISTORY_RENDER_MESSAGES),
+                    before=before,
+                )
+            except Exception:
+                self._queue_ui_event((
+                    "history_load_error", (generation, room_id),
+                ))
+                break
+            if not entries:
+                break
+            before = self._message_sort_key(entries[0])
+            remaining -= len(entries)
             prepared_items: list[dict[str, Any]] = []
-            for item in entries[chunk_start:chunk_end]:
+            for item in entries:
                 message = item.get("message")
                 if not isinstance(message, dict):
                     continue
@@ -14233,7 +14369,6 @@ QComboBox::drop-down {
                 },
             ))
             first_chunk = False
-            chunk_end = chunk_start
 
         if first_chunk and not self._closing:
             self._queue_ui_event((
@@ -14292,29 +14427,17 @@ QComboBox::drop-down {
         if not server_url or not encryption_key:
             return
 
-        serializable = []
-        history_limit = self._chatroom_history_limit()
-        for item in self.message_log[-history_limit:]:
-            serializable.append({
-                "message": item["message"],
-                "warning": item.get("warning"),
-                "ntfy_id": item.get("ntfy_id"),
-                "ntfy_time": int(item.get("ntfy_time", 0) or 0),
-                **(
-                    {"display_sort_time": int(item["display_sort_time"])}
-                    if type(item.get("display_sort_time")) is int
-                    else {}
-                ),
-            })
-
         try:
             save_chatroom_history(
                 server_url,
                 encryption_key,
-                serializable,
+                self.pending_history_entries,
+                self._chatroom_history_limit(),
             )
         except Exception:
-            pass
+            self.status_var.set("Could not save chat history")
+        else:
+            self.pending_history_entries.clear()
 
     def _chatroom_history_limit(self) -> int:
         value = (
@@ -17218,6 +17341,7 @@ QComboBox::drop-down {
         self.seen_client_message_ids.clear()
         self.seen_ntfy_message_ids.clear()
         self.message_log.clear()
+        self.pending_history_entries.clear()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
         self.rendered_message_last_blocks.clear()
@@ -17854,6 +17978,65 @@ def _write_crash_log(error_text: str) -> Path | None:
 
 
 
+def show_history_upgrade(client: EncryptedChatClient, pending: list[Path]) -> bool:
+    class HistoryUpgradeDialog(QDialog):
+        def reject(self) -> None:
+            # Escape must not interrupt the upgrade worker.
+            pass
+
+    dialog = HistoryUpgradeDialog(client.root)
+    dialog.setWindowTitle("Upgrading chat history")
+    dialog.setWindowFlags(
+        Qt.WindowType.Dialog | Qt.WindowType.CustomizeWindowHint
+        | Qt.WindowType.WindowTitleHint
+    )
+    layout = QVBoxLayout(dialog)
+    label = QLabel(
+        "Chat history is being upgraded to a new format. This shouldn't take long…"
+    )
+    label.setWordWrap(True)
+    label.setMinimumWidth(320)
+    layout.addWidget(label)
+    progress = QProgressBar()
+    progress.setRange(0, len(pending))
+    progress.setValue(0)
+    layout.addWidget(progress)
+    client._apply_dialog_window_theme(dialog)
+
+    updates: queue.Queue = queue.Queue()
+
+    def upgrade() -> None:
+        try:
+            for index, path in enumerate(pending, start=1):
+                _upgrade_chatroom_history(path)
+                updates.put(index)
+        except Exception as exc:
+            updates.put(exc)
+        else:
+            updates.put(None)
+
+    def poll_progress() -> None:
+        while not updates.empty():
+            update = updates.get_nowait()
+            if update is None:
+                dialog.accept()
+                return
+            if isinstance(update, Exception):
+                dialog.done(QDialog.DialogCode.Rejected)
+                return
+            progress.setValue(update)
+
+    timer = QTimer(dialog)
+    timer.timeout.connect(poll_progress)
+    timer.start(25)
+    threading.Thread(
+        target=upgrade, name="SpriteLinkHistoryUpgrade", daemon=True,
+    ).start()
+    result = dialog.exec()
+    timer.stop()
+    return result == QDialog.DialogCode.Accepted
+
+
 def main() -> None:
     notification_uri = notification_uri_from_arguments(sys.argv)
     notification_room_id = (
@@ -17941,6 +18124,19 @@ def main() -> None:
 
     instance_control = SingleInstanceControl(client._quit_from_tray, root)
     root.show()
+    try:
+        pending = _pending_history_upgrades()
+        upgraded = not pending or show_history_upgrade(client, pending)
+    except Exception:
+        upgraded = False
+    if not upgraded:
+        messagebox.showerror(
+            "Chat history upgrade",
+            "Could not upgrade chat history. Your old history is still available. "
+            "Restart SpriteLink to try again.",
+            parent=root,
+        )
+        return
     QTimer.singleShot(50, client.prepare_after_show)
     if notification_room_id is not None:
         QTimer.singleShot(
