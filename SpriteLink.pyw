@@ -6751,6 +6751,28 @@ class SearchResultMessage(QTextBrowser):
         policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         policy.setHeightForWidth(True)
         self.setSizePolicy(policy)
+        self._fit_height_timer = QTimer(self)
+        self._fit_height_timer.setSingleShot(True)
+        self._fit_height_timer.timeout.connect(self._fit_live_document_height)
+        self.document().documentLayout().documentSizeChanged.connect(
+            self._schedule_height_fit
+        )
+
+    def _schedule_height_fit(self) -> None:
+        if not self._fit_height_timer.isActive():
+            self._fit_height_timer.start(0)
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self._schedule_height_fit()
+
+    def _fit_live_document_height(self) -> None:
+        # The layout's provisional height can be shorter than the live viewport needs.
+        viewport = self.maximumViewportSize()
+        height = math.ceil(self.document().size().height()) + self.height() - viewport.height()
+        if height != self.minimumHeight():
+            self.setMinimumHeight(height)
+        self.verticalScrollBar().setValue(0)
 
     def setHtml(self, text: str) -> None:
         self._height_measurement = None

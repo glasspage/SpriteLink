@@ -217,6 +217,17 @@ class ChatSearchTests(unittest.TestCase):
         self.assertEqual(document.begin().layout().lineCount(), lines)
         body.close()
 
+    def test_wrapped_result_grows_to_fit_live_document(self):
+        body = self.client._search_result_message(
+            self.client._build_draft_message("Two lines of text")
+        )
+        body.resize(150, 20)
+        body.show()
+        self.wait_for(lambda: body.viewport().height() >= body.document().size().height())
+        self.assertEqual(body.document().begin().layout().lineCount(), 2)
+        self.assertEqual(body.verticalScrollBar().maximum(), 0)
+        body.close()
+
     def test_saved_history_search_pagination_and_jump(self):
         client = self.client
         self.root.resize(800, 600)
@@ -268,6 +279,10 @@ class ChatSearchTests(unittest.TestCase):
             self.assertTrue(client.search_more_button.isHidden())
             self.assertEqual(first_card.size(), first_size)
             self.assertEqual(document.begin().layout().lineCount(), first_lines)
+            self.assertGreaterEqual(first_body.viewport().height(), document.size().height())
+            self.root.resize(620, 600)
+            self.wait_for(lambda: first_body.viewport().height() >= document.size().height())
+            self.assertEqual(first_body.verticalScrollBar().maximum(), 0)
             self.assertEqual(client.search_results_layout.count(), 30)
             frame = client.search_results_layout.itemAt(29).widget()
             frame.findChild(QPushButton).click()
