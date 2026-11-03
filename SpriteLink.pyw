@@ -85,6 +85,8 @@ try:
         QTextFormat,
         QTextImageFormat,
         QTextLayout,
+        QTextLength,
+        QTextTableFormat,
         QTextOption,
     )
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -11053,29 +11055,51 @@ QComboBox::drop-down {
         cursor = QTextCursor(document)
         font_name = str(message.get("f", DEFAULT_MESSAGE_FONT))
         body_color = str(message.get("o", DEFAULT_MESSAGE_TEXT_COLOR))
-        if self._chat_icons_visible() and self._insert_profile_icon(
+        username = str(message["u"])
+        username_format = self._text_format(str(message["k"]), font_name=font_name)
+        body_format = self._text_format(body_color, font_name=font_name)
+        plain_text = message_plain_text(str(message["m"]))
+        visible_text = message_text_without_image_links(plain_text, set(embedded_urls))
+        icon = str(message.get("p", "")) if self._chat_icons_visible() else ""
+        media_row = None
+        if embedded_urls and not visible_text.strip():
+            # Separate cells keep the username at the top regardless of preview height.
+            width = (
+                QFontMetrics(username_format.font()).horizontalAdvance(username)
+                + QFontMetrics(body_format.font()).horizontalAdvance(":  ")
+                + (PROFILE_ICON_SIZE if icon else 0)
+            )
+            table_format = QTextTableFormat()
+            table_format.setBorder(0)
+            table_format.setCellPadding(0)
+            table_format.setCellSpacing(0)
+            table_format.setColumnWidthConstraints([
+                QTextLength(QTextLength.Type.FixedLength, width),
+                QTextLength(QTextLength.Type.VariableLength, 0),
+            ])
+            media_row = cursor.insertTable(1, 2, table_format)
+            cursor = media_row.cellAt(0, 0).firstCursorPosition()
+        if icon and self._insert_profile_icon(
             cursor,
-            str(message.get("p", "")),
+            icon,
             str(message["i"]),
             line_height_px=self._chat_line_height(font_name),
             inline_html=True,
         ):
-            cursor.insertText(" ", self._text_format(body_color, font_name=font_name))
-        cursor.insertText(
-            str(message["u"]),
-            self._text_format(str(message["k"]), font_name=font_name),
-        )
-        cursor.insertText(": ", self._text_format(body_color, font_name=font_name))
-        self._insert_message_text_with_links(
-            cursor, str(message["m"]), body_color, font_name,
-            str(message["c"]), str(message["i"]),
-            muted=False, ui_font=False, embedded_image_urls=set(embedded_urls),
-            align_top=False, top_align_height=0, preview=True,
-        )
-        plain_text = message_plain_text(str(message["m"]))
-        visible_text = message_text_without_image_links(plain_text, set(embedded_urls))
-        if embedded_urls and visible_text.strip() and not visible_text.rstrip(" \t").endswith(("\n", "\r")):
-            cursor.insertBlock()
+            cursor.insertText(" ", body_format)
+        cursor.insertText(username, username_format)
+        cursor.insertText(": ", body_format)
+        if media_row is not None:
+            cursor = media_row.cellAt(0, 1).firstCursorPosition()
+        else:
+            self._insert_message_text_with_links(
+                cursor, str(message["m"]), body_color, font_name,
+                str(message["c"]), str(message["i"]),
+                muted=False, ui_font=False, embedded_image_urls=set(embedded_urls),
+                align_top=False, top_align_height=0, preview=True,
+            )
+            if embedded_urls and not visible_text.rstrip(" \t").endswith(("\n", "\r")):
+                cursor.insertBlock()
         for url in embedded_urls:
             media = self.image_preview_cache.get(url)
             image = (

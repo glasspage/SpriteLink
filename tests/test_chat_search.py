@@ -4,7 +4,7 @@ import unittest
 from unittest import mock
 
 from PySide6.QtCore import QUrl
-from PySide6.QtGui import QColor, QImage, QTextDocument
+from PySide6.QtGui import QColor, QImage, QPainter, QTextDocument
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QLabel, QPushButton
 from spritelink_video import VideoInfo
@@ -123,6 +123,28 @@ class ChatSearchTests(unittest.TestCase):
         self.assertTrue(client.search_overlay.isHidden())
         self.assertEqual(client.search_entry.text(), "")
         self.assertFalse(client._search_media_updates)
+
+    def test_media_only_result_top_aligns_username(self):
+        client = self.client
+        url = "https://i.imgur.com/example.png"
+        image = QImage(120, 100, QImage.Format.Format_RGB32)
+        image.fill(QColor("#0000ff"))
+        client.image_preview_cache[url] = S.RemoteMediaPreview(url, b"", "static_image", image)
+        message = client._build_draft_message(url)
+        message.update(u="Username", k="#ff0000")
+        document = QTextDocument()
+        document.setHtml(client._search_result_html(message, [url]))
+        document.setTextWidth(350)
+        rendered = QImage(350, 140, QImage.Format.Format_RGB32)
+        rendered.fill(QColor("white"))
+        painter = QPainter(rendered)
+        document.drawContents(painter)
+        painter.end()
+        text_top = next(y for y in range(140) for x in range(130)
+                        if rendered.pixelColor(x, y) == QColor("#ff0000"))
+        image_top = next(y for y in range(140) for x in range(350)
+                         if rendered.pixelColor(x, y) == QColor("#0000ff"))
+        self.assertLess(abs(text_top - image_top), 20)
 
     def test_saved_history_search_pagination_and_jump(self):
         client = self.client
