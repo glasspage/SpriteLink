@@ -10840,9 +10840,6 @@ QComboBox::drop-down {
         footer = QHBoxLayout()
         self.search_status = QLabel()
         footer.addWidget(self.search_status, 1)
-        self.search_more_button = QPushButton("More")
-        self.search_more_button.clicked.connect(self._start_chat_search)
-        footer.addWidget(self.search_more_button)
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.search_toggle.click)
         footer.addWidget(close_button)
@@ -10886,7 +10883,6 @@ QComboBox::drop-down {
         self._search_media_updates.clear()
         while self.search_results_layout.count():
             self.search_results_layout.takeAt(0).widget().deleteLater()
-        self.search_more_button.hide()
         self.search_status.setText("Enter text or select a filter.")
         self.search_timer.start()
 
@@ -10898,11 +10894,10 @@ QComboBox::drop-down {
         filters = {name for name, box in self.search_filters.items() if box.isChecked()}
         if not query and not filters:
             return
-        if self.search_results_layout.count() and not self.search_more_button.isVisible():
+        if self.search_results_layout.count() and self._search_before is None:
             return
         self._search_running = True
-        self.search_more_button.hide()
-        self.search_status.setText("Searching…")
+        self.search_status.setText("Searching...")
         self.history_load_executor.submit(
             self._chat_search_worker,
             self._search_generation,
@@ -10982,8 +10977,15 @@ QComboBox::drop-down {
             self.search_results_layout.addWidget(frame)
             self._apply_ui_size_to_widget_tree(frame)
         self._search_before = next_page
-        self.search_more_button.setVisible(next_page is not None)
-        self.search_status.setText("" if self.search_results_layout.count() else "No matches.")
+        if next_page is not None:
+            self._start_chat_search()
+            return
+        count = self.search_results_layout.count()
+        if count == 0:
+            self.search_status.setText("No matches.")
+        else:
+            noun = "result" if count == 1 else "results"
+            self.search_status.setText(f"{count} {noun} found.")
 
     def _update_search_media_preview(
         self, url: str, media: RemoteMediaPreview | None,
