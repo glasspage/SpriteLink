@@ -1609,6 +1609,10 @@ def optimize_profile_icon(source_path: str) -> bytes:
     )
     canvas.alpha_composite(icon, offset)
 
+    return _encode_profile_icon_canvas(canvas)
+
+
+def _encode_profile_icon_canvas(canvas: Image.Image, dither: bool = False) -> bytes:
     # GIF allows one transparent palette entry; normalize partial alpha first.
     normalized_pixels = [
         (red, green, blue, 255)
@@ -1651,6 +1655,18 @@ def optimize_profile_icon(source_path: str) -> bytes:
             for index in used_indices
         ]
         opaque_indices = [remap[index] for index in quantized_indices]
+
+    if dither and len(exact_colors) > max_opaque_colors:
+        # Diffuse across the 2D crop using the palette fitted to opaque pixels.
+        palette = Image.new("P", (1, 1))
+        palette.putpalette([channel for color in palette_colors for channel in color])
+        mapped = canvas.convert("RGB").quantize(
+            palette=palette, dither=Image.Dither.FLOYDSTEINBERG,
+        )
+        opaque_indices = [
+            index for index, (*_rgb, alpha) in zip(mapped.tobytes(), normalized_pixels)
+            if alpha == 255
+        ]
 
     transparency_index = len(palette_colors) if has_transparency else None
     pixel_indices: list[int] = []
@@ -7800,7 +7816,7 @@ class EncryptedChatClient(QObject):
             )
         if hasattr(self, "profile_icon_button"):
             self.profile_icon_button.setText(
-                "..." if tiny else "Browse..."
+                "..." if tiny else "Import..."
             )
         if hasattr(self, "config_tab") and self.config_tab.layout() is not None:
             margin = 10 if tiny else 14
@@ -10497,7 +10513,7 @@ QComboBox::drop-down {
             self._show_profile_icon_context_menu
         )
         identity_layout.addWidget(self.profile_icon_preview)
-        self.profile_icon_button = QPushButton("Browse...")
+        self.profile_icon_button = QPushButton("Import...")
         self.profile_icon_button.clicked.connect(
             self._choose_profile_icon
         )
@@ -10689,8 +10705,9 @@ QComboBox::drop-down {
             self.message_size_timer.start(MESSAGE_SIZE_DEBOUNCE_MS)
             self._draw_message_size_bar()
 
-    def _open_drawing_import(self) -> None:
+    def _open_drawing_import(self, *, profile_icon: bool = False) -> None:
         self._close_drawing_import()
+        title = "Import profile icon" if profile_icon else "Import image"
         overlay = ConfigOverlay(self.chat_content)
         self.drawing_import_overlay = overlay
         panel = QFrame()
@@ -10700,7 +10717,7 @@ QComboBox::drop-down {
         layout.setContentsMargins(10, 10, 10, 10)
         layout.addWidget(panel)
         chooser = QVBoxLayout(panel)
-        chooser.addWidget(QLabel("Import image"))
+        chooser.addWidget(QLabel(title))
         chooser.addStretch()
         sources = QHBoxLayout()
         sources.addStretch()
@@ -10710,7 +10727,7 @@ QComboBox::drop-down {
         ):
             button = QPushButton(label)
             button.setMinimumSize(126, 44)
-            button.clicked.connect(action)
+            button.clicked.connect(lambda _checked, callback=action: callback(profile_icon))
             sources.addWidget(button)
         sources.addStretch()
         chooser.addLayout(sources)
@@ -10728,7 +10745,7 @@ QComboBox::drop-down {
         overlay.raise_()
         sources.itemAt(1).widget().setFocus()
 
-    def _import_drawing_from_file(self) -> None:
+    def _import_drawing_from_file(self, profile_icon: bool = False) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self.root, "Import image", "",
             "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff);;All files (*)",
@@ -10740,9 +10757,9 @@ QComboBox::drop-down {
         except (OSError, ValueError, Image.DecompressionBombError) as exc:
             messagebox.showerror("Cannot import image", str(exc), parent=self.root)
             return
-        self._show_drawing_import_preview(source)
+        self._show_drawing_import_preview(source, profile_icon=profile_icon)
 
-    def _import_drawing_from_clipboard(self) -> None:
+    def _import_drawing_from_clipboard(self, profile_icon: bool = False) -> None:
         image = QApplication.clipboard().image()
         if image.isNull():
             messagebox.showwarning("Import image", "The clipboard has no image.", parent=self.root)
@@ -10755,24 +10772,31 @@ QComboBox::drop-down {
             "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
             "raw", "RGBA", rgba.bytesPerLine(), 1,
         )
-        self._show_drawing_import_preview(source)
+        self._show_drawing_import_preview(source, profile_icon=profile_icon)
 
-    def _show_drawing_import_preview(self, source: Image.Image) -> None:
+    def _show_drawing_import_preview(self, source: Image.Image, *, profile_icon: bool = False) -> None:
         overlay = self.drawing_import_overlay
         if overlay is None:
             return
         previous_panel = overlay.panel
-        panel = DrawingImportPanel(source, ThemeComboBox)
+        panel = DrawingImportPanel(
+            source, ThemeComboBox,
+            icon_size=PROFILE_ICON_SIZE if profile_icon else None,
+            icon_encoder=_encode_profile_icon_canvas if profile_icon else None,
+        )
         overlay.layout().removeWidget(previous_panel)
         previous_panel.hide()
         previous_panel.deleteLater()
         overlay.panel = panel
         overlay.layout().addWidget(panel)
         panel.dismissed.connect(self._close_drawing_import)
-        panel.accepted.connect(self._apply_drawing_import)
+        if profile_icon:
+            panel.iconAccepted.connect(self._apply_imported_profile_icon)
+        else:
+            panel.accepted.connect(self._apply_drawing_import)
         self._apply_ui_size_to_widget_tree(panel)
         panel.show()
-        panel.size_combo.setFocus()
+        (panel.dither if profile_icon else panel.size_combo).setFocus()
 
     def _apply_drawing_import(self, size: int, pixels: bytes, palette: int) -> None:
         self.image_menu.canvas.replace(size, pixels, palette=palette)
@@ -11062,25 +11086,10 @@ QComboBox::drop-down {
         self._commit_identity_preset_changes(preset)
 
     def _choose_profile_icon(self) -> None:
-        dialog = QFileDialog(self.root, "Choose icon")
-        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
-        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter(
-            "Image files (*.png *.jpg *.jpeg);;PNG images (*.png);;"
-            "JPEG images (*.jpg *.jpeg)"
-        )
-        if (
-            self._exec_themed_file_dialog(dialog)
-            != QDialog.DialogCode.Accepted
-        ):
-            return
-        selected_files = dialog.selectedFiles()
-        source_path = selected_files[0] if selected_files else ""
-        if not source_path:
-            return
+        self._open_drawing_import(profile_icon=True)
 
+    def _apply_imported_profile_icon(self, gif_data: bytes) -> None:
         try:
-            gif_data = optimize_profile_icon(source_path)
             encoded_icon = encode_profile_icon(gif_data)
             decode_profile_icon(encoded_icon)
         except Exception as exc:
@@ -11095,6 +11104,7 @@ QComboBox::drop-down {
         preset["profile_icon"] = encoded_icon
         self._update_profile_icon_preview()
         self._commit_identity_preset_changes(preset)
+        self._close_drawing_import()
 
     def _update_profile_icon_preview(self) -> None:
         if not hasattr(self, "profile_icon_preview"):

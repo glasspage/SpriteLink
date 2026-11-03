@@ -73,22 +73,29 @@ class PixelView(QWidget):
     def sizeHint(self) -> QSize:
         return QSize(272, 182)
 
+    def image_size(self) -> tuple[int, int]:
+        return IMAGE_SIZES[self.canvas_size]
+
     def image_rect(self) -> QRectF:
-        width, height = IMAGE_SIZES[self.canvas_size]
+        width, height = self.image_size()
         scale = min((self.width() - 2) / width, (self.height() - 2) / height)
         return QRectF(
             (self.width() - width * scale) / 2, (self.height() - height * scale) / 2,
             width * scale, height * scale,
         )
 
+    def preview_image(self) -> QImage:
+        return drawing_image(self.canvas_size, self.pixels, self.palette_index) if self.pixels else QImage()
+
     def paintEvent(self, event) -> None:
-        if not self.pixels:
+        image = self.preview_image()
+        if image.isNull():
             return
         rect = self.image_rect()
-        width, height = IMAGE_SIZES[self.canvas_size]
+        width, height = self.image_size()
         scale = rect.width() / width
         painter = QPainter(self)
-        painter.drawImage(rect, drawing_image(self.canvas_size, self.pixels, self.palette_index))
+        painter.drawImage(rect, image)
         painter.setPen(self.palette().mid().color())
         painter.drawRect(rect.adjusted(-1, -1, 0, 0))
         if self.grid and scale >= 2:
@@ -525,11 +532,21 @@ class ImportPreview(PixelView):
     transformed = Signal()
     zoomRequested = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(self, icon_size: int | None = None) -> None:
         super().__init__()
+        self.icon_size = icon_size
+        self.icon_frame = QImage()
         self.pan = QPointF()
         self._last = None
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def image_size(self) -> tuple[int, int]:
+        if self.icon_size is not None:
+            return self.icon_size, self.icon_size
+        return super().image_size()
+
+    def preview_image(self) -> QImage:
+        return self.icon_frame if self.icon_size is not None else super().preview_image()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -538,7 +555,7 @@ class ImportPreview(PixelView):
 
     def mouseMoveEvent(self, event) -> None:
         if self._last is not None:
-            scale = self.image_rect().width() / IMAGE_SIZES[self.canvas_size][0]
+            scale = self.image_rect().width() / self.image_size()[0]
             self.pan += (event.position() - self._last) / scale
             self._last = event.position()
             self.transformed.emit()
@@ -566,44 +583,50 @@ def load_import_image(path: str) -> Image.Image:
 
 class DrawingImportPanel(QFrame):
     accepted = Signal(int, bytes, int)
+    iconAccepted = Signal(bytes)
     dismissed = Signal()
 
-    def __init__(self, source: Image.Image, combo_type) -> None:
+    def __init__(
+        self, source: Image.Image, combo_type, *, icon_size: int | None = None, icon_encoder=None,
+    ) -> None:
         super().__init__()
         self.setObjectName("configPanel")
         self.source = source
         self._reduced_source = source
         self._reduction = 1
+        self._icon_encoder = icon_encoder
+        self._icon_data = b""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(4)
-        layout.addWidget(QLabel("Import image"))
-        self.preview = ImportPreview()
+        layout.addWidget(QLabel("Import profile icon" if icon_size is not None else "Import image"))
+        self.preview = ImportPreview(icon_size)
         self.preview.transformed.connect(self.refresh)
         self.preview.zoomRequested.connect(self.zoom_by)
         layout.addWidget(self.preview, 1)
         settings = QHBoxLayout()
-        self.size_combo = combo_type()
-        self.size_combo.addItems(SIZE_LABELS)
-        self.size_combo.setAccessibleName("Canvas size")
-        ratio = source.width / source.height
-        self.size_combo.setCurrentIndex(min(
-            range(len(IMAGE_SIZES)),
-            key=lambda i: abs(math.log(ratio * IMAGE_SIZES[i][1] / IMAGE_SIZES[i][0])),
-        ))
-        settings.addWidget(self.size_combo)
-        self.mode = combo_type()
-        self.mode.addItems([f"{PALETTE_NAMES[index]} Color" for index in PALETTE_ORDER])
-        self.mode.setAccessibleName("Conversion")
-        settings.addWidget(self.mode)
+        if icon_size is None:
+            self.size_combo = combo_type()
+            self.size_combo.addItems(SIZE_LABELS)
+            self.size_combo.setAccessibleName("Canvas size")
+            ratio = source.width / source.height
+            self.size_combo.setCurrentIndex(min(
+                range(len(IMAGE_SIZES)),
+                key=lambda i: abs(math.log(ratio * IMAGE_SIZES[i][1] / IMAGE_SIZES[i][0])),
+            ))
+            settings.addWidget(self.size_combo)
+            self.mode = combo_type()
+            self.mode.addItems([f"{PALETTE_NAMES[index]} Color" for index in PALETTE_ORDER])
+            self.mode.setAccessibleName("Conversion")
+            settings.addWidget(self.mode)
+            self.background = combo_type()
+            self.background.setAccessibleName("Background")
+            order = SWATCH_ORDERS[0]
+            self.background.addItems([f"{BACKGROUND_NAMES[0][index]} background" for index in order])
+            self.background.setCurrentIndex(order.index(PALETTE_BACKGROUNDS[0]))
+            settings.addWidget(self.background)
         self.dither = QCheckBox("Dither")
         settings.addWidget(self.dither)
-        self.background = combo_type()
-        self.background.setAccessibleName("Background")
-        order = SWATCH_ORDERS[0]
-        self.background.addItems([f"{BACKGROUND_NAMES[0][index]} background" for index in order])
-        self.background.setCurrentIndex(order.index(PALETTE_BACKGROUNDS[0]))
-        settings.addWidget(self.background)
         settings.addStretch()
         layout.addLayout(settings)
 
@@ -620,17 +643,30 @@ class DrawingImportPanel(QFrame):
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.dismissed)
         buttons.addWidget(cancel)
-        accept = QPushButton("Use Image")
-        accept.clicked.connect(lambda: self.accepted.emit(self.preview.canvas_size, bytes(self.preview.pixels), self.preview.palette_index))
+        accept = QPushButton("Use Icon" if icon_size is not None else "Use Image")
+        accept.clicked.connect(self._accept)
         buttons.addWidget(accept)
         layout.addLayout(buttons)
         self.preset = "Fill"
-        self.size_combo.currentIndexChanged.connect(lambda _index: self.set_zoom(self.preset))
-        self.mode.currentIndexChanged.connect(self._update_import_palette)
+        if icon_size is None:
+            self.size_combo.currentIndexChanged.connect(lambda _index: self.set_zoom(self.preset))
+            self.mode.currentIndexChanged.connect(self._update_import_palette)
+            self.background.currentIndexChanged.connect(self.refresh)
         self.dither.toggled.connect(self.refresh)
-        self.background.currentIndexChanged.connect(self.refresh)
         self.set_zoom("Fill")
-        self.mode.setCurrentIndex(PALETTE_ORDER.index(self._best_palette()))
+        if icon_size is None:
+            self.mode.setCurrentIndex(PALETTE_ORDER.index(self._best_palette()))
+
+    def _accept(self) -> None:
+        if self._icon_encoder is not None:
+            self.iconAccepted.emit(self._icon_data)
+        else:
+            self.accepted.emit(self.preview.canvas_size, bytes(self.preview.pixels), self.preview.palette_index)
+
+    def _target_size(self) -> tuple[int, int]:
+        if self.preview.icon_size is not None:
+            return self.preview.image_size()
+        return IMAGE_SIZES[self.size_combo.currentIndex()]
 
     def _update_import_palette(self, choice: int) -> None:
         index = PALETTE_ORDER[choice]
@@ -647,7 +683,7 @@ class DrawingImportPanel(QFrame):
 
     def set_zoom(self, preset: str) -> None:
         self.preset = preset
-        width, height = IMAGE_SIZES[self.size_combo.currentIndex()]
+        width, height = self._target_size()
         scales = width / self.source.width, height / self.source.height
         self.zoom = {"Fit": min(scales), "Fill": max(scales), "Pixel": 1.0}[preset]
         self.preview.pan = QPointF()
@@ -662,7 +698,7 @@ class DrawingImportPanel(QFrame):
         self.refresh()
 
     def _sample_image(self) -> Image.Image:
-        width, height = IMAGE_SIZES[self.size_combo.currentIndex()]
+        width, height = self._target_size()
         # Prefilter large downscales before sampling the cropped preview.
         reduction = max(1, min(min(self.source.size), int(0.5 / self.zoom)))
         if reduction != self._reduction:
@@ -719,6 +755,11 @@ class DrawingImportPanel(QFrame):
 
     def refresh(self) -> None:
         image = self._sample_image()
+        if self._icon_encoder is not None:
+            self._icon_data = self._icon_encoder(image, self.dither.isChecked())
+            self.preview.icon_frame = QImage.fromData(self._icon_data)
+            self.preview.update()
+            return
         palette_index = PALETTE_ORDER[self.mode.currentIndex()]
         background = SWATCH_ORDERS[palette_index][self.background.currentIndex()]
         alpha = image.getchannel("A")
