@@ -578,7 +578,9 @@ class DrawingImportPanel(QFrame):
     def zoom_by(self, direction: str) -> None:
         scale = 1.25 if direction == "+" else 0.8
         min_zoom = 1 / max(self.source.size)
-        self.zoom = max(min_zoom, min(128, self.zoom * scale))
+        zoom = max(min_zoom, min(128, self.zoom * scale))
+        self.preview.pan *= zoom / self.zoom
+        self.zoom = zoom
         self.refresh()
 
     def refresh(self) -> None:
