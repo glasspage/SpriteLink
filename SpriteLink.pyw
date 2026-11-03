@@ -11471,7 +11471,12 @@ QComboBox::drop-down {
         visible_text = message_text_without_image_links(plain_text, set(embedded_urls))
         icon = str(message.get("p", "")) if self._chat_icons_visible() else ""
         media_row = None
-        if "drawing" in message or (embedded_urls and not visible_text.strip()):
+        drawing = message.get("drawing")
+        show_drawing = bool(drawing) and not (
+            str(message["c"]) != self._authenticated_client_id()
+            and self._is_user_muted(str(message["c"]))
+        )
+        if show_drawing or (embedded_urls and not visible_text.strip()):
             # Separate cells keep the username at the top regardless of preview height.
             width = (
                 QFontMetrics(username_format.font()).horizontalAdvance(username)
@@ -11523,8 +11528,10 @@ QComboBox::drop-down {
                 formatting.setWidth(image.width())
                 formatting.setHeight(image.height())
                 cursor.insertImage(formatting)
-        if "drawing" in message:
-            self._insert_inline_drawing(cursor, self._inline_drawing_image(message["drawing"]))
+        if show_drawing:
+            self._insert_inline_drawing(cursor, self._inline_drawing_image(drawing))
+        elif drawing:
+            cursor.insertText("[Image]", body_format)
         return document.toHtml()
 
     def _jump_to_search_result(self, message_id: str, order: tuple[int, int, str]) -> None:
@@ -16982,7 +16989,7 @@ QComboBox::drop-down {
         trusts_links_and_images = client_id in trusted_ids
 
         menu = QMenu(self.root)
-        trust_action = menu.addAction("Trust Links && Images from User")
+        trust_action = menu.addAction("Trust Links && Embeds from User")
         trust_action.setCheckable(True)
         trust_action.setChecked(is_local or trusts_links_and_images)
         trust_action.setEnabled(not is_local)
@@ -17044,19 +17051,20 @@ QComboBox::drop-down {
                 )
             )
 
-        collapse_action = menu.addAction(
-            "Expand Message"
-            if is_manually_collapsed
-            else "Collapse Message"
-        )
-        collapse_action.setEnabled(not is_muted)
-        if not is_muted:
-            collapse_action.triggered.connect(
-                lambda: self._set_message_collapsed(
-                    message_id,
-                    not is_manually_collapsed,
-                )
+        if "drawing" not in message:
+            collapse_action = menu.addAction(
+                "Expand Message"
+                if is_manually_collapsed
+                else "Collapse Message"
             )
+            collapse_action.setEnabled(not is_muted)
+            if not is_muted:
+                collapse_action.triggered.connect(
+                    lambda: self._set_message_collapsed(
+                        message_id,
+                        not is_manually_collapsed,
+                    )
+                )
 
         menu.exec(global_position)
 
@@ -18165,8 +18173,8 @@ QComboBox::drop-down {
             if is_muted
             else message_plain_text(text)
         )
-        is_collapsed = is_muted or bool(
-            source_message_ids.intersection(collapsed_ids)
+        is_collapsed = is_muted or (
+            not drawing and bool(source_message_ids.intersection(collapsed_ids))
         )
         message_block_format = QTextBlockFormat()
         message_block_format.setNonBreakableLines(is_collapsed)
