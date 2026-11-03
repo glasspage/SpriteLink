@@ -3,6 +3,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
+from PySide6.QtGui import QColor, QTextDocument
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QPushButton
 from test_startup import DeferredStartupTests
@@ -35,6 +36,25 @@ class ChatSearchTests(unittest.TestCase):
         self.assertIsNone(find("https://i.imgur.com/example.png", "unrelated", "Images"))
         self.assertIsNotNone(find("https://example.org/example.mp4", "", "Images", "Videos"))
 
+    def test_search_message_uses_chat_formatting_and_lighter_background(self):
+        client = self.client
+        message = client._build_draft_message("<b>Bold</b> <i>Italic</i> <u>Under</u> <sp>secret</sp>")
+        body = client._search_result_message(message)
+        document = QTextDocument()
+        document.setHtml(body.text())
+        bold = document.find("Bold").charFormat()
+        self.assertEqual(bold.fontWeight(), 700)
+        self.assertEqual(
+            bold.fontPointSize(),
+            client._make_message_font(message.get("f", S.DEFAULT_MESSAGE_FONT), bold=True,
+                                      role="chat_log").pointSizeF(),
+        )
+        self.assertTrue(document.find("Italic").charFormat().fontItalic())
+        self.assertTrue(document.find("Under").charFormat().fontUnderline())
+        self.assertNotIn("secret", document.toPlainText())
+        self.assertIn(max(S.message_row_backgrounds(), key=lambda color: QColor(color).lightness()),
+                      body.styleSheet())
+
     def test_saved_history_search_pagination_and_jump(self):
         client = self.client
         self.root.resize(800, 600)
@@ -55,7 +75,13 @@ class ChatSearchTests(unittest.TestCase):
         ):
             S.save_chatroom_history(server, key, entries)
             client.message_log = [dict(item, is_local=True) for item in entries]
+            client.config_toggle.click()
+            self.app.processEvents()
+            config_width = client.config_panel.width()
+            client.config_toggle.click()
             client.search_toggle.click()
+            self.app.processEvents()
+            self.assertEqual(client.search_overlay.panel.width(), config_width)
             client.search_filters["Links"].click()
             self.wait_for(lambda: client.search_results_layout.count() == 25)
             client.search_more_button.click()

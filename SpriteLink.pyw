@@ -10807,8 +10807,12 @@ QComboBox::drop-down {
         panel.setObjectName("configPanel")
         panel.setMaximumWidth(CONFIG_PANEL_MAX_WIDTH)
         self.search_overlay.panel = panel
-        overlay_layout.addWidget(panel, 1, Qt.AlignmentFlag.AlignHCenter)
-        panel.setMinimumWidth(min(440, max(0, self.chat_content.width() - 48)))
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        panel_row = QHBoxLayout()
+        panel_row.addStretch(1)
+        panel_row.addWidget(panel, 10)
+        panel_row.addStretch(1)
+        overlay_layout.addLayout(panel_row, 1)
         panel_layout = QVBoxLayout(panel)
         panel_layout.addWidget(self._heading("Search"))
         self.search_entry = QLineEdit()
@@ -10939,7 +10943,7 @@ QComboBox::drop-down {
                         break
                     matches.append((
                         self._message_sort_key(item), str(message["i"]),
-                        timestamp, str(message["u"]), text,
+                        timestamp, message,
                     ))
                 if next_page is not None:
                     break
@@ -10956,7 +10960,7 @@ QComboBox::drop-down {
         if matches is None:
             self.search_status.setText("Could not read chat history.")
             return
-        for sort_key, message_id, timestamp, sender, text in matches:
+        for sort_key, message_id, timestamp, message in matches:
             frame = QFrame()
             frame.setFrameShape(QFrame.Shape.StyledPanel)
             frame.setFrameShadow(QFrame.Shadow.Sunken)
@@ -10971,16 +10975,43 @@ QComboBox::drop-down {
             )
             header.addWidget(jump)
             layout.addLayout(header)
-            body = QLabel(f"{sender}: {text}")
-            body.setTextFormat(Qt.TextFormat.PlainText)
-            body.setWordWrap(True)
-            body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            layout.addWidget(body)
+            layout.addWidget(self._search_result_message(message))
             self.search_results_layout.addWidget(frame)
             self._apply_ui_size_to_widget_tree(frame)
         self._search_before = next_page
         self.search_more_button.setVisible(next_page is not None)
         self.search_status.setText("" if self.search_results_layout.count() else "No matches.")
+
+    def _search_result_message(self, message: dict[str, Any]) -> QLabel:
+        document = QTextDocument()
+        cursor = QTextCursor(document)
+        font_name = str(message.get("f", DEFAULT_MESSAGE_FONT))
+        body_color = str(message.get("o", DEFAULT_MESSAGE_TEXT_COLOR))
+        cursor.insertText(
+            str(message["u"]),
+            self._text_format(str(message["k"]), font_name=font_name),
+        )
+        cursor.insertText(": ", self._text_format(body_color, font_name=font_name))
+        self._insert_message_text_with_links(
+            cursor, str(message["m"]), body_color, font_name,
+            str(message["c"]), str(message["i"]),
+            muted=False, ui_font=False, embedded_image_urls=set(),
+            align_top=False, top_align_height=0, preview=True,
+        )
+        body = QLabel()
+        body.setObjectName("searchResultMessage")
+        body.setTextFormat(Qt.TextFormat.RichText)
+        body.setText(document.toHtml())
+        body.setWordWrap(True)
+        body.setMargin(6)
+        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        background = max(
+            message_row_backgrounds(), key=lambda color: QColor(color).lightness(),
+        )
+        body.setStyleSheet(
+            f"QLabel#searchResultMessage {{ background-color: {background}; }}"
+        )
+        return body
 
     def _jump_to_search_result(self, message_id: str, order: tuple[int, int, str]) -> None:
         index = bisect_right(self.message_log, order, key=self._message_sort_key) - 1
@@ -15821,9 +15852,6 @@ QComboBox::drop-down {
                 self._sync_config_overlay_geometry()
             if hasattr(self, "search_overlay"):
                 self.search_overlay.setGeometry(self.chat_content.rect())
-                self.search_overlay.panel.setMinimumWidth(
-                    min(440, max(0, self.chat_content.width() - 48))
-                )
             if hasattr(self, "message_limit_overlay"):
                 self._sync_message_limit_overlay_geometry()
             if hasattr(self, "image_preview_overlay"):
@@ -16347,6 +16375,7 @@ QComboBox::drop-down {
         embedded_image_urls: set[str],
         align_top: bool,
         top_align_height: int,
+        preview: bool = False,
     ) -> None:
         plain_text, rich_runs = parse_message_rich_text(text)
         url_spans = message_url_spans(plain_text)
@@ -16426,7 +16455,10 @@ QComboBox::drop-down {
                 if end <= start:
                     return
                 formatting = make_formatting(anchor)
-                cursor.insertText(plain_text[start:end], formatting)
+                content = plain_text[start:end]
+                if preview and run.spoiler is not None:
+                    content = "".join(char if char == "\n" else "█" for char in content)
+                cursor.insertText(content, formatting)
 
             first_spoiler_run = (
                 run.spoiler is not None
@@ -16451,7 +16483,8 @@ QComboBox::drop-down {
                     insert_chunk(
                         overlap_start,
                         overlap_end,
-                        self._register_rendered_link(url, client_id),
+                        (url if run.spoiler is None else None)
+                        if preview else self._register_rendered_link(url, client_id),
                     )
                 position = overlap_end
             insert_chunk(position, run.end)
