@@ -10687,6 +10687,44 @@ QComboBox::drop-down {
 
     def _open_drawing_import(self) -> None:
         self._close_drawing_import()
+        overlay = ConfigOverlay(self.chat_content)
+        self.drawing_import_overlay = overlay
+        panel = QFrame()
+        panel.setObjectName("configPanel")
+        overlay.panel = panel
+        layout = QVBoxLayout(overlay)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.addWidget(panel)
+        chooser = QVBoxLayout(panel)
+        chooser.addWidget(QLabel("Import image"))
+        chooser.addStretch()
+        sources = QHBoxLayout()
+        sources.addStretch()
+        for label, action in (
+            ("From file...", self._import_drawing_from_file),
+            ("From clipboard...", self._import_drawing_from_clipboard),
+        ):
+            button = QPushButton(label)
+            button.setMinimumSize(126, 44)
+            button.clicked.connect(action)
+            sources.addWidget(button)
+        sources.addStretch()
+        chooser.addLayout(sources)
+        chooser.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self._close_drawing_import)
+        chooser.addWidget(cancel, alignment=Qt.AlignmentFlag.AlignRight)
+        overlay.dismissed.connect(self._close_drawing_import)
+        escape = QShortcut(Qt.Key.Key_Escape, overlay)
+        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        escape.activated.connect(self._close_drawing_import)
+        self._apply_ui_size_to_widget_tree(overlay)
+        overlay.setGeometry(self.chat_content.rect())
+        overlay.show()
+        overlay.raise_()
+        sources.itemAt(1).widget().setFocus()
+
+    def _import_drawing_from_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self.root, "Import image", "",
             "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff);;All files (*)",
@@ -10698,24 +10736,38 @@ QComboBox::drop-down {
         except (OSError, ValueError, Image.DecompressionBombError) as exc:
             messagebox.showerror("Cannot import image", str(exc), parent=self.root)
             return
+        self._show_drawing_import_preview(source)
 
-        overlay = ConfigOverlay(self.chat_content)
-        self.drawing_import_overlay = overlay
+    def _import_drawing_from_clipboard(self) -> None:
+        image = QApplication.clipboard().image()
+        if image.isNull():
+            messagebox.showwarning("Import image", "The clipboard has no image.", parent=self.root)
+            return
+        if image.width() * image.height() > 24_000_000:
+            messagebox.showwarning("Import image", "Choose an image under 24 megapixels.", parent=self.root)
+            return
+        rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        source = Image.frombytes(
+            "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
+            "raw", "RGBA", rgba.bytesPerLine(), 1,
+        )
+        self._show_drawing_import_preview(source)
+
+    def _show_drawing_import_preview(self, source: Image.Image) -> None:
+        overlay = self.drawing_import_overlay
+        if overlay is None:
+            return
+        previous_panel = overlay.panel
         panel = DrawingImportPanel(source, ThemeComboBox)
+        overlay.layout().removeWidget(previous_panel)
+        previous_panel.hide()
+        previous_panel.deleteLater()
         overlay.panel = panel
-        layout = QVBoxLayout(overlay)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.addWidget(panel)
-        overlay.dismissed.connect(self._close_drawing_import)
-        escape = QShortcut(Qt.Key.Key_Escape, overlay)
-        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        escape.activated.connect(self._close_drawing_import)
+        overlay.layout().addWidget(panel)
         panel.dismissed.connect(self._close_drawing_import)
         panel.accepted.connect(self._apply_drawing_import)
-        self._apply_ui_size_to_widget_tree(overlay)
-        overlay.setGeometry(self.chat_content.rect())
-        overlay.show()
-        overlay.raise_()
+        self._apply_ui_size_to_widget_tree(panel)
+        panel.show()
         panel.size_combo.setFocus()
 
     def _apply_drawing_import(self, size: int, pixels: bytes) -> None:
