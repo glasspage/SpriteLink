@@ -1249,7 +1249,8 @@ QPushButton:disabled {
 }
 QPushButton#identityMenuButton,
 QPushButton#fontMenuButton,
-QPushButton#formattingMenuButton {
+QPushButton#formattingMenuButton,
+QPushButton#imageMenuButton {
     min-height: 17px;
     padding-top: 2px;
     padding-bottom: 2px;
@@ -8667,7 +8668,8 @@ QPushButton:pressed, QPushButton:checked {
 }
 QPushButton#identityMenuButton,
 QPushButton#fontMenuButton,
-QPushButton#formattingMenuButton {
+QPushButton#formattingMenuButton,
+QPushButton#imageMenuButton {
     min-height: 14px;
     padding-top: 1px;
     padding-bottom: 1px;
@@ -10435,6 +10437,7 @@ QComboBox::drop-down {
         )
         composer_actions.addWidget(self.formatting_menu_button)
         self.image_menu_button = QPushButton("Image")
+        self.image_menu_button.setObjectName("imageMenuButton")
         self.image_menu_button.setCheckable(True)
         self.image_menu_button.toggled.connect(self._on_image_menu_toggled)
         composer_actions.addWidget(self.image_menu_button)

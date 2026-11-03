@@ -371,7 +371,7 @@ class DrawingMenu(QFrame):
         palette.addLayout(swatches)
         self.palette_combo = combo_type()
         self.palette_combo.setAccessibleName("Color palette")
-        self.palette_combo.addItems([PALETTE_NAMES[index] for index in PALETTE_ORDER])
+        self.palette_combo.addItems([f"{PALETTE_NAMES[index]} Color" for index in PALETTE_ORDER])
         self.palette_combo.currentIndexChanged.connect(self._select_palette)
         palette.addWidget(self.palette_combo)
         palette.addWidget(QLabel("Pattern"))
