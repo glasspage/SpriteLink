@@ -11026,7 +11026,9 @@ QComboBox::drop-down {
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row, 1)
         panel_layout = QVBoxLayout(panel)
-        panel_layout.addWidget(self._heading("Search"))
+        self.search_heading = self._heading("")
+        self.search_heading.setTextFormat(Qt.TextFormat.PlainText)
+        panel_layout.addWidget(self.search_heading)
         self.search_entry = QLineEdit()
         self.search_entry.setPlaceholderText("Find words or phrases")
         panel_layout.addWidget(self.search_entry)
@@ -11090,6 +11092,7 @@ QComboBox::drop-down {
             return
         if not hasattr(self, "search_overlay"):
             self._build_search_popup()
+        self.search_heading.setText(f"Search in {self._active_chatroom()['nickname']}")
         self.search_overlay.setGeometry(self.chat_content.rect())
         self.search_overlay.show()
         self.search_overlay.raise_()
