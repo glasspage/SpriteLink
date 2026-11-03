@@ -12397,6 +12397,17 @@ QComboBox::drop-down {
             1,
             3,
         )
+        advanced_row += 1
+        advanced_layout.addWidget(self._separator(), advanced_row, 0, 1, 3)
+        advanced_row += 1
+        advanced_layout.addWidget(self._heading("Data Management"), advanced_row, 0, 1, 3)
+        advanced_row += 1
+        open_storage_button = QPushButton("Open storage folder")
+        open_storage_button.clicked.connect(self._open_storage_folder)
+        advanced_layout.addWidget(
+            open_storage_button, advanced_row, 0, 1, 3, Qt.AlignmentFlag.AlignLeft,
+        )
+
         self.advanced_config_content.hide()
         layout.addWidget(self.advanced_config_content, row, 0, 1, 3)
         row += 1
@@ -12407,6 +12418,16 @@ QComboBox::drop-down {
             "Advanced ▼" if expanded else "Advanced ▶"
         )
         self.advanced_config_content.setVisible(expanded)
+
+    def _open_storage_folder(self) -> None:
+        try:
+            APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            if QDesktopServices.openUrl(QUrl.fromLocalFile(str(APP_DATA_DIR))):
+                return
+            detail = str(APP_DATA_DIR)
+        except OSError as exc:
+            detail = str(exc)
+        messagebox.showerror("Could not open storage folder", detail, parent=self.root)
 
     def _on_ui_size_changed(self, value: Any) -> None:
         ui_size = normalize_ui_size(value)
