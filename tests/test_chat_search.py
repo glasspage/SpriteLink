@@ -269,6 +269,10 @@ class ChatSearchTests(unittest.TestCase):
             first_lines = document.begin().layout().lineCount()
             self.assertEqual(first_lines, 1)
             self.assertTrue(document.toPlainText().endswith("[...]"))
+            for count in (2, 3, 5, 10, 15, 20, 25):
+                self.wait_for(lambda: client.search_results_layout.count() >= count)
+                self.assertEqual(first_card.size(), first_size, f"after {count} cards")
+                self.assertGreaterEqual(first_body.viewport().height(), document.size().height())
             self.wait_for(lambda: client.search_status.text() == "25+ results found")
             self.assertEqual(client.search_results_layout.count(), 25)
             self.assertTrue(client.search_more_button.isVisible())

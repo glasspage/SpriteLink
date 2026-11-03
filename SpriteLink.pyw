@@ -6735,6 +6735,27 @@ class MessageLogBrowser(QTextBrowser):
         self._paint_unread_divider(event)
 
 
+class SearchResultCard(QFrame):
+    def _fit_height(self) -> None:
+        layout = self.layout()
+        # Give the scroll area the full card height so it cannot compress existing cards.
+        if layout is not None:
+            height = layout.totalHeightForWidth(self.width())
+            if height >= 0 and (height != self.minimumHeight() or height != self.maximumHeight()):
+                self.setFixedHeight(height)
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self._fit_height()
+
+    def event(self, event: Any) -> bool:
+        handled = super().event(event)
+        if event.type() == QEvent.Type.LayoutRequest:
+            self._fit_height()
+        return handled
+
+
 class SearchResultMessage(QTextBrowser):
     def __init__(self) -> None:
         super().__init__()
@@ -11140,7 +11161,7 @@ QComboBox::drop-down {
                 self._finish_chat_search_page(next_page)
                 return
             sort_key, message_id, timestamp, message = matches[index]
-            frame = QFrame()
+            frame = SearchResultCard()
             frame.setFrameShape(QFrame.Shape.StyledPanel)
             frame.setFrameShadow(QFrame.Shadow.Sunken)
             layout = QVBoxLayout(frame)
