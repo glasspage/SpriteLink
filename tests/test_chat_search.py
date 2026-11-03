@@ -6,7 +6,7 @@ from unittest import mock
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QColor, QImage, QPainter, QTextDocument
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QLabel, QPushButton
+from PySide6.QtWidgets import QPushButton
 from spritelink_video import VideoInfo
 from test_startup import DeferredStartupTests
 from test_security import SPRITELINK as S
@@ -43,7 +43,7 @@ class ChatSearchTests(unittest.TestCase):
         message = client._build_draft_message("<b>Bold</b> <i>Italic</i> <u>Under</u> <sp>secret</sp>")
         body = client._search_result_message(message)
         document = QTextDocument()
-        document.setHtml(body.text())
+        document.setHtml(body.toHtml())
         bold = document.find("Bold").charFormat()
         self.assertEqual(bold.fontWeight(), 700)
         self.assertEqual(
@@ -57,6 +57,20 @@ class ChatSearchTests(unittest.TestCase):
         self.assertIn(max(S.message_row_backgrounds(), key=lambda color: QColor(color).lightness()),
                       body.styleSheet())
 
+    def test_search_text_shadows_follow_the_setting(self):
+        body = self.client._search_result_message(self.client._build_draft_message("Shadow sample"))
+        body.resize(280, body.heightForWidth(280))
+        body.show()
+        self.app.processEvents()
+        self.app.setProperty("spritelinkTextShadows", False)
+        without = body.viewport().grab().toImage()
+        self.app.setProperty("spritelinkTextShadows", True)
+        with_shadow = body.viewport().grab().toImage()
+        self.assertEqual(without.size(), with_shadow.size())
+        self.assertNotEqual(without, with_shadow)
+        self.assertGreaterEqual(body.viewport().height(), body.document().size().height())
+        body.close()
+
     def test_search_message_contains_a_loadable_inline_profile_icon(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profile.png"
@@ -66,14 +80,14 @@ class ChatSearchTests(unittest.TestCase):
         message["p"] = icon
         body = self.client._search_result_message(message)
         document = QTextDocument()
-        document.setHtml(body.text())
+        document.setHtml(body.toHtml())
         image_format = document.begin().begin().fragment().charFormat().toImageFormat()
         self.assertEqual(image_format.width(), S.PROFILE_ICON_SIZE)
         image = document.resource(QTextDocument.ResourceType.ImageResource,
                                   QUrl(image_format.name()))
         self.assertFalse(image.isNull())
         self.client.config_data["ui_size"] = "Tiny"
-        self.assertNotIn("<img", self.client._search_result_message(message).text())
+        self.assertNotIn("<img", self.client._search_result_message(message).toHtml())
 
     def test_search_embeds_noninteractive_media_and_clears_query_on_room_change(self):
         client = self.client
@@ -97,8 +111,8 @@ class ChatSearchTests(unittest.TestCase):
             ], None)
             fetch.assert_called_once_with(image_url)
         frame = client.search_results_layout.itemAt(0).widget()
-        body = frame.findChild(QLabel, "searchResultMessage")
-        before = body.text()
+        body = frame.findChild(S.SearchResultMessage, "searchResultMessage")
+        before = body.toHtml()
         self.assertEqual(before.count("<img"), 2)
         self.assertNotIn(image_url, before)
         self.assertNotIn(video_url, before)
@@ -110,7 +124,7 @@ class ChatSearchTests(unittest.TestCase):
                 "url": image_url, "kind": "static_image", "data": path.read_bytes(),
             }))
             client._process_ui_queue()
-        after = body.text()
+        after = body.toHtml()
         self.assertNotEqual(before, after)
         self.assertEqual(after.count("<img"), 2)
         self.assertNotIn(image_url, after)

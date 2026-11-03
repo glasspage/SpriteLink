@@ -6735,6 +6735,35 @@ class MessageLogBrowser(QTextBrowser):
         self._paint_unread_divider(event)
 
 
+class SearchResultMessage(MessageLogBrowser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setReadOnly(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setOpenLinks(False)
+        self.setOpenExternalLinks(False)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.document().setDocumentMargin(6)
+        policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def heightForWidth(self, width: int) -> int:
+        self.document().setTextWidth(max(1, width))
+        return math.ceil(self.document().size().height())
+
+    def sizeHint(self) -> QSize:
+        return QSize(0, self.heightForWidth(self.viewport().width()))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
+
+    def wheelEvent(self, event: Any) -> None:
+        event.ignore()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -11029,18 +11058,14 @@ QComboBox::drop-down {
             controller.stop()
             controller.deleteLater()
 
-    def _search_result_message(self, message: dict[str, Any]) -> QLabel:
-        body = QLabel()
+    def _search_result_message(self, message: dict[str, Any]) -> SearchResultMessage:
+        body = SearchResultMessage()
         body.setObjectName("searchResultMessage")
-        body.setTextFormat(Qt.TextFormat.RichText)
-        body.setWordWrap(True)
-        body.setMargin(6)
-        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         background = max(
             message_row_backgrounds(), key=lambda color: QColor(color).lightness(),
         )
         body.setStyleSheet(
-            f"QLabel#searchResultMessage {{ background-color: {background}; }}"
+            f"QTextBrowser#searchResultMessage {{ background-color: {background}; }}"
         )
         client_id = str(message["c"])
         is_local = client_id == self._authenticated_client_id()
@@ -11051,10 +11076,15 @@ QComboBox::drop-down {
             if is_image_url_trusted_for_sender(url, client_id, is_local, trusted)
         ]
 
+        previous_html = ""
+
         def update() -> None:
+            nonlocal previous_html
             html = self._search_result_html(message, media_urls)
-            if html != body.text():
-                body.setText(html)
+            if html != previous_html:
+                previous_html = html
+                body.setHtml(html)
+                body.updateGeometry()
 
         update()
         for url in media_urls:
