@@ -6739,6 +6739,7 @@ class SearchResultMessage(QTextBrowser):
     def __init__(self) -> None:
         super().__init__()
         self._shadow_document: QTextDocument | None = None
+        self._height_measurement: tuple[tuple[int, int, str], int] | None = None
         self.setReadOnly(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -6752,6 +6753,7 @@ class SearchResultMessage(QTextBrowser):
         self.setSizePolicy(policy)
 
     def setHtml(self, text: str) -> None:
+        self._height_measurement = None
         if self._shadow_document is not None:
             self._shadow_document.deleteLater()
             self._shadow_document = None
@@ -6806,8 +6808,15 @@ class SearchResultMessage(QTextBrowser):
     def heightForWidth(self, width: int) -> int:
         self.ensurePolished()
         viewport = self.maximumViewportSize()
-        self.document().setTextWidth(max(1, width - (self.width() - viewport.width())))
-        return math.ceil(self.document().size().height()) + self.height() - viewport.height()
+        text_width = max(1, width - (self.width() - viewport.width()))
+        document = self.document()
+        key = (text_width, document.revision(), document.defaultFont().key())
+        if self._height_measurement is None or self._height_measurement[0] != key:
+            # Qt can ask about provisional widths without actually resizing the card.
+            measurement = document.clone()
+            measurement.setTextWidth(text_width)
+            self._height_measurement = key, math.ceil(measurement.size().height())
+        return self._height_measurement[1] + self.height() - viewport.height()
 
     def sizeHint(self) -> QSize:
         return QSize(0, self.heightForWidth(self.width()))

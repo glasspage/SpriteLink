@@ -199,6 +199,24 @@ class ChatSearchTests(unittest.TestCase):
                                     with_shadow.copy(0, 0, preview_left, 30))
                 body.close()
 
+    def test_wrapped_result_measurement_does_not_reflow_the_visible_document(self):
+        body = self.client._search_result_message(
+            self.client._build_draft_message("Wrapped message " * 5)
+        )
+        body.resize(350, body.heightForWidth(350))
+        body.show()
+        self.app.processEvents()
+        document = body.document()
+        document.size()
+        width = document.textWidth()
+        lines = document.begin().layout().lineCount()
+        self.assertGreater(lines, 1)
+        self.assertGreater(body.heightForWidth(100), body.heightForWidth(350))
+        body.heightForWidth(100)
+        self.assertEqual(document.textWidth(), width)
+        self.assertEqual(document.begin().layout().lineCount(), lines)
+        body.close()
+
     def test_saved_history_search_pagination_and_jump(self):
         client = self.client
         self.root.resize(800, 600)
@@ -207,6 +225,8 @@ class ChatSearchTests(unittest.TestCase):
         entries = []
         for index in range(100):
             text = "https://example.org/example" if index < 30 else f"Message {index}"
+            if index == 29:
+                text += " " + "wrapped result " * 6
             message = client._build_draft_message(text)
             message.update(i=f"item-{index:03}", t=1_730_000_000 + index)
             S.sign_message_identity(message, key, client._identity_private_key())
@@ -235,8 +255,14 @@ class ChatSearchTests(unittest.TestCase):
             first_card = client.search_results_layout.itemAt(0).widget()
             self.app.processEvents()
             first_size = first_card.size()
+            first_body = first_card.findChild(S.SearchResultMessage)
+            document = first_body.document()
+            document.size()
+            first_lines = document.begin().layout().lineCount()
+            self.assertGreater(first_lines, 1)
             self.wait_for(lambda: client.search_status.text() == "30 results found.")
             self.assertEqual(first_card.size(), first_size)
+            self.assertEqual(document.begin().layout().lineCount(), first_lines)
             self.assertEqual(client.search_results_layout.count(), 30)
             frame = client.search_results_layout.itemAt(29).widget()
             frame.findChild(QPushButton).click()
