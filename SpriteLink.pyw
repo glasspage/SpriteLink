@@ -12343,6 +12343,17 @@ QComboBox::drop-down {
         advanced_layout.setColumnStretch(1, 1)
         advanced_row = 0
 
+        advanced_layout.addWidget(self._heading("Data Management"), advanced_row, 0, 1, 3)
+        advanced_row += 1
+        open_storage_button = QPushButton("Open storage folder")
+        open_storage_button.clicked.connect(self._open_storage_folder)
+        advanced_layout.addWidget(
+            open_storage_button, advanced_row, 0, 1, 3, Qt.AlignmentFlag.AlignLeft,
+        )
+        advanced_row += 1
+        advanced_layout.addWidget(self._separator(), advanced_row, 0, 1, 3)
+        advanced_row += 1
+
         advanced_layout.addWidget(
             self._heading("Server"),
             advanced_row,
@@ -12400,17 +12411,6 @@ QComboBox::drop-down {
             1,
             3,
         )
-        advanced_row += 1
-        advanced_layout.addWidget(self._separator(), advanced_row, 0, 1, 3)
-        advanced_row += 1
-        advanced_layout.addWidget(self._heading("Data Management"), advanced_row, 0, 1, 3)
-        advanced_row += 1
-        open_storage_button = QPushButton("Open storage folder")
-        open_storage_button.clicked.connect(self._open_storage_folder)
-        advanced_layout.addWidget(
-            open_storage_button, advanced_row, 0, 1, 3, Qt.AlignmentFlag.AlignLeft,
-        )
-
         self.advanced_config_content.hide()
         layout.addWidget(self.advanced_config_content, row, 0, 1, 3)
         row += 1
