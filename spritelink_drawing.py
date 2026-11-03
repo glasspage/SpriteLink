@@ -46,7 +46,6 @@ class PixelView(QWidget):
         self.canvas_size = 0
         self.pixels = bytearray()
         self.grid = False
-        self.pixel_preview = False
         self.selection = QRect()
         self.setMinimumSize(92, 92)
 
@@ -56,8 +55,6 @@ class PixelView(QWidget):
     def image_rect(self) -> QRectF:
         width, height = IMAGE_SIZES[self.canvas_size]
         scale = min((self.width() - 2) / width, (self.height() - 2) / height)
-        if self.pixel_preview:
-            scale = min(scale, 1)
         return QRectF(
             (self.width() - width * scale) / 2, (self.height() - height * scale) / 2,
             width * scale, height * scale,
@@ -73,7 +70,7 @@ class PixelView(QWidget):
         painter.drawImage(rect, drawing_image(self.canvas_size, self.pixels))
         painter.setPen(self.palette().mid().color())
         painter.drawRect(rect.adjusted(-1, -1, 0, 0))
-        if self.grid and not self.pixel_preview and scale >= 2:
+        if self.grid and scale >= 2:
             painter.setPen(QColor(0, 0, 0, 60))
             for x in range(1, width):
                 offset = rect.left() + x * scale
@@ -98,10 +95,12 @@ class PixelView(QWidget):
 
 class DrawingCanvas(PixelView):
     changed = Signal()
+    resized = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.grid = True
+        self.preview_scale = 1
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.tool = "Pencil"
         self.colors = [0, 1]
@@ -111,6 +110,21 @@ class DrawingCanvas(PixelView):
         self.redo_stack = deque(maxlen=64)
         self._before = None
         self.reset()
+
+    def maximum_scale(self) -> int:
+        width, height = IMAGE_SIZES[self.canvas_size]
+        return max(1, min((self.width() - 2) // width, (self.height() - 2) // height))
+
+    def image_rect(self) -> QRectF:
+        width, height = IMAGE_SIZES[self.canvas_size]
+        scale = min(self.preview_scale, self.maximum_scale())
+        width *= scale
+        height *= scale
+        return QRectF((self.width() - width) // 2, (self.height() - height) // 2, width, height)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.resized.emit()
 
     def snapshot(self) -> tuple[int, bytes, bool]:
         return self.canvas_size, bytes(self.pixels), self.edited
@@ -351,11 +365,17 @@ class DrawingMenu(QFrame):
         self.size_combo.setAccessibleName("Canvas size")
         self.size_combo.currentIndexChanged.connect(self.canvas.resize_canvas)
         controls.addWidget(self.size_combo)
-        for label, attr in (("Grid", "grid"), ("Pixel Preview", "pixel_preview")):
-            check = QCheckBox(label)
-            check.setChecked(getattr(self.canvas, attr))
-            check.toggled.connect(lambda value, name=attr: self._set_view_option(name, value))
-            controls.addWidget(check)
+        grid = QCheckBox("Grid")
+        grid.setChecked(self.canvas.grid)
+        grid.toggled.connect(self._set_grid)
+        controls.addWidget(grid)
+        self.preview_scale_combo = combo_type()
+        self.preview_scale_combo.setAccessibleName("Preview scale")
+        self.preview_scale_combo.setToolTip("Preview scale")
+        self.preview_scale_combo.activated.connect(self._select_preview_scale)
+        self._preferred_preview_scale = None
+        self.canvas.resized.connect(self._update_preview_scales)
+        controls.addWidget(self.preview_scale_combo)
         self.undo = QPushButton("Undo")
         self.redo = QPushButton("Redo")
         self.undo.clicked.connect(lambda: self.canvas.step_history(self.canvas.undo_stack, self.canvas.redo_stack))
@@ -375,8 +395,23 @@ class DrawingMenu(QFrame):
         self.canvas.changed.connect(self._canvas_changed)
         self._canvas_changed()
 
-    def _set_view_option(self, name: str, value: bool) -> None:
-        setattr(self.canvas, name, value)
+    def _set_grid(self, enabled: bool) -> None:
+        self.canvas.grid = enabled
+        self.canvas.update()
+
+    def _select_preview_scale(self, index: int) -> None:
+        self._preferred_preview_scale = index + 1
+        self._update_preview_scales()
+
+    def _update_preview_scales(self) -> None:
+        maximum = self.canvas.maximum_scale()
+        combo = self.preview_scale_combo
+        if combo.count() != maximum:
+            combo.clear()
+            combo.addItems([f"{scale}x" for scale in range(1, maximum + 1)])
+        scale = min(self._preferred_preview_scale or maximum, maximum)
+        combo.setCurrentIndex(scale - 1)
+        self.canvas.preview_scale = scale
         self.canvas.update()
 
     def _clear(self) -> None:
@@ -391,6 +426,7 @@ class DrawingMenu(QFrame):
         self.size_combo.blockSignals(previous)
         self.undo.setEnabled(bool(self.canvas.undo_stack))
         self.redo.setEnabled(bool(self.canvas.redo_stack))
+        self._update_preview_scales()
         self.changed.emit()
 
     def _swap_colors(self) -> None:
