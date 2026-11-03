@@ -890,7 +890,7 @@ class BehaviorSettingsTests(unittest.TestCase):
             "self.rendered_history_message_limit + 1",
             add_source,
         )
-        self.assertIn("min(\n            len(self.message_log)", add_source)
+        self.assertIn("self.rendered_history_message_limit + 1", add_source)
         self.assertIn("_queue_live_message_render(", add_source)
         self.assertNotIn("_render_message_log(", add_source)
 
