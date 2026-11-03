@@ -7785,6 +7785,8 @@ class EncryptedChatClient(QObject):
 
     def _apply_layout_density(self) -> None:
         tiny = self._is_tiny_ui()
+        if hasattr(self, "image_menu"):
+            self.image_menu.set_ui_density(tiny=tiny)
         if hasattr(self, "chat_tab") and self.chat_tab.layout() is not None:
             margin = 6 if tiny else 10
             self.chat_tab.layout().setContentsMargins(

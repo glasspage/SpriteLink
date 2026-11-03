@@ -390,7 +390,6 @@ class DrawingMenu(QFrame):
         self.swatch_buttons = []
         for index in range(8):
             button = ColorButton()
-            button.setFixedSize(25, 24)
             button.clicked.connect(lambda _checked, value=index: self._pick_color(self.active_color, value))
             button.colorPicked.connect(lambda slot, value=index: self._pick_color(slot, value))
             swatches.addWidget(button, index // 4, index % 4)
@@ -408,7 +407,6 @@ class DrawingMenu(QFrame):
         self.pattern_buttons = []
         for index in range(len(PATTERNS)):
             button = QPushButton()
-            button.setFixedSize(22, 22)
             button.setIconSize(QSize(16, 16))
             button.setAccessibleName(f"Pattern {index + 1}")
             button.setCheckable(True)
@@ -456,8 +454,16 @@ class DrawingMenu(QFrame):
         buttons.addWidget(clear)
         controls.addLayout(buttons)
         row.addLayout(controls)
+        self.set_ui_density(tiny=False)
         self.canvas.changed.connect(self._canvas_changed)
         self._canvas_changed()
+
+    def set_ui_density(self, *, tiny: bool) -> None:
+        swatch_size = QSize(25, 26) if tiny else QSize(27, 24)
+        for button in self.swatch_buttons:
+            button.setFixedSize(swatch_size)
+        for button in self.pattern_buttons:
+            button.setFixedSize(22, 22 if tiny else 20)
 
     def _set_grid(self, enabled: bool) -> None:
         self.canvas.grid = enabled
