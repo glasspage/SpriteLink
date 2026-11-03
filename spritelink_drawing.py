@@ -537,9 +537,7 @@ class DrawingImportPanel(QFrame):
         self.background = combo_type()
         self.background.setAccessibleName("Background")
         names = ("Black", "White", "Red", "Yellow", "Green", "Blue", "Purple", "Gray")
-        for index, name in enumerate(names):
-            swatch = preview_icon(bytes([index]) * 256)
-            self.background.addItem(swatch, f"{name} background")
+        self.background.addItems([f"{name} background" for name in names])
         self.background.setCurrentIndex(1)
         settings.addWidget(self.background)
         settings.addStretch()
