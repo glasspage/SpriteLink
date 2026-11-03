@@ -534,13 +534,12 @@ class DrawingImportPanel(QFrame):
         settings.addWidget(self.mode)
         self.dither = QCheckBox("Dither")
         settings.addWidget(self.dither)
-        settings.addWidget(QLabel("Background"))
         self.background = combo_type()
         self.background.setAccessibleName("Background")
-        for index, color in enumerate(IMAGE_PALETTE):
-            self.background.addItem(preview_icon(bytes([index]) * 256), "")
-            self.background.setItemData(index, color, Qt.ItemDataRole.ToolTipRole)
-            self.background.setItemData(index, color, Qt.ItemDataRole.AccessibleTextRole)
+        names = ("Black", "White", "Red", "Yellow", "Green", "Blue", "Purple", "Gray")
+        for index, name in enumerate(names):
+            swatch = preview_icon(bytes([index]) * 256)
+            self.background.addItem(swatch, f"{name} background")
         self.background.setCurrentIndex(1)
         settings.addWidget(self.background)
         settings.addStretch()
