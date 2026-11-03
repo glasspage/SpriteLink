@@ -10943,6 +10943,10 @@ QComboBox::drop-down {
         footer = QHBoxLayout()
         self.search_status = QLabel()
         footer.addWidget(self.search_status, 1)
+        self.search_more_button = QPushButton("More")
+        self.search_more_button.clicked.connect(self._start_chat_search)
+        footer.addWidget(self.search_more_button)
+        self.search_more_button.hide()
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.search_toggle.click)
         footer.addWidget(close_button)
@@ -10986,6 +10990,7 @@ QComboBox::drop-down {
         self._search_media_updates.clear()
         while self.search_results_layout.count():
             self.search_results_layout.takeAt(0).widget().deleteLater()
+        self.search_more_button.hide()
         self.search_status.setText("Enter text or select a filter.")
         self.search_timer.start()
 
@@ -11000,6 +11005,7 @@ QComboBox::drop-down {
         if self.search_results_layout.count() and self._search_before is None:
             return
         self._search_running = True
+        self.search_more_button.hide()
         self.search_status.setText("Searching...")
         self.history_load_executor.submit(
             self._chat_search_worker,
@@ -11027,7 +11033,7 @@ QComboBox::drop-down {
                 batch = load_chatroom_history(server, key, limit=200, before=before)
                 if not batch:
                     break
-                for item in reversed(batch):
+                for index, item in enumerate(reversed(batch)):
                     text = message_text_for_search(item, query, filters)
                     if text is None:
                         continue
@@ -11039,14 +11045,19 @@ QComboBox::drop-down {
                         )
                     except Exception:
                         continue
-                    if len(matches) == 25:
-                        next_page = matches[-1][0]
-                        break
                     matches.append((
                         self._message_sort_key(item), str(message["i"]),
                         timestamp, message,
                     ))
-                if next_page is not None:
+                    if len(matches) == 25:
+                        cursor = matches[-1][0]
+                        if index + 1 < len(batch) or (
+                            len(batch) == 200
+                            and load_chatroom_history(server, key, limit=1, before=cursor)
+                        ):
+                            next_page = cursor
+                        break
+                if len(matches) == 25:
                     break
                 before = self._message_sort_key(batch[0])
         except Exception:
@@ -11059,6 +11070,7 @@ QComboBox::drop-down {
             return
         if matches is None:
             self._search_running = False
+            self.search_more_button.setVisible(self._search_before is not None)
             self.search_status.setText("Could not read chat history.")
             return
         def append_next(index: int) -> None:
@@ -11093,11 +11105,11 @@ QComboBox::drop-down {
     def _finish_chat_search_page(self, next_page: Any) -> None:
         self._search_running = False
         self._search_before = next_page
-        if next_page is not None:
-            self._start_chat_search()
-            return
+        self.search_more_button.setVisible(next_page is not None)
         count = self.search_results_layout.count()
-        if count == 0:
+        if next_page is not None:
+            self.search_status.setText(f"{count}+ results found")
+        elif count == 0:
             self.search_status.setText("No matches.")
         else:
             noun = "result" if count == 1 else "results"
