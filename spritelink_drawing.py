@@ -7,7 +7,7 @@ from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QPushButton, QVBoxLayout, QWidget,
+    QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from spritelink_image_codec import IMAGE_PALETTES, IMAGE_SIZES
@@ -433,6 +433,8 @@ class DrawingMenu(QFrame):
         self.preview_scale_combo = combo_type()
         self.preview_scale_combo.setAccessibleName("Preview scale")
         self.preview_scale_combo.setToolTip("Preview scale")
+        self.preview_scale_combo.addItems(("1x", "2x", "3x", "Max"))
+        self.preview_scale_combo.setCurrentIndex(3)
         self.preview_scale_combo.activated.connect(self._select_preview_scale)
         self._preferred_preview_scale = None
         self.canvas.resized.connect(self._update_preview_scales)
@@ -461,23 +463,29 @@ class DrawingMenu(QFrame):
         self.canvas.grid = enabled
         self.canvas.update()
 
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        scale = getattr(self, "_preferred_preview_scale", None)
+        if scale is not None:
+            _, height = self.canvas.image_size()
+            margins = self.layout().contentsMargins()
+            canvas_height = height * scale + 2 + margins.top() + margins.bottom() + 2 * self.frameWidth()
+            hint.setHeight(max(self.minimumSizeHint().height(), canvas_height))
+        return hint
+
     def _select_preview_scale(self, index: int) -> None:
-        self._preferred_preview_scale = (
-            None if self.preview_scale_combo.itemText(index) == "Max" else index + 1
+        self._preferred_preview_scale = None if index == 3 else index + 1
+        policy = self.sizePolicy()
+        policy.setVerticalPolicy(
+            QSizePolicy.Policy.Preferred if self._preferred_preview_scale is None
+            else QSizePolicy.Policy.Maximum
         )
+        self.setSizePolicy(policy)
+        self.updateGeometry()
         self._update_preview_scales()
 
     def _update_preview_scales(self) -> None:
-        maximum = self.canvas.maximum_scale()
-        numeric_count = min(maximum, 3)
-        combo = self.preview_scale_combo
-        if combo.count() != numeric_count + 1:
-            combo.clear()
-            combo.addItems([f"{scale}x" for scale in range(1, numeric_count + 1)] + ["Max"])
-        preferred = self._preferred_preview_scale
-        scale = min(preferred, maximum) if preferred is not None else maximum
-        combo.setCurrentIndex(scale - 1 if preferred is not None else numeric_count)
-        self.canvas.preview_scale = scale
+        self.canvas.preview_scale = self._preferred_preview_scale or self.canvas.maximum_scale()
         self.canvas.update()
 
     def _clear(self) -> None:
@@ -505,6 +513,7 @@ class DrawingMenu(QFrame):
         self.size_combo.blockSignals(previous)
         self.undo.setEnabled(bool(self.canvas.undo_stack))
         self.redo.setEnabled(bool(self.canvas.redo_stack))
+        self.updateGeometry()
         self._update_preview_scales()
         self.changed.emit()
 
