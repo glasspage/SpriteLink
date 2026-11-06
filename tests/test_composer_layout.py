@@ -116,3 +116,81 @@ class ComposerLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_emoji_canvas_action_and_composer_draft_round_trip(self):
+        client = self.client
+        client.image_menu_button.setChecked(True)
+        self.assertEqual(client.send_button.text(), "Send")
+        client.image_menu.size_combo.setCurrentIndex(S.EMOJI_SIZE)
+        self.assertEqual(client.image_menu.size_combo.currentText(), "Emoji (16x16)")
+        self.assertEqual(client.send_button.text(), "Save to Emojis")
+        self.assertFalse(client.send_button.isEnabled())
+
+        pixels = bytes([2]) * 256
+        client.image_menu.canvas.replace(S.EMOJI_SIZE, pixels)
+        encoded = S.encode_drawing(S.EMOJI_SIZE, pixels)
+        with mock.patch.object(client, "_save_emoji_dialog", return_value=True) as save:
+            client.send_button.click()
+            self.assertEqual(save.call_args.args[0], encoded)
+        self.assertTrue(client._store_saved_emojis({"sleepy cat": encoded}))
+
+        client.emojis_menu_button.setChecked(True)
+        self.assertEqual(client.send_button.text(), "Send")
+        self.edit.setPlainText("🐈 says ")
+        self.edit.moveCursor(S.QTextCursor.MoveOperation.End)
+        client._insert_saved_emoji(client.emojis_menu.item(0))
+        QTest.keyClicks(self.edit, " hi")
+        markup = f"🐈 says {S.emoji_markup('sleepy cat', encoded)} hi"
+        self.assertEqual(self.edit.toPlainText(), "🐈 says \ufffc hi")
+        self.assertEqual(self.edit.to_message_text(), markup)
+        client._restore_active_chatroom_draft()
+        self.assertEqual(self.edit.to_message_text(), markup)
+
+        self.edit.selectAll()
+        mime = self.edit.createMimeDataFromSelection()
+        self.assertEqual(mime.text(), "🐈 says :sleepy cat: hi")
+        self.edit.clear()
+        self.edit.insertFromMimeData(mime)
+        self.assertEqual(self.edit.to_message_text(), markup)
+        self.edit.moveCursor(S.QTextCursor.MoveOperation.Left)
+        self.edit.moveCursor(S.QTextCursor.MoveOperation.Left)
+        self.edit.moveCursor(S.QTextCursor.MoveOperation.Left)
+        QTest.keyClick(self.edit, Qt.Key.Key_Backspace)
+        self.assertEqual(self.edit.to_message_text(), "🐈 says  hi")
+
+    def test_tiny_inline_emoji_fits_text_and_spoilers_hide_the_pixels(self):
+        client = self.client
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+        markup = S.emoji_markup("sleepy cat", encoded)
+        for ui_size in ("Small", "Tiny"):
+            with self.subTest(ui_size=ui_size):
+                client.config_data["ui_size"] = ui_size
+                document = client.chat_display.document()
+                document.clear()
+                cursor = S.QTextCursor(document)
+                client._insert_message_text_with_links(
+                    cursor, f"before <sp>{markup}</sp> after", "#000000",
+                    S.DEFAULT_MESSAGE_FONT, "user", "message",
+                    muted=False, ui_font=False, embedded_image_urls=set(),
+                    align_top=False, top_align_height=0, render_emojis=True,
+                )
+                def image_format():
+                    iterator = document.begin().begin()
+                    while not iterator.atEnd():
+                        formatting = iterator.fragment().charFormat()
+                        if formatting.isImageFormat():
+                            return formatting.toImageFormat()
+                        iterator += 1
+                    self.fail("No inline image")
+                formatting = image_format()
+                self.assertFalse(formatting.isAnchor())
+                if ui_size == "Tiny":
+                    font = client._make_message_font(S.DEFAULT_MESSAGE_FONT, role="chat_log")
+                    self.assertLessEqual(formatting.height(), S.QFontMetrics(font).ascent())
+                else:
+                    self.assertEqual(formatting.height(), 16)
+                client._toggle_rendered_spoiler("message:1")
+                self.assertTrue(image_format().isAnchor())
+                self.assertEqual(image_format().toolTip(), "sleepy cat")
+                client._toggle_rendered_spoiler("message:1")
+                self.assertFalse(image_format().isAnchor())
