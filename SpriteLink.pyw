@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+from bisect import bisect_right, insort_right
 import ctypes
+from contextlib import closing
 from ctypes import wintypes
 from dataclasses import dataclass
 from functools import lru_cache
@@ -19,6 +21,7 @@ from pathlib import Path
 import queue
 import re
 import secrets
+import sqlite3
 import subprocess
 import threading
 import time
@@ -74,6 +77,7 @@ try:
         QPixmapCache,
         QPolygon,
         QRegion,
+        QShortcut,
         QTextBlockFormat,
         QTextBlockUserData,
         QTextCharFormat,
@@ -82,6 +86,8 @@ try:
         QTextFormat,
         QTextImageFormat,
         QTextLayout,
+        QTextLength,
+        QTextTableFormat,
         QTextOption,
     )
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -131,7 +137,7 @@ except ImportError as exc:
         "Missing dependency: PySide6\n\nInstall it with:\n"
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
-from typing import Any
+from typing import Any, Callable, Iterable
 
 QAudioOutput: Any = None
 QMediaPlayer: Any = None
@@ -195,6 +201,11 @@ except ImportError as exc:
         "Missing dependency: Pillow\n\nInstall it with:\n"
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
+
+from spritelink_drawing import (
+    DrawingImportPanel, DrawingMenu, drawing_image, load_import_image,
+)
+from spritelink_image_codec import decode_drawing, encode_drawing
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
@@ -350,8 +361,8 @@ CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
 MESSAGE_SOUND_COOLDOWN_SECONDS = 2.0
 COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
 DESKTOP_NOTIFICATION_DEBOUNCE_MS = 250
-CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
-DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
+CHATROOM_HISTORY_OPTIONS = (1000, 5000, 10000, 50000)
+DEFAULT_CHATROOM_HISTORY_LIMIT = 10000
 INITIAL_HISTORY_RENDER_MESSAGES = 50
 HISTORY_RENDER_PAGE_MESSAGES = 50
 HISTORY_PREFETCH_SCROLL_FRACTION = 0.20
@@ -652,6 +663,7 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "cdn.donmai.*",
     "pbs.twimg.com",
     "i.imgur.com",
+    "i.kym-cdn.com",
     "images.unsplash.com",
     "images.pexels.com",
     "cdn.bsky.app",
@@ -783,6 +795,7 @@ TRUSTED_LINK_DOMAINS = (
     "myanimelist.net",
 )
 TRUSTED_LINK_EXACT_HOSTS = (
+    "i.kym-cdn.com",
     "adriansblinkiecollection.neocities.org",
     "steamuserimages-a.akamaihd.net",
     "ak.picdn.net",
@@ -1236,7 +1249,8 @@ QPushButton:disabled {
 }
 QPushButton#identityMenuButton,
 QPushButton#fontMenuButton,
-QPushButton#formattingMenuButton {
+QPushButton#formattingMenuButton,
+QPushButton#imageMenuButton {
     min-height: 17px;
     padding-top: 2px;
     padding-bottom: 2px;
@@ -1595,6 +1609,10 @@ def optimize_profile_icon(source_path: str) -> bytes:
     )
     canvas.alpha_composite(icon, offset)
 
+    return _encode_profile_icon_canvas(canvas)
+
+
+def _encode_profile_icon_canvas(canvas: Image.Image, dither: bool = False) -> bytes:
     # GIF allows one transparent palette entry; normalize partial alpha first.
     normalized_pixels = [
         (red, green, blue, 255)
@@ -1637,6 +1655,18 @@ def optimize_profile_icon(source_path: str) -> bytes:
             for index in used_indices
         ]
         opaque_indices = [remap[index] for index in quantized_indices]
+
+    if dither and len(exact_colors) > max_opaque_colors:
+        # Diffuse across the 2D crop using the palette fitted to opaque pixels.
+        palette = Image.new("P", (1, 1))
+        palette.putpalette([channel for color in palette_colors for channel in color])
+        mapped = canvas.convert("RGB").quantize(
+            palette=palette, dither=Image.Dither.FLOYDSTEINBERG,
+        )
+        opaque_indices = [
+            index for index, (*_rgb, alpha) in zip(mapped.tobytes(), normalized_pixels)
+            if alpha == 255
+        ]
 
     transparency_index = len(palette_colors) if has_transparency else None
     pixel_indices: list[int] = []
@@ -2314,6 +2344,8 @@ def group_messages_for_display(
         )
         should_combine = (
             same_remote_user
+            and "drawing" not in message
+            and "drawing" not in previous_message
             and message_items_are_contiguous(previous_item, item)
             and (
                 client_id in muted_user_ids
@@ -2361,6 +2393,8 @@ def consecutive_duplicate_message_ordinal(
     ntfy_time: int,
     ntfy_id: str | None = None,
 ) -> int:
+    if "drawing" in message:
+        return 1
     current_item = {
         "message": message,
         "is_local": False,
@@ -2380,6 +2414,7 @@ def consecutive_duplicate_message_ordinal(
         if (
             str(previous_message.get("c", ""))
             != str(message.get("c", ""))
+            or "drawing" in previous_message
             or str(previous_message.get("m", ""))
             != str(message.get("m", ""))
             or not message_items_are_contiguous(
@@ -3082,6 +3117,41 @@ def is_likely_nsfw_image_url(url: str) -> bool:
     )
 
 
+def message_text_for_search(
+    item: dict[str, Any], query: str, filters: set[str],
+) -> str | None:
+    if "drawing" in item["message"]:
+        return "" if not query and (not filters or "Images" in filters) else None
+    raw_text = item["message"].get("m")
+    if not isinstance(raw_text, str):
+        return None
+    text = message_plain_text_with_spoilers_redacted(raw_text)
+    if query and query not in text.casefold():
+        return None
+    if not filters:
+        return text
+    for _start, _end, url in message_url_spans(text):
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        video = (
+            is_click_to_play_video_url(url)
+            or is_trusted_looping_video_url(url)
+            or _url_has_video_extension(parsed)
+            or parsed.hostname in ("redgifs.com", "www.redgifs.com")
+        )
+        if video:
+            category = "Embedded Videos"
+        elif is_direct_image_url(url) or is_supported_media_page_url(url):
+            category = "Embedded Images"
+        else:
+            category = "Links"
+        if category in filters:
+            return text
+    return None
+
+
 def message_contains_only_image_links(text: str) -> bool:
     return (
         bool(direct_image_urls_in_message(text))
@@ -3306,6 +3376,8 @@ def _signed_message_payload(
         message["t"],
         message["m"],
     ]
+    if "drawing" in message:
+        values.append(message["drawing"])
     return json.dumps(
         values,
         ensure_ascii=False,
@@ -3373,6 +3445,8 @@ def normalize_chatroom_history_limit(value: Any) -> int:
         candidate = int(value)
     except (TypeError, ValueError):
         candidate = DEFAULT_CHATROOM_HISTORY_LIMIT
+    if candidate in (100, 500):
+        return CHATROOM_HISTORY_OPTIONS[0]
     return (
         candidate
         if candidate in CHATROOM_HISTORY_OPTIONS
@@ -3407,7 +3481,7 @@ def _load_dpapi_config(encrypted: bytes) -> dict[str, Any]:
 
 def chatroom_history_path(server_url: str, encryption_key: str) -> Path:
     scope_id = room_scope_id(server_url, encryption_key)
-    return CHATROOM_HISTORY_DIRECTORY / f"{scope_id}.bin"
+    return CHATROOM_HISTORY_DIRECTORY / f"{scope_id}.sqlite3"
 
 
 def _load_chatroom_history_file(path: Path) -> list[dict[str, Any]]:
@@ -3420,36 +3494,133 @@ def _load_chatroom_history_file(path: Path) -> list[dict[str, Any]]:
     return [entry for entry in loaded if isinstance(entry, dict)]
 
 
+def _open_chatroom_history(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                message_id TEXT PRIMARY KEY NOT NULL,
+                ntfy_id TEXT,
+                sort_time INTEGER NOT NULL,
+                sent_time INTEGER NOT NULL,
+                payload BLOB NOT NULL
+            )
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS messages_by_time
+            ON messages (sort_time, sent_time, message_id)
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS messages_by_ntfy_id
+            ON messages (ntfy_id) WHERE ntfy_id IS NOT NULL
+        """)
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
+
+def _history_rows(entries: Iterable[dict[str, Any]]) -> Iterable[tuple]:
+    for item in entries:
+        message = item.get("message")
+        if not isinstance(message, dict) or not message.get("i"):
+            continue
+        sort_time, sent_time, message_id = message_item_sort_key(item)
+        entry = {key: value for key, value in item.items() if key != "is_local"}
+        raw = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+        payload = dpapi_encrypt(
+            zlib.compress(raw.encode("utf-8"), level=1),
+            CHATROOM_HISTORY_DPAPI_ENTROPY,
+        )
+        yield message_id, item.get("ntfy_id"), sort_time, sent_time, payload
+
+
+def _insert_chatroom_history(
+    connection: sqlite3.Connection,
+    entries: Iterable[dict[str, Any]],
+) -> None:
+    connection.executemany("""
+        INSERT INTO messages (message_id, ntfy_id, sort_time, sent_time, payload)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO NOTHING
+    """, _history_rows(entries))
+
+
+def _pending_history_upgrades() -> list[Path]:
+    pending = []
+    for legacy_path in sorted(CHATROOM_HISTORY_DIRECTORY.glob("*.bin")):
+        path = legacy_path.with_suffix(".sqlite3")
+        if path.exists():
+            with closing(sqlite3.connect(path)) as connection:
+                if connection.execute("PRAGMA user_version").fetchone()[0] >= 1:
+                    continue
+        pending.append(legacy_path)
+    return pending
+
+
+def _upgrade_chatroom_history(legacy_path: Path) -> None:
+    entries = _load_chatroom_history_file(legacy_path)
+    with closing(_open_chatroom_history(legacy_path.with_suffix(".sqlite3"))) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("PRAGMA user_version").fetchone()[0] < 1:
+                _insert_chatroom_history(connection, entries)
+                connection.execute("PRAGMA user_version = 1")
+
+
 def load_chatroom_history(
     server_url: str,
     encryption_key: str,
+    *,
+    limit: int = -1,
+    before: tuple[int, int, str] | None = None,
 ) -> list[dict[str, Any]]:
-    try:
-        path = chatroom_history_path(server_url, encryption_key)
-        if not path.exists():
-            return []
-        return _load_chatroom_history_file(path)
-    except Exception:
+    path = chatroom_history_path(server_url, encryption_key)
+    if not path.exists():
         return []
+    with closing(sqlite3.connect(path)) as connection:
+        query = "SELECT payload FROM messages"
+        params = ()
+        if before is not None:
+            query += " WHERE (sort_time, sent_time, message_id) < (?, ?, ?)"
+            params = before
+        query += " ORDER BY sort_time DESC, sent_time DESC, message_id DESC LIMIT ?"
+        rows = connection.execute(query, (*params, limit)).fetchall()
+    return [
+        json.loads(zlib.decompress(dpapi_decrypt(payload, CHATROOM_HISTORY_DPAPI_ENTROPY)))
+        for (payload,) in reversed(rows)
+    ]
 
 
 def save_chatroom_history(
     server_url: str,
     encryption_key: str,
     entries: list[dict[str, Any]],
+    maximum_messages: int | None = None,
 ) -> None:
     path = chatroom_history_path(server_url, encryption_key)
-    if not entries:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+    if not entries and not path.exists():
         return
-    _write_dpapi_json(
-        path,
-        entries,
-        CHATROOM_HISTORY_DPAPI_ENTROPY,
-    )
+    with closing(_open_chatroom_history(path)) as connection:
+        with connection:
+            _insert_chatroom_history(connection, entries)
+            if maximum_messages is not None:
+                _prune_history_rows(connection, maximum_messages)
+
+
+def _prune_history_rows(connection: sqlite3.Connection, limit: int) -> bool:
+    boundary = connection.execute("""
+        SELECT sort_time, sent_time, message_id FROM messages
+        ORDER BY sort_time DESC, sent_time DESC, message_id DESC
+        LIMIT 1 OFFSET ?
+    """, (limit - 1,)).fetchone()
+    if boundary is None:
+        return False
+    return connection.execute("""
+        DELETE FROM messages WHERE (sort_time, sent_time, message_id) < (?, ?, ?)
+    """, boundary).rowcount > 0
 
 
 def prune_chatroom_history(
@@ -3457,36 +3628,30 @@ def prune_chatroom_history(
     encryption_key: str,
     maximum_messages: int,
 ) -> bool:
-    try:
-        path = chatroom_history_path(server_url, encryption_key)
-        if not path.exists():
-            return False
-        entries = _load_chatroom_history_file(path)
-    except Exception:
+    path = chatroom_history_path(server_url, encryption_key)
+    if not path.exists():
         return False
-
-    limit = normalize_chatroom_history_limit(maximum_messages)
-    if len(entries) <= limit:
-        return False
-    save_chatroom_history(
-        server_url,
-        encryption_key,
-        entries[-limit:],
-    )
-    return True
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            pruned = _prune_history_rows(connection, maximum_messages)
+        if pruned:
+            connection.execute("PRAGMA incremental_vacuum(256)")
+    return pruned
 
 
 def delete_local_chatroom_history(
     server_url: str,
     encryption_key: str,
 ) -> bool:
+    path = chatroom_history_path(server_url, encryption_key)
+    existed = path.exists() or path.with_suffix(".bin").exists()
     try:
-        chatroom_history_path(server_url, encryption_key).unlink()
-        return True
-    except FileNotFoundError:
+        path.with_suffix(".bin").unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+    except OSError:
         return False
-    except Exception:
-        return False
+    return existed
 
 
 def default_config() -> dict[str, Any]:
@@ -6031,6 +6196,7 @@ class MessageLogBrowser(QTextBrowser):
         self._fade_document.contentsChange.connect(self._invalidate_collapsed_text_fades)
         self.unread_divider_block_number: int | None = None
         self.unread_divider_alpha = 255
+        self.show_unread_bottom_edge = False
         self.horizontalScrollBar().rangeChanged.connect(
             self._lock_horizontal_scroll
         )
@@ -6602,6 +6768,186 @@ class MessageLogBrowser(QTextBrowser):
         # Style changes can drop character backgrounds; repaint spoilers in every mode.
         self._paint_spoilers(event)
         self._paint_unread_divider(event)
+        if self.show_unread_bottom_edge:
+            viewport = self.viewport()
+            painter = QPainter(viewport)
+            painter.setClipRegion(event.region())
+            painter.fillRect(0, viewport.height() - 2, viewport.width(), 2, QColor("#ff8a00"))
+            painter.end()
+
+
+class SearchResultCard(QFrame):
+    def _fit_height(self) -> None:
+        layout = self.layout()
+        # Give the scroll area the full card height so it cannot compress existing cards.
+        if layout is not None:
+            height = layout.totalHeightForWidth(self.width())
+            if height >= 0 and (height != self.minimumHeight() or height != self.maximumHeight()):
+                self.setFixedHeight(height)
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self._fit_height()
+
+    def event(self, event: Any) -> bool:
+        handled = super().event(event)
+        if event.type() == QEvent.Type.LayoutRequest:
+            self._fit_height()
+        return handled
+
+
+class SearchResultMessage(QTextBrowser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._source_html = ""
+        self._preview_width = -1
+        self._shadow_document: QTextDocument | None = None
+        self._height_measurement: tuple[tuple[int, int, str], int] | None = None
+        self.setReadOnly(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setOpenLinks(False)
+        self.setOpenExternalLinks(False)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.document().setDocumentMargin(6)
+        policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def setHtml(self, text: str) -> None:
+        self._source_html = text
+        self._preview_width = -1
+        self._update_preview()
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self._update_preview()
+
+    @staticmethod
+    def _elide_preview(document: QTextDocument, width: int) -> None:
+        document.setTextWidth(width)
+        document.size()
+        first = document.begin()
+        layout = first.layout()
+        if not layout.lineCount():
+            return
+
+        # Keep the separate media block (or media cell) after the text preview.
+        cursor = QTextCursor(document)
+        block = first.next()
+        while block.isValid():
+            cursor.setPosition(block.position())
+            if cursor.currentTable() or block.text().startswith("\ufffc"):
+                break
+            block = block.next()
+
+        line_end = first.position() + layout.lineAt(0).textLength()
+        end = block.position() - 1 if block.isValid() else document.characterCount() - 1
+        if line_end >= end:
+            return
+
+        cursor.setPosition(line_end)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        # Keep the marker outside any link or concealed spoiler formatting.
+        marker_format = QTextCharFormat()
+        marker_format.setFont(cursor.charFormat().font())
+        cursor.insertText("[...]", marker_format)
+        document.size()
+        while first.layout().lineCount() > 1:
+            cut = QTextCursor(document)
+            cut.setPosition(cursor.position() - len("[...]"))
+            if cut.atBlockStart():
+                break
+            cut.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor)
+            cut.removeSelectedText()
+            document.size()
+
+    def _update_preview(self) -> None:
+        width = max(1, self.maximumViewportSize().width())
+        if width == self._preview_width:
+            return
+        self._preview_width = width
+        self._height_measurement = None
+        if self._shadow_document is not None:
+            self._shadow_document.deleteLater()
+            self._shadow_document = None
+        super().setHtml(self._source_html)
+        self._elide_preview(self.document(), width)
+        self.updateGeometry()
+
+    def _make_shadow_document(self) -> QTextDocument:
+        shadow = self.document().clone(self)
+        transparent_image = QImage(1, 1, QImage.Format.Format_ARGB32)
+        transparent_image.fill(Qt.GlobalColor.transparent)
+        image_url = QUrl("spritelink-search-shadow:transparent")
+        shadow.addResource(QTextDocument.ResourceType.ImageResource, image_url, transparent_image)
+        fragments = []
+        block = shadow.begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    fragments.append((fragment.position(), fragment.length(), fragment.charFormat()))
+                iterator += 1
+            block = block.next()
+
+        cursor = QTextCursor(shadow)
+        for position, length, formatting in fragments:
+            if formatting.isImageFormat():
+                formatting = formatting.toImageFormat()
+                formatting.setName(image_url.toString())
+            else:
+                hidden = formatting.hasProperty(QTextFormat.Property.BackgroundBrush)
+                formatting.clearBackground()
+                formatting.setForeground(QColor(Qt.GlobalColor.transparent if hidden else Qt.GlobalColor.black))
+            cursor.setPosition(position)
+            cursor.setPosition(position + length, QTextCursor.MoveMode.KeepAnchor)
+            cursor.setCharFormat(formatting)
+        return shadow
+
+    def paintEvent(self, event: Any) -> None:
+        app = QApplication.instance()
+        if app is not None and app.property("spritelinkTextShadows") and not self.textCursor().hasSelection():
+            if self._shadow_document is None:
+                self._shadow_document = self._make_shadow_document()
+            shadow = self._shadow_document
+            shadow.setTextWidth(self.document().textWidth())
+            painter = QPainter(self.viewport())
+            painter.setClipRegion(event.region())
+            painter.translate(1 - self.horizontalScrollBar().value(), 1 - self.verticalScrollBar().value())
+            painter.setOpacity(0.15)
+            shadow.drawContents(painter)
+            painter.end()
+        super().paintEvent(event)
+
+    def heightForWidth(self, width: int) -> int:
+        self.ensurePolished()
+        viewport = self.maximumViewportSize()
+        text_width = max(1, width - (self.width() - viewport.width()))
+        document = self.document()
+        key = (text_width, document.revision(), document.defaultFont().key())
+        if self._height_measurement is None or self._height_measurement[0] != key:
+            # Qt can ask about provisional widths without actually resizing the card.
+            measurement = QTextDocument()
+            measurement.setDocumentMargin(document.documentMargin())
+            measurement.setDefaultFont(document.defaultFont())
+            measurement.setHtml(self._source_html)
+            self._elide_preview(measurement, text_width)
+            self._height_measurement = key, math.ceil(measurement.size().height())
+        return self._height_measurement[1] + self.height() - viewport.height()
+
+    def sizeHint(self) -> QSize:
+        return QSize(0, self.heightForWidth(self.width()))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
+
+    def wheelEvent(self, event: Any) -> None:
+        event.ignore()
 
 
 class MainWindow(QMainWindow):
@@ -6837,8 +7183,10 @@ class EncryptedChatClient(QObject):
         self.seen_client_message_ids: set[str] = set()
         self.seen_ntfy_message_ids: set[str] = set()
         self.message_log: list[dict[str, Any]] = []
+        self.pending_history_entries: list[dict[str, Any]] = []
         self.draft_message_id = uuid.uuid4().hex
         self.chatroom_drafts: dict[str, str] = {}
+        self.drawing_drafts: dict[str, tuple[int, bytes, bool, int]] = {}
         self.read_divider_message_ids: dict[str, str] = {}
         self.read_divider_visible_seconds: dict[str, float] = {}
         self._read_divider_last_tick = time.monotonic()
@@ -6863,6 +7211,7 @@ class EncryptedChatClient(QObject):
         ] = {}
         self.last_inline_animation_frame_at: dict[str, float] = {}
         self.current_image_preview_url: str | None = None
+        self.current_drawing_preview: QImage | None = None
         self.current_image_preview_client_id: str | None = None
         self.recent_chatroom_switch_times: list[float] = []
         self.rendered_history_message_limit = (
@@ -6878,6 +7227,12 @@ class EncryptedChatClient(QObject):
         self._message_render_job: dict[str, Any] | None = None
         self._rendering_message_log = False
         self._pending_live_render_message_ids: list[str] = []
+        self._history_render_pruned = False
+        self._search_generation = 0
+        self._history_load_complete = True
+        self._search_history_end: tuple[int, int, str] | None = None
+        self._unseen_live_message: tuple[tuple[int, int, str], str] | None = None
+        self._pending_search_jump: tuple[str, tuple[int, int, str]] | None = None
         self._media_rerender_in_progress = False
         self.embedded_image_preview_sizes: dict[str, tuple[int, int]] = {}
         self.history_load_executor = DaemonTaskPool(
@@ -7430,6 +7785,8 @@ class EncryptedChatClient(QObject):
 
     def _apply_layout_density(self) -> None:
         tiny = self._is_tiny_ui()
+        if hasattr(self, "image_menu"):
+            self.image_menu.set_ui_density(tiny=tiny)
         if hasattr(self, "chat_tab") and self.chat_tab.layout() is not None:
             margin = 6 if tiny else 10
             self.chat_tab.layout().setContentsMargins(
@@ -7461,7 +7818,7 @@ class EncryptedChatClient(QObject):
             )
         if hasattr(self, "profile_icon_button"):
             self.profile_icon_button.setText(
-                "..." if tiny else "Browse..."
+                "..." if tiny else "Import..."
             )
         if hasattr(self, "config_tab") and self.config_tab.layout() is not None:
             margin = 10 if tiny else 14
@@ -8330,7 +8687,8 @@ QPushButton:pressed, QPushButton:checked {
 }
 QPushButton#identityMenuButton,
 QPushButton#fontMenuButton,
-QPushButton#formattingMenuButton {
+QPushButton#formattingMenuButton,
+QPushButton#imageMenuButton {
     min-height: 14px;
     padding-top: 1px;
     padding-bottom: 1px;
@@ -8443,6 +8801,8 @@ QComboBox::drop-down {
         EncryptedChatClient._apply_video_player_theme(self)
         for overlay_name in (
             "config_overlay",
+            "search_overlay",
+            "drawing_import_overlay",
             "message_limit_overlay",
             "image_preview_overlay",
             "link_warning_overlay",
@@ -9028,7 +9388,33 @@ QComboBox::drop-down {
         )
         self.chat_display.viewport().update()
 
+    def _update_live_unread_edge(self) -> None:
+        if self._rendering_message_log or self._history_render_updates_suppressed:
+            return
+        display = self.chat_display
+        pending = self._unseen_live_message
+        if (
+            pending is not None
+            and self.window_focused_event.is_set()
+            and self.root.isVisible()
+            and not self.root.isMinimized()
+            and not self.search_toggle.isChecked()
+            and not self.config_toggle.isChecked()
+        ):
+            block_number = self.rendered_message_last_blocks.get(pending[1])
+            if block_number is not None:
+                document = display.document()
+                block = document.findBlockByNumber(block_number)
+                bottom = display.verticalScrollBar().value() + display.viewport().height()
+                if block.isValid() and document.documentLayout().blockBoundingRect(block).bottom() <= bottom + 1:
+                    self._unseen_live_message = None
+        visible = self._unseen_live_message is not None
+        if display.show_unread_bottom_edge != visible:
+            display.show_unread_bottom_edge = visible
+            display.viewport().update()
+
     def _update_unread_divider_fade(self) -> None:
+        self._update_live_unread_edge()
         now = time.monotonic()
         elapsed_since_tick = max(0.0, now - self._read_divider_last_tick)
         self._read_divider_last_tick = now
@@ -9527,6 +9913,7 @@ QComboBox::drop-down {
         self.config_data.get("room_settings", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
         self.chatroom_drafts.pop(room_id, None)
+        self.drawing_drafts.pop(room_id, None)
         self._request_subscription_refresh()
 
         if self.active_chatroom_id == room_id:
@@ -9617,8 +10004,11 @@ QComboBox::drop-down {
         return self._apply_theme_colors()
 
     def _reset_history_render_window(self) -> None:
+        self._unseen_live_message = None
+        self.chat_display.show_unread_bottom_edge = False
         self._set_history_render_updates_suppressed(False)
         self._history_render_generation += 1
+        self._history_load_complete = True
         self._older_history_page_scheduled = False
         self._loading_older_history_page = False
         self._history_initial_render_complete = False
@@ -9627,6 +10017,9 @@ QComboBox::drop-down {
         self._message_render_job = None
         self._rendering_message_log = False
         self._pending_live_render_message_ids.clear()
+        self._search_history_end = None
+        self.latest_history_button.hide()
+        self._history_render_pruned = False
         self._media_rerender_in_progress = False
         self.rendered_history_message_limit = (
             INITIAL_HISTORY_RENDER_MESSAGES
@@ -9715,7 +10108,7 @@ QComboBox::drop-down {
             self._older_history_page_scheduled
             or self._loading_older_history_page
             or self._tray_ui_suspended
-            or self.rendered_history_message_limit >= len(self.message_log)
+            or self.rendered_history_message_limit >= self._history_view_end()
         ):
             return
         self._older_history_page_scheduled = True
@@ -9743,16 +10136,17 @@ QComboBox::drop-down {
         self._older_history_page_scheduled = False
         if (
             self._loading_older_history_page
-            or self.rendered_history_message_limit >= len(self.message_log)
+            or self._rendering_message_log
+            or self.rendered_history_message_limit >= self._history_view_end()
         ):
             return
 
         previous_limit = min(
-            len(self.message_log),
+            self._history_view_end(),
             self.rendered_history_message_limit,
         )
         next_limit = min(
-            len(self.message_log),
+            self._history_view_end(),
             previous_limit + HISTORY_RENDER_PAGE_MESSAGES,
         )
         self._loading_older_history_page = True
@@ -9778,7 +10172,8 @@ QComboBox::drop-down {
             self._loading_older_history_page = False
             return
 
-        new_items = self.message_log[-next_limit:-previous_limit]
+        end = self._history_view_end()
+        new_items = self.message_log[end - next_limit:end - previous_limit]
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
         trusted_user_ids = self._room_preference_ids(
@@ -9814,7 +10209,7 @@ QComboBox::drop-down {
 
         following_timestamp = (
             self._display_timestamp_for_item(
-                self.message_log[-previous_limit]
+                self.message_log[end - previous_limit]
             )
             if previous_limit > 0
             else None
@@ -9847,7 +10242,7 @@ QComboBox::drop-down {
         following_background_index = 0
         if previous_limit > 0:
             following_message_id = self._message_id_from_log_item(
-                self.message_log[-previous_limit]
+                self.message_log[end - previous_limit]
             )
             following_block_number = self.rendered_message_last_blocks.get(
                 following_message_id
@@ -9972,9 +10367,9 @@ QComboBox::drop-down {
         )
         self.status_var.bind(self._on_connection_status_changed)
         status_layout.addWidget(self.status_label)
-        status_layout.addStretch(1)
+        status_layout.addSpacing(6)
 
-        self.recently_online_label = QLabel("Recently online: …")
+        self.recently_online_label = QLabel()
         self.recently_online_label.setFont(
             self._make_font(self._ui_font_family(), 9)
         )
@@ -9982,7 +10377,18 @@ QComboBox::drop-down {
         opacity.setOpacity(0.6)
         self.recently_online_label.setGraphicsEffect(opacity)
         status_layout.addWidget(self.recently_online_label)
+        status_layout.addStretch(1)
         self._update_recently_online_label()
+
+        self.latest_history_button = QPushButton("Latest")
+        self.latest_history_button.clicked.connect(self._show_latest_history)
+        status_layout.addWidget(self.latest_history_button)
+        self.latest_history_button.hide()
+
+        self.search_toggle = QPushButton("Search")
+        self.search_toggle.setCheckable(True)
+        self.search_toggle.toggled.connect(self._on_search_toggled)
+        status_layout.addWidget(self.search_toggle)
 
         self.config_toggle = QPushButton("Config")
         self.config_toggle.setCheckable(True)
@@ -10049,6 +10455,11 @@ QComboBox::drop-down {
             self._on_formatting_menu_toggled
         )
         composer_actions.addWidget(self.formatting_menu_button)
+        self.image_menu_button = QPushButton("Image")
+        self.image_menu_button.setObjectName("imageMenuButton")
+        self.image_menu_button.setCheckable(True)
+        self.image_menu_button.toggled.connect(self._on_image_menu_toggled)
+        composer_actions.addWidget(self.image_menu_button)
         composer_actions.addStretch(1)
 
         self.identity_menu = QFrame()
@@ -10104,7 +10515,7 @@ QComboBox::drop-down {
             self._show_profile_icon_context_menu
         )
         identity_layout.addWidget(self.profile_icon_preview)
-        self.profile_icon_button = QPushButton("Browse...")
+        self.profile_icon_button = QPushButton("Import...")
         self.profile_icon_button.clicked.connect(
             self._choose_profile_icon
         )
@@ -10180,6 +10591,11 @@ QComboBox::drop-down {
         formatting_layout.addStretch(1)
         self.formatting_menu.hide()
         content_layout.addWidget(self.formatting_menu)
+        self.image_menu = DrawingMenu(ThemeComboBox)
+        self.image_menu.changed.connect(self._on_drawing_changed)
+        self.image_menu.importRequested.connect(self._open_drawing_import)
+        self.image_menu.hide()
+        content_layout.addWidget(self.image_menu, 2)
         content_layout.addLayout(composer_actions)
 
         compose_layout = QGridLayout()
@@ -10212,6 +10628,10 @@ QComboBox::drop-down {
             self._toggle_composer_formatting_shortcut
         )
         compose_layout.addWidget(self.message_entry, 0, 0)
+        self.image_composer_label = QLabel("Image message")
+        self.image_composer_label.setIndent(5)
+        self.image_composer_label.hide()
+        compose_layout.addWidget(self.image_composer_label, 0, 0)
 
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self._send_current_message)
@@ -10271,6 +10691,131 @@ QComboBox::drop-down {
             self._sync_formatting_buttons()
         self._restore_chat_bottom_after_layout_change(keep_at_bottom)
 
+    def _on_image_menu_toggled(self, checked: bool) -> None:
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
+        self._set_composer_menu_visibility(self.image_menu if checked else None)
+        if checked:
+            self.image_menu.canvas.setFocus()
+        else:
+            self.message_entry.setFocus()
+        self._restore_chat_bottom_after_layout_change(keep_at_bottom)
+
+    def _on_drawing_changed(self) -> None:
+        self.drawing_drafts[self.active_chatroom_id] = self.image_menu.canvas.snapshot()
+        if self.image_menu_button.isChecked():
+            self.message_size_check_pending = True
+            self.message_size_timer.start(MESSAGE_SIZE_DEBOUNCE_MS)
+            self._draw_message_size_bar()
+
+    def _open_drawing_import(self, *, profile_icon: bool = False) -> None:
+        self._close_drawing_import()
+        title = "Import profile icon" if profile_icon else "Import image"
+        overlay = ConfigOverlay(self.chat_content)
+        self.drawing_import_overlay = overlay
+        panel = QFrame()
+        panel.setObjectName("configPanel")
+        overlay.panel = panel
+        layout = QVBoxLayout(overlay)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.addWidget(panel)
+        chooser = QVBoxLayout(panel)
+        chooser.addWidget(QLabel(title))
+        chooser.addStretch()
+        sources = QHBoxLayout()
+        sources.addStretch()
+        for label, action in (
+            ("From file...", self._import_drawing_from_file),
+            ("From clipboard...", self._import_drawing_from_clipboard),
+        ):
+            button = QPushButton(label)
+            button.setMinimumSize(126, 44)
+            button.clicked.connect(lambda _checked, callback=action: callback(profile_icon))
+            sources.addWidget(button)
+        sources.addStretch()
+        chooser.addLayout(sources)
+        chooser.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self._close_drawing_import)
+        chooser.addWidget(cancel, alignment=Qt.AlignmentFlag.AlignRight)
+        overlay.dismissed.connect(self._close_drawing_import)
+        escape = QShortcut(Qt.Key.Key_Escape, overlay)
+        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        escape.activated.connect(self._close_drawing_import)
+        self._apply_ui_size_to_widget_tree(overlay)
+        overlay.setGeometry(self.chat_content.rect())
+        overlay.show()
+        overlay.raise_()
+        sources.itemAt(1).widget().setFocus()
+
+    def _import_drawing_from_file(self, profile_icon: bool = False) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self.root, "Import image", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            source = load_import_image(path)
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
+            messagebox.showerror("Cannot import image", str(exc), parent=self.root)
+            return
+        self._show_drawing_import_preview(source, profile_icon=profile_icon)
+
+    def _import_drawing_from_clipboard(self, profile_icon: bool = False) -> None:
+        image = QApplication.clipboard().image()
+        if image.isNull():
+            messagebox.showwarning("Import image", "The clipboard has no image.", parent=self.root)
+            return
+        if image.width() * image.height() > 24_000_000:
+            messagebox.showwarning("Import image", "Choose an image under 24 megapixels.", parent=self.root)
+            return
+        rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        source = Image.frombytes(
+            "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
+            "raw", "RGBA", rgba.bytesPerLine(), 1,
+        )
+        self._show_drawing_import_preview(source, profile_icon=profile_icon)
+
+    def _show_drawing_import_preview(self, source: Image.Image, *, profile_icon: bool = False) -> None:
+        overlay = self.drawing_import_overlay
+        if overlay is None:
+            return
+        previous_panel = overlay.panel
+        panel = DrawingImportPanel(
+            source, ThemeComboBox,
+            icon_size=PROFILE_ICON_SIZE if profile_icon else None,
+            icon_encoder=_encode_profile_icon_canvas if profile_icon else None,
+        )
+        overlay.layout().removeWidget(previous_panel)
+        previous_panel.hide()
+        previous_panel.deleteLater()
+        overlay.panel = panel
+        overlay.layout().addWidget(panel)
+        panel.dismissed.connect(self._close_drawing_import)
+        if profile_icon:
+            panel.iconAccepted.connect(self._apply_imported_profile_icon)
+        else:
+            panel.accepted.connect(self._apply_drawing_import)
+        self._apply_ui_size_to_widget_tree(panel)
+        panel.show()
+        (panel.dither if profile_icon else panel.size_combo).setFocus()
+
+    def _apply_drawing_import(self, size: int, pixels: bytes, palette: int) -> None:
+        self.image_menu.canvas.replace(size, pixels, palette=palette)
+        self._close_drawing_import()
+
+    def _import_chat_drawing(self, size: int, pixels: bytes, palette: int) -> None:
+        self._apply_drawing_import(size, pixels, palette)
+        self.image_menu_button.setChecked(True)
+        self.image_menu.canvas.setFocus()
+
+    def _close_drawing_import(self) -> None:
+        overlay = getattr(self, "drawing_import_overlay", None)
+        if overlay is not None:
+            self.drawing_import_overlay = None
+            overlay.hide()
+            overlay.deleteLater()
+
     def _set_composer_menu_visibility(
         self,
         visible_menu: QWidget | None,
@@ -10282,10 +10827,18 @@ QComboBox::drop-down {
                 (self.identity_menu, self.identity_menu_button),
                 (self.font_menu, self.font_menu_button),
                 (self.formatting_menu, self.formatting_menu_button),
+                (self.image_menu, self.image_menu_button),
             ):
                 should_show = menu is visible_menu
                 self._set_button_checked(button, should_show)
                 menu.setVisible(should_show)
+            drawing = visible_menu is self.image_menu
+            self.message_entry.setVisible(not drawing)
+            self.image_composer_label.setVisible(drawing)
+            if not drawing:
+                self._close_drawing_import()
+            self._cancel_pending_message_size_check()
+            self._run_message_size_check()
             content_layout = self.chat_content.layout()
             if content_layout is not None:
                 content_layout.activate()
@@ -10535,25 +11088,10 @@ QComboBox::drop-down {
         self._commit_identity_preset_changes(preset)
 
     def _choose_profile_icon(self) -> None:
-        dialog = QFileDialog(self.root, "Choose icon")
-        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
-        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter(
-            "Image files (*.png *.jpg *.jpeg);;PNG images (*.png);;"
-            "JPEG images (*.jpg *.jpeg)"
-        )
-        if (
-            self._exec_themed_file_dialog(dialog)
-            != QDialog.DialogCode.Accepted
-        ):
-            return
-        selected_files = dialog.selectedFiles()
-        source_path = selected_files[0] if selected_files else ""
-        if not source_path:
-            return
+        self._open_drawing_import(profile_icon=True)
 
+    def _apply_imported_profile_icon(self, gif_data: bytes) -> None:
         try:
-            gif_data = optimize_profile_icon(source_path)
             encoded_icon = encode_profile_icon(gif_data)
             decode_profile_icon(encoded_icon)
         except Exception as exc:
@@ -10568,6 +11106,7 @@ QComboBox::drop-down {
         preset["profile_icon"] = encoded_icon
         self._update_profile_icon_preview()
         self._commit_identity_preset_changes(preset)
+        self._close_drawing_import()
 
     def _update_profile_icon_preview(self) -> None:
         if not hasattr(self, "profile_icon_preview"):
@@ -10644,6 +11183,438 @@ QComboBox::drop-down {
         )
         self._apply_active_composer_style()
         self._schedule_profile_save()
+
+    def _build_search_popup(self) -> None:
+        self.search_overlay = ConfigOverlay(self.chat_content)
+        self.search_overlay.dismissed.connect(self.search_toggle.click)
+        overlay_layout = QVBoxLayout(self.search_overlay)
+        overlay_layout.setContentsMargins(24, 24, 24, 24)
+        panel = QFrame()
+        panel.setObjectName("configPanel")
+        panel.setMaximumWidth(CONFIG_PANEL_MAX_WIDTH)
+        self.search_overlay.panel = panel
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        panel_row = QHBoxLayout()
+        panel_row.addStretch(1)
+        panel_row.addWidget(panel, 10)
+        panel_row.addStretch(1)
+        overlay_layout.addLayout(panel_row, 1)
+        panel_layout = QVBoxLayout(panel)
+        self.search_heading = self._heading("")
+        self.search_heading.setTextFormat(Qt.TextFormat.PlainText)
+        panel_layout.addWidget(self.search_heading)
+        self.search_entry = QLineEdit()
+        self.search_entry.setPlaceholderText("Find words or phrases")
+        panel_layout.addWidget(self.search_entry)
+        filters = QHBoxLayout()
+        self.search_filters = {
+            name: QCheckBox(name)
+            for name in ("Images", "Links", "Embedded Images", "Embedded Videos")
+        }
+        for checkbox in self.search_filters.values():
+            filters.addWidget(checkbox)
+            checkbox.toggled.connect(self._reset_chat_search)
+        filters.addStretch()
+        panel_layout.addLayout(filters)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        # Reserve the gutter before the first card so overflow cannot rewrap results.
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        self.search_results_layout = QVBoxLayout(content)
+        self.search_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        # Grow the scroll content instead of squeezing the gaps between fixed-height cards.
+        self.search_results_layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
+        self._search_media_updates: dict[str, list[Callable[[], None]]] = {}
+        scroll.setWidget(content)
+        panel_layout.addWidget(scroll, 1)
+        footer = QHBoxLayout()
+        self.search_status = QLabel()
+        footer.addWidget(self.search_status, 1)
+        self.search_more_button = QPushButton("More")
+        self.search_more_button.clicked.connect(self._start_chat_search)
+        footer.addWidget(self.search_more_button)
+        self.search_more_button.hide()
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.search_toggle.click)
+        footer.addWidget(close_button)
+        panel_layout.addLayout(footer)
+
+        self.search_timer = QTimer(self.search_overlay)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(200)
+        self.search_timer.timeout.connect(self._start_chat_search)
+        self.search_entry.textChanged.connect(self._reset_chat_search)
+        self.search_entry.returnPressed.connect(self._start_chat_search)
+        self.chat_content.installEventFilter(self)
+        self._apply_ui_size_to_widget_tree(self.search_overlay)
+
+    def _on_search_toggled(self, checked: bool) -> None:
+        if not checked:
+            if hasattr(self, "search_overlay"):
+                self._search_generation += 1
+                self._pending_search_jump = None
+                self.search_timer.stop()
+                self._search_media_updates.clear()
+                self.search_overlay.hide()
+                self.message_entry.setFocus()
+            return
+        if not self._dismiss_config_popup():
+            self.search_toggle.setChecked(False)
+            return
+        self._close_drawing_import()
+        if not hasattr(self, "search_overlay"):
+            self._build_search_popup()
+        self.search_heading.setText(f"Search in {self._active_chatroom()['nickname']}")
+        self.search_overlay.setGeometry(self.chat_content.rect())
+        self.search_overlay.show()
+        self.search_overlay.raise_()
+        self.search_entry.setFocus()
+        self._reset_chat_search()
+
+    def _reset_chat_search(self) -> None:
+        self._search_generation += 1
+        self._pending_search_jump = None
+        self._search_before = None
+        self._search_running = False
+        self._search_media_updates.clear()
+        while self.search_results_layout.count():
+            self.search_results_layout.takeAt(0).widget().deleteLater()
+        self.search_more_button.hide()
+        self.search_status.setText("Enter text or select a filter.")
+        self.search_timer.start()
+
+    def _start_chat_search(self) -> None:
+        self.search_timer.stop()
+        if self._search_running or not self.search_overlay.isVisible():
+            return
+        query = self.search_entry.text().strip().casefold()
+        filters = {name for name, box in self.search_filters.items() if box.isChecked()}
+        if not query and not filters:
+            return
+        if self.search_results_layout.count() and self._search_before is None:
+            return
+        self._search_running = True
+        self.search_more_button.hide()
+        self.search_status.setText("Searching...")
+        self.history_load_executor.submit(
+            self._chat_search_worker,
+            self._search_generation,
+            normalize_server_url(self.config_data["server_url"]),
+            self._active_chatroom()["key"],
+            query,
+            filters,
+            self._search_before,
+        )
+
+    def _chat_search_worker(
+        self,
+        generation: int,
+        server: str,
+        key: str,
+        query: str,
+        filters: set[str],
+        before: tuple[int, int, str] | None,
+    ) -> None:
+        matches = []
+        next_page = None
+        try:
+            while not self._closing and generation == self._search_generation:
+                batch = load_chatroom_history(server, key, limit=200, before=before)
+                if not batch:
+                    break
+                for index, item in enumerate(reversed(batch)):
+                    text = message_text_for_search(item, query, filters)
+                    if text is None:
+                        continue
+                    message = item["message"]
+                    try:
+                        timestamp = self._display_timestamp_for_item(item)
+                        self._validate_decrypted_message(
+                            message, key, ntfy_time=timestamp or None,
+                        )
+                    except Exception:
+                        continue
+                    matches.append((
+                        self._message_sort_key(item), str(message["i"]),
+                        timestamp, message,
+                    ))
+                    if len(matches) == 25:
+                        cursor = matches[-1][0]
+                        if index + 1 < len(batch) or (
+                            len(batch) == 200
+                            and load_chatroom_history(server, key, limit=1, before=cursor)
+                        ):
+                            next_page = cursor
+                        break
+                if len(matches) == 25:
+                    break
+                before = self._message_sort_key(batch[0])
+        except Exception:
+            matches = None
+        if not self._closing and generation == self._search_generation:
+            self._queue_ui_event(("chat_search_results", (generation, matches, next_page)))
+
+    def _show_chat_search_results(self, generation: int, matches: Any, next_page: Any) -> None:
+        if generation != self._search_generation:
+            return
+        if matches is None:
+            self._search_running = False
+            self.search_more_button.setVisible(self._search_before is not None)
+            self.search_status.setText("Could not read chat history.")
+            return
+        def append_next(index: int) -> None:
+            if generation != self._search_generation or self._closing:
+                return
+            if index == len(matches):
+                self._finish_chat_search_page(next_page)
+                return
+            sort_key, message_id, timestamp, message = matches[index]
+            frame = SearchResultCard()
+            frame.setFrameShape(QFrame.Shape.StyledPanel)
+            frame.setFrameShadow(QFrame.Shadow.Sunken)
+            layout = QVBoxLayout(frame)
+            header = QHBoxLayout()
+            date = QLabel(datetime.fromtimestamp(timestamp).strftime("%b %d, %Y  %H:%M"))
+            header.addWidget(date, 1)
+            jump = QPushButton("Jump")
+            jump.clicked.connect(
+                lambda checked=False, target=message_id, order=sort_key:
+                self._jump_to_search_result(target, order)
+            )
+            header.addWidget(jump)
+            layout.addLayout(header)
+            layout.addWidget(self._search_result_message(message))
+            self._apply_ui_size_to_widget_tree(frame)
+            self.search_results_layout.addWidget(frame)
+            # Yield to scroll, paint and media events between result cards.
+            QTimer.singleShot(24, lambda: append_next(index + 1))
+
+        append_next(0)
+
+    def _finish_chat_search_page(self, next_page: Any) -> None:
+        self._search_running = False
+        self._search_before = next_page
+        self.search_more_button.setVisible(next_page is not None)
+        count = self.search_results_layout.count()
+        if next_page is not None:
+            self.search_status.setText(f"{count}+ results found")
+        elif count == 0:
+            self.search_status.setText("No matches.")
+        else:
+            noun = "result" if count == 1 else "results"
+            self.search_status.setText(f"{count} {noun} found.")
+
+    def _update_search_media_preview(
+        self, url: str, media: RemoteMediaPreview | None,
+    ) -> None:
+        updates = getattr(self, "_search_media_updates", {}).get(url)
+        if not updates:
+            return
+        if media is not None and media.frame is None and not is_likely_nsfw_image_url(url):
+            self._ensure_animated_media_controller(url, media)
+        for update in updates:
+            update()
+
+    def _stop_search_preview_loop(self, url: str) -> None:
+        if url in self.viewport_embedded_image_urls or url == self.current_image_preview_url:
+            return
+        controller = self.animated_media_controllers.pop(url, None)
+        if controller is not None:
+            controller.stop()
+            controller.deleteLater()
+
+    def _search_result_message(self, message: dict[str, Any]) -> SearchResultMessage:
+        body = SearchResultMessage()
+        body.setObjectName("searchResultMessage")
+        background = max(
+            message_row_backgrounds(), key=lambda color: QColor(color).lightness(),
+        )
+        body.setStyleSheet(
+            f"QTextBrowser#searchResultMessage {{ background-color: {background}; }}"
+        )
+        client_id = str(message["c"])
+        is_local = client_id == self._authenticated_client_id()
+        trusted = self._room_preference_ids("trusted_link_and_image_users")
+        text = message_plain_text_with_spoilers_redacted(str(message["m"]))
+        media_urls = [
+            url for url in direct_image_urls_in_message(text)
+            if is_image_url_trusted_for_sender(url, client_id, is_local, trusted)
+        ]
+
+        previous_html = ""
+
+        def update() -> None:
+            nonlocal previous_html
+            html = self._search_result_html(message, media_urls)
+            if html != previous_html:
+                previous_html = html
+                body.setHtml(html)
+                body.updateGeometry()
+
+        update()
+        for url in media_urls:
+            self._search_media_updates.setdefault(url, []).append(update)
+            if url in self.image_preview_cache:
+                media = self.image_preview_cache[url]
+                if media is not None and media.frame is None and not is_likely_nsfw_image_url(url):
+                    self._ensure_animated_media_controller(url, media)
+            else:
+                self._schedule_image_preview_fetch(url)
+        return body
+
+    def _search_result_html(
+        self, message: dict[str, Any], media_urls: list[str],
+    ) -> str:
+        embedded_urls = [
+            url for url in media_urls
+            if url not in self.image_preview_cache or self.image_preview_cache[url] is not None
+        ]
+        document = QTextDocument()
+        cursor = QTextCursor(document)
+        font_name = str(message.get("f", DEFAULT_MESSAGE_FONT))
+        body_color = str(message.get("o", DEFAULT_MESSAGE_TEXT_COLOR))
+        username = str(message["u"])
+        username_format = self._text_format(str(message["k"]), font_name=font_name)
+        body_format = self._text_format(body_color, font_name=font_name)
+        plain_text = message_plain_text(str(message["m"]))
+        visible_text = message_text_without_image_links(plain_text, set(embedded_urls))
+        icon = str(message.get("p", "")) if self._chat_icons_visible() else ""
+        media_row = None
+        drawing = message.get("drawing")
+        show_drawing = bool(drawing) and not (
+            str(message["c"]) != self._authenticated_client_id()
+            and self._is_user_muted(str(message["c"]))
+        )
+        if show_drawing or (embedded_urls and not visible_text.strip()):
+            # Separate cells keep the username at the top regardless of preview height.
+            width = (
+                QFontMetrics(username_format.font()).horizontalAdvance(username)
+                + QFontMetrics(body_format.font()).horizontalAdvance(":  ")
+                + (PROFILE_ICON_SIZE if icon else 0)
+            )
+            table_format = QTextTableFormat()
+            table_format.setBorder(0)
+            table_format.setCellPadding(0)
+            table_format.setCellSpacing(0)
+            table_format.setColumnWidthConstraints([
+                QTextLength(QTextLength.Type.FixedLength, width),
+                QTextLength(QTextLength.Type.VariableLength, 0),
+            ])
+            media_row = cursor.insertTable(1, 2, table_format)
+            cursor = media_row.cellAt(0, 0).firstCursorPosition()
+        if icon and self._insert_profile_icon(
+            cursor,
+            icon,
+            str(message["i"]),
+            line_height_px=self._chat_line_height(font_name),
+            inline_html=True,
+        ):
+            cursor.insertText(" ", body_format)
+        cursor.insertText(username, username_format)
+        cursor.insertText(": ", body_format)
+        if media_row is not None:
+            cursor = media_row.cellAt(0, 1).firstCursorPosition()
+        else:
+            self._insert_message_text_with_links(
+                cursor, str(message["m"]), body_color, font_name,
+                str(message["c"]), str(message["i"]),
+                muted=False, ui_font=False, embedded_image_urls=set(embedded_urls),
+                align_top=False, top_align_height=0, preview=True,
+            )
+            if embedded_urls and not visible_text.rstrip(" \t").endswith(("\n", "\r")):
+                cursor.insertBlock()
+        for url in embedded_urls:
+            media = self.image_preview_cache.get(url)
+            image = (
+                self._embedded_media_preview(url, media)
+                if isinstance(media, RemoteMediaPreview)
+                else self._unloaded_image_placeholder(
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE, EMBEDDED_IMAGE_PLACEHOLDER_SIZE, url=url,
+                )
+            )
+            formatting = QTextImageFormat()
+            if self._set_inline_html_image(formatting, image):
+                formatting.setWidth(image.width())
+                formatting.setHeight(image.height())
+                cursor.insertImage(formatting)
+        if show_drawing:
+            self._insert_inline_drawing(cursor, self._inline_drawing_image(drawing))
+        elif drawing:
+            cursor.insertText("[Image]", body_format)
+        return document.toHtml()
+
+    def _jump_to_search_result(self, message_id: str, order: tuple[int, int, str]) -> None:
+        index = bisect_right(self.message_log, order, key=self._message_sort_key) - 1
+        if index < 0 or self._message_id_from_log_item(self.message_log[index]) != message_id:
+            if self._history_load_complete:
+                self.search_status.setText("Message is no longer in history.")
+            else:
+                self._pending_search_jump = message_id, order
+                self.search_status.setText("Loading message…")
+            return
+        self.search_toggle.setChecked(False)
+        if (
+            message_id in self.rendered_message_last_blocks
+            and not self._rendering_message_log
+            and not self._loading_older_history_page
+        ):
+            self._scroll_to_search_result(message_id)
+            return
+        self._older_history_user_request = None
+        self._loading_older_history_page = False
+        self._media_rerender_in_progress = False
+        self.rendered_history_message_limit = INITIAL_HISTORY_RENDER_MESSAGES
+        end = min(len(self.message_log), index + 1 + INITIAL_HISTORY_RENDER_MESSAGES // 2)
+        self._search_history_end = (
+            self._message_sort_key(self.message_log[end - 1])
+            if end < len(self.message_log) else None
+        )
+        self.latest_history_button.setVisible(self._search_history_end is not None)
+        self._set_history_render_updates_suppressed(True)
+        self._render_message_log(
+            scroll_to_bottom=False,
+            on_finished=lambda: self._finish_search_jump(message_id),
+        )
+
+    def _finish_search_jump(self, message_id: str) -> None:
+        self._scroll_to_search_result(message_id)
+        self._history_initial_render_complete = True
+        self._set_history_render_updates_suppressed(False)
+
+    def _scroll_to_search_result(self, message_id: str) -> None:
+        block_number = next(
+            (number for number, value in self.rendered_message_blocks.items() if value == message_id),
+            self.rendered_message_last_blocks.get(message_id),
+        )
+        if block_number is None:
+            return
+        document = self.chat_display.document()
+        block = document.findBlockByNumber(block_number)
+        if block.isValid():
+            scrollbar = self.chat_display.verticalScrollBar()
+            top = document.documentLayout().blockBoundingRect(block).top()
+            scrollbar.setValue(round(top))
+
+    def _show_latest_history(self) -> None:
+        self._search_history_end = None
+        self.latest_history_button.hide()
+        self._older_history_user_request = None
+        self._loading_older_history_page = False
+        self._media_rerender_in_progress = False
+        self.rendered_history_message_limit = INITIAL_HISTORY_RENDER_MESSAGES
+        self._set_history_render_updates_suppressed(False)
+        self._render_message_log(scroll_to_bottom=True)
+
+    def _history_view_end(self) -> int:
+        if self._search_history_end is None:
+            return len(self.message_log)
+        return bisect_right(
+            self.message_log, self._search_history_end, key=self._message_sort_key,
+        )
 
     def _build_config_popup(self) -> None:
         self.config_overlay = ConfigOverlay(self.chat_content)
@@ -10810,6 +11781,11 @@ QComboBox::drop-down {
         open_button = QPushButton("Open in Browser")
         open_button.clicked.connect(self._open_current_image_in_browser)
         button_row.addWidget(open_button)
+        self.image_preview_open_button = open_button
+        self.image_preview_copy_button = QPushButton("Copy")
+        self.image_preview_copy_button.clicked.connect(self._copy_current_drawing)
+        button_row.addWidget(self.image_preview_copy_button)
+        self.image_preview_copy_button.hide()
         dismiss_button = QPushButton("Dismiss")
         dismiss_button.clicked.connect(self._hide_image_preview_popup)
         button_row.addWidget(dismiss_button)
@@ -10997,7 +11973,12 @@ QComboBox::drop-down {
         media = self.image_preview_cache.get(url)
         if not isinstance(media, RemoteMediaPreview):
             return
+        had_frame = media.frame is not None
         media.frame = frame_value
+        if not had_frame:
+            self._update_search_media_preview(url, media)
+            if media.kind == "looping_video" and url in getattr(self, "_search_media_updates", {}):
+                QTimer.singleShot(0, lambda: self._stop_search_preview_loop(url))
         if media.kind == "video" and media.video_info is not None:
             controller = self.animated_media_controllers.get(url)
             if isinstance(controller, DirectVideoThumbnail) and controller.duration:
@@ -11037,7 +12018,7 @@ QComboBox::drop-down {
             document.markContentsDirty(position, 1)
         self.chat_display.viewport().update()
 
-    def _set_large_image_preview_frame(self, image: QImage) -> None:
+    def _set_large_image_preview_frame(self, image: QImage, *, pixel_art: bool = False) -> None:
         overlay_layout = self.image_preview_overlay.layout()
         panel_layout = self.image_preview_panel.layout()
         overlay_margins = overlay_layout.contentsMargins()
@@ -11073,7 +12054,8 @@ QComboBox::drop-down {
             available_width,
             available_height,
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation if pixel_art
+            else Qt.TransformationMode.SmoothTransformation,
         )
         self.image_preview_label.clear()
         self.image_preview_label.setPixmap(QPixmap.fromImage(preview))
@@ -11091,6 +12073,7 @@ QComboBox::drop-down {
             self.video_player.stop()
             self.video_player.hide()
         self._hide_chat_tooltip()
+        self.current_drawing_preview = None
         self.current_image_preview_url = url
         self.current_image_preview_client_id = client_id
         self._ensure_animated_media_controller(url, media)
@@ -11122,7 +12105,37 @@ QComboBox::drop-down {
         self._update_image_preview_popup()
         QTimer.singleShot(0, self._update_image_preview_popup)
 
+    def _show_drawing_preview(self, encoded: str) -> None:
+        try:
+            image = drawing_image(*decode_drawing(encoded))
+        except ValueError:
+            return
+        self._ensure_popup("image_preview")
+        self._hide_image_preview_popup()
+        self._hide_chat_tooltip()
+        self.current_drawing_preview = image
+        self.image_preview_footer.show()
+        self.image_preview_panel_row.setStretch(0, 1)
+        self.image_preview_panel_row.setStretch(2, 1)
+        self._sync_image_preview_overlay_geometry()
+        self.image_preview_overlay.show()
+        self.image_preview_overlay.raise_()
+        self._update_image_preview_popup()
+        QTimer.singleShot(0, self._update_image_preview_popup)
+
+    def _copy_current_drawing(self) -> None:
+        if self.current_drawing_preview is not None:
+            QApplication.clipboard().setImage(self.current_drawing_preview)
+
     def _update_image_preview_popup(self) -> None:
+        drawing = self.current_drawing_preview
+        self.image_preview_open_button.setVisible(drawing is None)
+        self.image_preview_copy_button.setVisible(drawing is not None)
+        if drawing is not None:
+            self.image_preview_url_label.clear()
+            self.image_preview_url_label.setToolTip("")
+            self._set_large_image_preview_frame(drawing, pixel_art=True)
+            return
         url = self.current_image_preview_url
         media = self.image_preview_cache.get(url or "")
         if not isinstance(media, RemoteMediaPreview):
@@ -11164,6 +12177,7 @@ QComboBox::drop-down {
             self.video_player.hide()
         self.image_preview_label.show()
         self.current_image_preview_url = None
+        self.current_drawing_preview = None
         self.current_image_preview_client_id = None
         self.image_preview_label.clear()
         self.image_preview_url_label.clear()
@@ -11427,9 +12441,14 @@ QComboBox::drop-down {
 
         layout.addWidget(QLabel("Chatroom History"), row, 0)
         self.chatroom_history_combo = ThemeComboBox()
-        self.chatroom_history_combo.addItems([
-            str(option) for option in CHATROOM_HISTORY_OPTIONS
-        ])
+        for index, option in enumerate(CHATROOM_HISTORY_OPTIONS):
+            self.chatroom_history_combo.addItem(str(option))
+            megabytes = option * 4 // 1000
+            self.chatroom_history_combo.setItemData(
+                index,
+                f"Chatroom max storage: ~{megabytes} MB",
+                Qt.ItemDataRole.ToolTipRole,
+            )
         self.chatroom_history_combo.setCurrentText(
             str(self.chatroom_history_limit_var.get())
         )
@@ -11547,6 +12566,17 @@ QComboBox::drop-down {
         advanced_layout.setColumnStretch(1, 1)
         advanced_row = 0
 
+        advanced_layout.addWidget(self._heading("Data Management"), advanced_row, 0, 1, 3)
+        advanced_row += 1
+        open_storage_button = QPushButton("Open storage folder")
+        open_storage_button.clicked.connect(self._open_storage_folder)
+        advanced_layout.addWidget(
+            open_storage_button, advanced_row, 0, 1, 3, Qt.AlignmentFlag.AlignLeft,
+        )
+        advanced_row += 1
+        advanced_layout.addWidget(self._separator(), advanced_row, 0, 1, 3)
+        advanced_row += 1
+
         advanced_layout.addWidget(
             self._heading("Server"),
             advanced_row,
@@ -11614,6 +12644,16 @@ QComboBox::drop-down {
             "Advanced ▼" if expanded else "Advanced ▶"
         )
         self.advanced_config_content.setVisible(expanded)
+
+    def _open_storage_folder(self) -> None:
+        try:
+            APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            if QDesktopServices.openUrl(QUrl.fromLocalFile(str(APP_DATA_DIR))):
+                return
+            detail = str(APP_DATA_DIR)
+        except OSError as exc:
+            detail = str(exc)
+        messagebox.showerror("Could not open storage folder", detail, parent=self.root)
 
     def _on_ui_size_changed(self, value: Any) -> None:
         ui_size = normalize_ui_size(value)
@@ -11873,6 +12913,8 @@ QComboBox::drop-down {
 
     def _on_config_toggled(self, checked: bool) -> None:
         if checked:
+            self._close_drawing_import()
+            self.search_toggle.setChecked(False)
             self._ensure_popup("config")
             self._config_snapshot_at_open = self._config_ui_snapshot()
             self._sync_config_overlay_geometry()
@@ -12234,7 +13276,7 @@ QComboBox::drop-down {
         self._request_network_refresh(poll_immediately=True)
         return True
 
-    def _build_draft_message(self, text: str) -> dict[str, Any]:
+    def _build_draft_message(self, text: str, drawing: str = "") -> dict[str, Any]:
         profile = self._active_room_profile()
         text = trim_message_text(text)
 
@@ -12248,6 +13290,9 @@ QComboBox::drop-down {
             "t": int(time.time()),
             "m": text,
         }
+        if drawing:
+            message["m"] = ""
+            message["drawing"] = drawing
         if profile["profile_icon"]:
             message["p"] = profile["profile_icon"]
         return sign_message_identity(
@@ -12257,6 +13302,16 @@ QComboBox::drop-down {
         )
 
     def _restore_active_chatroom_draft(self) -> None:
+        canvas = self.image_menu.canvas
+        state = self.drawing_drafts.get(self.active_chatroom_id)
+        canvas.undo_stack.clear()
+        canvas.redo_stack.clear()
+        if state is None:
+            canvas.canvas_size = 0
+            canvas.palette_index = 0
+            canvas.reset()
+        else:
+            canvas.restore(state)
         self._cancel_pending_message_size_check()
         signals_were_blocked = self.message_entry.blockSignals(True)
         try:
@@ -12330,12 +13385,21 @@ QComboBox::drop-down {
         self.message_size_timer.stop()
         self.message_size_check_pending = False
 
+    def _drawing_payload(self) -> str:
+        canvas = self.image_menu.canvas
+        if self.image_menu_button.isChecked() and canvas.edited:
+            return encode_drawing(canvas.canvas_size, bytes(canvas.pixels), canvas.palette_index)
+        return ""
+
     def _run_message_size_check(self) -> None:
         self.message_size_check_pending = False
         text = trim_message_text(self.message_entry.to_message_text())
 
         try:
-            draft_message = self._build_draft_message(text)
+            draft_message = self._build_draft_message(
+                "" if self.image_menu_button.isChecked() else text,
+                self._drawing_payload(),
+            )
             self.current_estimated_packet_size = estimate_opaque_packet_size(
                 draft_message
             )
@@ -12501,15 +13565,21 @@ QComboBox::drop-down {
             )
 
         self.send_button.setEnabled(
-            self.message_size_check_pending or not at_or_over_limit
+            (self.message_size_check_pending or not at_or_over_limit)
+            and (not self.image_menu_button.isChecked() or self.image_menu.canvas.edited)
         )
 
     def _send_current_message(self) -> None:
-        text = trim_message_text(self.message_entry.to_message_text())
-        plain_text = message_plain_text(text)
-
-        if not plain_text:
-            return
+        image_mode = self.image_menu_button.isChecked()
+        drawing = self._drawing_payload()
+        if image_mode:
+            if not drawing:
+                return
+            text = ""
+        else:
+            text = trim_message_text(self.message_entry.to_message_text())
+            if not message_plain_text(text):
+                return
 
         if len(text) > MAX_MESSAGE_CHARS:
             messagebox.showwarning(
@@ -12531,7 +13601,7 @@ QComboBox::drop-down {
 
         encryption_key = self._active_chatroom()["key"]
 
-        message = self._build_draft_message(text)
+        message = self._build_draft_message(text, drawing)
         (
             message["i"],
             self._last_outbound_message_order,
@@ -12599,9 +13669,12 @@ QComboBox::drop-down {
         })
         self.network_wakeup_event.set()
 
-        self.message_entry.clear()
-        self.message_entry.clear_formatting_state()
-        self._sync_formatting_buttons()
+        if image_mode:
+            self.image_menu.canvas.reset()
+        else:
+            self.message_entry.clear()
+            self.message_entry.clear_formatting_state()
+            self._sync_formatting_buttons()
         self.draft_message_id = uuid.uuid4().hex
         self._resize_message_entry()
         self._run_message_size_check()
@@ -13008,17 +14081,18 @@ QComboBox::drop-down {
         label = getattr(self, "recently_online_label", None)
         if label is None:
             return
-        label.setVisible(True)
         server = normalize_server_url(self.config_data.get("server_url", ""))
         topic = derive_ntfy_topic(self._active_chatroom()["key"])
         counts = self.recently_online_counts.get(server)
         if counts is not None:
             self._last_recently_online_counts[topic] = counts.get(topic, 0)
         count = self._last_recently_online_counts.get(topic)
-        if count is None:
-            label.setText("Recently online: …")
+        if not count:
+            label.clear()
+            label.hide()
             return
-        label.setText(f"Recently online: {count}")
+        label.setText(f"{count} recently online")
+        label.show()
 
     def _network_recently_online_step(self, *, now: float) -> bool:
         server = normalize_server_url(self.config_data.get("server_url", ""))
@@ -13405,6 +14479,10 @@ QComboBox::drop-down {
             raise ValueError("Username contains unsupported characters.")
         if len(message["m"]) > MAX_MESSAGE_CHARS:
             raise ValueError("Message text is too long.")
+        if "drawing" in message:
+            if message["m"]:
+                raise ValueError("Drawings cannot contain message text.")
+            decode_drawing(message["drawing"])
         if not QColor(message["k"]).isValid():
             raise ValueError("Username color is invalid.")
 
@@ -13492,7 +14570,6 @@ QComboBox::drop-down {
                             )
 
                     if added_message_ids:
-                        self.message_log.sort(key=self._message_sort_key)
                         self._persist_local_history()
                         self._queue_live_message_render(
                             added_message_ids
@@ -13510,12 +14587,37 @@ QComboBox::drop-down {
                         f"Message could not be uploaded: {payload['error']}",
                         warning=True,
                     )
+                    if "drawing" in message:
+                        canvas = self.image_menu.canvas
+                        if not canvas.edited:
+                            size, pixels, palette = decode_drawing(message["drawing"])
+                            canvas.replace(size, pixels, palette=palette)
+                        continue
                     self._append_system_message(
                         "Unsent text from "
                         f"{message['u']}: "
                         f"{message_plain_text(str(message['m']))}",
                         warning=True,
                     )
+
+                elif event_type == "chat_search_results":
+                    self._show_chat_search_results(*payload)
+
+                elif event_type == "history_load_finished":
+                    if payload == (self._history_render_generation, self.active_chatroom_id):
+                        self._history_load_complete = True
+                        if self._pending_search_jump is not None:
+                            target, order = self._pending_search_jump
+                            self._pending_search_jump = None
+                            self._jump_to_search_result(target, order)
+
+                elif event_type == "history_load_error":
+                    if payload == (self._history_render_generation, self.active_chatroom_id):
+                        messagebox.showerror(
+                            "Chat history",
+                            "Could not read saved chat history.",
+                            parent=self.root,
+                        )
 
                 elif event_type == "history_chunk_loaded":
                     generation = int(payload.get("generation", -1))
@@ -13548,8 +14650,20 @@ QComboBox::drop-down {
                         self.message_log.extend(accepted_items)
                         self.message_log.sort(key=self._message_sort_key)
                     elif accepted_items:
-                        # Prepend newest-first history chunks without repeatedly sorting the log.
-                        self.message_log[0:0] = accepted_items
+                        # A delayed live message can overlap this older page.
+                        overlap = bisect_right(
+                            self.message_log,
+                            self._message_sort_key(accepted_items[-1]),
+                            key=self._message_sort_key,
+                        )
+                        self.message_log[:overlap] = sorted(
+                            accepted_items + self.message_log[:overlap],
+                            key=self._message_sort_key,
+                        )
+                    if accepted_items:
+                        self._trim_message_log(self._chatroom_history_limit())
+                        if not initial_chunk and self._history_render_pruned:
+                            self._flush_pending_live_message_render()
                     if initial_chunk:
                         if self.message_log and not self._tray_ui_suspended:
                             self._render_message_log(
@@ -13566,6 +14680,11 @@ QComboBox::drop-down {
                                 generation,
                                 room_id,
                             )
+                    if self._pending_search_jump is not None:
+                        target, order = self._pending_search_jump
+                        if any(self._message_id_from_log_item(item) == target for item in accepted_items):
+                            self._jump_to_search_result(target, order)
+
                 elif event_type == "image_preview_loaded":
                     url = str(payload.get("url", ""))
                     data = payload.get("data")
@@ -13601,6 +14720,7 @@ QComboBox::drop-down {
                                     candidate,
                                 )
                     self.image_preview_cache[url] = media
+                    self._update_search_media_preview(url, media)
                     while (
                         len(self.image_preview_cache)
                         > IMAGE_PREVIEW_CACHE_LIMIT
@@ -13672,19 +14792,30 @@ QComboBox::drop-down {
         if not server_url or not encryption_key:
             return
 
-        history = load_chatroom_history(server_url, encryption_key)
-        seen_ntfy_ids = {
-            str(entry.get("ntfy_id"))
-            for entry in history
-            if isinstance(entry.get("ntfy_id"), str)
-            and entry.get("ntfy_id")
-        }
-        seen_client_message_ids = {
-            str(entry["message"].get("i"))
-            for entry in history
-            if isinstance(entry.get("message"), dict)
-            and isinstance(entry["message"].get("i"), str)
-        }
+        history = load_chatroom_history(server_url, encryption_key, limit=2)
+        path = chatroom_history_path(server_url, encryption_key)
+        seen_client_message_ids = set()
+        seen_ntfy_ids = set()
+        if path.exists():
+            with closing(sqlite3.connect(path)) as connection:
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    message = item.get("message")
+                    if not isinstance(message, dict):
+                        continue
+                    message_id = message.get("i")
+                    ntfy_id = item.get("ntfy_id")
+                    if not isinstance(message_id, str) or not isinstance(ntfy_id, str):
+                        continue
+                    match = connection.execute(
+                        "SELECT 1 FROM messages WHERE message_id = ? OR ntfy_id = ?",
+                        (message_id, ntfy_id),
+                    ).fetchone()
+                    if match:
+                        seen_client_message_ids.add(message_id)
+                        seen_ntfy_ids.add(ntfy_id)
+        new_entries = []
         muted_user_ids = self._room_preference_ids_for_key(
             "muted_users",
             encryption_key,
@@ -13723,12 +14854,14 @@ QComboBox::drop-down {
                 ntfy_time=message_ntfy_time,
                 ntfy_id=ntfy_id,
             )
-            history.append({
+            entry = {
                 "message": message,
                 "warning": None,
                 "ntfy_id": ntfy_id,
                 "ntfy_time": message_ntfy_time,
-            })
+            }
+            new_entries.append(entry)
+            history.append(entry)
             added += 1
 
             should_notify = poll_message_should_notify(
@@ -13772,12 +14905,12 @@ QComboBox::drop-down {
         if not added:
             return
 
-        history.sort(key=self._message_sort_key)
         try:
             save_chatroom_history(
                 server_url,
                 encryption_key,
-                history,
+                new_entries,
+                self._chatroom_history_limit(),
             )
         except Exception:
             pass
@@ -13826,6 +14959,11 @@ QComboBox::drop-down {
             ntfy_time=int(item["ntfy_time"]),
             ntfy_id=str(ntfy_id),
         )
+
+        if play_chime and not is_local and self.root.isVisible() and not self.root.isMinimized():
+            pending = self._message_sort_key(item), str(client_message_id)
+            if self._unseen_live_message is None or pending > self._unseen_live_message:
+                self._unseen_live_message = pending
 
         self._add_message_to_log(
             message,
@@ -13917,17 +15055,16 @@ QComboBox::drop-down {
                 int(item["ntfy_time"]),
                 newest_received_time + 1,
             )
-        self.message_log.append(item)
+        insort_right(self.message_log, item, key=self._message_sort_key)
+        self.pending_history_entries.append(item)
 
-        self.message_log.sort(key=self._message_sort_key)
-        history_limit = self._chatroom_history_limit()
-        if len(self.message_log) > history_limit:
-            del self.message_log[:-history_limit]
-        # Live arrivals extend the visible history suffix without evicting loaded rows.
-        self.rendered_history_message_limit = min(
-            len(self.message_log),
-            self.rendered_history_message_limit + 1,
-        )
+        self._trim_message_log(self._chatroom_history_limit())
+        if self._search_history_end is None:
+            # Live arrivals extend the visible suffix without evicting loaded rows.
+            self.rendered_history_message_limit = min(
+                len(self.message_log),
+                self.rendered_history_message_limit + 1,
+            )
         if persist:
             self._persist_local_history()
         if render:
@@ -13948,12 +15085,21 @@ QComboBox::drop-down {
 
     def _flush_pending_live_message_render(self) -> None:
         if (
-            not self._pending_live_render_message_ids
+            not (self._pending_live_render_message_ids or self._history_render_pruned)
             or self._tray_ui_suspended
+            or self._loading_older_history_page
             or self._rendering_message_log
             or self._history_render_updates_suppressed
             or self._media_rerender_in_progress
         ):
+            return
+
+        if self._history_render_pruned:
+            self._rerender_preserving_scroll()
+            return
+
+        if self._search_history_end is not None:
+            self._pending_live_render_message_ids.clear()
             return
 
         pending_ids = list(self._pending_live_render_message_ids)
@@ -13971,7 +15117,10 @@ QComboBox::drop-down {
 
         if not self._append_live_message_items(items):
             # Delayed messages may belong inside an existing group; use the rebuild fallback.
-            self._render_message_log(scroll_to_bottom=True)
+            if self._unseen_live_message is not None and not any(item["is_local"] for item in items):
+                self._rerender_preserving_scroll()
+            else:
+                self._render_message_log(scroll_to_bottom=True)
 
     def _append_live_message_items(
         self,
@@ -14069,6 +15218,13 @@ QComboBox::drop-down {
                     + 1
                 ) % len(message_row_backgrounds())
 
+        preserve_view = (
+            self._unseen_live_message is not None
+            and previous_item is not None
+            and not any(item["is_local"] for item in items)
+        )
+        scrollbar = self.chat_display.verticalScrollBar()
+        previous_scroll = scrollbar.value()
         self._hide_chat_tooltip()
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -14130,12 +15286,13 @@ QComboBox::drop-down {
             for selection in row_selections
             if selection.cursor.block().isValid()
         })
-        self._bottom_align_short_message_log()
+        if not preserve_view:
+            self._bottom_align_short_message_log()
         self.chat_display.setExtraSelections([])
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
-        scrollbar = self.chat_display.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        scrollbar.setValue(previous_scroll if preserve_view else scrollbar.maximum())
+        self._update_live_unread_edge()
         if not self.viewport_media_timer.isActive():
             self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
         self.chat_display.viewport().update()
@@ -14153,6 +15310,7 @@ QComboBox::drop-down {
         generation = self._history_render_generation
         room_id = self.active_chatroom_id
         history_limit = self._chatroom_history_limit()
+        self._history_load_complete = False
         try:
             self.history_load_executor.submit(
                 self._load_saved_history_worker,
@@ -14163,7 +15321,7 @@ QComboBox::drop-down {
                 history_limit,
             )
         except RuntimeError:
-            pass
+            self._history_load_complete = True
 
     def _load_saved_history_worker(
         self,
@@ -14173,18 +15331,31 @@ QComboBox::drop-down {
         encryption_key: str,
         history_limit: int,
     ) -> None:
-        entries = load_chatroom_history(server_url, encryption_key)[
-            -history_limit:
-        ]
         first_chunk = True
-        chunk_end = len(entries)
-        while chunk_end > 0 and not self._closing:
-            chunk_start = max(
-                0,
-                chunk_end - INITIAL_HISTORY_RENDER_MESSAGES,
-            )
+        remaining = history_limit
+        before = None
+        while (
+            remaining > 0 and not self._closing
+            and generation == self._history_render_generation
+        ):
+            try:
+                entries = load_chatroom_history(
+                    server_url,
+                    encryption_key,
+                    limit=min(remaining, INITIAL_HISTORY_RENDER_MESSAGES),
+                    before=before,
+                )
+            except Exception:
+                self._queue_ui_event((
+                    "history_load_error", (generation, room_id),
+                ))
+                break
+            if not entries:
+                break
+            before = self._message_sort_key(entries[0])
+            remaining -= len(entries)
             prepared_items: list[dict[str, Any]] = []
-            for item in entries[chunk_start:chunk_end]:
+            for item in entries:
                 message = item.get("message")
                 if not isinstance(message, dict):
                     continue
@@ -14233,7 +15404,6 @@ QComboBox::drop-down {
                 },
             ))
             first_chunk = False
-            chunk_end = chunk_start
 
         if first_chunk and not self._closing:
             self._queue_ui_event((
@@ -14245,6 +15415,9 @@ QComboBox::drop-down {
                     "initial": True,
                 },
             ))
+
+        if not self._closing and generation == self._history_render_generation:
+            self._queue_ui_event(("history_load_finished", (generation, room_id)))
 
     def _finish_initial_history_render(
         self,
@@ -14292,29 +15465,17 @@ QComboBox::drop-down {
         if not server_url or not encryption_key:
             return
 
-        serializable = []
-        history_limit = self._chatroom_history_limit()
-        for item in self.message_log[-history_limit:]:
-            serializable.append({
-                "message": item["message"],
-                "warning": item.get("warning"),
-                "ntfy_id": item.get("ntfy_id"),
-                "ntfy_time": int(item.get("ntfy_time", 0) or 0),
-                **(
-                    {"display_sort_time": int(item["display_sort_time"])}
-                    if type(item.get("display_sort_time")) is int
-                    else {}
-                ),
-            })
-
         try:
             save_chatroom_history(
                 server_url,
                 encryption_key,
-                serializable,
+                self.pending_history_entries,
+                self._chatroom_history_limit(),
             )
         except Exception:
-            pass
+            self.status_var.set("Could not save chat history")
+        else:
+            self.pending_history_entries.clear()
 
     def _chatroom_history_limit(self) -> int:
         value = (
@@ -14327,13 +15488,34 @@ QComboBox::drop-down {
         )
         return normalize_chatroom_history_limit(value)
 
+    def _trim_message_log(self, limit: int) -> None:
+        excess = len(self.message_log) - limit
+        if excess <= 0:
+            return
+        if self._rendering_message_log or self._loading_older_history_page or any(
+            self._message_id_from_log_item(item) in self.rendered_message_last_blocks
+            for item in self.message_log[:excess]
+        ):
+            self._history_render_pruned = True
+        if self._unseen_live_message is not None and any(
+            self._message_id_from_log_item(item) == self._unseen_live_message[1]
+            for item in self.message_log[:excess]
+        ):
+            self._unseen_live_message = None
+        del self.message_log[:excess]
+        if self._search_history_end is not None and not self._history_view_end():
+            self._search_history_end = None
+            self.latest_history_button.hide()
+            self.rendered_history_message_limit = INITIAL_HISTORY_RENDER_MESSAGES
+        self.rendered_history_message_limit = min(
+            self.rendered_history_message_limit, self._history_view_end()
+        )
+
     def _apply_chatroom_history_limit(self) -> None:
         history_limit = self._chatroom_history_limit()
         self.config_data["chatroom_history_limit"] = history_limit
-        if len(self.message_log) > history_limit:
-            del self.message_log[:-history_limit]
-            if hasattr(self, "chat_display"):
-                self._render_message_log(scroll_to_bottom=True)
+        self._trim_message_log(history_limit)
+        self._flush_pending_live_message_render()
         self._persist_local_history()
         self._prune_background_local_histories()
 
@@ -14506,6 +15688,10 @@ QComboBox::drop-down {
             )
             return
         anchor = self._capture_chat_view_anchor()
+        if self._unseen_live_message is not None:
+            anchor["at_bottom"] = False
+            anchor["live_top_margin"] = self.chat_display.document().rootFrame().frameFormat().topMargin()
+            anchor["fallback_scroll"] = self.chat_display.verticalScrollBar().value()
         generation = self._history_render_generation
         room_id = self.active_chatroom_id
         self._media_rerender_in_progress = True
@@ -14540,6 +15726,13 @@ QComboBox::drop-down {
                 block.blockNumber()
             )
             if message_id:
+                previous = block.previous()
+                while (
+                    previous.isValid()
+                    and self.rendered_message_blocks.get(previous.blockNumber()) == message_id
+                ):
+                    block = previous
+                    previous = block.previous()
                 block_top = (
                     document.documentLayout()
                     .blockBoundingRect(block)
@@ -14584,9 +15777,15 @@ QComboBox::drop-down {
         ):
             return
 
+        if "live_top_margin" in anchor:
+            frame = self.chat_display.document().rootFrame()
+            formatting = frame.frameFormat()
+            formatting.setTopMargin(anchor["live_top_margin"])
+            frame.setFrameFormat(formatting)
         self._restore_chat_view_anchor(anchor)
         self._media_rerender_in_progress = False
         self._set_history_render_updates_suppressed(False)
+        self._update_live_unread_edge()
         self._flush_pending_live_message_render()
 
     def _restore_chat_view_anchor(
@@ -14617,6 +15816,8 @@ QComboBox::drop-down {
                 scrollbar.setValue(round(
                     block_top - float(anchor.get("viewport_offset", 0.0))
                 ))
+            elif "fallback_scroll" in anchor:
+                scrollbar.setValue(anchor["fallback_scroll"])
             else:
                 scrollbar.setValue(max(
                     scrollbar.minimum(),
@@ -14807,8 +16008,17 @@ QComboBox::drop-down {
         self,
         url: str,
         global_position: QPoint,
+        *,
+        embedded_image: bool = False,
     ) -> None:
         menu = QMenu(self.root)
+        if embedded_image:
+            media = self.image_preview_cache.get(url)
+            if isinstance(media, RemoteMediaPreview) and media.kind != "video":
+                frame = media.frame
+                if isinstance(frame, QImage) and not frame.isNull():
+                    copy_image = menu.addAction("Copy Image")
+                    copy_image.triggered.connect(lambda: QApplication.clipboard().setImage(frame))
         copy_action = menu.addAction("Copy Link")
         copy_action.triggered.connect(
             lambda: QApplication.clipboard().setText(url)
@@ -15330,6 +16540,10 @@ QComboBox::drop-down {
         ):
             if hasattr(self, "config_overlay"):
                 self._sync_config_overlay_geometry()
+            if hasattr(self, "search_overlay"):
+                self.search_overlay.setGeometry(self.chat_content.rect())
+            if getattr(self, "drawing_import_overlay", None) is not None:
+                self.drawing_import_overlay.setGeometry(self.chat_content.rect())
             if hasattr(self, "message_limit_overlay"):
                 self._sync_message_limit_overlay_geometry()
             if hasattr(self, "image_preview_overlay"):
@@ -15360,11 +16574,19 @@ QComboBox::drop-down {
                 self._on_chat_history_scroll_action(0)
 
             elif event_type == QEvent.Type.MouseMove:
-                anchor = self.chat_display.anchorAt(event.position().toPoint())
+                position = event.position().toPoint()
+                anchor = self.chat_display.anchorAt(position)
                 message_id = self._message_id_from_anchor(anchor)
-                spoiler_id = self._spoiler_id_at_position(
-                    event.position().toPoint()
-                )
+                item = self.rendered_message_items.get(message_id or "")
+                if item is not None and "drawing" in item["message"]:
+                    cursor = self.chat_display.cursorForPosition(position)
+                    cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                    top = self.chat_display.cursorRect(cursor).top()
+                    font = str(item["message"].get("f", DEFAULT_MESSAGE_FONT))
+                    if position.y() >= top + self._chat_line_height(font):
+                        anchor = ""
+                        message_id = None
+                spoiler_id = self._spoiler_id_at_position(position)
 
                 if anchor or spoiler_id:
                     self.chat_display.viewport().setCursor(
@@ -15408,6 +16630,12 @@ QComboBox::drop-down {
                     )
                     if self._message_id_from_anchor(anchor):
                         # Consume user-link clicks to prevent navigation and Qt focus outlines.
+                        return True
+                    if anchor.startswith("spritelink-drawing:"):
+                        if event_type == QEvent.Type.MouseButtonRelease:
+                            item = self.rendered_message_items.get(anchor.removeprefix("spritelink-drawing:"))
+                            if item is not None:
+                                self._show_drawing_preview(item["message"]["drawing"])
                         return True
                     image_url = self._image_url_from_anchor(anchor)
                     if image_url:
@@ -15455,6 +16683,7 @@ QComboBox::drop-down {
                         self._show_link_context_menu(
                             link_url,
                             event.globalPos(),
+                            embedded_image=self._image_url_from_anchor(anchor) is not None,
                         )
                     else:
                         clicked_message_id = self._message_id_at_position(
@@ -15609,6 +16838,41 @@ QComboBox::drop-down {
 
         return normalized
 
+    @staticmethod
+    def _set_inline_html_image(formatting: QTextImageFormat, image: QImage) -> bool:
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not image.save(buffer, "PNG"):
+            return False
+        encoded = base64.b64encode(bytes(buffer.data())).decode("ascii")
+        formatting.setName(f"data:image/png;base64,{encoded}")
+        return True
+
+    @staticmethod
+    def _inline_drawing_image(encoded: str) -> QImage | None:
+        try:
+            image = drawing_image(*decode_drawing(encoded))
+        except ValueError:
+            return None
+        return image.scaled(image.width() * 2, image.height() * 2)
+
+    def _insert_inline_drawing(
+        self, cursor: QTextCursor, image: QImage | None, *, message_id: str = "",
+    ) -> None:
+        if image is None:
+            cursor.insertText("[Image unavailable]")
+            return
+        formatting = QTextImageFormat()
+        if self._set_inline_html_image(formatting, image):
+            formatting.setWidth(image.width())
+            formatting.setHeight(image.height())
+            formatting.setProperty(QTextFormat.Property.ImageAltText, "Drawing")
+            formatting.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignTop)
+            if message_id:
+                formatting.setAnchor(True)
+                formatting.setAnchorHref(f"spritelink-drawing:{message_id}")
+            cursor.insertImage(formatting)
+
     def _insert_profile_icon(
         self,
         cursor: QTextCursor,
@@ -15618,6 +16882,7 @@ QComboBox::drop-down {
         align_top: bool = False,
         opacity: float = 1.0,
         line_height_px: int = DEFAULT_MESSAGE_LINE_HEIGHT_PX,
+        inline_html: bool = False,
     ) -> bool:
         if not encoded_icon:
             return False
@@ -15691,23 +16956,27 @@ QComboBox::drop-down {
             displayed_image = faded_image
             resource_suffix += f"-opacity-{round(opacity * 100)}"
 
-        resource_name = (
-            "spritelink-profile-icon:"
-            + hashlib.sha256(gif_data).hexdigest()
-            + resource_suffix
-        )
-        resource_url = QUrl(resource_name)
-        cursor.document().addResource(
-            QTextDocument.ResourceType.ImageResource,
-            resource_url,
-            displayed_image,
-        )
         image_format = QTextImageFormat()
-        image_format.setName(resource_url.toString())
+        if inline_html:
+            # The search label receives HTML rather than this document's resources.
+            if not self._set_inline_html_image(image_format, displayed_image):
+                return False
+        else:
+            resource_url = QUrl(
+                "spritelink-profile-icon:"
+                + hashlib.sha256(gif_data).hexdigest()
+                + resource_suffix
+            )
+            cursor.document().addResource(
+                QTextDocument.ResourceType.ImageResource,
+                resource_url,
+                displayed_image,
+            )
+            image_format.setName(resource_url.toString())
+            image_format.setAnchor(True)
+            image_format.setAnchorHref(f"spritelink:{message_id}")
         image_format.setWidth(displayed_image.width())
         image_format.setHeight(displayed_image.height())
-        image_format.setAnchor(True)
-        image_format.setAnchorHref(f"spritelink:{message_id}")
         # Keep the optical offset; AlignTop avoids half-pixel AlignMiddle rounding.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
@@ -15733,7 +17002,7 @@ QComboBox::drop-down {
         trusts_links_and_images = client_id in trusted_ids
 
         menu = QMenu(self.root)
-        trust_action = menu.addAction("Trust Links && Images from User")
+        trust_action = menu.addAction("Trust Links && Embeds from User")
         trust_action.setCheckable(True)
         trust_action.setChecked(is_local or trusts_links_and_images)
         trust_action.setEnabled(not is_local)
@@ -15772,26 +17041,43 @@ QComboBox::drop-down {
         )
 
         menu = QMenu(self.root)
-        copy_action = menu.addAction("Copy Message")
-        copy_action.triggered.connect(
-            lambda: QApplication.clipboard().setText(
-                message_plain_text(str(message["m"]))
-            )
-        )
-
-        collapse_action = menu.addAction(
-            "Expand Message"
-            if is_manually_collapsed
-            else "Collapse Message"
-        )
-        collapse_action.setEnabled(not is_muted)
-        if not is_muted:
-            collapse_action.triggered.connect(
-                lambda: self._set_message_collapsed(
-                    message_id,
-                    not is_manually_collapsed,
+        if "drawing" in message:
+            copy_action = menu.addAction("Copy Image")
+            import_action = menu.addAction("Import Image")
+            try:
+                size, pixels, palette = decode_drawing(message["drawing"])
+            except ValueError:
+                copy_action.setEnabled(False)
+                import_action.setEnabled(False)
+            else:
+                copy_action.triggered.connect(
+                    lambda: QApplication.clipboard().setImage(drawing_image(size, pixels, palette))
+                )
+                import_action.triggered.connect(
+                    lambda: self._import_chat_drawing(size, pixels, palette)
+                )
+        else:
+            copy_action = menu.addAction("Copy Message")
+            copy_action.triggered.connect(
+                lambda: QApplication.clipboard().setText(
+                    message_plain_text(str(message["m"]))
                 )
             )
+
+        if "drawing" not in message:
+            collapse_action = menu.addAction(
+                "Expand Message"
+                if is_manually_collapsed
+                else "Collapse Message"
+            )
+            collapse_action.setEnabled(not is_muted)
+            if not is_muted:
+                collapse_action.triggered.connect(
+                    lambda: self._set_message_collapsed(
+                        message_id,
+                        not is_manually_collapsed,
+                    )
+                )
 
         menu.exec(global_position)
 
@@ -15853,6 +17139,7 @@ QComboBox::drop-down {
         embedded_image_urls: set[str],
         align_top: bool,
         top_align_height: int,
+        preview: bool = False,
     ) -> None:
         plain_text, rich_runs = parse_message_rich_text(text)
         url_spans = message_url_spans(plain_text)
@@ -15932,7 +17219,10 @@ QComboBox::drop-down {
                 if end <= start:
                     return
                 formatting = make_formatting(anchor)
-                cursor.insertText(plain_text[start:end], formatting)
+                content = plain_text[start:end]
+                if preview and run.spoiler is not None:
+                    content = "".join(char if char == "\n" else "█" for char in content)
+                cursor.insertText(content, formatting)
 
             first_spoiler_run = (
                 run.spoiler is not None
@@ -15957,7 +17247,8 @@ QComboBox::drop-down {
                     insert_chunk(
                         overlap_start,
                         overlap_end,
-                        self._register_rendered_link(url, client_id),
+                        (url if run.spoiler is None else None)
+                        if preview else self._register_rendered_link(url, client_id),
                     )
                 position = overlap_end
             insert_chunk(position, run.end)
@@ -16293,6 +17584,7 @@ QComboBox::drop-down {
         self._message_render_generation += 1
         generation = self._message_render_generation
         self._rendering_message_log = True
+        self._history_render_pruned = False
         self._hide_chat_tooltip()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
@@ -16320,7 +17612,8 @@ QComboBox::drop-down {
             INITIAL_HISTORY_RENDER_MESSAGES,
             int(self.rendered_history_message_limit),
         )
-        visible_message_items = self.message_log[-visible_message_limit:]
+        end = self._history_view_end()
+        visible_message_items = self.message_log[max(0, end - visible_message_limit):end]
         display_groups = group_messages_for_display(
             visible_message_items,
             muted_ids,
@@ -16876,7 +18169,8 @@ QComboBox::drop-down {
             message.get("o", DEFAULT_MESSAGE_TEXT_COLOR)
         )
         profile_icon = str(message.get("p", ""))
-        text = str(message["m"])
+        drawing = message.get("drawing")
+        text = "[Image]" if drawing else str(message["m"])
         message_id = str(message["i"])
         client_id = str(message["c"])
         user_id_preview = visible_user_id(client_id)
@@ -16892,8 +18186,8 @@ QComboBox::drop-down {
             if is_muted
             else message_plain_text(text)
         )
-        is_collapsed = is_muted or bool(
-            source_message_ids.intersection(collapsed_ids)
+        is_collapsed = is_muted or (
+            not drawing and bool(source_message_ids.intersection(collapsed_ids))
         )
         message_block_format = QTextBlockFormat()
         message_block_format.setNonBreakableLines(is_collapsed)
@@ -16981,7 +18275,8 @@ QComboBox::drop-down {
         )
 
         self.rendered_message_items[message_id] = item
-        top_align_height = 0
+        drawing_preview = self._inline_drawing_image(drawing) if drawing and not is_collapsed else None
+        top_align_height = drawing_preview.height() if drawing_preview is not None else 0
         if (
             not is_collapsed
             and bool(displayed_image_urls)
@@ -17097,6 +18392,10 @@ QComboBox::drop-down {
                     top_align_height=top_align_height,
                 ),
             )
+        elif drawing:
+            self._insert_inline_drawing(cursor, drawing_preview, message_id=message_id)
+            if drawing_preview is not None:
+                embedded_media_block_numbers.add(cursor.block().blockNumber())
         else:
             self._insert_message_text_with_links(
                 cursor,
@@ -17206,6 +18505,11 @@ QComboBox::drop-down {
         scrollbar.setValue(scrollbar.maximum())
 
     def _clear_visible_room(self, *, preserve_detached_video: bool = False) -> None:
+        self._close_drawing_import()
+        self.search_toggle.setChecked(False)
+        if hasattr(self, "search_entry"):
+            self.search_entry.clear()
+            self.search_timer.stop()
         self._reset_history_render_window()
         self._hide_chat_tooltip()
         if hasattr(self, "link_warning_overlay") and self.link_warning_overlay.isVisible():
@@ -17218,6 +18522,7 @@ QComboBox::drop-down {
         self.seen_client_message_ids.clear()
         self.seen_ntfy_message_ids.clear()
         self.message_log.clear()
+        self.pending_history_entries.clear()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
         self.rendered_message_last_blocks.clear()
@@ -17268,10 +18573,10 @@ QComboBox::drop-down {
         room = self._find_chatroom(room_id)
         if room is None:
             return
-        body = (
-            f"{str(message.get('u', 'Unknown'))}: "
-            f"{message_plain_text(str(message.get('m', '')))}"
+        preview = "[Image]" if "drawing" in message else message_plain_text(
+            str(message.get("m", ""))
         )
+        body = f"{message.get('u', 'Unknown')}: {preview}"
         if len(body) > 1024:
             body = body[:1023] + "…"
         notification = (
@@ -17854,6 +19159,65 @@ def _write_crash_log(error_text: str) -> Path | None:
 
 
 
+def show_history_upgrade(client: EncryptedChatClient, pending: list[Path]) -> bool:
+    class HistoryUpgradeDialog(QDialog):
+        def reject(self) -> None:
+            # Escape must not interrupt the upgrade worker.
+            pass
+
+    dialog = HistoryUpgradeDialog(client.root)
+    dialog.setWindowTitle("Upgrading chat history")
+    dialog.setWindowFlags(
+        Qt.WindowType.Dialog | Qt.WindowType.CustomizeWindowHint
+        | Qt.WindowType.WindowTitleHint
+    )
+    layout = QVBoxLayout(dialog)
+    label = QLabel(
+        "Chat history is being upgraded to a new format. This shouldn't take long…"
+    )
+    label.setWordWrap(True)
+    label.setMinimumWidth(320)
+    layout.addWidget(label)
+    progress = QProgressBar()
+    progress.setRange(0, len(pending))
+    progress.setValue(0)
+    layout.addWidget(progress)
+    client._apply_dialog_window_theme(dialog)
+
+    updates: queue.Queue = queue.Queue()
+
+    def upgrade() -> None:
+        try:
+            for index, path in enumerate(pending, start=1):
+                _upgrade_chatroom_history(path)
+                updates.put(index)
+        except Exception as exc:
+            updates.put(exc)
+        else:
+            updates.put(None)
+
+    def poll_progress() -> None:
+        while not updates.empty():
+            update = updates.get_nowait()
+            if update is None:
+                dialog.accept()
+                return
+            if isinstance(update, Exception):
+                dialog.done(QDialog.DialogCode.Rejected)
+                return
+            progress.setValue(update)
+
+    timer = QTimer(dialog)
+    timer.timeout.connect(poll_progress)
+    timer.start(25)
+    threading.Thread(
+        target=upgrade, name="SpriteLinkHistoryUpgrade", daemon=True,
+    ).start()
+    result = dialog.exec()
+    timer.stop()
+    return result == QDialog.DialogCode.Accepted
+
+
 def main() -> None:
     notification_uri = notification_uri_from_arguments(sys.argv)
     notification_room_id = (
@@ -17941,6 +19305,30 @@ def main() -> None:
 
     instance_control = SingleInstanceControl(client._quit_from_tray, root)
     root.show()
+    try:
+        pending = _pending_history_upgrades()
+        upgraded = not pending or show_history_upgrade(client, pending)
+    except Exception:
+        upgraded = False
+    if not upgraded:
+        messagebox.showerror(
+            "Chat history upgrade",
+            "Could not upgrade chat history. Your old history is still available. "
+            "Restart SpriteLink to try again.",
+            parent=root,
+        )
+        return
+    if pending and client._chatroom_history_limit() < DEFAULT_CHATROOM_HISTORY_LIMIT:
+        client.chatroom_history_limit_var.set(DEFAULT_CHATROOM_HISTORY_LIMIT)
+        client.config_data["chatroom_history_limit"] = DEFAULT_CHATROOM_HISTORY_LIMIT
+        try:
+            save_config(client.config_data)
+        except OSError:
+            messagebox.showerror(
+                "Chatroom History",
+                "Chat history was upgraded, but the new history limit could not be saved.",
+                parent=root,
+            )
     QTimer.singleShot(50, client.prepare_after_show)
     if notification_room_id is not None:
         QTimer.singleShot(

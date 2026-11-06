@@ -77,6 +77,42 @@ class ProgressiveImageTests(unittest.TestCase):
             self.assertEqual((formatting.width(), formatting.height()), (96, 64))
             self.assertEqual(resource.pixelColor(10, 10).name(), "#ff0000")
 
+    def test_overlapping_history_chunk_preserves_order_and_limit(self):
+        c = self.client
+        items = self._items(6)
+        c.message_log = [items[1], items[3], items[5]]
+        c.ui_queue.put(("history_chunk_loaded", {
+            "generation": c._history_render_generation,
+            "room_id": c.active_chatroom_id,
+            "initial": False,
+            "items": [items[0], items[2], items[4]],
+        }))
+        with mock.patch.object(c, "_chatroom_history_limit", return_value=5):
+            c._process_ui_queue()
+        self.assertEqual(c.message_log, items[1:])
+
+    def test_live_retention_removes_visible_row_without_jumping_to_bottom(self):
+        c = self.client
+        items = self._items(66, image_index=-1)
+        c.rendered_history_message_limit = 65
+        self._start(items[:-1])
+        self._wait_for(lambda: c._history_initial_render_complete)
+        self.assertIn("0", c.rendered_message_last_blocks)
+        scrollbar = c.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum() // 2)
+        anchor = c._capture_chat_view_anchor()["message_id"]
+        self.assertIsNotNone(anchor)
+        self.assertNotEqual(anchor, "0")
+
+        with mock.patch.object(c, "_chatroom_history_limit", return_value=65):
+            c._add_message_to_log(
+                items[-1]["message"], is_local=False, persist=False,
+            )
+            self._wait_for(lambda: not c._media_rerender_in_progress)
+        self.assertNotIn("0", c.rendered_message_last_blocks)
+        self.assertIn("65", c.rendered_message_last_blocks)
+        self.assertEqual(c._capture_chat_view_anchor()["message_id"], anchor)
+
     def test_first_visible_image_downloads_and_displays_before_initial_render_finishes(self):
         c = self.client
         with mock.patch.object(S, "MESSAGE_RENDER_STEP_DELAY_MS", 40), \
