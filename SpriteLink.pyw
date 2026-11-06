@@ -4589,7 +4589,7 @@ def inline_emoji_format(
     formatting.setName(resource.toString())
     formatting.setWidth(size)
     formatting.setHeight(size)
-    formatting.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignMiddle)
+    formatting.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignBaseline)
     formatting.setProperty(QTextFormat.Property.ImageAltText, name)
     formatting.setProperty(INLINE_EMOJI_PROPERTY, emoji_markup(name, encoded))
     formatting.setToolTip(name)
@@ -17499,7 +17499,7 @@ QComboBox::drop-down {
         emoji_size = PROFILE_ICON_SIZE
         if render_emojis and self._is_tiny_ui():
             font = self._make_message_font(font_name, role="chat_log")
-            emoji_size = min(emoji_size, max(1, QFontMetrics(font).ascent()))
+            emoji_size = min(PROFILE_ICON_SIZE - 2, max(1, math.floor(QFontMetricsF(font).ascent())))
         link_color = (
             "#0000ee"
             if self._is_windows_classic_theme()

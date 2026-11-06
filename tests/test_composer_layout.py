@@ -167,13 +167,24 @@ if __name__ == "__main__":
                 client.config_data["ui_size"] = ui_size
                 document = client.chat_display.document()
                 document.clear()
-                cursor = S.QTextCursor(document)
-                client._insert_message_text_with_links(
-                    cursor, f"before <sp>{markup}</sp> after", "#000000",
-                    S.DEFAULT_MESSAGE_FONT, "user", "message",
-                    muted=False, ui_font=False, embedded_image_urls=set(),
-                    align_top=False, top_align_height=0, render_emojis=True,
-                )
+                def render(text):
+                    document.clear()
+                    document.setTextWidth(400)
+                    client._insert_message_text_with_links(
+                        S.QTextCursor(document), text, "#000000",
+                        S.DEFAULT_MESSAGE_FONT, "user", "message",
+                        muted=False, ui_font=False, embedded_image_urls=set(),
+                        align_top=False, top_align_height=0, render_emojis=True,
+                    )
+                    document.size()
+                    return document.begin().layout().lineAt(0).height()
+
+                plain_height = render("before after")
+                emoji_height = render(f"before {markup} after")
+                if ui_size == "Tiny":
+                    self.assertEqual(emoji_height, plain_height)
+                render(f"before <sp>{markup}</sp> after")
+
                 def image_format():
                     iterator = document.begin().begin()
                     while not iterator.atEnd():
