@@ -4574,6 +4574,15 @@ def message_emoji_markup(message: dict[str, Any]) -> str:
     return text
 
 
+def message_is_standalone_emoji(message: dict[str, Any]) -> bool:
+    entries = message.get("emojis")
+    return (
+        isinstance(entries, list)
+        and len(entries) == 1
+        and EMOJI_MARKUP.fullmatch(message_plain_text(message_emoji_markup(message)).strip()) is not None
+    )
+
+
 def inline_emoji_format(
     cursor: QTextCursor,
     name: str,
@@ -4609,8 +4618,7 @@ class ComposeTextEdit(QTextEdit):
     def insert_emoji(self, name: str, encoded: str) -> None:
         cursor = self.textCursor()
         base = self.currentCharFormat()
-        size = min(PROFILE_ICON_SIZE, QFontMetrics(self.font()).ascent())
-        cursor.insertImage(inline_emoji_format(cursor, name, encoded, size, base))
+        cursor.insertImage(inline_emoji_format(cursor, name, encoded, PROFILE_ICON_SIZE, base))
         self.setTextCursor(cursor)
         self.setCurrentCharFormat(base)
         self.setFocus()
@@ -4693,7 +4701,6 @@ class ComposeTextEdit(QTextEdit):
 
     def _insert_message_text(self, cursor: QTextCursor, text: str) -> None:
         plain_text, runs = parse_message_rich_text(text)
-        size = min(PROFILE_ICON_SIZE, QFontMetrics(self.font()).ascent())
         for run in runs:
             formatting = QTextCharFormat()
             formatting.setFontWeight(QFont.Weight.Bold if run.bold else QFont.Weight.Normal)
@@ -4712,7 +4719,7 @@ class ComposeTextEdit(QTextEdit):
                 if not valid_emoji(name, encoded):
                     continue
                 cursor.insertText(chunk[offset:match.start()], formatting)
-                cursor.insertImage(inline_emoji_format(cursor, name, encoded, size, formatting))
+                cursor.insertImage(inline_emoji_format(cursor, name, encoded, PROFILE_ICON_SIZE, formatting))
                 offset = match.end()
             cursor.insertText(chunk[offset:], formatting)
 
@@ -17489,6 +17496,7 @@ QComboBox::drop-down {
         top_align_height: int,
         preview: bool = False,
         render_emojis: bool = False,
+        standalone_emoji: bool = False,
     ) -> None:
         plain_text, rich_runs = parse_message_rich_text(text)
         link_text = (
@@ -17497,7 +17505,9 @@ QComboBox::drop-down {
         )
         url_spans = message_url_spans(link_text)
         emoji_size = PROFILE_ICON_SIZE
-        if render_emojis and self._is_tiny_ui():
+        if standalone_emoji:
+            emoji_size *= 2
+        elif render_emojis and self._is_tiny_ui():
             font = self._make_message_font(font_name, role="chat_log")
             emoji_size = min(PROFILE_ICON_SIZE - 2, max(1, math.floor(QFontMetricsF(font).ascent())))
         link_color = (
@@ -17587,6 +17597,8 @@ QComboBox::drop-down {
                             continue
                         cursor.insertText(content[offset:match.start()], formatting)
                         image_format = inline_emoji_format(cursor, name, encoded, emoji_size, formatting)
+                        if standalone_emoji:
+                            image_format.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignTop)
                         if preview:
                             self._set_inline_html_image(image_format, emoji_image(encoded, emoji_size))
                         else:
@@ -17929,6 +17941,7 @@ QComboBox::drop-down {
             message.pop("emojis", None)
         elif len(group) > 1:
             if "emojis" in message:
+                item["standalone_emoji"] = message_is_standalone_emoji(message)
                 prefix_length = len(self._repeat_prefixed_message_text("", len(group)))
                 message["emojis"] = [
                     [start + prefix_length, name, encoded]
@@ -18672,7 +18685,12 @@ QComboBox::drop-down {
 
         self.rendered_message_items[message_id] = item
         drawing_preview = self._inline_drawing_image(drawing) if drawing and not is_collapsed else None
+        standalone_emoji = not is_collapsed and (
+            item.get("standalone_emoji") or message_is_standalone_emoji(message)
+        )
         top_align_height = drawing_preview.height() if drawing_preview is not None else 0
+        if standalone_emoji:
+            top_align_height = PROFILE_ICON_SIZE * 2
         if (
             not is_collapsed
             and bool(displayed_image_urls)
@@ -18806,7 +18824,10 @@ QComboBox::drop-down {
                 align_top=align_message_top,
                 top_align_height=top_align_height,
                 render_emojis="emojis" in message,
+                standalone_emoji=standalone_emoji,
             )
+            if standalone_emoji:
+                embedded_media_block_numbers.add(cursor.block().blockNumber())
         cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
         if add_image_line_break:
             cursor.insertBlock()

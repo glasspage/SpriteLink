@@ -113,10 +113,6 @@ class ComposerLayoutTests(unittest.TestCase):
         QTest.qWait(30)
         self.assertEqual(self.edit.height(), wide_height)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_emoji_canvas_action_and_composer_draft_round_trip(self):
         client = self.client
         client.image_menu_button.setChecked(True)
@@ -205,3 +201,45 @@ if __name__ == "__main__":
                 self.assertEqual(image_format().toolTip(), "sleepy cat")
                 client._toggle_rendered_spoiler("message:1")
                 self.assertFalse(image_format().isAnchor())
+
+    def test_standalone_emoji_uses_double_size_only_in_chat(self):
+        client = self.client
+        client.config_data["ui_size"] = "Tiny"
+        client._apply_ui_size()
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+        self.edit.insert_emoji("sleepy cat", encoded)
+        composer_image = self.edit.document().begin().begin().fragment().charFormat().toImageFormat()
+        self.assertEqual(composer_image.height(), 16)
+        markup = self.edit.to_message_text()
+        self.edit.set_message_text(markup)
+        restored_image = self.edit.document().begin().begin().fragment().charFormat().toImageFormat()
+        self.assertEqual(restored_image.height(), 16)
+
+        for text, expected_size in ((markup, 32), (f"hi {markup}", 14), (f"{markup} {markup}", 14)):
+            with self.subTest(text=text):
+                message = client._build_draft_message(text)
+                item = {"message": message, "is_local": True, "ntfy_time": message["t"]}
+                document = client.chat_display.document()
+                document.clear()
+                client._insert_message_item(
+                    S.QTextCursor(document), item, muted_ids=set(), collapsed_ids=set(),
+                    trusted_user_ids=set(), background_color="#ffffff", row_selections=[],
+                )
+                iterator = document.begin().begin()
+                sizes = []
+                while not iterator.atEnd():
+                    formatting = iterator.fragment().charFormat()
+                    if formatting.isImageFormat():
+                        sizes.append(formatting.toImageFormat().height())
+                    iterator += 1
+                self.assertTrue(sizes)
+                self.assertEqual(set(sizes), {expected_size})
+                if expected_size == 32:
+                    self.assertNotEqual(
+                        document.begin().blockFormat().lineHeightType(),
+                        S.QTextBlockFormat.LineHeightTypes.FixedHeight.value,
+                    )
+
+
+if __name__ == "__main__":
+    unittest.main()
