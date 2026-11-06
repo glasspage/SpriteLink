@@ -113,11 +113,62 @@ class ProgressiveImageTests(unittest.TestCase):
         self.assertIn("65", c.rendered_message_last_blocks)
         self.assertEqual(c._capture_chat_view_anchor()["message_id"], anchor)
 
+    def test_initial_history_renders_ten_then_one_group_per_step(self):
+        c = self.client
+        with mock.patch.object(S, "MESSAGE_RENDER_STEP_DELAY_MS", 5000):
+            self._start(self._items(15))
+            self.assertEqual(set(c.rendered_message_last_blocks), {str(i) for i in range(5, 15)})
+            blocks = [c.rendered_message_last_blocks[str(i)] for i in range(5, 15)]
+            self.assertEqual(blocks, sorted(blocks))
+            self.assertTrue(c._rendering_message_log)
+            self.assertEqual(c._message_render_job["index"], 4)
+            c._continue_message_log_render(c._message_render_generation)
+            self.assertEqual(set(c.rendered_message_last_blocks), {str(i) for i in range(4, 15)})
+            self.assertEqual(c._message_render_job["index"], 3)
+
+    def test_initial_batch_keeps_combined_messages_together(self):
+        c = self.client
+        items = self._items(16, image_index=-1)
+        for item in items[4:]:
+            item["message"]["m"] = "Repeated message"
+        with mock.patch.object(S, "MESSAGE_RENDER_STEP_DELAY_MS", 5000):
+            self._start(items)
+            self.assertEqual(set(c.rendered_message_last_blocks), {str(i) for i in range(4, 16)})
+            self.assertEqual(len(set(c.rendered_message_last_blocks.values())), 1)
+            self.assertEqual(c._message_render_job["index"], 3)
+            c._continue_message_log_render(c._message_render_generation)
+            self.assertIn("3", c.rendered_message_last_blocks)
+            self.assertNotIn("2", c.rendered_message_last_blocks)
+
+    def test_short_initial_history_finishes_without_waiting_between_rows(self):
+        c = self.client
+        with mock.patch.object(S, "MESSAGE_RENDER_STEP_DELAY_MS", 5000):
+            self._start(self._items(6))
+            self.assertEqual(set(c.rendered_message_last_blocks), {str(i) for i in range(6)})
+            self.assertFalse(c._rendering_message_log)
+            self._wait_for(lambda: c._history_initial_render_complete)
+
+    def test_older_history_still_prepends_one_group_per_step(self):
+        c = self.client
+        items = self._items(30, image_index=-1)
+        self._start(items[10:])
+        self._wait_for(lambda: c._history_initial_render_complete)
+        c.message_log = items
+        c.rendered_history_message_limit = 20
+        with mock.patch.object(S, "MESSAGE_RENDER_STEP_DELAY_MS", 5000):
+            c._loading_older_history_page = True
+            c._prepend_older_history_page(c._history_render_generation, c.active_chatroom_id, 20, 30)
+            self.assertEqual(set(c.rendered_message_last_blocks), {str(i) for i in range(9, 30)})
+            self.assertTrue(c._loading_older_history_page)
+            c._continue_message_log_render(c._message_render_generation)
+            self.assertIn("8", c.rendered_message_last_blocks)
+            self.assertNotIn("7", c.rendered_message_last_blocks)
+
     def test_first_visible_image_downloads_and_displays_before_initial_render_finishes(self):
         c = self.client
         with mock.patch.object(S, "MESSAGE_RENDER_STEP_DELAY_MS", 40), \
              mock.patch.object(c.image_fetch_executor, "submit") as submit:
-            self._start(self._items())
+            self._start(self._items(30))
             self.assertTrue(c._rendering_message_log)
             self._wait_for(lambda: submit.called)
             submit.assert_called_once_with(c._fetch_remote_image_preview, self.url)
@@ -153,7 +204,7 @@ class ProgressiveImageTests(unittest.TestCase):
         c = self.client
         with mock.patch.object(S, "MESSAGE_RENDER_STEP_DELAY_MS", 40), \
              mock.patch.object(c.image_fetch_executor, "submit") as submit:
-            items = self._items(image_index=0)
+            items = self._items(22, image_index=0)
             items[-1]["message"]["m"] = "https://untrusted.example/image.png"
             items[-2]["message"]["m"] = "https://i.imgur.com/collapsed.png"
             c._write_room_preference_ids("collapsed_messages", {str(len(items) - 2)})
@@ -200,7 +251,7 @@ class ProgressiveImageTests(unittest.TestCase):
         c = self.client
         with mock.patch.object(S, "MESSAGE_RENDER_STEP_DELAY_MS", 40), \
              mock.patch.object(c.image_fetch_executor, "submit") as submit:
-            self._start(self._items())
+            self._start(self._items(30))
             self._wait_for(lambda: submit.called)
             c._activate_chatroom("room-a")
             document = c.chat_display.document()
@@ -215,7 +266,7 @@ class ProgressiveImageTests(unittest.TestCase):
         c = self.client
         with mock.patch.object(S, "MESSAGE_RENDER_STEP_DELAY_MS", 40), \
              mock.patch.object(c.image_fetch_executor, "submit") as submit:
-            self._start(self._items())
+            self._start(self._items(30))
             c._set_history_render_updates_suppressed(True)
             self._wait_for(lambda: submit.called)
             self._deliver()

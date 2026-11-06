@@ -364,6 +364,7 @@ DESKTOP_NOTIFICATION_DEBOUNCE_MS = 250
 CHATROOM_HISTORY_OPTIONS = (1000, 5000, 10000, 50000)
 DEFAULT_CHATROOM_HISTORY_LIMIT = 10000
 INITIAL_HISTORY_RENDER_MESSAGES = 50
+INITIAL_HISTORY_IMMEDIATE_MESSAGES = 10
 HISTORY_RENDER_PAGE_MESSAGES = 50
 HISTORY_PREFETCH_SCROLL_FRACTION = 0.20
 MESSAGE_RENDER_STEP_DELAY_MS = 1
@@ -14688,6 +14689,7 @@ QComboBox::drop-down {
                         if self.message_log and not self._tray_ui_suspended:
                             self._render_message_log(
                                 scroll_to_bottom=True,
+                                initial_message_batch=INITIAL_HISTORY_IMMEDIATE_MESSAGES,
                                 on_finished=lambda: (
                                     self._finish_initial_history_render(
                                         generation,
@@ -17578,6 +17580,7 @@ QComboBox::drop-down {
         *,
         scroll_to_bottom: bool,
         on_finished: Any | None = None,
+        initial_message_batch: int = 0,
     ) -> None:
         if self._tray_ui_suspended:
             return
@@ -17760,6 +17763,7 @@ QComboBox::drop-down {
             "render_steps": render_steps,
             "unread_boundary_id": unread_boundary_id,
             "newest_first": bool(scroll_to_bottom),
+            "immediate_messages_remaining": max(0, initial_message_batch),
             "cursor": self.chat_display.textCursor(),
             "previous_timestamp": None,
             "previous_message_id": None,
@@ -18110,6 +18114,10 @@ QComboBox::drop-down {
                     last_separator_block_number
                 )
             index -= 1
+            job["immediate_messages_remaining"] = max(
+                0,
+                int(job.get("immediate_messages_remaining", 0)) - len(group),
+            )
 
         job["index"] = index
 
@@ -18130,6 +18138,9 @@ QComboBox::drop-down {
                 scrollbar = self.chat_display.verticalScrollBar()
                 scrollbar.setValue(scrollbar.maximum())
             self.chat_display.viewport().update()
+            if job.get("immediate_messages_remaining", 0) > 0:
+                self._continue_message_log_render(generation)
+                return
             QTimer.singleShot(
                 MESSAGE_RENDER_STEP_DELAY_MS,
                 lambda: self._continue_message_log_render(generation),
