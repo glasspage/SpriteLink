@@ -1,26 +1,11 @@
-# SpriteLink v13
-# Windows + Python 3.10+
-#
-# Required packages:
-#   pip install PySide6 requests cryptography Pillow
-#
-# Default transport:
-#   https://ntfy.sh
-#
-# The client derives an opaque ntfy topic from the shared encryption key.
-# ntfy only sees:
-#   - an opaque topic name
-#   - an opaque padded encrypted packet
-#   - ordinary connection metadata such as IP address and request time
-#
-# Username, username color, hidden client identity, message timestamp,
-# client message ID, and message text are compressed, padded, and encrypted.
 
 from __future__ import annotations
 
 import base64
 import binascii
+from bisect import bisect_right, insort_right
 import ctypes
+from contextlib import closing
 from ctypes import wintypes
 from dataclasses import dataclass
 from functools import lru_cache
@@ -36,11 +21,19 @@ from pathlib import Path
 import queue
 import re
 import secrets
+import sqlite3
 import subprocess
 import threading
 import time
 import traceback
 import sys
+
+# Route the helper before chat imports and single-instance checks.
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--spritelink-video-worker":
+    from spritelink_video_worker import main as video_worker_main
+    video_worker_main(sys.argv[2])
+    raise SystemExit
+
 import unicodedata
 import uuid
 import zlib
@@ -48,6 +41,7 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 try:
     from PySide6.QtCore import (
         QBuffer,
+        QTextBoundaryFinder,
         QByteArray,
         QEvent,
         QIODevice,
@@ -70,6 +64,7 @@ try:
         QFont,
         QFontDatabase,
         QFontMetrics,
+        QFontMetricsF,
         QIcon,
         QImage,
         QLinearGradient,
@@ -82,15 +77,20 @@ try:
         QPixmapCache,
         QPolygon,
         QRegion,
+        QShortcut,
         QTextBlockFormat,
+        QTextBlockUserData,
         QTextCharFormat,
         QTextCursor,
         QTextDocument,
         QTextFormat,
         QTextImageFormat,
         QTextLayout,
+        QTextLength,
+        QTextTableFormat,
         QTextOption,
     )
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -137,7 +137,7 @@ except ImportError as exc:
         "Missing dependency: PySide6\n\nInstall it with:\n"
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
-from typing import Any
+from typing import Any, Callable, Iterable
 
 QAudioOutput: Any = None
 QMediaPlayer: Any = None
@@ -146,7 +146,7 @@ QVideoSink: Any = None
 
 
 def ensure_qt_multimedia_loaded() -> None:
-    """Load Qt's multimedia backend only when audio or video is first used."""
+    """Load multimedia only on first use."""
     global QAudioOutput, QMediaPlayer, QSoundEffect, QVideoSink
     if QMediaPlayer is not None:
         return
@@ -162,19 +162,22 @@ def ensure_qt_multimedia_loaded() -> None:
     QVideoSink = VideoSink
 
 
-try:
-    import requests
-except ImportError as exc:
-    raise SystemExit(
-        "Missing dependency: requests\n\nInstall it with:\n"
-        "pip install PySide6 requests cryptography Pillow"
-    ) from exc
+from spritelink_http import requests
 
 from spritelink_update import (
     ReleaseInfo,
     download_release_installer,
     fetch_latest_release,
     release_is_newer,
+)
+from spritelink_video import (
+    VIDEO_EMBED_BORDER_COLOR,
+    DirectVideoThumbnail,
+    VideoInfo,
+    VideoPlayer,
+    fetch_video_info,
+    video_link,
+    video_thumbnail,
 )
 
 try:
@@ -199,6 +202,11 @@ except ImportError as exc:
         "pip install PySide6 requests cryptography Pillow"
     ) from exc
 
+from spritelink_drawing import (
+    DrawingImportPanel, DrawingMenu, drawing_image, load_import_image,
+)
+from spritelink_image_codec import decode_drawing, encode_drawing
+
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
 CONFIG_FORMAT_VERSION = 24
@@ -214,6 +222,7 @@ WINDOWS_SINGLE_INSTANCE_MUTEX_NAME = (
     r"Local\SpriteLink-{D2EB08B2-F3E3-4F88-8D9E-51DC7A8754A0}"
 )
 _SINGLE_INSTANCE_MUTEX_HANDLE: Any = None
+SINGLE_INSTANCE_SERVER_NAME = "SpriteLink-D2EB08B2-F3E3-4F88-8D9E-51DC7A8754A0"
 
 try:
     from spritelink_build_version import VERSION as RUNNING_VERSION
@@ -297,6 +306,15 @@ def notification_button_stylesheet(
     glassy: bool = False,
 ) -> str:
     if glassy:
+        app = QApplication.instance()
+        if app is not None and app.property("spritelinkGlassyDark"):
+            return (
+                "QPushButton { color:#f2e3cc; border:1px solid #000000; border-radius:5px; padding:4px 10px;"
+                " background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #8d7f6b,stop:0.46 #6f5e47,"
+                " stop:0.50 #473725,stop:1 #655037); }"
+                "QPushButton:hover { background:#7d674b; border-color:#000000; }"
+                "QPushButton:pressed,QPushButton:checked { background:#463726; border-color:#000000; }"
+            )
         return GLASSY_NOTIFICATION_BUTTON_STYLESHEET
     return (
         WINDOWS_CLASSIC_NOTIFICATION_BUTTON_STYLESHEET
@@ -314,7 +332,7 @@ def chatroom_connection_label(
     return f"{room_name}{suffix}"
 
 
-DEFAULT_SERVER_PRESET = "ntfy.sh (public)"
+DEFAULT_SERVER_PRESET = "ntfy.sh (default)"
 DEFAULT_SERVER_URL = "https://ntfy.sh"
 GLOBAL_CHATROOM_ID = "global"
 UNREAD_FROM_START_MARKER = "__start__"
@@ -343,9 +361,10 @@ CUSTOM_MESSAGE_SOUND_MAX_MS = 3000
 MESSAGE_SOUND_COOLDOWN_SECONDS = 2.0
 COMPRESSED_MESSAGE_SOUND_EXTENSIONS = {".mp3", ".ogg"}
 DESKTOP_NOTIFICATION_DEBOUNCE_MS = 250
-CHATROOM_HISTORY_OPTIONS = (100, 500, 1000, 10000)
-DEFAULT_CHATROOM_HISTORY_LIMIT = 1000
+CHATROOM_HISTORY_OPTIONS = (1000, 5000, 10000, 50000)
+DEFAULT_CHATROOM_HISTORY_LIMIT = 10000
 INITIAL_HISTORY_RENDER_MESSAGES = 50
+INITIAL_HISTORY_IMMEDIATE_MESSAGES = 10
 HISTORY_RENDER_PAGE_MESSAGES = 50
 HISTORY_PREFETCH_SCROLL_FRACTION = 0.20
 MESSAGE_RENDER_STEP_DELAY_MS = 1
@@ -362,7 +381,9 @@ MINIMIZE_TO_TRAY_NOTICE_KEY = "minimize_to_tray_notice_shown"
 
 SERVER_PRESETS: dict[str, str] = {
     DEFAULT_SERVER_PRESET: DEFAULT_SERVER_URL,
-    "Local ntfy server": "http://127.0.0.1:8080",
+    "ntfy.envs.net": "https://ntfy.envs.net",
+    "ntfy.adminforge.de": "https://ntfy.adminforge.de",
+    "ntfy.hostux.net": "https://ntfy.hostux.net",
     "Custom ntfy server": "",
 }
 
@@ -370,17 +391,18 @@ DEFAULT_THEME = "Classic"
 THEMES = (
     DEFAULT_THEME,
     "Glassy",
+    "Glassy Dark",
     "Modern",
 )
+GLASSY_THEMES = ("Glassy", "Glassy Dark")
 LEGACY_THEME_NAMES = {
     "Glassy+": "Glassy",
     "Windows Classic": "Classic",
     "Modern (Light)": "Modern",
 }
 
-# Windows Classic/XP scheme RGB values, verified against the archived theme
-# files at https://github.com/zkedem/windows10-classic-themes . The first entry
-# retains SpriteLink's original Classic colors for existing configurations.
+# Classic RGB source: https://github.com/zkedem/windows10-classic-themes
+# Keep the original scheme first for existing configurations.
 CLASSIC_COLOR_SCHEMES = (
     dict(name="Default", face="#c0c0c0", shadow="#808080", light="#ffffff",
          title="#000080", highlight="#007f82", highlight_text="#000000",
@@ -418,9 +440,85 @@ def normalize_theme_colors(value: Any) -> dict[str, int]:
     return result
 
 
-def client_theme_color(client: Any, theme: str) -> int:
+def normalize_room_settings(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    colors = source.get("theme_colors")
+    colors = colors if isinstance(colors, dict) else {}
+    normalized_colors = normalize_theme_colors(colors)
+    volume = source.get("message_sound_volume")
+    try:
+        volume = None if volume is None or isinstance(volume, bool) else max(
+            10, min(100, ((int(volume) + 5) // 10) * 10)
+        )
+    except (TypeError, ValueError, OverflowError):
+        volume = None
+    return {
+        "theme_colors": {theme: normalized_colors[theme] for theme in THEMES
+                         if theme in colors and colors[theme] is not None},
+        "message_sound": source.get("message_sound")
+        if source.get("message_sound") in MESSAGE_SOUND_OPTIONS else "Default",
+        "message_sound_volume": volume,
+        "custom_message_sound_path": source.get("custom_message_sound_path", "")
+        if isinstance(source.get("custom_message_sound_path", ""), str) else "",
+    }
+
+
+def client_room_settings(client: Any, room_id: str | None = None) -> dict[str, Any]:
     config = getattr(client, "config_data", {})
+    config = config if isinstance(config, dict) else {}
+    rooms = config.get("room_settings", {})
+    return normalize_room_settings(rooms.get(
+        room_id if room_id is not None else getattr(client, "active_chatroom_id", "")
+    ) if isinstance(rooms, dict) else None)
+
+
+def client_theme_color(client: Any, theme: str, *, use_room: bool = True) -> int:
+    config = getattr(client, "config_data", {})
+    if use_room:
+        colors = client_room_settings(client)["theme_colors"]
+        if theme in colors:
+            return colors[theme]
     return normalize_theme_colors(config.get("theme_colors") if isinstance(config, dict) else None)[theme]
+
+
+def client_glassy_theme(client: Any) -> str:
+    model = getattr(client, "theme_var", None)
+    return "Glassy Dark" if model is not None and model.get() == "Glassy Dark" else "Glassy"
+
+
+def glassy_stylesheet(theme: str) -> str:
+    return GLASSY_DARK_STYLESHEET if theme == "Glassy Dark" else GLASSY_STYLESHEET
+
+
+@lru_cache(maxsize=512)
+def dark_message_color(color: str) -> str:
+    original = QColor(color)
+    if not original.isValid():
+        return color
+    if original.name() in (DEFAULT_MESSAGE_TEXT_COLOR, "#000000"):
+        return "#ffffff"
+    if original.lightnessF() < 0.65:
+        hue, saturation, _lightness, alpha = original.getHslF()
+        return QColor.fromHslF(max(0.0, hue), saturation, 0.76, alpha).name(QColor.NameFormat.HexArgb)
+    return color
+
+
+def message_display_color(color: str) -> str:
+    app = QApplication.instance()
+    return dark_message_color(color) if app is not None and app.property("spritelinkGlassyDark") else color
+
+
+def client_message_sound_settings(client: Any, room_id: str | None = None) -> tuple[str, int, str]:
+    settings = client_room_settings(client, room_id)
+    sound = settings["message_sound"]
+    inherited = sound == "Default"
+    return (
+        str(client.message_sound_var.get()) if inherited else sound,
+        int(client.message_sound_volume_var.get()) if settings["message_sound_volume"] is None
+        else settings["message_sound_volume"],
+        str(client.custom_message_sound_path_var.get()) if inherited
+        else settings["custom_message_sound_path"],
+    )
 
 
 def shift_theme_color(color: Any, degrees: int | None = None) -> QColor:
@@ -445,8 +543,7 @@ def hue_theme_stylesheet(stylesheet: str, degrees: int) -> str:
         else:
             channels = [int(part) for part in re.findall(r"\d+", text)]
             color = QColor(*channels)
-        # Only the original blue/cyan accent family moves. Warning/error
-        # colors, visited links, and neutral whites/grays remain unchanged.
+        # Shift only blue/cyan accents; preserve status colors and neutrals.
         if not 0.45 <= color.hslHueF() <= 0.69:
             return text
         shifted = shift_theme_color(color, degrees)
@@ -484,8 +581,7 @@ ON_SCREEN_POLL_INTERVAL_SECONDS = 6.0
 OFF_SCREEN_POLL_INTERVAL_SECONDS = 9.0
 MUTED_INACTIVE_ON_SCREEN_POLL_INTERVAL_SECONDS = 5 * 60.0
 MUTED_INACTIVE_OFF_SCREEN_POLL_INTERVAL_SECONDS = 7.5 * 60.0
-# Focused catch-up polls use most of ntfy's sustained request allowance.
-# Leave the remaining budget for reconnecting the long-lived stream.
+# Reserve request budget for stream reconnects.
 SUBSCRIPTION_RECONNECT_DELAY_SECONDS = 30.0
 SUBSCRIPTION_READ_TIMEOUT_SECONDS = 75
 SUBSCRIPTION_RECONNECT_BACKFILL_SECONDS = 2 * 60
@@ -494,7 +590,9 @@ CHATROOM_SWITCH_BURST_WINDOW_SECONDS = 6.0
 IMMEDIATE_CHATROOM_SWITCH_LIMIT = 2
 CHATROOM_SWITCH_REPAYMENT_BACKGROUND_POLLS = 6
 REQUEST_TIMEOUT_SECONDS = 10
-RECENTLY_ONLINE_INTERVAL_SECONDS = 6 * 60 * 60
+RECENTLY_ONLINE_INTERVAL_SECONDS = 3 * 60 * 60
+RECENTLY_ONLINE_VERSION = 2
+RECENTLY_ONLINE_AAD = b"SpriteLink-recently-online-v2"
 RECENTLY_ONLINE_POLL_SECONDS = 5 * 60
 RECENTLY_ONLINE_RETRY_SECONDS = 60
 SERVER_HISTORY_RETENTION_SECONDS = 12 * 60 * 60
@@ -566,6 +664,7 @@ TRUSTED_IMAGE_HOST_PATTERNS = (
     "cdn.donmai.*",
     "pbs.twimg.com",
     "i.imgur.com",
+    "i.kym-cdn.com",
     "images.unsplash.com",
     "images.pexels.com",
     "cdn.bsky.app",
@@ -629,6 +728,16 @@ TRUSTED_LINK_DOMAINS = (
     "youtube.com",
     "youtu.be",
     "ytimg.com",
+    "youtube-nocookie.com",
+    "vimeo.com",
+    "vimeocdn.com",
+    "dailymotion.com",
+    "dai.ly",
+    "dmcdn.net",
+    "streamable.com",
+    "streamablecdn.com",
+    "googlevideo.com",
+    "ttvnw.net",
     "github.com",
     "githubassets.com",
     "githubusercontent.com",
@@ -687,6 +796,7 @@ TRUSTED_LINK_DOMAINS = (
     "myanimelist.net",
 )
 TRUSTED_LINK_EXACT_HOSTS = (
+    "i.kym-cdn.com",
     "adriansblinkiecollection.neocities.org",
     "steamuserimages-a.akamaihd.net",
     "ak.picdn.net",
@@ -756,6 +866,7 @@ DEFAULT_MESSAGE_TEXT_COLOR = "#202020"
 MUTED_CONTENT_OPACITY = 0.30
 MESSAGE_ROW_BACKGROUNDS = ("#ffffff", "#f5f5f5")
 GLASSY_MESSAGE_ROW_BACKGROUNDS = ("#38ffffff", "#50d7e7f2")
+GLASSY_DARK_MESSAGE_ROW_BACKGROUNDS = ("#4023262a", "#58383d43")
 
 
 def message_row_backgrounds() -> tuple[str, str]:
@@ -764,11 +875,13 @@ def message_row_backgrounds() -> tuple[str, str]:
         position = int(app.property("spritelinkClassicColor") or 0)
         return CLASSIC_COLOR_SCHEMES[position].get("chat_backgrounds", MESSAGE_ROW_BACKGROUNDS)
     if app is not None and bool(app.property("spritelinkGlassy")):
+        backgrounds = (GLASSY_DARK_MESSAGE_ROW_BACKGROUNDS if app.property("spritelinkGlassyDark")
+                       else GLASSY_MESSAGE_ROW_BACKGROUNDS)
         degrees = int(app.property("spritelinkThemeHue") or 0)
         if degrees:
             return tuple(shift_theme_color(color, degrees).name(QColor.NameFormat.HexArgb)
-                         for color in GLASSY_MESSAGE_ROW_BACKGROUNDS)
-        return GLASSY_MESSAGE_ROW_BACKGROUNDS
+                         for color in backgrounds)
+        return backgrounds
     return MESSAGE_ROW_BACKGROUNDS
 
 
@@ -913,6 +1026,7 @@ QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
     selection-background-color: #007f82;
     selection-color: #000000;
 }
+QLineEdit#serverUrl:disabled { background-color: #c0c0c0; color: #808080; }
 QComboBox {
     padding: 2px 4px;
 }
@@ -969,8 +1083,6 @@ QFrame[frameShape="4"], QFrame[frameShape="5"] {
 }
 """
 
-# Keep the chat viewport on its original Base palette color. Modern's extra
-# contrast belongs to the surrounding controls, not the message backdrop.
 MODERN_STYLESHEET = """
 QMainWindow, QDialog, QWidget#glassRoot, QWidget#chatTab {
     background: #f3f3f3;
@@ -1138,7 +1250,8 @@ QPushButton:disabled {
 }
 QPushButton#identityMenuButton,
 QPushButton#fontMenuButton,
-QPushButton#formattingMenuButton {
+QPushButton#formattingMenuButton,
+QPushButton#imageMenuButton {
     min-height: 17px;
     padding-top: 2px;
     padding-bottom: 2px;
@@ -1150,6 +1263,10 @@ QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
     border-radius: 4px;
     selection-background-color: #5ba7d5;
     selection-color: #ffffff;
+}
+QLineEdit#serverUrl:disabled {
+    color: rgba(49, 68, 82, 125); background-color: rgba(216, 226, 233, 156);
+    border-color: rgba(99, 132, 151, 110);
 }
 QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus,
 QListWidget:focus, QComboBox:focus {
@@ -1351,9 +1468,111 @@ QFrame[frameShape="4"], QFrame[frameShape="5"] {
 }
 """.replace("SPRITELINK_SCROLLBAR_ASSETS", (Path(__file__).resolve().parent / "assets").as_posix())
 
-# Dark, moderately saturated colors that remain readable against the standard
-# light chat background. A color is selected only when a new local
-# configuration is first created.
+GLASSY_DARK_STYLESHEET = GLASSY_STYLESHEET + """
+QMainWindow, QDialog { background: rgba(34, 38, 43, 140); color: #e3e7eb; }
+QMainWindow { background: transparent; }
+QWidget#glassRoot {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 rgba(53, 58, 65, 100), stop:0.40 rgba(35, 39, 45, 112),
+        stop:1 rgba(24, 27, 32, 128));
+}
+QWidget#chatroomsPanel {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(64, 69, 77, 60), stop:1 rgba(24, 28, 34, 80));
+    border-right: 1px solid #000000;
+}
+QLabel { color: #e3e7eb; }
+QPushButton {
+    color: #e9edf0;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(99, 105, 113, 166), stop:0.46 rgba(70, 76, 84, 150),
+        stop:0.50 rgba(39, 44, 51, 164), stop:1 rgba(51, 58, 67, 174));
+    border-color: #000000;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(118, 130, 141, 182), stop:0.46 rgba(83, 99, 113, 168),
+        stop:0.50 rgba(47, 65, 81, 178), stop:1 rgba(62, 83, 101, 186));
+    border-color: #000000;
+}
+QPushButton:pressed, QPushButton:checked {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(27, 37, 47, 196), stop:0.08 rgba(46, 60, 73, 180),
+        stop:0.92 rgba(55, 70, 84, 180), stop:1 rgba(94, 107, 120, 190));
+    border-color: #000000;
+}
+QPushButton:default { border-color: #000000; }
+QPushButton:disabled { color: #858d96; background: rgba(51, 56, 63, 104); border-color: #000000; }
+QLabel:disabled, QCheckBox:disabled { color: #87919a; }
+QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
+    color: #e1e6eb; background-color: rgba(22, 26, 31, 136);
+    border-color: #000000; selection-background-color: #586e80; selection-color: #ffffff;
+}
+QLineEdit#serverUrl:disabled {
+    color: #858d96; background-color: rgba(51, 56, 63, 104); border-color: #000000;
+}
+QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus, QListWidget:focus, QComboBox:focus {
+    border-color: #000000;
+}
+QComboBox::drop-down {
+    border-left-color: #000000;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(100, 108, 117, 152), stop:1 rgba(42, 50, 59, 174));
+}
+QTextBrowser#chatViewport { background-color: rgba(22, 25, 30, 48); border-color: #000000; }
+QFrame#comboPopup, QComboBox QAbstractItemView, QMenu {
+    color: #e3e8ec; background-color: #252b32; border-color: #000000;
+    selection-background-color: #526779; selection-color: #ffffff;
+}
+QListWidget::item:selected, QMenu::item:selected {
+    color: #ffffff;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #40586c, stop:1 #657c8e);
+}
+QMenu::item:disabled { color: #818a93; }
+QFrame[frameShape="6"] {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(82, 89, 98, 128), stop:1 rgba(34, 40, 48, 148));
+    border-color: #000000;
+}
+QScrollBar:vertical {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #191e24, stop:0.25 #292f37, stop:1 #343c45);
+}
+QScrollBar:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #191e24, stop:0.25 #292f37, stop:1 #343c45);
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #777f88, stop:0.46 #5d6670, stop:0.50 #3b4551, stop:1 #4f5c69);
+    border-color: #000000; border-top-color: #000000;
+}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #8b9baa, stop:0.46 #6c8398, stop:0.50 #465f74, stop:1 #617c92);
+    border-color: #000000; border-top-color: #000000;
+}
+QScrollBar::handle:vertical:pressed, QScrollBar::handle:horizontal:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #5d7183, stop:0.46 #52697c, stop:0.50 #334a5e, stop:1 #4c6479);
+    border-color: #000000;
+}
+QScrollBar::handle:vertical:disabled, QScrollBar::handle:horizontal:disabled {
+    background: #373f48; border-color: #000000;
+}
+QSlider::groove:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #171e25, stop:1 #667480); border-color: #000000;
+}
+QProgressBar { color: #e1e6eb; background-color: rgba(25, 30, 36, 112); border-color: #000000; }
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #9dabb5, stop:0.48 #748b9c, stop:0.52 #4f6c82, stop:1 #3f5a70);
+}
+QToolTip { color: #e4e9ee; background-color: rgba(32, 39, 47, 250); border-color: #000000; }
+QFrame[frameShape="4"], QFrame[frameShape="5"] { color: rgba(140, 152, 163, 150); }
+"""
+
 SAFE_USERNAME_COLORS = (
     "#2f6bff",
     "#7a3fd0",
@@ -1369,7 +1588,7 @@ SAFE_USERNAME_COLORS = (
 
 
 def optimize_profile_icon(source_path: str) -> bytes:
-    """Convert a PNG or JPEG to a compact, single-frame 16x16 palette GIF."""
+    """Convert PNG/JPEG to a 16x16 palette GIF."""
     with Image.open(source_path) as source:
         if source.format not in {"PNG", "JPEG"}:
             raise ValueError("Profile icons must be PNG or JPG images.")
@@ -1391,8 +1610,11 @@ def optimize_profile_icon(source_path: str) -> bytes:
     )
     canvas.alpha_composite(icon, offset)
 
-    # GIF supports one transparent palette entry, so normalize partial alpha
-    # before counting and quantizing colors.
+    return _encode_profile_icon_canvas(canvas)
+
+
+def _encode_profile_icon_canvas(canvas: Image.Image, dither: bool = False) -> bytes:
+    # GIF allows one transparent palette entry; normalize partial alpha first.
     normalized_pixels = [
         (red, green, blue, 255)
         if alpha >= 128
@@ -1434,6 +1656,18 @@ def optimize_profile_icon(source_path: str) -> bytes:
             for index in used_indices
         ]
         opaque_indices = [remap[index] for index in quantized_indices]
+
+    if dither and len(exact_colors) > max_opaque_colors:
+        # Diffuse across the 2D crop using the palette fitted to opaque pixels.
+        palette = Image.new("P", (1, 1))
+        palette.putpalette([channel for color in palette_colors for channel in color])
+        mapped = canvas.convert("RGB").quantize(
+            palette=palette, dither=Image.Dither.FLOYDSTEINBERG,
+        )
+        opaque_indices = [
+            index for index, (*_rgb, alpha) in zip(mapped.tobytes(), normalized_pixels)
+            if alpha == 255
+        ]
 
     transparency_index = len(palette_colors) if has_transparency else None
     pixel_indices: list[int] = []
@@ -1540,11 +1774,11 @@ def normalize_profile_icon(value: Any, fallback: str = "") -> str:
 
 
 FORBIDDEN_USERNAME_UNICODE_CATEGORIES = frozenset({
-    "Cc",  # Control characters, including tabs and CR/LF.
-    "Cf",  # Formatting controls, including zero-width and bidi controls.
-    "Cs",  # Lone UTF-16 surrogate code points.
-    "Zl",  # Unicode line separator.
-    "Zp",  # Unicode paragraph separator.
+    "Cc",  # Control characters.
+    "Cf",  # Zero-width/bidi controls.
+    "Cs",  # UTF-16 surrogates.
+    "Zl",  # Line separator.
+    "Zp",  # Paragraph separator.
 })
 FORBIDDEN_USERNAME_BIDI_CLASSES = frozenset({
     "LRE",
@@ -1720,7 +1954,6 @@ def set_windows_taskbar_attention(
     window_handle: int,
     enabled: bool,
 ) -> bool:
-    """Start or stop native Windows taskbar-button flashing."""
     if (
         os.name != "nt"
         or not hasattr(ctypes, "windll")
@@ -1750,6 +1983,47 @@ def set_windows_taskbar_attention(
     return True
 
 
+def set_windows_fullscreen_window(window_handle: int, fullscreen: bool) -> bool:
+    """Mark fullscreen video for Windows taskbar handling."""
+    if os.name != "nt" or not hasattr(ctypes, "windll") or not window_handle:
+        return False
+    interface = ctypes.c_void_p()
+    initialized = False
+    release = None
+    try:
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        ole32.CoInitializeEx.restype = ctypes.c_int32
+        ole32.CoUninitialize.argtypes = []
+        ole32.CoUninitialize.restype = None
+        status = int(ole32.CoInitializeEx(None, 2))  # COINIT_APARTMENTTHREADED
+        initialized = status in (0, 1)
+        if status < 0 and status != -2147417850:  # RPC_E_CHANGED_MODE: reuse the apartment.
+            return False
+        guid_type = ctypes.c_ubyte * 16
+        clsid = guid_type.from_buffer_copy(uuid.UUID("56fdf344-fd6d-11d0-958a-006097c9a090").bytes_le)
+        iid = guid_type.from_buffer_copy(uuid.UUID("602d4995-b13a-429b-a66e-1935e44f4317").bytes_le)
+        ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                                          ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        ole32.CoCreateInstance.restype = ctypes.c_int32
+        if ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid),
+                                  ctypes.byref(interface)) < 0 or not interface.value:
+            return False
+        table = ctypes.cast(interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        release = ctypes.WINFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p)(table[2])
+        hr_init = ctypes.WINFUNCTYPE(ctypes.c_int32, ctypes.c_void_p)(table[3])
+        mark = ctypes.WINFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, wintypes.HWND,
+                                 wintypes.BOOL)(table[8])
+        return hr_init(interface) >= 0 and mark(interface, wintypes.HWND(window_handle), fullscreen) >= 0
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    finally:
+        if release is not None:
+            release(interface)
+        if initialized:
+            ole32.CoUninitialize()
+
+
 def _bytes_to_blob(data: bytes) -> tuple[DATA_BLOB, Any]:
     buffer = ctypes.create_string_buffer(data, len(data))
     blob = DATA_BLOB(
@@ -1763,7 +2037,7 @@ def dpapi_encrypt(
     data: bytes,
     entropy: bytes = SETTINGS_DPAPI_ENTROPY,
 ) -> bytes:
-    """Encrypt bytes using Windows DPAPI for the current Windows user."""
+    """Encrypt bytes with user-scoped DPAPI."""
     if os.name != "nt":
         raise RuntimeError("Windows DPAPI is only available on Windows.")
 
@@ -1800,7 +2074,7 @@ def dpapi_decrypt(
     data: bytes,
     entropy: bytes = SETTINGS_DPAPI_ENTROPY,
 ) -> bytes:
-    """Decrypt bytes using Windows DPAPI for the current Windows user."""
+    """Decrypt bytes with user-scoped DPAPI."""
     if os.name != "nt":
         raise RuntimeError("Windows DPAPI is only available on Windows.")
 
@@ -1903,7 +2177,7 @@ RICH_TEXT_TAG_ORDER = ("sp", "b", "i", "u")
 def parse_message_rich_text(
     text: str,
 ) -> tuple[str, tuple[RichTextRun, ...]]:
-    """Parse SpriteLink's small formatting language without accepting HTML."""
+    """Parse message formatting without accepting HTML."""
     parts: list[str] = []
     runs: list[RichTextRun] = []
     active = {tag: 0 for tag in ("b", "i", "u")}
@@ -1972,7 +2246,6 @@ def message_plain_text(text: str) -> str:
 
 
 def message_plain_text_with_spoilers_redacted(text: str) -> str:
-    """Return plain message text with every spoiler character concealed."""
     plain_text, runs = parse_message_rich_text(text)
     redacted = list(plain_text)
     for run in runs:
@@ -2029,8 +2302,7 @@ def message_log_separator_texts(
         previous_local_date = None
         current_local_datetime = None
 
-    # A date row already communicates the break in the conversation. Avoid
-    # placing an elapsed-time row directly beside it as a redundant divider.
+    # Date rows replace elapsed-time dividers.
     if (
         current_local_datetime is not None
         and current_local_datetime.date() != previous_local_date
@@ -2073,6 +2345,8 @@ def group_messages_for_display(
         )
         should_combine = (
             same_remote_user
+            and "drawing" not in message
+            and "drawing" not in previous_message
             and message_items_are_contiguous(previous_item, item)
             and (
                 client_id in muted_user_ids
@@ -2097,9 +2371,7 @@ def message_item_sort_key(
             item.get("ntfy_time", message.get("t", 0)),
         ) or 0),
         int(message.get("t", 0) or 0),
-        # New message IDs begin with a monotonic send-order value. Ntfy's
-        # record IDs are unique but not chronological, so using them here can
-        # visibly reorder messages sent within the same whole second.
+        # Ntfy IDs are not chronological; use send order for same-second messages.
         str(message.get("i") or item.get("ntfy_id", "")),
     )
 
@@ -2109,7 +2381,7 @@ def ordered_message_id(
     *,
     now_ns: int | None = None,
 ) -> tuple[str, int]:
-    """Return a fixed-width ID that increases in composer submission order."""
+    """Monotonic fixed-width ID in submission order."""
     current_ns = time.time_ns() if now_ns is None else int(now_ns)
     order = max(current_ns, int(previous_order) + 1)
     return f"{order:016x}{secrets.token_hex(8)}", order
@@ -2122,6 +2394,8 @@ def consecutive_duplicate_message_ordinal(
     ntfy_time: int,
     ntfy_id: str | None = None,
 ) -> int:
+    if "drawing" in message:
+        return 1
     current_item = {
         "message": message,
         "is_local": False,
@@ -2141,6 +2415,7 @@ def consecutive_duplicate_message_ordinal(
         if (
             str(previous_message.get("c", ""))
             != str(message.get("c", ""))
+            or "drawing" in previous_message
             or str(previous_message.get("m", ""))
             != str(message.get("m", ""))
             or not message_items_are_contiguous(
@@ -2384,7 +2659,6 @@ def clear_windows_notification(tag: str) -> bool:
 def serialize_message_rich_text(
     segments: list[tuple[str, bool, bool, bool, bool]],
 ) -> str:
-    """Serialize visibly formatted composer segments into safe message tags."""
     output: list[str] = []
     active_tags: list[str] = []
     for text, bold, italic, underline, spoiler in segments:
@@ -2535,6 +2809,16 @@ def is_embeddable_media_url(url: str) -> bool:
         is_direct_image_url(url)
         or is_trusted_looping_video_url(url)
         or is_supported_media_page_url(url)
+        or is_click_to_play_video_url(url)
+    )
+
+
+def is_click_to_play_video_url(url: str) -> bool:
+    # Keep GIF-style videos on the silent-loop path.
+    return (
+        not is_trusted_looping_video_url(url)
+        and not is_supported_media_page_url(url)
+        and video_link(url, lambda candidate: analyze_link_url(candidate).trusted) is not None
     )
 
 
@@ -2721,7 +3005,7 @@ def link_warning_url_html(
         should_underline = index in underlined_indices
         if should_underline != underlining:
             output.append(
-                '<span style="color: #c00000;"><u>'
+                f'<span style="color: {message_display_color("#c00000")};"><u>'
                 if should_underline
                 else "</u></span>"
             )
@@ -2738,6 +3022,8 @@ def is_image_url_trusted_for_sender(
     is_local: bool,
     trusted_user_ids: set[str],
 ) -> bool:
+    if is_click_to_play_video_url(url):
+        return analyze_link_url(url).trusted
     return (
         is_local
         or client_id in trusted_user_ids
@@ -2746,7 +3032,6 @@ def is_image_url_trusted_for_sender(
 
 
 def generate_chatroom_key() -> str:
-    # 24 random bytes encode to exactly 32 URL-safe characters.
     return secrets.token_urlsafe(24)
 
 
@@ -2831,6 +3116,41 @@ def is_likely_nsfw_image_url(url: str) -> bool:
         hostname == domain or hostname.endswith(f".{domain}")
         for domain in LIKELY_NSFW_IMAGE_DOMAINS
     )
+
+
+def message_text_for_search(
+    item: dict[str, Any], query: str, filters: set[str],
+) -> str | None:
+    if "drawing" in item["message"]:
+        return "" if not query and (not filters or "Images" in filters) else None
+    raw_text = item["message"].get("m")
+    if not isinstance(raw_text, str):
+        return None
+    text = message_plain_text_with_spoilers_redacted(raw_text)
+    if query and query not in text.casefold():
+        return None
+    if not filters:
+        return text
+    for _start, _end, url in message_url_spans(text):
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        video = (
+            is_click_to_play_video_url(url)
+            or is_trusted_looping_video_url(url)
+            or _url_has_video_extension(parsed)
+            or parsed.hostname in ("redgifs.com", "www.redgifs.com")
+        )
+        if video:
+            category = "Embedded Videos"
+        elif is_direct_image_url(url) or is_supported_media_page_url(url):
+            category = "Embedded Images"
+        else:
+            category = "Links"
+        if category in filters:
+            return text
+    return None
 
 
 def message_contains_only_image_links(text: str) -> bool:
@@ -3057,6 +3377,8 @@ def _signed_message_payload(
         message["t"],
         message["m"],
     ]
+    if "drawing" in message:
+        values.append(message["drawing"])
     return json.dumps(
         values,
         ensure_ascii=False,
@@ -3124,6 +3446,8 @@ def normalize_chatroom_history_limit(value: Any) -> int:
         candidate = int(value)
     except (TypeError, ValueError):
         candidate = DEFAULT_CHATROOM_HISTORY_LIMIT
+    if candidate in (100, 500):
+        return CHATROOM_HISTORY_OPTIONS[0]
     return (
         candidate
         if candidate in CHATROOM_HISTORY_OPTIONS
@@ -3158,7 +3482,7 @@ def _load_dpapi_config(encrypted: bytes) -> dict[str, Any]:
 
 def chatroom_history_path(server_url: str, encryption_key: str) -> Path:
     scope_id = room_scope_id(server_url, encryption_key)
-    return CHATROOM_HISTORY_DIRECTORY / f"{scope_id}.bin"
+    return CHATROOM_HISTORY_DIRECTORY / f"{scope_id}.sqlite3"
 
 
 def _load_chatroom_history_file(path: Path) -> list[dict[str, Any]]:
@@ -3171,36 +3495,133 @@ def _load_chatroom_history_file(path: Path) -> list[dict[str, Any]]:
     return [entry for entry in loaded if isinstance(entry, dict)]
 
 
+def _open_chatroom_history(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                message_id TEXT PRIMARY KEY NOT NULL,
+                ntfy_id TEXT,
+                sort_time INTEGER NOT NULL,
+                sent_time INTEGER NOT NULL,
+                payload BLOB NOT NULL
+            )
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS messages_by_time
+            ON messages (sort_time, sent_time, message_id)
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS messages_by_ntfy_id
+            ON messages (ntfy_id) WHERE ntfy_id IS NOT NULL
+        """)
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
+
+def _history_rows(entries: Iterable[dict[str, Any]]) -> Iterable[tuple]:
+    for item in entries:
+        message = item.get("message")
+        if not isinstance(message, dict) or not message.get("i"):
+            continue
+        sort_time, sent_time, message_id = message_item_sort_key(item)
+        entry = {key: value for key, value in item.items() if key != "is_local"}
+        raw = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+        payload = dpapi_encrypt(
+            zlib.compress(raw.encode("utf-8"), level=1),
+            CHATROOM_HISTORY_DPAPI_ENTROPY,
+        )
+        yield message_id, item.get("ntfy_id"), sort_time, sent_time, payload
+
+
+def _insert_chatroom_history(
+    connection: sqlite3.Connection,
+    entries: Iterable[dict[str, Any]],
+) -> None:
+    connection.executemany("""
+        INSERT INTO messages (message_id, ntfy_id, sort_time, sent_time, payload)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO NOTHING
+    """, _history_rows(entries))
+
+
+def _pending_history_upgrades() -> list[Path]:
+    pending = []
+    for legacy_path in sorted(CHATROOM_HISTORY_DIRECTORY.glob("*.bin")):
+        path = legacy_path.with_suffix(".sqlite3")
+        if path.exists():
+            with closing(sqlite3.connect(path)) as connection:
+                if connection.execute("PRAGMA user_version").fetchone()[0] >= 1:
+                    continue
+        pending.append(legacy_path)
+    return pending
+
+
+def _upgrade_chatroom_history(legacy_path: Path) -> None:
+    entries = _load_chatroom_history_file(legacy_path)
+    with closing(_open_chatroom_history(legacy_path.with_suffix(".sqlite3"))) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("PRAGMA user_version").fetchone()[0] < 1:
+                _insert_chatroom_history(connection, entries)
+                connection.execute("PRAGMA user_version = 1")
+
+
 def load_chatroom_history(
     server_url: str,
     encryption_key: str,
+    *,
+    limit: int = -1,
+    before: tuple[int, int, str] | None = None,
 ) -> list[dict[str, Any]]:
-    try:
-        path = chatroom_history_path(server_url, encryption_key)
-        if not path.exists():
-            return []
-        return _load_chatroom_history_file(path)
-    except Exception:
+    path = chatroom_history_path(server_url, encryption_key)
+    if not path.exists():
         return []
+    with closing(sqlite3.connect(path)) as connection:
+        query = "SELECT payload FROM messages"
+        params = ()
+        if before is not None:
+            query += " WHERE (sort_time, sent_time, message_id) < (?, ?, ?)"
+            params = before
+        query += " ORDER BY sort_time DESC, sent_time DESC, message_id DESC LIMIT ?"
+        rows = connection.execute(query, (*params, limit)).fetchall()
+    return [
+        json.loads(zlib.decompress(dpapi_decrypt(payload, CHATROOM_HISTORY_DPAPI_ENTROPY)))
+        for (payload,) in reversed(rows)
+    ]
 
 
 def save_chatroom_history(
     server_url: str,
     encryption_key: str,
     entries: list[dict[str, Any]],
+    maximum_messages: int | None = None,
 ) -> None:
     path = chatroom_history_path(server_url, encryption_key)
-    if not entries:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+    if not entries and not path.exists():
         return
-    _write_dpapi_json(
-        path,
-        entries,
-        CHATROOM_HISTORY_DPAPI_ENTROPY,
-    )
+    with closing(_open_chatroom_history(path)) as connection:
+        with connection:
+            _insert_chatroom_history(connection, entries)
+            if maximum_messages is not None:
+                _prune_history_rows(connection, maximum_messages)
+
+
+def _prune_history_rows(connection: sqlite3.Connection, limit: int) -> bool:
+    boundary = connection.execute("""
+        SELECT sort_time, sent_time, message_id FROM messages
+        ORDER BY sort_time DESC, sent_time DESC, message_id DESC
+        LIMIT 1 OFFSET ?
+    """, (limit - 1,)).fetchone()
+    if boundary is None:
+        return False
+    return connection.execute("""
+        DELETE FROM messages WHERE (sort_time, sent_time, message_id) < (?, ?, ?)
+    """, boundary).rowcount > 0
 
 
 def prune_chatroom_history(
@@ -3208,36 +3629,30 @@ def prune_chatroom_history(
     encryption_key: str,
     maximum_messages: int,
 ) -> bool:
-    try:
-        path = chatroom_history_path(server_url, encryption_key)
-        if not path.exists():
-            return False
-        entries = _load_chatroom_history_file(path)
-    except Exception:
+    path = chatroom_history_path(server_url, encryption_key)
+    if not path.exists():
         return False
-
-    limit = normalize_chatroom_history_limit(maximum_messages)
-    if len(entries) <= limit:
-        return False
-    save_chatroom_history(
-        server_url,
-        encryption_key,
-        entries[-limit:],
-    )
-    return True
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            pruned = _prune_history_rows(connection, maximum_messages)
+        if pruned:
+            connection.execute("PRAGMA incremental_vacuum(256)")
+    return pruned
 
 
 def delete_local_chatroom_history(
     server_url: str,
     encryption_key: str,
 ) -> bool:
+    path = chatroom_history_path(server_url, encryption_key)
+    existed = path.exists() or path.with_suffix(".bin").exists()
     try:
-        chatroom_history_path(server_url, encryption_key).unlink()
-        return True
-    except FileNotFoundError:
+        path.with_suffix(".bin").unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+    except OSError:
         return False
-    except Exception:
-        return False
+    return existed
 
 
 def default_config() -> dict[str, Any]:
@@ -3266,6 +3681,7 @@ def default_config() -> dict[str, Any]:
         "identity_private_key": generate_identity_private_key(),
         "chatrooms": [],
         "active_chatroom_id": GLOBAL_CHATROOM_ID,
+        "room_settings": {},
         "room_profiles": {
             GLOBAL_CHATROOM_ID: global_profile,
         },
@@ -3284,13 +3700,25 @@ def default_config() -> dict[str, Any]:
     }
 
 
+_loaded_config_snapshot: tuple[str, str] | None = None
+
+
+def _config_snapshot(config: dict[str, Any]) -> tuple[str, str]:
+    stored = dict(config)
+    stored.pop("history", None)
+    return str(CONFIG_PATH), json.dumps(stored, sort_keys=True)
+
+
 def load_config() -> dict[str, Any]:
+    global _loaded_config_snapshot
+    _loaded_config_snapshot = None
     config = default_config()
     apply_minimize_to_tray_1_2_default = False
 
     if CONFIG_PATH.exists():
         try:
             loaded = _load_dpapi_config(CONFIG_PATH.read_bytes())
+            _loaded_config_snapshot = str(CONFIG_PATH), json.dumps(loaded, sort_keys=True)
             if loaded.get("config_version") != CONFIG_FORMAT_VERSION:
                 return config
             apply_minimize_to_tray_1_2_default = not bool(
@@ -3299,6 +3727,15 @@ def load_config() -> dict[str, Any]:
             config.update(loaded)
         except Exception:
             return config
+
+    server_preset = str(config.get("server_preset", DEFAULT_SERVER_PRESET))
+    if server_preset == "ntfy.sh (public)":
+        server_preset = DEFAULT_SERVER_PRESET
+    elif server_preset not in SERVER_PRESETS:
+        server_preset = "Custom ntfy server"
+    config["server_preset"] = server_preset
+    if server_preset != "Custom ntfy server":
+        config["server_url"] = SERVER_PRESETS[server_preset]
 
     message_sound = str(
         config.get("message_sound", DEFAULT_MESSAGE_SOUND)
@@ -3452,6 +3889,13 @@ def load_config() -> dict[str, Any]:
         active_chatroom_id = GLOBAL_CHATROOM_ID
     config["active_chatroom_id"] = active_chatroom_id
 
+    raw_room_settings = config.get("room_settings")
+    raw_room_settings = raw_room_settings if isinstance(raw_room_settings, dict) else {}
+    config["room_settings"] = {
+        room_id: normalize_room_settings(settings)
+        for room_id, settings in raw_room_settings.items() if room_id in valid_room_ids
+    }
+
     raw_profiles = config.get("room_profiles")
     if not isinstance(raw_profiles, dict):
         raw_profiles = {}
@@ -3570,6 +4014,7 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(config: dict[str, Any]) -> None:
+    global _loaded_config_snapshot
     stored_config = dict(config)
     stored_config.pop("history", None)
     _write_dpapi_json(
@@ -3577,6 +4022,13 @@ def save_config(config: dict[str, Any]) -> None:
         stored_config,
         SETTINGS_DPAPI_ENTROPY,
     )
+    _loaded_config_snapshot = _config_snapshot(stored_config)
+
+
+def _save_startup_config(config: dict[str, Any]) -> None:
+    # Skip unchanged settings; persist new identities before networking.
+    if _loaded_config_snapshot != _config_snapshot(config):
+        save_config(config)
 
 
 def normalize_window_size(
@@ -3622,7 +4074,15 @@ def windows_startup_command() -> str:
     return subprocess.list2cmdline(executable_parts)
 
 
+_windows_startup_registry_lock = threading.RLock()
+
+
 def set_start_with_windows(enabled: bool) -> bool:
+    with _windows_startup_registry_lock:
+        return _set_start_with_windows(enabled)
+
+
+def _set_start_with_windows(enabled: bool) -> bool:
     if os.name != "nt":
         return not enabled
     try:
@@ -3656,12 +4116,7 @@ def normalize_server_url(url: str) -> str:
 
 @lru_cache(maxsize=16)
 def derive_ntfy_topic(passphrase: str) -> str:
-    """
-    Derive a stable, opaque topic from the shared room key.
-
-    Scrypt slows down casual dictionary guessing of the topic when a weak
-    human-readable key is used. A strong room key is still recommended.
-    """
+    """Scrypt-derived topics resist guessing weak room keys."""
     if not passphrase:
         raise ValueError("The encryption key is empty.")
 
@@ -3686,33 +4141,43 @@ def room_scope_id(server_url: str, passphrase: str) -> str:
 
 @lru_cache(maxsize=1)
 def recently_online_transport() -> tuple[str, bytes]:
-    # Separate from chat topics, signing identities and message encryption.
-    # A cached key keeps counting many tiny pings inexpensive.
-    passphrase = GLOBAL_CHATROOM_KEY + "\0SpriteLink-recently-online-v1"
+    # Presence keys are separate from chat/signing keys; cache expensive derivation.
+    passphrase = GLOBAL_CHATROOM_KEY + "\0SpriteLink-recently-online-v2"
     key = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=b"SpriteLink-recently-online-v1",
-        info=b"anonymous-ping",
+        salt=RECENTLY_ONLINE_AAD,
+        info=b"anonymous-room-presence",
     ).derive(passphrase.encode("utf-8"))
     return derive_ntfy_topic(passphrase), key
 
 
-def make_recently_online_packet(token: str) -> str:
-    if not re.fullmatch(r"[0-9a-f]{32}", token):
+def make_recently_online_packet(token: str, topics: list[str]) -> str:
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
         raise ValueError("Invalid presence token.")
+    if not topics or any(
+        not isinstance(topic, str) or not re.fullmatch(r"e2chat-[a-z2-7]{39}", topic)
+        for topic in topics
+    ):
+        raise ValueError("Invalid presence topics.")
+    payload = json.dumps(
+        {"token": token, "topics": sorted(set(topics))}, separators=(",", ":"),
+    ).encode("utf-8")
     nonce = os.urandom(12)
     _topic, key = recently_online_transport()
     ciphertext = ChaCha20Poly1305(key).encrypt(
-        nonce, bytes.fromhex(token), b"SpriteLink-recently-online-v1"
+        nonce, payload, RECENTLY_ONLINE_AAD
     )
-    return base64.b64encode(b"\x01" + nonce + ciphertext).decode("ascii")
+    packet = base64.b64encode(bytes([RECENTLY_ONLINE_VERSION]) + nonce + ciphertext).decode("ascii")
+    if len(packet) > MAX_ENCRYPTED_PACKET_CHARS:
+        raise ValueError("Presence packet is too large.")
+    return packet
 
 
 def recently_online_pings(
     records: list[dict[str, Any]], *, now: float,
-) -> dict[str, int]:
-    pings: dict[str, int] = {}
+) -> dict[str, tuple[int, tuple[str, ...]]]:
+    pings: dict[str, tuple[int, tuple[str, ...]]] = {}
     _topic, key = recently_online_transport()
     for record in records:
         timestamp = record.get("time")
@@ -3721,20 +4186,44 @@ def recently_online_pings(
             type(timestamp) is not int
             or not now - RECENTLY_ONLINE_INTERVAL_SECONDS < timestamp <= now
             or not isinstance(packet, str)
-            or len(packet) != 60
+            or not 40 <= len(packet) <= MAX_ENCRYPTED_PACKET_CHARS
         ):
             continue
         try:
             raw = base64.b64decode(packet, validate=True)
-            if len(raw) != 45 or raw[0] != 1:
+            if len(raw) < 29 or raw[0] != RECENTLY_ONLINE_VERSION:
                 continue
-            token = ChaCha20Poly1305(key).decrypt(
-                raw[1:13], raw[13:], b"SpriteLink-recently-online-v1"
-            ).hex()
+            payload = json.loads(ChaCha20Poly1305(key).decrypt(
+                raw[1:13], raw[13:], RECENTLY_ONLINE_AAD
+            ))
+            if not isinstance(payload, dict):
+                continue
+            token, topics = payload.get("token"), payload.get("topics")
+            if (
+                not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)
+                or not isinstance(topics, list) or not topics
+                or any(
+                    not isinstance(topic, str) or not re.fullmatch(r"e2chat-[a-z2-7]{39}", topic)
+                    for topic in topics
+                )
+            ):
+                continue
         except Exception:
             continue
-        pings[token] = max(timestamp, pings.get(token, timestamp))
+        # Use the newest retry's room list, regardless of relay response order.
+        if token not in pings or timestamp >= pings[token][0]:
+            pings[token] = (timestamp, tuple(sorted(set(topics))))
     return pings
+
+
+def recently_online_topic_counts(
+    pings: dict[str, tuple[int, tuple[str, ...]]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for _timestamp, topics in pings.values():
+        for topic in topics:
+            counts[topic] = counts.get(topic, 0) + 1
+    return counts
 
 
 def derive_message_key(passphrase: str, salt: bytes) -> bytes:
@@ -3752,17 +4241,8 @@ def derive_message_key(passphrase: str, salt: bytes) -> bytes:
 
 
 def make_opaque_packet(message: dict[str, Any], passphrase: str) -> str:
-    """
-    Compress, length-prefix, randomly pad, and encrypt one message.
-
-    Binary layout:
-      1 byte  packet version
-      16 bytes random scrypt salt
-      12 bytes random ChaCha20-Poly1305 nonce
-      remaining authenticated ciphertext
-
-    The plaintext is padded to a 128-byte boundary so the exact text length is
-    less obvious. The final packet is URL-safe Base64 for ntfy text transport.
+    """Compress JSON, pad to 128-byte blocks, encrypt as URL-safe Base64.
+    Layout: version (1 byte), salt (16), nonce (12), authenticated ciphertext.
     """
     raw_json = json.dumps(
         message,
@@ -3794,14 +4274,7 @@ def make_opaque_packet(message: dict[str, Any], passphrase: str) -> str:
 
 
 def estimate_opaque_packet_size(message: dict[str, Any]) -> int:
-    """
-    Calculate the exact UTF-8 byte length of the packet that make_opaque_packet()
-    will produce, without running Scrypt or encryption.
-
-    ChaCha20-Poly1305 ciphertext is always plaintext length + 16 bytes, and all
-    other packet fields have fixed sizes, so the final unpadded Base64 length is
-    deterministic after JSON serialization, compression, and padding.
-    """
+    """Exact UTF-8 packet size without Scrypt/encryption; AEAD adds 16 bytes."""
     raw_json = json.dumps(
         message,
         ensure_ascii=False,
@@ -3935,7 +4408,6 @@ def newest_first_ntfy_records(
 
 
 class ValueModel:
-    """Small get/set model used to keep network and UI state decoupled."""
 
     def __init__(self, value: Any) -> None:
         self._value = value
@@ -3957,7 +4429,7 @@ class ValueModel:
 
 
 class DaemonTaskPool:
-    """Small fixed-size worker pool whose tasks cannot hold process exit."""
+    """Daemon workers never delay process exit."""
 
     def __init__(self, max_workers: int, thread_name_prefix: str) -> None:
         self._tasks: queue.Queue[Any] = queue.Queue()
@@ -4204,7 +4676,7 @@ class ClickableProgressBar(QProgressBar):
 
 
 class ClickableSubmenuMenu(QMenu):
-    """Let a submenu-bearing row retain its own direct click action."""
+    """Allow direct clicks on submenu-bearing rows."""
 
     def mouseReleaseEvent(self, event: Any) -> None:
         action = self.actionAt(event.position().toPoint())
@@ -4221,7 +4693,6 @@ class ClickableSubmenuMenu(QMenu):
 
 
 class SpoilerFormatButton(QPushButton):
-    """Show the revealed spoiler block treatment behind the button text."""
 
     def paintEvent(self, _event: Any) -> None:
         option = QStyleOptionButton()
@@ -4311,8 +4782,7 @@ class ConfigOverlay(QWidget):
         self.update()
 
     def schedule_background_refresh(self) -> None:
-        # Capture after stylesheet, composer and layout updates have settled.
-        # Repeated resize events share one pending capture.
+        # Coalesce captures until layout settles.
         if self._glassy and self.isVisible():
             self._background_refresh_timer.start()
 
@@ -4329,10 +4799,9 @@ class ConfigOverlay(QWidget):
         if source.isNull():
             return None
 
-        # Glassy captures retain the translucent palette/stylesheet alpha.
-        # Flatten before blurring so sharp live controls cannot show through
-        # the blurred composer, even away from the padded window edges.
-        background = shift_theme_color(QColor(224, 240, 250))
+        # Flatten translucent captures before blur to hide sharp controls beneath.
+        app = QApplication.instance()
+        background = shift_theme_color(QColor("#262b31") if app is not None and app.property("spritelinkGlassyDark") else QColor(224, 240, 250))
         opaque_source = QPixmap(source.size())
         opaque_source.setDevicePixelRatio(source.devicePixelRatio())
         opaque_source.fill(background)
@@ -4364,12 +4833,8 @@ class ConfigOverlay(QWidget):
         padded.setDevicePixelRatio(device_ratio)
         padded.fill(Qt.GlobalColor.transparent)
 
-        # A blur fades toward transparency outside its source. Without a
-        # gutter, the live unblurred controls beneath this overlay show
-        # through along the window edges. Stretch each outermost source row
-        # and column into the gutter so the blur stays opaque everywhere.
-        # QPainter pixmap source rectangles use physical pixels; destination
-        # rectangles and graphics-scene bounds use device-independent units.
+        # Extend edge pixels into a gutter to keep blur opaque.
+        # Source pixels are physical; destinations and scene bounds use logical units.
         source_pixel_width = float(source.width())
         source_pixel_height = float(source.height())
         source_rect = QRectF(
@@ -4463,7 +4928,6 @@ class ConfigOverlay(QWidget):
 
         blurred = QPixmap(source.size())
         blurred.setDevicePixelRatio(device_ratio)
-        # Also cover any rounding/blur-kernel transparency at the crop edge.
         blurred.fill(background)
         painter = QPainter(blurred)
         painter.drawPixmap(
@@ -4484,21 +4948,20 @@ class ConfigOverlay(QWidget):
             self._blurred_background = None
             return
 
-        was_visible = self.isVisible()
-        focused_widget = QApplication.focusWidget() if was_visible else None
-        if was_visible:
-            super().hide()
-        try:
-            self._blurred_background = self._blur_pixmap(parent.grab())
-        finally:
-            if was_visible:
-                super().show()
-                self.raise_()
-                if (
-                    focused_widget is not None
-                    and self.isAncestorOf(focused_widget)
-                ):
-                    focused_widget.setFocus()
+        # Capture without hiding the overlay to preserve its alpha backing store.
+        ratio = parent.devicePixelRatioF()
+        capture = QPixmap(parent.size() * ratio)
+        capture.setDevicePixelRatio(ratio)
+        capture.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(capture)
+        parent.render(painter, QPoint(), QRegion(), QWidget.RenderFlag.DrawWindowBackground)
+        for child in parent.findChildren(QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly):
+            if child is self or not child.isVisible():
+                continue
+            child.render(painter, child.pos(), QRegion(),
+                         QWidget.RenderFlag.DrawWindowBackground | QWidget.RenderFlag.DrawChildren)
+        painter.end()
+        self._blurred_background = self._blur_pixmap(capture)
         self.update()
 
     def show(self) -> None:
@@ -4508,9 +4971,7 @@ class ConfigOverlay(QWidget):
     def paintEvent(self, event: Any) -> None:
         if self._glassy and self._blurred_background is not None:
             painter = QPainter(self)
-            # Cover the full overlay while a resized capture is queued.
             painter.drawPixmap(self.rect(), self._blurred_background)
-            painter.fillRect(self.rect(), QColor(20, 54, 76, 82))
             painter.end()
             return
         super().paintEvent(event)
@@ -4639,7 +5100,9 @@ class ChatroomDetailsDialog(QDialog):
             + (f" {history_note}" if history_note else "")
         )
         key_hint.setWordWrap(True)
-        key_hint.setStyleSheet("color: #777777; font-size: 8pt;")
+        app = QApplication.instance()
+        hint_color = "#aab4bd" if app is not None and app.property("spritelinkGlassyDark") else "#777777"
+        key_hint.setStyleSheet(f"color: {hint_color}; font-size: 8pt;")
         form.addWidget(key_hint, 2, 1, 1, 2)
         layout.addLayout(form)
 
@@ -4661,6 +5124,155 @@ class ChatroomDetailsDialog(QDialog):
 
     def chatroom_key(self) -> str:
         return self.key_entry.text()
+
+
+class EditChatroomDialog(ChatroomDetailsDialog):
+    def __init__(self, client: Any, room_id: str, **kwargs: Any) -> None:
+        super().__init__(client.root, title="Edit Chatroom", submit_label="Save", **kwargs)
+        self.client = client
+        self.settings = client_room_settings(client, room_id)
+        if room_id == GLOBAL_CHATROOM_ID:
+            self.name_entry.setEnabled(False)
+            self.key_entry.setEnabled(False)
+
+        panel = QWidget(self)
+        form = QGridLayout(panel)
+        form.setContentsMargins(0, 8, 0, 8)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(client._config_row_spacing())
+        form.setColumnStretch(1, 1)
+        self.layout().insertWidget(1, panel)
+        form.addWidget(client._heading("Appearance"), 0, 0, 1, 3)
+        form.addWidget(QLabel("Color"), 1, 0)
+        self.color_default = QCheckBox("Default")
+        self.color_default.setAccessibleName("Use Config theme color")
+        form.addWidget(self.color_default, 1, 1)
+        self.color_control = QWidget()
+        color_layout = QHBoxLayout(self.color_control)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.setSpacing(6)
+        self.color_label = QLabel()
+        self.color_slider = ThemeSlider(Qt.Orientation.Horizontal)
+        self.color_slider.setAccessibleName("Chatroom theme color")
+        self.color_slider.setMinimumWidth(64)
+        self.color_slider.setMaximumWidth(112)
+        color_layout.addWidget(self.color_label)
+        color_layout.addWidget(self.color_slider, 1)
+        form.addWidget(self.color_control, 1, 2)
+
+        form.addWidget(client._heading("Notifications"), 2, 0, 1, 3)
+        form.addWidget(QLabel("Message Sound"), 3, 0)
+        self.sound_combo = ThemeComboBox()
+        self.sound_combo.addItems(["Default", *MESSAGE_SOUND_OPTIONS])
+        self.sound_combo.setCurrentText(self.settings["message_sound"])
+        form.addWidget(self.sound_combo, 3, 1, 1, 2)
+        form.addWidget(QLabel("Volume"), 4, 0)
+        self.volume_default = QCheckBox("Default")
+        self.volume_default.setAccessibleName("Use Config message sound volume")
+        self.volume_default.setChecked(self.settings["message_sound_volume"] is None)
+        form.addWidget(self.volume_default, 4, 1)
+        volume_control = QWidget()
+        volume_layout = QHBoxLayout(volume_control)
+        volume_layout.setContentsMargins(0, 0, 0, 0)
+        volume_layout.setSpacing(6)
+        self.volume_label = QLabel()
+        self.volume_slider = ThemeSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setAccessibleName("Chatroom message sound volume")
+        self.volume_slider.setRange(1, 10)
+        self.volume_slider.setSingleStep(1)
+        self.volume_slider.setPageStep(1)
+        self.volume_slider.setMinimumWidth(64)
+        self.volume_slider.setMaximumWidth(112)
+        self.volume_slider.setValue(self.sound_settings()[1] // 10)
+        self.volume_slider.setEnabled(not self.volume_default.isChecked())
+        self.volume_label.setText(f"{self.volume_slider.value() * 10}%")
+        volume_layout.addWidget(self.volume_label)
+        volume_layout.addWidget(self.volume_slider, 1)
+        form.addWidget(volume_control, 4, 2)
+
+        self.color_default.toggled.connect(self._set_color_default)
+        self.color_slider.valueChanged.connect(self._set_color)
+        self.sound_combo.textActivated.connect(self._select_sound)
+        self.volume_default.toggled.connect(self._set_volume_default)
+        self.volume_slider.valueChanged.connect(self._set_volume)
+        self.finished.connect(client._stop_message_sound)
+        self._sync_color()
+
+    def _theme(self) -> str:
+        return str(self.client.theme_var.get())
+
+    def _sync_color(self, *_args: Any) -> None:
+        theme = self._theme()
+        colors = self.settings["theme_colors"]
+        position = colors.get(theme, client_theme_color(self.client, theme, use_room=False))
+        classic = theme == "Classic"
+        self.color_default.blockSignals(True)
+        self.color_default.setChecked(theme not in colors)
+        self.color_default.blockSignals(False)
+        slider = self.color_slider
+        slider.blockSignals(True)
+        slider.setRange(0, len(CLASSIC_COLOR_SCHEMES) - 1 if classic else 359)
+        slider.setSingleStep(1)
+        slider.setPageStep(1 if classic else 15)
+        slider.setTickPosition(QSlider.TickPosition.TicksBelow if classic else QSlider.TickPosition.NoTicks)
+        slider.setTickInterval(1 if classic else 0)
+        slider.setValue(position)
+        slider.blockSignals(False)
+        slider.setEnabled(theme in colors)
+        slider.setProperty("spritelinkPreviewHue", None if classic else position)
+        slider.setProperty("spritelinkPreviewClassicColor", position if classic else None)
+        self.color_label.setText(CLASSIC_COLOR_SCHEMES[position]["name"] if classic else "")
+        slider.setToolTip(CLASSIC_COLOR_SCHEMES[position]["name"] if classic else "")
+        slider.update()
+
+    def _set_color_default(self, checked: bool) -> None:
+        theme = self._theme()
+        if checked:
+            self.settings["theme_colors"].pop(theme, None)
+        else:
+            self.settings["theme_colors"][theme] = self.color_slider.value()
+        self._sync_color()
+
+    def _set_color(self, value: int) -> None:
+        self.settings["theme_colors"][self._theme()] = value
+        self._sync_color()
+
+    def sound_settings(self) -> tuple[str, int, str]:
+        settings = self.settings
+        inherited = settings["message_sound"] == "Default"
+        return (
+            str(self.client.message_sound_var.get()) if inherited else settings["message_sound"],
+            int(self.client.message_sound_volume_var.get()) if settings["message_sound_volume"] is None
+            else settings["message_sound_volume"],
+            str(self.client.custom_message_sound_path_var.get()) if inherited
+            else settings["custom_message_sound_path"],
+        )
+
+    def _select_sound(self, value: str) -> None:
+        if value == "Custom":
+            dialog = QFileDialog(self, "Choose message sound")
+            dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+            dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+            dialog.setNameFilter("Audio files (*.wav *.mp3 *.ogg)")
+            if self.client._exec_themed_file_dialog(dialog) != QDialog.DialogCode.Accepted or not dialog.selectedFiles():
+                self.sound_combo.setCurrentText(self.settings["message_sound"])
+                return
+            self.settings["custom_message_sound_path"] = dialog.selectedFiles()[0]
+        self.settings["message_sound"] = value
+        self.client._play_message_sound(report_errors=True, settings=self.sound_settings())
+
+    def _set_volume_default(self, checked: bool) -> None:
+        self.settings["message_sound_volume"] = None if checked else self.volume_slider.value() * 10
+        self.volume_slider.setEnabled(not checked)
+        self.volume_slider.setValue(self.sound_settings()[1] // 10)
+        self.volume_label.setText(f"{self.volume_slider.value() * 10}%")
+        self.client._play_message_sound(report_errors=True, settings=self.sound_settings())
+
+    def _set_volume(self, value: int) -> None:
+        if not self.volume_default.isChecked():
+            self.settings["message_sound_volume"] = value * 10
+        self.volume_label.setText(f"{value * 10}%")
+        self.client._play_message_sound(report_errors=True, settings=self.sound_settings())
 
 
 class JoinChatroomDialog(QDialog):
@@ -4787,8 +5399,7 @@ class ChatroomListWidget(QListWidget):
         self._dragged_row = -1
 
     def refresh_row_sizes(self) -> None:
-        # Item widgets own their margins. Recalculate their height after a
-        # theme/font change instead of retaining the old font's size hint.
+        # Recompute row heights after font/theme changes.
         for index in range(self.count()):
             item = self.item(index)
             row = self.itemWidget(item)
@@ -4891,8 +5502,7 @@ class ChatroomListWidget(QListWidget):
                     insertion_row,
                 ),
             )
-        # The configuration/list rebuild performs the move. Report Ignore to
-        # Qt's InternalMove source so it does not also delete the dragged row.
+        # Ignore Qt InternalMove cleanup; the configuration rebuild already moved the row.
         event.setDropAction(Qt.DropAction.IgnoreAction)
         event.accept()
 
@@ -5030,9 +5640,8 @@ def next_poll_room_id(
     if now - active_last_poll >= active_poll_deadline:
         return active_room_id
 
-    # Finish the first manual pass for ordinary rooms before stream activity
-    # can favor rooms that have already been checked. Muted inactive rooms
-    # deliberately wait for their long timer before their first poll.
+    # Poll ordinary rooms once before prioritizing stream activity.
+    # Muted inactive rooms wait for their timer.
     never_polled_room_ids = [
         room_id for room_id in regular_room_ids
         if room_id not in last_poll_times
@@ -5067,8 +5676,7 @@ def next_poll_room_id(
     manual_check_deadline = (
         max(0.0, poll_interval) * max(1, len(regular_room_ids))
     )
-    # Once the active-room reservation is satisfied, an overdue ordinary room
-    # gets the next global request slot so passive checks keep progressing.
+    # After reserving the active slot, serve overdue rooms to prevent starvation.
     if (
         now - last_poll_times[oldest_room_id]
         >= manual_check_deadline
@@ -5114,7 +5722,6 @@ def subscription_room_ids(
 
 
 class TextShadowProxyStyle(QProxyStyle):
-    """Theme outlines and optional subtle shadows for standard Qt widgets."""
 
     def pixelMetric(self, metric, option=None, widget=None) -> int:
         app = QApplication.instance()
@@ -5182,11 +5789,11 @@ class TextShadowProxyStyle(QProxyStyle):
         if (element != QStyle.PrimitiveElement.PE_IndicatorCheckBox
                 or app is None or not bool(app.property("spritelinkGlassy"))):
             return
-        # Preserve Fusion's checked/mixed glyph and add a reliable outline
-        # even when the translucent palette makes its native frame faint.
+        # Preserve checked/mixed glyphs; outline faint translucent frames.
         enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
-        color = shift_theme_color("#496f87" if enabled else "#7391a4")
-        if enabled and option.state & (
+        dark = bool(app.property("spritelinkGlassyDark"))
+        color = QColor("#000000") if dark else shift_theme_color("#496f87" if enabled else "#7391a4")
+        if not dark and enabled and option.state & (
             QStyle.StateFlag.State_MouseOver | QStyle.StateFlag.State_HasFocus
         ):
             color = shift_theme_color("#246a92")
@@ -5253,7 +5860,6 @@ class TextShadowProxyStyle(QProxyStyle):
 
 
 class ThemeSlider(QSlider):
-    """Keep native interaction and paint theme-colored handles."""
 
     def paintEvent(self, event: Any) -> None:
         super().paintEvent(event)
@@ -5264,8 +5870,6 @@ class ThemeSlider(QSlider):
         self.initStyleOption(option)
         position = self.property("spritelinkPreviewClassicColor")
         if bool(app.property("spritelinkWindowsClassic")) and position is not None:
-            # Repaint only the native thumb using the selected scheme's bevel
-            # and face colors. The track and application palette stay untouched.
             scheme = CLASSIC_COLOR_SCHEMES[int(position)]
             for role, key in (
                 (QPalette.ColorRole.Window, "face"), (QPalette.ColorRole.Button, "face"),
@@ -5275,8 +5879,7 @@ class ThemeSlider(QSlider):
                 option.palette.setColor(role, QColor(scheme[key]))
             option.subControls = QStyle.SubControl.SC_SliderHandle
             painter = QPainter(self)
-            # Some native styles fill the entire slider background even when
-            # only its handle is requested. Protect the groove/ticks/focus.
+            # Native handle painting may fill the background; clip to protect the track.
             painter.setClipRect(self.style().subControlRect(
                 QStyle.ComplexControl.CC_Slider, option,
                 QStyle.SubControl.SC_SliderHandle, self,
@@ -5290,9 +5893,7 @@ class ThemeSlider(QSlider):
             QStyle.ComplexControl.CC_Slider, option,
             QStyle.SubControl.SC_SliderHandle, self,
         )
-        # Snap the outside to physical pixels, then inset the shared fill/stroke
-        # path by half a pen width. This keeps opposite corners symmetrical
-        # at fractional scaling without stacking two rounded stylesheet edges.
+        # Snap edges to physical pixels and inset by half a pen for symmetric corners.
         ratio = self.devicePixelRatioF()
         rect = QRectF(
             round(handle.x() * ratio) / ratio,
@@ -5302,7 +5903,6 @@ class ThemeSlider(QSlider):
         ).adjusted(0.5, 0.5, -0.5, -0.5)
         enabled = self.isEnabled()
         highlighted = self.hasFocus() or handle.contains(self.mapFromGlobal(QCursor.pos()))
-        # A Color slider can preview its own thumb without restyling the app.
         degrees = self.property("spritelinkPreviewHue")
         if degrees is None:
             degrees = int(app.property("spritelinkThemeHue") or 0)
@@ -5318,12 +5918,13 @@ class ThemeSlider(QSlider):
             painter.drawEllipse(rect.center(), radius, radius)
             painter.end()
             return
-        border = shift_theme_color("#496f87" if enabled else "#7391a4", degrees)
-        if enabled and highlighted:
+        dark = bool(app.property("spritelinkGlassyDark"))
+        border = QColor("#000000") if dark else shift_theme_color("#496f87" if enabled else "#7391a4", degrees)
+        if not dark and enabled and highlighted:
             border = shift_theme_color("#246a92", degrees)
         gradient = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-        gradient.setColorAt(0, shift_theme_color("#ffffff" if enabled else "#e6eef3", degrees))
-        gradient.setColorAt(1, shift_theme_color("#99c5e1" if enabled else "#dae7ef", degrees))
+        gradient.setColorAt(0, shift_theme_color(("#919ca7" if enabled else "#525b64") if dark else ("#ffffff" if enabled else "#e6eef3"), degrees))
+        gradient.setColorAt(1, shift_theme_color(("#3f5365" if enabled else "#303d49") if dark else ("#99c5e1" if enabled else "#dae7ef"), degrees))
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(border, 1.0))
@@ -5333,13 +5934,11 @@ class ThemeSlider(QSlider):
 
 
 class ThemeComboBox(QComboBox):
-    """Config combo box with theme arrows and no wheel changes."""
 
     def showPopup(self) -> None:
         popup = self.view().window()
         if popup.objectName() != "comboPopup":
-            # The generic translucent QFrame rule must not style the popup's
-            # outside padding. An explicit ID takes precedence over it.
+            # Override generic QFrame styling on popup padding.
             popup.setObjectName("comboPopup")
             popup.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             popup.style().unpolish(popup)
@@ -5347,8 +5946,6 @@ class ThemeComboBox(QComboBox):
         super().showPopup()
 
     def wheelEvent(self, event: Any) -> None:
-        # Let a containing scroll area handle the wheel without changing the
-        # selected setting under the pointer.
         event.ignore()
 
     def paintEvent(self, event: Any) -> None:
@@ -5386,13 +5983,12 @@ class ThemeComboBox(QComboBox):
         ])
         painter = QPainter(self)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#000000") if windows_classic else shift_theme_color("#24485f"))
+        painter.setBrush(QColor("#000000") if windows_classic else shift_theme_color("#dce5ed" if app.property("spritelinkGlassyDark") else "#24485f"))
         painter.drawPolygon(arrow)
         painter.end()
 
 
 class NoFocusRectItemDelegate(QStyledItemDelegate):
-    """Draw selected font entries without Qt's dotted focus rectangle."""
 
     def paint(
         self,
@@ -5475,7 +6071,7 @@ class IdentityPresetSelector(QPushButton):
             if preset_icon is not None:
                 item.setIcon(preset_icon)
             item.setData(Qt.ItemDataRole.UserRole, preset["id"])
-            item.setForeground(QColor(preset["username_color"]))
+            item.setForeground(QColor(message_display_color(preset["username_color"])))
             self.preset_list.addItem(item)
             if preset["id"] == selected_id:
                 selected_preset = preset
@@ -5494,7 +6090,7 @@ class IdentityPresetSelector(QPushButton):
         )
         self.setIcon(selected_icon or QIcon())
         self.setStyleSheet(
-            f"color: {selected_preset['username_color']};"
+            f"color: {message_display_color(selected_preset['username_color'])};"
         )
         if self.popup.isVisible():
             self._resize_popup_to_contents()
@@ -5572,8 +6168,19 @@ class IdentityPresetSelector(QPushButton):
         self.newRequested.emit()
 
 
+class CollapsedTextFade(QTextBlockUserData):
+    def __init__(self, width: int, layout: QTextLayout) -> None:
+        super().__init__()
+        self.width = width
+        self.layout = layout
+        self.left = layout.position().x()
+        self.dirty = False
+        self.source_formats: list[tuple[str, QTextCharFormat]] = []
+        self.formats: list[QTextLayout.FormatRange] = []
+        self.shadow_formats: list[QTextLayout.FormatRange] = []
+
+
 class MessageLogBrowser(QTextBrowser):
-    """Complete full-width row selections across paragraph left margins."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -5582,9 +6189,15 @@ class MessageLogBrowser(QTextBrowser):
             int,
             tuple[QColor, int, int],
         ] = {}
-        self.collapsed_fade_blocks: dict[int, QColor] = {}
+        self.collapsed_fade_blocks: set[int] = set()
+        self._fade_opacity_width = -1
+        self._fade_opacities: tuple[int, ...] = ()
+        self._has_collapsed_fades = False
+        self._fade_document = self.document()
+        self._fade_document.contentsChange.connect(self._invalidate_collapsed_text_fades)
         self.unread_divider_block_number: int | None = None
         self.unread_divider_alpha = 255
+        self.show_unread_bottom_edge = False
         self.horizontalScrollBar().rangeChanged.connect(
             self._lock_horizontal_scroll
         )
@@ -5600,11 +6213,31 @@ class MessageLogBrowser(QTextBrowser):
         scrollbar.setValue(0)
         scrollbar.blockSignals(signals_were_blocked)
 
+    def setDocument(self, document: QTextDocument) -> None:
+        previous = getattr(self, "_fade_document", None)
+        if previous is not None:
+            previous.contentsChange.disconnect(self._invalidate_collapsed_text_fades)
+        self._has_collapsed_fades = False
+        super().setDocument(document)
+        self._fade_document = document
+        document.contentsChange.connect(self._invalidate_collapsed_text_fades)
+
+    def _invalidate_collapsed_text_fades(self, position: int, _removed: int, added: int) -> None:
+        if not self._has_collapsed_fades:
+            return
+        document = self.document()
+        block = document.findBlock(position)
+        end = position + added
+        while block.isValid() and block.position() <= end:
+            cache = block.userData()
+            if isinstance(cache, CollapsedTextFade):
+                cache.dirty = True
+            block = block.next()
+
     def _block_content_vertical_bounds(
         self,
         block: Any,
     ) -> tuple[int, int]:
-        """Return text-layout bounds without the block's outer margins."""
         layout = block.layout()
         if layout is not None:
             content_rect = layout.boundingRect().translated(
@@ -5615,9 +6248,7 @@ class MessageLogBrowser(QTextBrowser):
                 self.document().documentLayout().blockBoundingRect(block)
             )
 
-        # Separator margin bands are painted separately after Qt draws the
-        # document, so this helper deliberately keeps the content-only layout
-        # rectangle for that path.
+        # Return content bounds; separator margins are painted separately.
         aligned_rect = content_rect.toAlignedRect()
         scroll_y = self.verticalScrollBar().value()
         painted_top = aligned_rect.top() - scroll_y
@@ -5626,14 +6257,13 @@ class MessageLogBrowser(QTextBrowser):
 
     @staticmethod
     def _nearest_pixel_edge(value: float) -> int:
-        """Resolve one document edge without creating overlapping rows."""
         return int(math.floor(float(value) + 0.5))
 
     def _block_row_vertical_bounds(
         self,
         block: Any,
     ) -> tuple[int, int]:
-        """Return shared row edges, assigning top margins to their own row."""
+        """Assign top margins to their row when resolving shared edges."""
         document_layout = self.document().documentLayout()
         block_rect = document_layout.blockBoundingRect(block)
         next_block = block.next()
@@ -5644,9 +6274,7 @@ class MessageLogBrowser(QTextBrowser):
         else:
             bottom_edge = block_rect.top() + block_rect.height()
 
-        # Round each shared edge once. Aligning every QRect independently
-        # makes neighboring rows overlap whenever their coordinates are
-        # fractional, so the later alternating color steals an edge pixel.
+        # Round shared edges once to avoid overlapping fractional rows.
         scroll_y = self.verticalScrollBar().value()
         top_edge = block_rect.top() - block.blockFormat().topMargin()
         painted_top = self._nearest_pixel_edge(top_edge) - scroll_y
@@ -5663,7 +6291,7 @@ class MessageLogBrowser(QTextBrowser):
         block: Any,
         layout: QTextLayout,
     ) -> QRegion:
-        """Exclude inline images while retaining their layout space."""
+        """Retain inline-image layout without painting images."""
         clip_region = event.region()
         block_text = block.text()
         if "\ufffc" not in block_text:
@@ -5703,6 +6331,117 @@ class MessageLogBrowser(QTextBrowser):
         self._lock_horizontal_scroll()
         super().scrollContentsBy(0, dy)
 
+    @staticmethod
+    def _append_fade_format(
+        ranges: list[QTextLayout.FormatRange], start: int, length: int, color: QColor,
+    ) -> None:
+        if (ranges and ranges[-1].start + ranges[-1].length == start
+                and ranges[-1].format.foreground().color() == color):
+            ranges[-1].length += length
+            return
+        item = QTextLayout.FormatRange()
+        item.start = start
+        item.length = length
+        item.format.setForeground(color)
+        ranges.append(item)
+
+    def _build_collapsed_text_fade(self, block: Any, width: int) -> CollapsedTextFade:
+        layout = block.layout()
+        cache = CollapsedTextFade(width, layout)
+        simple_line = layout.lineCount() == 1 and block.text().isascii()
+        iterator = block.begin()
+        while not iterator.atEnd():
+            fragment = iterator.fragment()
+            if fragment.isValid():
+                cache.source_formats.append((fragment.text(), fragment.charFormat()))
+                original = fragment.charFormat().foreground().color()
+                finder = QTextBoundaryFinder(
+                    QTextBoundaryFinder.BoundaryType.Grapheme, fragment.text(),
+                )
+                start = 0
+                end = finder.toNextBoundary()
+                while end >= 0:
+                    position = fragment.position() - block.position() + start
+                    line = layout.lineForTextPosition(position)
+                    if line.isValid():
+                        center = cache.left + (
+                            line.cursorToX(position)[0]
+                            + line.cursorToX(position + end - start)[0]
+                        ) / 2
+                        opacity = self._fade_opacities[max(0, min(width - 1, round(center)))]
+                        color = QColor(original)
+                        color.setAlpha(round(original.alpha() * opacity / 255))
+                        if simple_line and opacity == 0:
+                            # The rest of a left-to-right ASCII line is also invisible.
+                            length = fragment.length() - start
+                            self._append_fade_format(cache.formats, position, length, color)
+                            self._append_fade_format(
+                                cache.shadow_formats, position, length, QColor(0, 0, 0, 0),
+                            )
+                            break
+                        if opacity < 255:
+                            self._append_fade_format(cache.formats, position, end - start, color)
+                        shadow = QColor(0, 0, 0, color.alpha())
+                        self._append_fade_format(cache.shadow_formats, position, end - start, shadow)
+                    start = end
+                    end = finder.toNextBoundary()
+            iterator += 1
+        return cache
+
+    def _ensure_collapsed_text_fades(self, event: Any) -> None:
+        if not self.collapsed_fade_blocks and not self._has_collapsed_fades:
+            return
+        width = self.viewport().width()
+        if width <= 0:
+            return
+        if self._fade_opacity_width != width:
+            start = round(width * 0.55)
+            end = max(start + 1, round(width * 0.98))
+            self._fade_opacities = tuple(
+                round(255 * max(0.0, min(1.0, (end - x) / (end - start))))
+                for x in range(width)
+            )
+            self._fade_opacity_width = width
+        document = self.document()
+        first = self.cursorForPosition(QPoint(
+            0, max(0, event.rect().top()),
+        )).block().blockNumber()
+        last = self.cursorForPosition(QPoint(
+            width - 1, min(self.viewport().height() - 1, event.rect().bottom()),
+        )).block().blockNumber()
+        for number in range(max(0, first - 1), min(document.blockCount(), last + 2)):
+            block = document.findBlockByNumber(number)
+            cache = block.userData()
+            if number not in self.collapsed_fade_blocks:
+                if isinstance(cache, CollapsedTextFade):
+                    block.layout().clearFormats()
+                    block.setUserData(None)
+                    document.markContentsDirty(block.position(), block.length())
+                continue
+            document.documentLayout().blockBoundingRect(block)
+            layout = block.layout()
+            if (isinstance(cache, CollapsedTextFade) and cache.width == width
+                    and cache.layout is layout
+                    and cache.left == layout.position().x()):
+                if not cache.dirty:
+                    continue
+                source_formats = []
+                iterator = block.begin()
+                while not iterator.atEnd():
+                    fragment = iterator.fragment()
+                    if fragment.isValid():
+                        source_formats.append((fragment.text(), fragment.charFormat()))
+                    iterator += 1
+                if source_formats == cache.source_formats:
+                    cache.dirty = False
+                    continue
+            cache = self._build_collapsed_text_fade(block, width)
+            self._has_collapsed_fades = True
+            block.setUserData(cache)
+            layout.setFormats(cache.formats)
+            # Additional formats invalidate layout; alpha leaves geometry unchanged.
+            document.markContentsDirty(block.position(), block.length())
+
     def _paint_text_shadows(self, event: Any) -> None:
         app = QApplication.instance()
         if (
@@ -5733,10 +6472,7 @@ class MessageLogBrowser(QTextBrowser):
             last_block + 1,
         )
 
-        # Enforce opacity on the painter as well as the format. QTextLayout
-        # can use its default foreground for characters outside an explicit
-        # format range on wrapped lines; painter opacity guarantees those
-        # fallback glyphs can never become opaque black.
+        # Painter opacity also covers wrapped glyphs without explicit formats.
         shadow_color = QColor(0, 0, 0)
         shadow_format = QTextCharFormat()
         shadow_format.setForeground(shadow_color)
@@ -5745,10 +6481,7 @@ class MessageLogBrowser(QTextBrowser):
         transparent_spoiler_format.setBackground(QColor(0, 0, 0, 0))
         painter = QPainter(viewport)
         painter.setClipRegion(event.region())
-        # QTextLayout already retains its absolute document position.  The
-        # draw origin must therefore contain only the viewport's scroll
-        # offset; adding each block position again makes the shadow drift
-        # downward by another line for every message.
+        # QTextLayout includes block position; add only the viewport scroll offset.
         layout_origin = QPointF(
             -self.horizontalScrollBar().value(),
             -self.verticalScrollBar().value(),
@@ -5783,6 +6516,10 @@ class MessageLogBrowser(QTextBrowser):
                     shadow_ranges.append(shadow_range)
                 iterator += 1
 
+            fade = block.userData()
+            if block_number in self.collapsed_fade_blocks and isinstance(fade, CollapsedTextFade):
+                shadow_ranges = fade.shadow_formats
+
             if not shadow_ranges:
                 continue
 
@@ -5800,7 +6537,6 @@ class MessageLogBrowser(QTextBrowser):
         painter.end()
 
     def _paint_spoilers(self, event: Any) -> None:
-        """Paint spoiler formatting independently from optional shadows."""
         viewport = self.viewport()
         viewport_width = viewport.width()
         viewport_height = viewport.height()
@@ -5938,7 +6674,6 @@ class MessageLogBrowser(QTextBrowser):
         painter.end()
 
     def _paint_row_background_padding(self, event: Any) -> None:
-        """Paint block-margin bands after Qt clears the document viewport."""
         if not self.row_background_padding_blocks:
             return
 
@@ -5949,8 +6684,7 @@ class MessageLogBrowser(QTextBrowser):
         for block_number, padding in (
             self.row_background_padding_blocks.items()
         ):
-            # The full-width row painter already includes both margins.
-            # Repainting a translucent band would increase its opacity.
+            # Row painting includes margins; another translucent pass would darken them.
             if block_number in self.row_background_blocks:
                 continue
             background, top_padding, bottom_padding = padding
@@ -5980,7 +6714,6 @@ class MessageLogBrowser(QTextBrowser):
         painter.end()
 
     def _paint_final_row_background_tail(self, event: Any) -> None:
-        """Extend the final message stripe through the viewport bottom."""
         if not self.row_background_blocks:
             return
 
@@ -6025,116 +6758,209 @@ class MessageLogBrowser(QTextBrowser):
         painter.end()
 
     def paintEvent(self, event: Any) -> None:
+        self._ensure_collapsed_text_fades(event)
         self._paint_row_backgrounds(event)
         super().paintEvent(event)
-        # QTextBrowser clears the document's trailing margin with its base
-        # color. If the newest row is gray, continue that stripe through the
-        # otherwise-white pixels at the bottom edge of the viewport.
+        # Extend the last stripe over QTextBrowser's trailing margin.
         self._paint_final_row_background_tail(event)
-        # QTextDocument paints block backgrounds only behind the text line,
-        # not inside block margins. These bands contain no text, so they can
-        # safely be completed after the base document paint.
+        # Qt omits backgrounds in block margins; fill them after document painting.
         self._paint_row_background_padding(event)
         self._paint_text_shadows(event)
-        # The base QTextBrowser paint can omit character backgrounds after
-        # an application-style replacement.  Text shadows previously hid
-        # that problem because their final layout redraw also happened to
-        # redraw spoilers.  Paint spoiler ranges explicitly in every mode so
-        # they remain visible when shadows start or become disabled, and so
-        # Qt's selection colors cannot replace them.
+        # Style changes can drop character backgrounds; repaint spoilers in every mode.
         self._paint_spoilers(event)
-        if not self.collapsed_fade_blocks:
-            self._paint_unread_divider(event)
-            return
-
-        viewport = self.viewport()
-        viewport_width = viewport.width()
-        viewport_height = viewport.height()
-        if viewport_width <= 0 or viewport_height <= 0:
-            return
-
-        paint_rect = event.rect()
-        first_block = self.cursorForPosition(QPoint(
-            0,
-            max(0, paint_rect.top()),
-        )).block().blockNumber()
-        last_block = self.cursorForPosition(QPoint(
-            max(0, viewport_width - 1),
-            min(viewport_height - 1, paint_rect.bottom()),
-        )).block().blockNumber()
-        first_block = max(0, first_block - 1)
-        last_block = min(
-            self.document().blockCount() - 1,
-            last_block + 1,
-        )
-
-        painter = QPainter(viewport)
-        painter.setClipRegion(event.region())
-        document_layout = self.document().documentLayout()
-        fade_start = round(viewport_width * 0.55)
-        fade_end = max(fade_start + 1, round(viewport_width * 0.98))
-        fade_brushes: dict[int, QBrush] = {}
-
-        for block_number in range(first_block, last_block + 1):
-            fade_background = self.collapsed_fade_blocks.get(block_number)
-            if fade_background is None:
-                continue
-
-            block = self.document().findBlockByNumber(block_number)
-            if not block.isValid():
-                continue
-            block_cursor = QTextCursor(block)
-            cursor_rect = self.cursorRect(block_cursor)
-            top = cursor_rect.top()
-            height = max(
-                1,
-                round(document_layout.blockBoundingRect(block).height()),
-            )
-            if top > paint_rect.bottom() or top + height < paint_rect.top():
-                continue
-
-            color_key = int(fade_background.rgba())
-            fade_brush = fade_brushes.get(color_key)
-            if fade_brush is None:
-                transparent = QColor(fade_background)
-                transparent.setAlpha(0)
-                opaque = QColor(fade_background)
-                opaque.setAlpha(255)
-                gradient = QLinearGradient(
-                    fade_start,
-                    0,
-                    fade_end,
-                    0,
-                )
-                gradient.setColorAt(0.0, transparent)
-                gradient.setColorAt(1.0, opaque)
-                fade_brush = QBrush(gradient)
-                fade_brushes[color_key] = fade_brush
-            painter.fillRect(
-                fade_start,
-                top,
-                max(0, viewport_width - fade_start),
-                height + 1,
-                fade_brush,
-            )
-        painter.end()
         self._paint_unread_divider(event)
+        if self.show_unread_bottom_edge:
+            viewport = self.viewport()
+            painter = QPainter(viewport)
+            painter.setClipRegion(event.region())
+            painter.fillRect(0, viewport.height() - 2, viewport.width(), 2, QColor("#ff8a00"))
+            painter.end()
+
+
+class SearchResultCard(QFrame):
+    def _fit_height(self) -> None:
+        layout = self.layout()
+        # Give the scroll area the full card height so it cannot compress existing cards.
+        if layout is not None:
+            height = layout.totalHeightForWidth(self.width())
+            if height >= 0 and (height != self.minimumHeight() or height != self.maximumHeight()):
+                self.setFixedHeight(height)
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self._fit_height()
+
+    def event(self, event: Any) -> bool:
+        handled = super().event(event)
+        if event.type() == QEvent.Type.LayoutRequest:
+            self._fit_height()
+        return handled
+
+
+class SearchResultMessage(QTextBrowser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._source_html = ""
+        self._preview_width = -1
+        self._shadow_document: QTextDocument | None = None
+        self._height_measurement: tuple[tuple[int, int, str], int] | None = None
+        self.setReadOnly(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setOpenLinks(False)
+        self.setOpenExternalLinks(False)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.document().setDocumentMargin(6)
+        policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def setHtml(self, text: str) -> None:
+        self._source_html = text
+        self._preview_width = -1
+        self._update_preview()
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self._update_preview()
+
+    @staticmethod
+    def _elide_preview(document: QTextDocument, width: int) -> None:
+        document.setTextWidth(width)
+        document.size()
+        first = document.begin()
+        layout = first.layout()
+        if not layout.lineCount():
+            return
+
+        # Keep the separate media block (or media cell) after the text preview.
+        cursor = QTextCursor(document)
+        block = first.next()
+        while block.isValid():
+            cursor.setPosition(block.position())
+            if cursor.currentTable() or block.text().startswith("\ufffc"):
+                break
+            block = block.next()
+
+        line_end = first.position() + layout.lineAt(0).textLength()
+        end = block.position() - 1 if block.isValid() else document.characterCount() - 1
+        if line_end >= end:
+            return
+
+        cursor.setPosition(line_end)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        # Keep the marker outside any link or concealed spoiler formatting.
+        marker_format = QTextCharFormat()
+        marker_format.setFont(cursor.charFormat().font())
+        cursor.insertText("[...]", marker_format)
+        document.size()
+        while first.layout().lineCount() > 1:
+            cut = QTextCursor(document)
+            cut.setPosition(cursor.position() - len("[...]"))
+            if cut.atBlockStart():
+                break
+            cut.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor)
+            cut.removeSelectedText()
+            document.size()
+
+    def _update_preview(self) -> None:
+        width = max(1, self.maximumViewportSize().width())
+        if width == self._preview_width:
+            return
+        self._preview_width = width
+        self._height_measurement = None
+        if self._shadow_document is not None:
+            self._shadow_document.deleteLater()
+            self._shadow_document = None
+        super().setHtml(self._source_html)
+        self._elide_preview(self.document(), width)
+        self.updateGeometry()
+
+    def _make_shadow_document(self) -> QTextDocument:
+        shadow = self.document().clone(self)
+        transparent_image = QImage(1, 1, QImage.Format.Format_ARGB32)
+        transparent_image.fill(Qt.GlobalColor.transparent)
+        image_url = QUrl("spritelink-search-shadow:transparent")
+        shadow.addResource(QTextDocument.ResourceType.ImageResource, image_url, transparent_image)
+        fragments = []
+        block = shadow.begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    fragments.append((fragment.position(), fragment.length(), fragment.charFormat()))
+                iterator += 1
+            block = block.next()
+
+        cursor = QTextCursor(shadow)
+        for position, length, formatting in fragments:
+            if formatting.isImageFormat():
+                formatting = formatting.toImageFormat()
+                formatting.setName(image_url.toString())
+            else:
+                hidden = formatting.hasProperty(QTextFormat.Property.BackgroundBrush)
+                formatting.clearBackground()
+                formatting.setForeground(QColor(Qt.GlobalColor.transparent if hidden else Qt.GlobalColor.black))
+            cursor.setPosition(position)
+            cursor.setPosition(position + length, QTextCursor.MoveMode.KeepAnchor)
+            cursor.setCharFormat(formatting)
+        return shadow
+
+    def paintEvent(self, event: Any) -> None:
+        app = QApplication.instance()
+        if app is not None and app.property("spritelinkTextShadows") and not self.textCursor().hasSelection():
+            if self._shadow_document is None:
+                self._shadow_document = self._make_shadow_document()
+            shadow = self._shadow_document
+            shadow.setTextWidth(self.document().textWidth())
+            painter = QPainter(self.viewport())
+            painter.setClipRegion(event.region())
+            painter.translate(1 - self.horizontalScrollBar().value(), 1 - self.verticalScrollBar().value())
+            painter.setOpacity(0.15)
+            shadow.drawContents(painter)
+            painter.end()
+        super().paintEvent(event)
+
+    def heightForWidth(self, width: int) -> int:
+        self.ensurePolished()
+        viewport = self.maximumViewportSize()
+        text_width = max(1, width - (self.width() - viewport.width()))
+        document = self.document()
+        key = (text_width, document.revision(), document.defaultFont().key())
+        if self._height_measurement is None or self._height_measurement[0] != key:
+            # Qt can ask about provisional widths without actually resizing the card.
+            measurement = QTextDocument()
+            measurement.setDocumentMargin(document.documentMargin())
+            measurement.setDefaultFont(document.defaultFont())
+            measurement.setHtml(self._source_html)
+            self._elide_preview(measurement, text_width)
+            self._height_measurement = key, math.ceil(measurement.size().height())
+        return self._height_measurement[1] + self.height() - viewport.height()
+
+    def sizeHint(self) -> QSize:
+        return QSize(0, self.heightForWidth(self.width()))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0)
+
+    def wheelEvent(self, event: Any) -> None:
+        event.ignore()
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         if os.name == "nt":
-            # Allocate an alpha backing store before the native HWND exists.
-            # Keep the native frame: DWM composites the client area's alpha,
-            # so no layered/frameless window or titlebar replacement is needed.
-            # The format stays fixed when themes are swapped at runtime.
+            # Allocate alpha before HWND creation; keep this format across themes for DWM.
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.close_callback: Any = None
 
     def paintEvent(self, event: Any) -> None:
-        # Clear every damaged pixel before painting translucent children;
-        # otherwise repeated repaints can accumulate tint over the backdrop.
+        # Clear damaged pixels to prevent translucent tint accumulation.
         background = self.palette().color(QPalette.ColorRole.Window)
         background.setAlpha(
             0 if bool(self.property("spritelinkDesktopBlur")) else 255
@@ -6161,6 +6987,8 @@ class RemoteMediaPreview:
     data: bytes
     kind: str
     frame: QImage | None
+    video_info: VideoInfo | None = None
+    thumbnail_attempted: bool = False
 
 
 class AnimatedMediaController(QObject):
@@ -6278,8 +7106,17 @@ class AnimatedMediaController(QObject):
 class EncryptedChatClient(QObject):
     ui_event_available = Signal()
 
-    def __init__(self, root: MainWindow) -> None:
+    def __init__(self, root: MainWindow, *, defer_startup: bool = False) -> None:
         super().__init__(root)
+        # The entry point defers optional work; embedded callers may prepare synchronously.
+        self._defer_startup = defer_startup
+        self._startup_begun = False
+        self._startup_complete = False
+        self._history_startup_ready = not defer_startup
+        self._prepared_popups: set[str] = set()
+        self._available_font_families: tuple[str, ...] | None = None
+        self.video_player: VideoPlayer | None = None
+        self.current_link_warning_url: str | None = None
         self.root = root
         self.root.setWindowTitle("SpriteLink")
         self.config_data = load_config()
@@ -6291,13 +7128,12 @@ class EncryptedChatClient(QObject):
             int(self.config_data["window_height"]),
         )
         self.root.installEventFilter(self)
-        if os.name == "nt":
+        if os.name == "nt" and not defer_startup:
             set_start_with_windows(
                 bool(self.config_data.get("start_with_windows", False))
             )
-        # Persist a newly generated signing identity before any messages are
-        # created so the authenticated ID survives a crash.
-        save_config(self.config_data)
+        # Persist signing identity before sending so it survives a crash.
+        _save_startup_config(self.config_data)
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -6313,16 +7149,9 @@ class EncryptedChatClient(QObject):
         self._basic_application_stylesheet = (
             app.styleSheet() if app is not None else ""
         )
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
-            "Accept": "application/json, application/x-ndjson",
-        })
-        self.subscription_session = requests.Session()
-        self.subscription_session.headers.update({
-            "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
-            "Accept": "application/x-ndjson, application/json",
-        })
+        self.session = None
+        self.subscription_session = None
+        self._http_session_lock = threading.Lock()
 
         self.stop_event = threading.Event()
         self.network_wakeup_event = threading.Event()
@@ -6346,7 +7175,7 @@ class EncryptedChatClient(QObject):
         self.recently_online_poll_attempts: dict[str, float] = {}
         self.recently_online_send_attempts: dict[str, float] = {}
         self.recently_online_counts: dict[str, dict[str, int]] = {}
-        self._last_recently_online_count: int | None = None
+        self._last_recently_online_counts: dict[str, int] = {}
         self.recently_online_refresh_event = threading.Event()
 
         self.network_thread: threading.Thread | None = None
@@ -6356,8 +7185,10 @@ class EncryptedChatClient(QObject):
         self.seen_client_message_ids: set[str] = set()
         self.seen_ntfy_message_ids: set[str] = set()
         self.message_log: list[dict[str, Any]] = []
+        self.pending_history_entries: list[dict[str, Any]] = []
         self.draft_message_id = uuid.uuid4().hex
         self.chatroom_drafts: dict[str, str] = {}
+        self.drawing_drafts: dict[str, tuple[int, bytes, bool, int]] = {}
         self.read_divider_message_ids: dict[str, str] = {}
         self.read_divider_visible_seconds: dict[str, float] = {}
         self._read_divider_last_tick = time.monotonic()
@@ -6382,6 +7213,7 @@ class EncryptedChatClient(QObject):
         ] = {}
         self.last_inline_animation_frame_at: dict[str, float] = {}
         self.current_image_preview_url: str | None = None
+        self.current_drawing_preview: QImage | None = None
         self.current_image_preview_client_id: str | None = None
         self.recent_chatroom_switch_times: list[float] = []
         self.rendered_history_message_limit = (
@@ -6397,6 +7229,12 @@ class EncryptedChatClient(QObject):
         self._message_render_job: dict[str, Any] | None = None
         self._rendering_message_log = False
         self._pending_live_render_message_ids: list[str] = []
+        self._history_render_pruned = False
+        self._search_generation = 0
+        self._history_load_complete = True
+        self._search_history_end: tuple[int, int, str] | None = None
+        self._unseen_live_message: tuple[tuple[int, int, str], str] | None = None
+        self._pending_search_jump: tuple[str, tuple[int, int, str]] | None = None
         self._media_rerender_in_progress = False
         self.embedded_image_preview_sizes: dict[str, tuple[int, int]] = {}
         self.history_load_executor = DaemonTaskPool(
@@ -6556,14 +7394,8 @@ class EncryptedChatClient(QObject):
         self.notification_activation_timer.timeout.connect(
             self._consume_notification_activation
         )
-        self.notification_activation_timer.start()
-        QTimer.singleShot(
-            0,
-            lambda: self._clear_desktop_notification(
-                self.active_chatroom_id,
-                force=True,
-            ),
-        )
+        if not defer_startup:
+            self._start_notification_activation()
 
         self.background_history_prune_timer = QTimer(self)
         self.background_history_prune_timer.setInterval(
@@ -6582,6 +7414,7 @@ class EncryptedChatClient(QObject):
         self.active_message_sound_effect: QSoundEffect | None = None
         self.pending_message_sound_effect: QSoundEffect | None = None
         self.pending_message_sound_name = ""
+        self.pending_message_sound_volume = DEFAULT_MESSAGE_SOUND_VOLUME
         self.pending_message_sound_report_errors = False
         self.compressed_message_sound_audio_output: (
             QAudioOutput | None
@@ -6613,6 +7446,7 @@ class EncryptedChatClient(QObject):
         self.unread_divider_timer.timeout.connect(
             self._update_unread_divider_fade
         )
+        self.unread_divider_timer.start()
 
         self.ui_event_available.connect(self._process_ui_queue)
 
@@ -6623,16 +7457,120 @@ class EncryptedChatClient(QObject):
         self._build_tray_icon()
         self._schedule_utc_midnight_reset()
         self._apply_server_preset_state()
-        self._load_saved_history_for_current_room()
+        if not defer_startup:
+            self._load_saved_history_for_current_room()
 
         self.root.close_callback = self._on_close
         QTimer.singleShot(0, self._apply_titlebar_theme)
-        QTimer.singleShot(0, self._check_for_updates)
-        self.update_check_timer.start()
+        if not defer_startup:
+            QTimer.singleShot(0, self._check_for_updates)
+            self.update_check_timer.start()
+        if not defer_startup:
+            self._start_periodic_ui_timers()
+        self.startup_timer = QTimer(self)
+        self.startup_timer.setSingleShot(True)
+        self.startup_timer.timeout.connect(self._prepare_next_startup_popup)
+        self._startup_popups = ["config", "message_limit", "image_preview", "link_warning"]
+        if not defer_startup:
+            self._prepare_http_sessions()
+            self._start_network_thread()
+
+    def prepare_after_show(self) -> None:
+        """Prepare optional features after the first paint."""
+        if self._startup_begun or self._closing:
+            return
+        self._startup_begun = True
+        self._start_notification_activation()
+        self._start_periodic_ui_timers()
+        self.startup_timer.start(50)
+        self._load_saved_history_for_current_room()
+        threading.Thread(
+            target=self._prepare_startup_services,
+            name="SpriteLinkStartupServices",
+            daemon=True,
+        ).start()
+
+    def _start_periodic_ui_timers(self) -> None:
         self.background_history_prune_timer.start()
         self.timed_mute_timer.start()
-        self.unread_divider_timer.start()
-        self._start_network_thread()
+
+    def _start_notification_activation(self) -> None:
+        self.notification_activation_timer.start()
+        QTimer.singleShot(
+            0,
+            lambda: self._clear_desktop_notification(
+                self.active_chatroom_id,
+                force=True,
+            ),
+        )
+
+    def _prepare_http_sessions(self) -> bool:
+        # Import off-thread; publish both sessions together unless exiting.
+        session = requests.Session()
+        subscription_session = requests.Session()
+        session.headers.update({
+            "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
+            "Accept": "application/json, application/x-ndjson",
+        })
+        subscription_session.headers.update({
+            "User-Agent": f"{APP_NAME}/{CONFIG_FORMAT_VERSION}",
+            "Accept": "application/x-ndjson, application/json",
+        })
+        with self._http_session_lock:
+            if self.stop_event.is_set():
+                session.close()
+                subscription_session.close()
+                return False
+            self.session = session
+            self.subscription_session = subscription_session
+        return True
+
+    def _prepare_startup_services(self) -> None:
+        if self.stop_event.is_set():
+            return
+        try:
+            if self._prepare_http_sessions():
+                with self._http_session_lock:
+                    if not self.stop_event.is_set():
+                        self._start_network_thread()
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self._queue_ui_event(("startup_error", str(exc)))
+        if not self.stop_event.is_set() and os.name == "nt":
+            register_windows_notification_protocol()
+            with _windows_startup_registry_lock:
+                if not self.stop_event.is_set():
+                    set_start_with_windows(bool(self.start_with_windows_var.get()))
+
+    def _ensure_popup(self, name: str) -> None:
+        if name in self._prepared_popups:
+            return
+        getattr(self, f"_build_{name}_popup")()
+        self._prepared_popups.add(name)
+        overlay = getattr(self, f"{name}_overlay")
+        overlay.apply_theme(self._is_glassy_theme())
+        self._apply_ui_size_to_widget_tree(overlay)
+        self._apply_layout_density()
+        if name == "config":
+            self._apply_server_preset_state()
+
+    def _prepare_next_startup_popup(self) -> None:
+        if self._closing or self._startup_complete:
+            return
+        while self._startup_popups:
+            name = self._startup_popups.pop(0)
+            if name not in self._prepared_popups:
+                self._ensure_popup(name)
+                self.startup_timer.start(25)
+                return
+        self._startup_complete = True
+        self._prepare_tray_notification_icon()
+        self._check_for_updates()
+
+    def _font_families(self) -> tuple[str, ...]:
+        if self._available_font_families is None:
+            self._available_font_families = tuple(QFontDatabase.families())
+        return self._available_font_families
 
     def _font_style_strategy(self) -> QFont.StyleStrategy:
         return (
@@ -6659,8 +7597,7 @@ class EncryptedChatClient(QObject):
         *,
         bold: bool = False,
     ) -> QFont:
-        # UI families (Segoe UI, Tahoma, etc.) must not pass through the
-        # message-font allowlist, which would silently replace them with Arial.
+        # UI fonts must bypass the message-font allowlist to avoid an Arial fallback.
         family = self._resolved_font_family(font_name) if font_name == "System" else font_name
         font = QFont(family, point_size)
         font.setBold(bold)
@@ -6673,6 +7610,42 @@ class EncryptedChatClient(QObject):
 
     def _is_tiny_ui(self) -> bool:
         return client_is_tiny_ui(self)
+
+    @staticmethod
+    def _fit_message_font_height(font: QFont, reference: QFont, preferred_size: float) -> QFont:
+        # Ink height excludes each font's different leading and line-box padding.
+        target = QFontMetricsF(reference).tightBoundingRect("Hg").height()
+        candidate = QFont(font)
+        candidate.setPointSizeF(max(TEXT_SIZE_MIN_PT, min(TEXT_SIZE_MAX_PT, preferred_size)))
+        height = QFontMetricsF(candidate).tightBoundingRect("Hg").height()
+        if target <= 0 or height <= 0:
+            return candidate
+        if abs(height - target) < 0.01:
+            return candidate
+        candidate.setPointSizeF(max(
+            TEXT_SIZE_MIN_PT,
+            min(TEXT_SIZE_MAX_PT, candidate.pointSizeF() * target / height),
+        ))
+        height = QFontMetricsF(candidate).tightBoundingRect("Hg").height()
+        best = QFont(candidate)
+        best_error = abs(height - target)
+        if best_error < 0.01:
+            return best
+        low, high = float(TEXT_SIZE_MIN_PT), float(TEXT_SIZE_MAX_PT)
+        for _ in range(9):
+            size = (low + high) / 2
+            candidate.setPointSizeF(size)
+            height = QFontMetricsF(candidate).tightBoundingRect("Hg").height()
+            error = abs(height - target)
+            if error < best_error:
+                best, best_error = QFont(candidate), error
+            if error < 0.01:
+                break
+            if height < target:
+                low = size
+            else:
+                high = size
+        return best
 
     def _make_message_font(
         self,
@@ -6713,6 +7686,14 @@ class EncryptedChatClient(QObject):
                 point_size,
                 bold=bold,
             )
+            if configured_point_size != DEFAULT_TEXT_SIZES[role] and font_name != DEFAULT_MESSAGE_FONT:
+                reference = self._make_font(
+                    self._resolved_font_family(DEFAULT_MESSAGE_FONT), configured_point_size, bold=bold,
+                )
+                cached = self._fit_message_font_height(
+                    cached, reference,
+                    base_point_size * configured_point_size / DEFAULT_TEXT_SIZES[role],
+                )
             self._message_font_cache[cache_key] = cached
         return cached
 
@@ -6816,6 +7797,8 @@ class EncryptedChatClient(QObject):
 
     def _apply_layout_density(self) -> None:
         tiny = self._is_tiny_ui()
+        if hasattr(self, "image_menu"):
+            self.image_menu.set_ui_density(tiny=tiny)
         if hasattr(self, "chat_tab") and self.chat_tab.layout() is not None:
             margin = 6 if tiny else 10
             self.chat_tab.layout().setContentsMargins(
@@ -6847,7 +7830,7 @@ class EncryptedChatClient(QObject):
             )
         if hasattr(self, "profile_icon_button"):
             self.profile_icon_button.setText(
-                "..." if tiny else "Browse..."
+                "..." if tiny else "Import..."
             )
         if hasattr(self, "config_tab") and self.config_tab.layout() is not None:
             margin = 10 if tiny else 14
@@ -6875,6 +7858,7 @@ class EncryptedChatClient(QObject):
         app = QApplication.instance()
         if app is not None:
             app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
+        app.setProperty("spritelinkGlassyDark", str(self.theme_var.get()) == "Glassy Dark")
         minimum_width, minimum_height = minimum_window_size(
             self.config_data["ui_size"]
         )
@@ -6951,7 +7935,7 @@ class EncryptedChatClient(QObject):
     def _make_link_warning_url_font(self) -> QFont:
         available_families = {
             family.casefold(): family
-            for family in QFontDatabase.families()
+            for family in self._font_families()
         }
         family = available_families.get(
             "lucida console",
@@ -6998,18 +7982,18 @@ class EncryptedChatClient(QObject):
         if self._is_windows_classic_theme():
             return "Tahoma"
         if not self._is_glassy_theme():
-            families = set(QFontDatabase.families())
-            # Static Segoe UI provides consistent regular/bold faces in Qt.
+            families = set(self._font_families())
+            # Prefer static Segoe UI for consistent regular/bold faces.
             for family in ("Segoe UI", "Segoe UI Variable"):
                 if family in families:
                     return family
         return self._basic_application_font.family()
 
     def _is_windows_classic_theme(self) -> bool:
-        return self.theme_var.get() == "Classic"
+        return str(self.theme_var.get()) == "Classic"
 
     def _is_glassy_theme(self) -> bool:
-        return self.theme_var.get() == "Glassy"
+        return str(self.theme_var.get()) in GLASSY_THEMES
 
     def _windows_classic_palette(self) -> QPalette:
         palette = QPalette()
@@ -7085,25 +8069,46 @@ class EncryptedChatClient(QObject):
             QPalette.ColorRole.Link: QColor("#006fae"),
             QPalette.ColorRole.LinkVisited: QColor("#5e4b9e"),
         }
-        degrees = client_theme_color(self, "Glassy")
+        dark = client_glassy_theme(self) == "Glassy Dark"
+        if dark:
+            colors.update({
+                QPalette.ColorRole.Window: QColor(33, 37, 42, 0),
+                QPalette.ColorRole.WindowText: QColor("#e3e7eb"),
+                QPalette.ColorRole.Base: QColor(22, 25, 30, 48),
+                QPalette.ColorRole.AlternateBase: QColor(44, 48, 53, 88),
+                QPalette.ColorRole.ToolTipBase: QColor("#222931"),
+                QPalette.ColorRole.ToolTipText: QColor("#e4e9ee"),
+                QPalette.ColorRole.Text: QColor("#e1e6eb"),
+                QPalette.ColorRole.Button: QColor("#424b55"),
+                QPalette.ColorRole.ButtonText: QColor("#e9edf0"),
+                QPalette.ColorRole.Light: QColor("#a4afb9"),
+                QPalette.ColorRole.Midlight: QColor("#6b7885"),
+                QPalette.ColorRole.Mid: QColor("#465360"),
+                QPalette.ColorRole.Dark: QColor("#202a34"),
+                QPalette.ColorRole.Shadow: QColor("#11171e"),
+                QPalette.ColorRole.Highlight: QColor("#586e80"),
+                QPalette.ColorRole.Link: QColor("#b4cadb"),
+                QPalette.ColorRole.LinkVisited: QColor("#b2a4cf"),
+                QPalette.ColorRole.PlaceholderText: QColor("#9aa5af"),
+            })
+        degrees = client_theme_color(self, client_glassy_theme(self))
         for role, color in colors.items():
             palette.setColor(role, color if role == QPalette.ColorRole.LinkVisited else shift_theme_color(color, degrees))
         palette.setColor(
             QPalette.ColorGroup.Disabled,
             QPalette.ColorRole.Text,
-            shift_theme_color(QColor(49, 68, 82, 125), degrees),
+            shift_theme_color(QColor("#87919a") if dark else QColor(49, 68, 82, 125), degrees),
         )
         palette.setColor(
             QPalette.ColorGroup.Disabled,
             QPalette.ColorRole.ButtonText,
-            shift_theme_color(QColor(49, 68, 82, 125), degrees),
+            shift_theme_color(QColor("#87919a") if dark else QColor(49, 68, 82, 125), degrees),
         )
         return palette
 
     def _modern_palette(self) -> QPalette:
         palette = QPalette(self._basic_palette)
-        # Deliberately retain Base and AlternateBase, including disabled and
-        # inactive groups, so switching to Modern never darkens the chat log.
+        # Preserve chat background colors across palette groups.
         colors = {
             QPalette.ColorRole.Window: "#f3f3f3",
             QPalette.ColorRole.WindowText: "#1b1b1b",
@@ -7130,6 +8135,13 @@ class EncryptedChatClient(QObject):
         return palette
 
     def _config_panel_stylesheet(self) -> str:
+        if client_glassy_theme(self) == "Glassy Dark":
+            return hue_theme_stylesheet(
+                "QFrame#configPanel { background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+                " stop:0 rgba(79, 86, 95, 172), stop:0.42 rgba(44, 50, 58, 164),"
+                " stop:1 rgba(27, 33, 41, 180)); border: 1px solid #000000; border-radius:9px; }",
+                client_theme_color(self, "Glassy Dark"),
+            )
         if self._is_windows_classic_theme():
             return classic_theme_stylesheet((
                 "QFrame#configPanel { background: #c0c0c0;"
@@ -7149,7 +8161,7 @@ class EncryptedChatClient(QObject):
                 " stop:1 rgba(174, 211, 234, 210));"
                 " border: 1px solid rgba(49, 91, 118, 245);"
                 " border-radius: 9px; }"
-            ), client_theme_color(self, "Glassy"))
+            ), client_theme_color(self, client_glassy_theme(self)))
         return (
             "QFrame#configPanel { background: #fbfbfb; "
             "border: 1px solid #b8b8b8; border-radius: 8px; }"
@@ -7166,9 +8178,7 @@ class EncryptedChatClient(QObject):
 
     @staticmethod
     def _set_windows_legacy_blur(hwnd: Any, enabled: bool) -> bool:
-        # Windows 10/early Windows 11 have no DWMWA_SYSTEMBACKDROP_TYPE.
-        # The legacy accent policy provides live blur behind the same alpha
-        # surface. Prefer the supported DWM acrylic API when available.
+        # Use legacy accent blur when Windows lacks DWM acrylic.
         try:
             class AccentPolicy(ctypes.Structure):
                 _fields_ = [
@@ -7197,12 +8207,15 @@ class EncryptedChatClient(QObject):
         except (AttributeError, OSError):
             return False
 
-    def _apply_window_titlebar_theme(self, window: QWidget) -> None:
+    def _apply_window_titlebar_theme(self, window: QWidget, *, color_only: bool = False) -> None:
         if os.name != "nt" or not hasattr(ctypes, "windll"):
             return
 
         try:
             hwnd = wintypes.HWND(int(window.winId()))
+            video_fullscreen = bool(window.property("spritelinkVideoFullscreen"))
+            if bool(window.property("spritelinkVideoWindow")):
+                set_windows_fullscreen_window(int(window.winId()), video_fullscreen)
             dwmapi = ctypes.windll.dwmapi
             dwmapi.DwmSetWindowAttribute.argtypes = [
                 wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD
@@ -7222,20 +8235,25 @@ class EncryptedChatClient(QObject):
                     ctypes.sizeof(data),
                 ))
 
-            # Keep all themes light, then color the Windows 11 non-client
-            # frame where the DWM color attributes are supported.
-            set_attribute(20, 0)  # DWMWA_USE_IMMERSIVE_DARK_MODE
-            if self._is_windows_classic_theme():
+            if not color_only:
+                set_attribute(20, int(client_glassy_theme(self) == "Glassy Dark"))  # DWMWA_USE_IMMERSIVE_DARK_MODE
+            if video_fullscreen:
+                border, caption, text = "#000000", "#000000", "#ffffff"
+                corner_preference = 1  # DWMWCP_DONOTROUND
+                backdrop = 1  # DWMSBT_NONE
+            elif self._is_windows_classic_theme():
                 border = "#000000"
                 caption = CLASSIC_COLOR_SCHEMES[client_theme_color(self, "Classic")]["title"]
                 text = "#ffffff"
                 corner_preference = 1  # DWMWCP_DONOTROUND
                 backdrop = 1  # DWMSBT_NONE
             elif self._is_glassy_theme():
-                degrees = client_theme_color(self, "Glassy")
-                border = shift_theme_color("#6292af", degrees).name()
-                caption = None
-                text = shift_theme_color("#102637", degrees).name()
+                degrees = client_theme_color(self, client_glassy_theme(self))
+                dark = client_glassy_theme(self) == "Glassy Dark"
+                border = "#000000" if dark else shift_theme_color("#6292af", degrees).name()
+                # Default acrylic captions can stay light despite immersive dark mode.
+                caption = shift_theme_color("#252a30", degrees).name() if dark else None
+                text = shift_theme_color("#dde4eb" if dark else "#102637", degrees).name()
                 corner_preference = 2  # DWMWCP_ROUND
                 backdrop = 3  # DWMSBT_TRANSIENTWINDOW (acrylic)
             else:
@@ -7245,15 +8263,19 @@ class EncryptedChatClient(QObject):
                 corner_preference = 2  # DWMWCP_ROUND
                 backdrop = 1  # DWMSBT_NONE
 
-            set_attribute(33, corner_preference)  # DWMWA_WINDOW_CORNER_PREFERENCE
+            if not color_only:
+                set_attribute(33, corner_preference)  # DWMWA_WINDOW_CORNER_PREFERENCE
             set_attribute(34, self._windows_colorref(border))
             set_attribute(
                 35,
-                0xFFFFFFFF  # DWMWA_COLOR_DEFAULT keeps acrylic visible.
+                0xFFFFFFFF  # DWMWA_COLOR_DEFAULT preserves acrylic.
                 if caption is None
                 else self._windows_colorref(caption),
             )
             set_attribute(36, self._windows_colorref(text))
+            if color_only:
+                window.update()
+                return
             backdrop_result = set_attribute(38, backdrop)  # DWMWA_SYSTEMBACKDROP_TYPE
 
             class Margins(ctypes.Structure):
@@ -7264,7 +8286,7 @@ class EncryptedChatClient(QObject):
                     ("bottom", ctypes.c_int),
                 ]
 
-            glass_margin = -1 if self._is_glassy_theme() else 0
+            glass_margin = -1 if self._is_glassy_theme() and not video_fullscreen else 0
             margins = Margins(
                 glass_margin,
                 glass_margin,
@@ -7279,12 +8301,12 @@ class EncryptedChatClient(QObject):
                 self._set_windows_legacy_blur(hwnd, False)
                 window.setProperty("spritelinkLegacyBlur", False)
             desktop_blur = (
-                self._is_glassy_theme()
+                self._is_glassy_theme() and not video_fullscreen
                 and frame_result == 0
                 and backdrop_result == 0
             )
             if (
-                self._is_glassy_theme()
+                self._is_glassy_theme() and not video_fullscreen
                 and frame_result == 0
                 and not desktop_blur
             ):
@@ -7293,12 +8315,10 @@ class EncryptedChatClient(QObject):
             window.setProperty("spritelinkDesktopBlur", desktop_blur)
             window.update()
         except Exception:
-            # Older Windows versions do not expose the color attributes.
             window.setProperty("spritelinkDesktopBlur", False)
             window.update()
 
     def _apply_dialog_window_theme(self, dialog: QDialog) -> None:
-        """Apply native theme properties after a dialog window exists."""
         if isinstance(dialog, QFileDialog):
             return
         self._apply_window_titlebar_theme(dialog)
@@ -7308,8 +8328,7 @@ class EncryptedChatClient(QObject):
         )
 
     def _exec_themed_file_dialog(self, dialog: QFileDialog) -> int:
-        # Native Windows dialogs are created when exec() starts. Apply once to
-        # the wrapper and once from the nested event loop after it is visible.
+        # Native dialogs appear during exec(); theme both wrapper and visible window.
         self._apply_window_titlebar_theme(dialog)
         QTimer.singleShot(
             0,
@@ -7368,11 +8387,10 @@ class EncryptedChatClient(QObject):
         self._tray_normal_icon = QIcon(str(WINDOW_ICON_PATH))
         if self._tray_normal_icon.isNull():
             self._tray_normal_icon = self.root.windowIcon()
-        self._tray_notification_icon = (
-            self._build_tray_notification_icon(self._tray_normal_icon)
-            if not self._tray_normal_icon.isNull()
-            else QIcon()
-        )
+        self._tray_notification_icon = QIcon()
+        self._tray_notification_icon_ready = False
+        if not self._defer_startup:
+            self._prepare_tray_notification_icon()
         self.tray_icon = QSystemTrayIcon(
             self._tray_normal_icon,
             self.root,
@@ -7401,6 +8419,15 @@ class EncryptedChatClient(QObject):
         if self._tray_available():
             self.tray_icon.show()
         if self._has_unread_messages():
+            self._mark_tray_notification()
+
+    def _prepare_tray_notification_icon(self) -> None:
+        if self._tray_notification_icon_ready:
+            return
+        self._tray_notification_icon_ready = True
+        if not self._tray_normal_icon.isNull():
+            self._tray_notification_icon = self._build_tray_notification_icon(self._tray_normal_icon)
+        if hasattr(self, "tray_icon") and self._has_unread_messages():
             self._mark_tray_notification()
 
     def _tray_available(self) -> bool:
@@ -7476,9 +8503,9 @@ class EncryptedChatClient(QObject):
         self._sync_window_activity()
         self.viewport_media_timer.stop()
         self._hide_chat_tooltip()
-        if self.link_warning_overlay.isVisible():
+        if hasattr(self, "link_warning_overlay") and self.link_warning_overlay.isVisible():
             self._hide_link_warning_popup()
-        if self.image_preview_overlay.isVisible():
+        if (hasattr(self, "image_preview_overlay") and self.image_preview_overlay.isVisible()) or self.current_image_preview_url:
             self._hide_image_preview_popup()
         self._pause_animated_media()
         self._release_message_sound_resources()
@@ -7598,8 +8625,7 @@ class EncryptedChatClient(QObject):
             return
         self._force_quit = True
         self._tray_quit_pending = True
-        # Let the native tray menu finish handling its action before closing
-        # its owner window and stopping the Qt event loop.
+        # Close after the native tray action finishes.
         QTimer.singleShot(0, self._finish_quit_from_tray)
 
     def _finish_quit_from_tray(self) -> None:
@@ -7611,8 +8637,8 @@ class EncryptedChatClient(QObject):
         if app is not None:
             app.quit()
 
-    def _apply_titlebar_theme(self) -> None:
-        self._apply_window_titlebar_theme(self.root)
+    def _apply_titlebar_theme(self, *, color_only: bool = False) -> None:
+        self._apply_window_titlebar_theme(self.root, color_only=color_only)
 
     def _ui_density_stylesheet(
         self,
@@ -7661,7 +8687,7 @@ QMenu::separator {
     margin: 2px 5px;
 }
 """
-        elif theme == "Glassy":
+        elif theme in GLASSY_THEMES:
             compact = """
 QPushButton {
     padding: 2px 7px;
@@ -7673,7 +8699,8 @@ QPushButton:pressed, QPushButton:checked {
 }
 QPushButton#identityMenuButton,
 QPushButton#fontMenuButton,
-QPushButton#formattingMenuButton {
+QPushButton#formattingMenuButton,
+QPushButton#imageMenuButton {
     min-height: 14px;
     padding-top: 1px;
     padding-bottom: 1px;
@@ -7717,11 +8744,12 @@ QComboBox::drop-down {
         if app is None:
             return
 
-        theme = "Classic" if self._is_windows_classic_theme() else "Glassy" if self._is_glassy_theme() else "Modern"
+        theme = "Classic" if self._is_windows_classic_theme() else client_glassy_theme(self) if self._is_glassy_theme() else "Modern"
         position = client_theme_color(self, theme)
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
         app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
+        app.setProperty("spritelinkGlassyDark", theme == "Glassy Dark")
 
         available_styles = {
             name.casefold(): name for name in QStyleFactory.keys()
@@ -7735,14 +8763,14 @@ QComboBox::drop-down {
             app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
                 classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position),
                 theme,
-            ))
+            ) + self._config_panel_stylesheet())
         elif self._is_glassy_theme():
             style_name = available_styles.get("fusion", "Fusion")
             app.setPalette(self._glassy_palette())
             app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
-                hue_theme_stylesheet(GLASSY_STYLESHEET, position),
+                hue_theme_stylesheet(glassy_stylesheet(theme), position),
                 theme,
-            ))
+            ) + self._config_panel_stylesheet())
         else:
             style_name = next(
                 (available_styles[name] for name in (
@@ -7754,7 +8782,7 @@ QComboBox::drop-down {
             app.setStyleSheet(EncryptedChatClient._ui_density_stylesheet(self, 
                 hue_theme_stylesheet(MODERN_STYLESHEET, position),
                 theme,
-            ))
+            ) + self._config_panel_stylesheet())
 
         text_shadows_enabled = bool(self.text_shadows_var.get())
         app.setProperty("spritelinkTextShadows", text_shadows_enabled)
@@ -7782,24 +8810,11 @@ QComboBox::drop-down {
             if panel is not None and isinstance(panel.layout(), QGridLayout):
                 panel.layout().setVerticalSpacing(self._config_row_spacing())
 
-        if hasattr(self, "config_panel"):
-            self.config_panel.setStyleSheet(
-                self._config_panel_stylesheet()
-            )
-        if hasattr(self, "message_limit_panel"):
-            self.message_limit_panel.setStyleSheet(
-                self._config_panel_stylesheet()
-            )
-        if hasattr(self, "image_preview_panel"):
-            self.image_preview_panel.setStyleSheet(
-                self._config_panel_stylesheet()
-            )
-        if hasattr(self, "link_warning_panel"):
-            self.link_warning_panel.setStyleSheet(
-                self._config_panel_stylesheet()
-            )
+        EncryptedChatClient._apply_video_player_theme(self)
         for overlay_name in (
             "config_overlay",
+            "search_overlay",
+            "drawing_import_overlay",
             "message_limit_overlay",
             "image_preview_overlay",
             "link_warning_overlay",
@@ -7856,10 +8871,10 @@ QComboBox::drop-down {
         central_layout.addWidget(self.chat_tab, 1)
 
         self._build_chat_tab()
-        self._build_config_popup()
-        self._build_message_limit_popup()
-        self._build_image_preview_popup()
-        self._build_link_warning_popup()
+        self.chat_content.installEventFilter(self)
+        if not self._defer_startup:
+            for name in ("config", "message_limit", "image_preview", "link_warning"):
+                self._ensure_popup(name)
 
     def _build_chatroom_sidebar(self, root_layout: QHBoxLayout) -> None:
         self.chatrooms_panel = QWidget()
@@ -7900,9 +8915,13 @@ QComboBox::drop-down {
 
         self.chatrooms_panel.hide()
         root_layout.addWidget(self.chatrooms_panel)
-        self._refresh_chatroom_list()
+        self._chatroom_list_ready = False
+        if not self._defer_startup:
+            self._refresh_chatroom_list()
 
     def _on_chatrooms_toggled(self, expanded: bool) -> None:
+        if expanded and not self._chatroom_list_ready:
+            self._refresh_chatroom_list()
         keep_at_bottom = self._chat_is_scrolled_to_bottom()
         self.chatrooms_toggle.setText("‹" if expanded else "›")
         self.chatrooms_panel.setVisible(expanded)
@@ -8185,6 +9204,7 @@ QComboBox::drop-down {
         return room_id in self._muted_chatroom_ids()
 
     def _refresh_chatroom_list(self) -> None:
+        self._chatroom_list_ready = True
         self.chatrooms_list.clear()
         active_item: QListWidgetItem | None = None
         muted_ids = self._muted_chatroom_ids()
@@ -8361,9 +9381,7 @@ QComboBox::drop-down {
         if not hasattr(self, "chat_display"):
             return
         if self._rendering_message_log:
-            # Block numbers change after every staggered prepend. Keep the
-            # divider hidden until the complete document map is stable so its
-            # line cannot appear to move through partially rendered history.
+            # Hide the divider until prepending stabilizes block numbers.
             self.chat_display.unread_divider_block_number = None
             self.chat_display.viewport().update()
             return
@@ -8387,7 +9405,33 @@ QComboBox::drop-down {
         )
         self.chat_display.viewport().update()
 
+    def _update_live_unread_edge(self) -> None:
+        if self._rendering_message_log or self._history_render_updates_suppressed:
+            return
+        display = self.chat_display
+        pending = self._unseen_live_message
+        if (
+            pending is not None
+            and self.window_focused_event.is_set()
+            and self.root.isVisible()
+            and not self.root.isMinimized()
+            and not self.search_toggle.isChecked()
+            and not self.config_toggle.isChecked()
+        ):
+            block_number = self.rendered_message_last_blocks.get(pending[1])
+            if block_number is not None:
+                document = display.document()
+                block = document.findBlockByNumber(block_number)
+                bottom = display.verticalScrollBar().value() + display.viewport().height()
+                if block.isValid() and document.documentLayout().blockBoundingRect(block).bottom() <= bottom + 1:
+                    self._unseen_live_message = None
+        visible = self._unseen_live_message is not None
+        if display.show_unread_bottom_edge != visible:
+            display.show_unread_bottom_edge = visible
+            display.viewport().update()
+
     def _update_unread_divider_fade(self) -> None:
+        self._update_live_unread_edge()
         now = time.monotonic()
         elapsed_since_tick = max(0.0, now - self._read_divider_last_tick)
         self._read_divider_last_tick = now
@@ -8609,8 +9653,6 @@ QComboBox::drop-down {
         return room_id
 
     def _edit_chatroom(self, room_id: str) -> None:
-        if room_id == GLOBAL_CHATROOM_ID:
-            return
         room = next(
             (
                 candidate
@@ -8620,15 +9662,16 @@ QComboBox::drop-down {
             ),
             None,
         )
+        if room_id == GLOBAL_CHATROOM_ID:
+            room = self._find_chatroom(room_id)
         if room is None:
             return
 
         old_name = str(room.get("nickname", ""))
         old_key = str(room.get("key", ""))
-        dialog = ChatroomDetailsDialog(
-            self.root,
-            title="Edit Chatroom",
-            submit_label="Save",
+        dialog = EditChatroomDialog(
+            self,
+            room_id,
             name=old_name,
             chatroom_key=old_key,
             history_note=(
@@ -8684,6 +9727,9 @@ QComboBox::drop-down {
             self._persist_local_history()
         room["nickname"] = name
         room["key"] = key
+        room_settings = self.config_data.setdefault("room_settings", {})
+        old_settings = room_settings.get(room_id)
+        room_settings[room_id] = normalize_room_settings(dialog.settings)
         if key_changed:
             self.initial_history_pending_rooms.add(room_id)
         try:
@@ -8691,6 +9737,10 @@ QComboBox::drop-down {
         except Exception as exc:
             room["nickname"] = old_name
             room["key"] = old_key
+            if old_settings is None:
+                room_settings.pop(room_id, None)
+            else:
+                room_settings[room_id] = old_settings
             if not was_initial_history_pending:
                 self.initial_history_pending_rooms.discard(room_id)
             messagebox.showerror(
@@ -8707,6 +9757,7 @@ QComboBox::drop-down {
         else:
             if room_id == self.active_chatroom_id:
                 self._update_window_title()
+                self._refresh_room_appearance()
             self._refresh_chatroom_list()
 
     def _copy_chatroom_invite_code(self, room_id: str) -> None:
@@ -8737,11 +9788,7 @@ QComboBox::drop-down {
         menu = ClickableSubmenuMenu(self.root)
 
         edit_action = menu.addAction("Edit")
-        edit_action.setEnabled(room_id != GLOBAL_CHATROOM_ID)
-        if room_id != GLOBAL_CHATROOM_ID:
-            edit_action.triggered.connect(
-                lambda: self._edit_chatroom(room_id)
-            )
+        edit_action.triggered.connect(lambda: self._edit_chatroom(room_id))
 
         copy_invite_action = menu.addAction("Copy Invite Code")
         copy_invite_action.triggered.connect(
@@ -8880,8 +9927,10 @@ QComboBox::drop-down {
         self.read_divider_visible_seconds.pop(room_id, None)
         self._clear_tray_notification_if_no_unread()
         self.config_data.get("room_profiles", {}).pop(room_id, None)
+        self.config_data.get("room_settings", {}).pop(room_id, None)
         self.initial_history_pending_rooms.discard(room_id)
         self.chatroom_drafts.pop(room_id, None)
+        self.drawing_drafts.pop(room_id, None)
         self._request_subscription_refresh()
 
         if self.active_chatroom_id == room_id:
@@ -8919,9 +9968,7 @@ QComboBox::drop-down {
             self.active_chatroom_id in muted_room_ids
             or room_id in muted_room_ids
         )
-        # Every message mutation is persisted when it occurs. Rewriting the
-        # complete history again here made leaving a long room needlessly
-        # proportional to its retained message count.
+        # Mutations already persist history; avoid rewriting it on room exit.
         self.active_chatroom_id = room_id
         self.config_data["active_chatroom_id"] = room_id
         self._switch_active_chatroom(
@@ -8955,7 +10002,8 @@ QComboBox::drop-down {
             save_config(self.config_data)
         except Exception:
             pass
-        self._clear_visible_room()
+        self._clear_visible_room(preserve_detached_video=True)
+        self._refresh_room_appearance()
         self._load_active_room_profile_into_controls()
         self._load_saved_history_for_current_room()
         self.connected = False
@@ -8969,9 +10017,15 @@ QComboBox::drop-down {
         self._restore_active_chatroom_draft()
         self._refresh_chatroom_list()
 
+    def _refresh_room_appearance(self) -> bool:
+        return self._apply_theme_colors()
+
     def _reset_history_render_window(self) -> None:
+        self._unseen_live_message = None
+        self.chat_display.show_unread_bottom_edge = False
         self._set_history_render_updates_suppressed(False)
         self._history_render_generation += 1
+        self._history_load_complete = True
         self._older_history_page_scheduled = False
         self._loading_older_history_page = False
         self._history_initial_render_complete = False
@@ -8980,6 +10034,9 @@ QComboBox::drop-down {
         self._message_render_job = None
         self._rendering_message_log = False
         self._pending_live_render_message_ids.clear()
+        self._search_history_end = None
+        self.latest_history_button.hide()
+        self._history_render_pruned = False
         self._media_rerender_in_progress = False
         self.rendered_history_message_limit = (
             INITIAL_HISTORY_RENDER_MESSAGES
@@ -8994,27 +10051,21 @@ QComboBox::drop-down {
             return
         self._history_render_updates_suppressed = suppressed
         if suppressed:
-            # A scroll action queued before a document transaction must not
-            # observe the temporary zero-position created by clear/rebuild.
+            # Ignore scroll actions during temporary document rebuild positions.
             self._older_history_user_request = None
         self.chat_display.setUpdatesEnabled(not suppressed)
         if not suppressed:
             self.chat_display.viewport().update()
-            # Theme swaps rebuild the log in batches. Recapture once the
-            # complete document and its saved scroll anchor are restored.
+            # Recapture after batched theme rebuild and anchor restoration.
             for overlay in self.chat_content.findChildren(ConfigOverlay):
                 overlay.schedule_background_refresh()
 
     def _on_chat_history_scrolled(self, _value: int) -> None:
-        self.viewport_media_timer.start(
-            VIEWPORT_MEDIA_UPDATE_DELAY_MS
-        )
+        if not self.viewport_media_timer.isActive():
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
 
     def _on_chat_history_scroll_action(self, _action: int) -> None:
-        # Queue at most one request once a genuine user scroll reaches the
-        # oldest 20 percent of the loaded history. actionTriggered exposes the
-        # new slider position before Qt propagates it to value(), so use that
-        # position to begin loading before the visible rows reach the top.
+        # Coalesce requests in the oldest 20%; actionTriggered precedes value() updates.
         scrollbar = self.chat_display.verticalScrollBar()
         if (
             self._older_history_user_request is not None
@@ -9074,7 +10125,7 @@ QComboBox::drop-down {
             self._older_history_page_scheduled
             or self._loading_older_history_page
             or self._tray_ui_suspended
-            or self.rendered_history_message_limit >= len(self.message_log)
+            or self.rendered_history_message_limit >= self._history_view_end()
         ):
             return
         self._older_history_page_scheduled = True
@@ -9102,16 +10153,17 @@ QComboBox::drop-down {
         self._older_history_page_scheduled = False
         if (
             self._loading_older_history_page
-            or self.rendered_history_message_limit >= len(self.message_log)
+            or self._rendering_message_log
+            or self.rendered_history_message_limit >= self._history_view_end()
         ):
             return
 
         previous_limit = min(
-            len(self.message_log),
+            self._history_view_end(),
             self.rendered_history_message_limit,
         )
         next_limit = min(
-            len(self.message_log),
+            self._history_view_end(),
             previous_limit + HISTORY_RENDER_PAGE_MESSAGES,
         )
         self._loading_older_history_page = True
@@ -9137,7 +10189,8 @@ QComboBox::drop-down {
             self._loading_older_history_page = False
             return
 
-        new_items = self.message_log[-next_limit:-previous_limit]
+        end = self._history_view_end()
+        new_items = self.message_log[end - next_limit:end - previous_limit]
         muted_ids = self._room_preference_ids("muted_users")
         collapsed_ids = self._room_preference_ids("collapsed_messages")
         trusted_user_ids = self._room_preference_ids(
@@ -9173,7 +10226,7 @@ QComboBox::drop-down {
 
         following_timestamp = (
             self._display_timestamp_for_item(
-                self.message_log[-previous_limit]
+                self.message_log[end - previous_limit]
             )
             if previous_limit > 0
             else None
@@ -9206,7 +10259,7 @@ QComboBox::drop-down {
         following_background_index = 0
         if previous_limit > 0:
             following_message_id = self._message_id_from_log_item(
-                self.message_log[-previous_limit]
+                self.message_log[end - previous_limit]
             )
             following_block_number = self.rendered_message_last_blocks.get(
                 following_message_id
@@ -9304,9 +10357,8 @@ QComboBox::drop-down {
             self._loading_older_history_page = False
             return
         self._loading_older_history_page = False
-        self.viewport_media_timer.start(
-            VIEWPORT_MEDIA_UPDATE_DELAY_MS
-        )
+        if not self.viewport_media_timer.isActive():
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
         self._flush_pending_live_message_render()
 
     def _build_chat_tab(self) -> None:
@@ -9332,9 +10384,9 @@ QComboBox::drop-down {
         )
         self.status_var.bind(self._on_connection_status_changed)
         status_layout.addWidget(self.status_label)
-        status_layout.addStretch(1)
+        status_layout.addSpacing(6)
 
-        self.recently_online_label = QLabel("Recently online: …")
+        self.recently_online_label = QLabel()
         self.recently_online_label.setFont(
             self._make_font(self._ui_font_family(), 9)
         )
@@ -9342,7 +10394,18 @@ QComboBox::drop-down {
         opacity.setOpacity(0.6)
         self.recently_online_label.setGraphicsEffect(opacity)
         status_layout.addWidget(self.recently_online_label)
+        status_layout.addStretch(1)
         self._update_recently_online_label()
+
+        self.latest_history_button = QPushButton("Latest")
+        self.latest_history_button.clicked.connect(self._show_latest_history)
+        status_layout.addWidget(self.latest_history_button)
+        self.latest_history_button.hide()
+
+        self.search_toggle = QPushButton("Search")
+        self.search_toggle.setCheckable(True)
+        self.search_toggle.toggled.connect(self._on_search_toggled)
+        status_layout.addWidget(self.search_toggle)
 
         self.config_toggle = QPushButton("Config")
         self.config_toggle.setCheckable(True)
@@ -9409,6 +10472,11 @@ QComboBox::drop-down {
             self._on_formatting_menu_toggled
         )
         composer_actions.addWidget(self.formatting_menu_button)
+        self.image_menu_button = QPushButton("Image")
+        self.image_menu_button.setObjectName("imageMenuButton")
+        self.image_menu_button.setCheckable(True)
+        self.image_menu_button.toggled.connect(self._on_image_menu_toggled)
+        composer_actions.addWidget(self.image_menu_button)
         composer_actions.addStretch(1)
 
         self.identity_menu = QFrame()
@@ -9464,7 +10532,7 @@ QComboBox::drop-down {
             self._show_profile_icon_context_menu
         )
         identity_layout.addWidget(self.profile_icon_preview)
-        self.profile_icon_button = QPushButton("Browse...")
+        self.profile_icon_button = QPushButton("Import...")
         self.profile_icon_button.clicked.connect(
             self._choose_profile_icon
         )
@@ -9540,6 +10608,11 @@ QComboBox::drop-down {
         formatting_layout.addStretch(1)
         self.formatting_menu.hide()
         content_layout.addWidget(self.formatting_menu)
+        self.image_menu = DrawingMenu(ThemeComboBox)
+        self.image_menu.changed.connect(self._on_drawing_changed)
+        self.image_menu.importRequested.connect(self._open_drawing_import)
+        self.image_menu.hide()
+        content_layout.addWidget(self.image_menu, 2)
         content_layout.addLayout(composer_actions)
 
         compose_layout = QGridLayout()
@@ -9572,6 +10645,10 @@ QComboBox::drop-down {
             self._toggle_composer_formatting_shortcut
         )
         compose_layout.addWidget(self.message_entry, 0, 0)
+        self.image_composer_label = QLabel("Image message")
+        self.image_composer_label.setIndent(5)
+        self.image_composer_label.hide()
+        compose_layout.addWidget(self.image_composer_label, 0, 0)
 
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self._send_current_message)
@@ -9631,22 +10708,154 @@ QComboBox::drop-down {
             self._sync_formatting_buttons()
         self._restore_chat_bottom_after_layout_change(keep_at_bottom)
 
+    def _on_image_menu_toggled(self, checked: bool) -> None:
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
+        self._set_composer_menu_visibility(self.image_menu if checked else None)
+        if checked:
+            self.image_menu.canvas.setFocus()
+        else:
+            self.message_entry.setFocus()
+        self._restore_chat_bottom_after_layout_change(keep_at_bottom)
+
+    def _on_drawing_changed(self) -> None:
+        self.drawing_drafts[self.active_chatroom_id] = self.image_menu.canvas.snapshot()
+        if self.image_menu_button.isChecked():
+            self.message_size_check_pending = True
+            self.message_size_timer.start(MESSAGE_SIZE_DEBOUNCE_MS)
+            self._draw_message_size_bar()
+
+    def _open_drawing_import(self, *, profile_icon: bool = False) -> None:
+        self._close_drawing_import()
+        title = "Import profile icon" if profile_icon else "Import image"
+        overlay = ConfigOverlay(self.chat_content)
+        self.drawing_import_overlay = overlay
+        panel = QFrame()
+        panel.setObjectName("configPanel")
+        overlay.panel = panel
+        layout = QVBoxLayout(overlay)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.addWidget(panel)
+        chooser = QVBoxLayout(panel)
+        chooser.addWidget(QLabel(title))
+        chooser.addStretch()
+        sources = QHBoxLayout()
+        sources.addStretch()
+        for label, action in (
+            ("From file...", self._import_drawing_from_file),
+            ("From clipboard...", self._import_drawing_from_clipboard),
+        ):
+            button = QPushButton(label)
+            button.setMinimumSize(126, 44)
+            button.clicked.connect(lambda _checked, callback=action: callback(profile_icon))
+            sources.addWidget(button)
+        sources.addStretch()
+        chooser.addLayout(sources)
+        chooser.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self._close_drawing_import)
+        chooser.addWidget(cancel, alignment=Qt.AlignmentFlag.AlignRight)
+        overlay.dismissed.connect(self._close_drawing_import)
+        escape = QShortcut(Qt.Key.Key_Escape, overlay)
+        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        escape.activated.connect(self._close_drawing_import)
+        self._apply_ui_size_to_widget_tree(overlay)
+        overlay.setGeometry(self.chat_content.rect())
+        overlay.show()
+        overlay.raise_()
+        sources.itemAt(1).widget().setFocus()
+
+    def _import_drawing_from_file(self, profile_icon: bool = False) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self.root, "Import image", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            source = load_import_image(path)
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
+            messagebox.showerror("Cannot import image", str(exc), parent=self.root)
+            return
+        self._show_drawing_import_preview(source, profile_icon=profile_icon)
+
+    def _import_drawing_from_clipboard(self, profile_icon: bool = False) -> None:
+        image = QApplication.clipboard().image()
+        if image.isNull():
+            messagebox.showwarning("Import image", "The clipboard has no image.", parent=self.root)
+            return
+        if image.width() * image.height() > 24_000_000:
+            messagebox.showwarning("Import image", "Choose an image under 24 megapixels.", parent=self.root)
+            return
+        rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        source = Image.frombytes(
+            "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
+            "raw", "RGBA", rgba.bytesPerLine(), 1,
+        )
+        self._show_drawing_import_preview(source, profile_icon=profile_icon)
+
+    def _show_drawing_import_preview(self, source: Image.Image, *, profile_icon: bool = False) -> None:
+        overlay = self.drawing_import_overlay
+        if overlay is None:
+            return
+        previous_panel = overlay.panel
+        panel = DrawingImportPanel(
+            source, ThemeComboBox,
+            icon_size=PROFILE_ICON_SIZE if profile_icon else None,
+            icon_encoder=_encode_profile_icon_canvas if profile_icon else None,
+        )
+        overlay.layout().removeWidget(previous_panel)
+        previous_panel.hide()
+        previous_panel.deleteLater()
+        overlay.panel = panel
+        overlay.layout().addWidget(panel)
+        panel.dismissed.connect(self._close_drawing_import)
+        if profile_icon:
+            panel.iconAccepted.connect(self._apply_imported_profile_icon)
+        else:
+            panel.accepted.connect(self._apply_drawing_import)
+        self._apply_ui_size_to_widget_tree(panel)
+        panel.show()
+        (panel.dither if profile_icon else panel.size_combo).setFocus()
+
+    def _apply_drawing_import(self, size: int, pixels: bytes, palette: int) -> None:
+        self.image_menu.canvas.replace(size, pixels, palette=palette)
+        self._close_drawing_import()
+
+    def _import_chat_drawing(self, size: int, pixels: bytes, palette: int) -> None:
+        self._apply_drawing_import(size, pixels, palette)
+        self.image_menu_button.setChecked(True)
+        self.image_menu.canvas.setFocus()
+
+    def _close_drawing_import(self) -> None:
+        overlay = getattr(self, "drawing_import_overlay", None)
+        if overlay is not None:
+            self.drawing_import_overlay = None
+            overlay.hide()
+            overlay.deleteLater()
+
     def _set_composer_menu_visibility(
         self,
         visible_menu: QWidget | None,
     ) -> None:
-        # Direct switching used to show the new panel before hiding the old
-        # one, making the log jump through a two-menu intermediate height.
+        # Hide the old panel first to avoid an intermediate layout jump.
         self.chat_content.setUpdatesEnabled(False)
         try:
             for menu, button in (
                 (self.identity_menu, self.identity_menu_button),
                 (self.font_menu, self.font_menu_button),
                 (self.formatting_menu, self.formatting_menu_button),
+                (self.image_menu, self.image_menu_button),
             ):
                 should_show = menu is visible_menu
                 self._set_button_checked(button, should_show)
                 menu.setVisible(should_show)
+            drawing = visible_menu is self.image_menu
+            self.message_entry.setVisible(not drawing)
+            self.image_composer_label.setVisible(drawing)
+            if not drawing:
+                self._close_drawing_import()
+            self._cancel_pending_message_size_check()
+            self._run_message_size_check()
             content_layout = self.chat_content.layout()
             if content_layout is not None:
                 content_layout.activate()
@@ -9828,7 +11037,7 @@ QComboBox::drop-down {
         room_name = self._active_chatroom()["nickname"]
         self.message_entry.setPlaceholderText(f"Chat in {room_name}")
         placeholder_color = QColor(
-            self._active_room_profile()["text_color"]
+            message_display_color(self._active_room_profile()["text_color"])
         )
         placeholder_color.setAlpha(140)
         palette = self.message_entry.palette()
@@ -9850,7 +11059,7 @@ QComboBox::drop-down {
         self.message_entry.document().setDefaultFont(composer_font)
         self.message_entry.viewport().setFont(composer_font)
         self.message_entry.setStyleSheet(
-            f"color: {profile['text_color']};"
+            f"color: {message_display_color(profile['text_color'])};"
         )
         self._update_message_entry_placeholder()
         self._resize_message_entry()
@@ -9896,25 +11105,10 @@ QComboBox::drop-down {
         self._commit_identity_preset_changes(preset)
 
     def _choose_profile_icon(self) -> None:
-        dialog = QFileDialog(self.root, "Choose icon")
-        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
-        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter(
-            "Image files (*.png *.jpg *.jpeg);;PNG images (*.png);;"
-            "JPEG images (*.jpg *.jpeg)"
-        )
-        if (
-            self._exec_themed_file_dialog(dialog)
-            != QDialog.DialogCode.Accepted
-        ):
-            return
-        selected_files = dialog.selectedFiles()
-        source_path = selected_files[0] if selected_files else ""
-        if not source_path:
-            return
+        self._open_drawing_import(profile_icon=True)
 
+    def _apply_imported_profile_icon(self, gif_data: bytes) -> None:
         try:
-            gif_data = optimize_profile_icon(source_path)
             encoded_icon = encode_profile_icon(gif_data)
             decode_profile_icon(encoded_icon)
         except Exception as exc:
@@ -9929,6 +11123,7 @@ QComboBox::drop-down {
         preset["profile_icon"] = encoded_icon
         self._update_profile_icon_preview()
         self._commit_identity_preset_changes(preset)
+        self._close_drawing_import()
 
     def _update_profile_icon_preview(self) -> None:
         if not hasattr(self, "profile_icon_preview"):
@@ -9982,9 +11177,8 @@ QComboBox::drop-down {
         self._schedule_profile_save()
 
     def _choose_message_text_color(self) -> None:
-        profile = self._active_room_profile()
         dialog = QColorDialog(
-            QColor(profile["text_color"]),
+            QColor(self._active_room_profile()["text_color"]),
             self.root,
         )
         dialog.setWindowTitle("Choose message text color")
@@ -9998,13 +11192,446 @@ QComboBox::drop-down {
         selected = dialog.currentColor()
         if not selected.isValid():
             return
-        profile["text_color"] = selected.name()
+        # Modal events can replace the normalized room profile.
+        self._active_room_profile()["text_color"] = selected.name()
         self._set_color_preview(
             self.message_text_color_preview,
             selected.name(),
         )
         self._apply_active_composer_style()
         self._schedule_profile_save()
+
+    def _build_search_popup(self) -> None:
+        self.search_overlay = ConfigOverlay(self.chat_content)
+        self.search_overlay.dismissed.connect(self.search_toggle.click)
+        overlay_layout = QVBoxLayout(self.search_overlay)
+        overlay_layout.setContentsMargins(24, 24, 24, 24)
+        panel = QFrame()
+        panel.setObjectName("configPanel")
+        panel.setMaximumWidth(CONFIG_PANEL_MAX_WIDTH)
+        self.search_overlay.panel = panel
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        panel_row = QHBoxLayout()
+        panel_row.addStretch(1)
+        panel_row.addWidget(panel, 10)
+        panel_row.addStretch(1)
+        overlay_layout.addLayout(panel_row, 1)
+        panel_layout = QVBoxLayout(panel)
+        self.search_heading = self._heading("")
+        self.search_heading.setTextFormat(Qt.TextFormat.PlainText)
+        panel_layout.addWidget(self.search_heading)
+        self.search_entry = QLineEdit()
+        self.search_entry.setPlaceholderText("Find words or phrases")
+        panel_layout.addWidget(self.search_entry)
+        filters = QHBoxLayout()
+        self.search_filters = {
+            name: QCheckBox(name)
+            for name in ("Images", "Links", "Embedded Images", "Embedded Videos")
+        }
+        for checkbox in self.search_filters.values():
+            filters.addWidget(checkbox)
+            checkbox.toggled.connect(self._reset_chat_search)
+        filters.addStretch()
+        panel_layout.addLayout(filters)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        # Reserve the gutter before the first card so overflow cannot rewrap results.
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        self.search_results_layout = QVBoxLayout(content)
+        self.search_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        # Grow the scroll content instead of squeezing the gaps between fixed-height cards.
+        self.search_results_layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
+        self._search_media_updates: dict[str, list[Callable[[], None]]] = {}
+        scroll.setWidget(content)
+        panel_layout.addWidget(scroll, 1)
+        footer = QHBoxLayout()
+        self.search_status = QLabel()
+        footer.addWidget(self.search_status, 1)
+        self.search_more_button = QPushButton("More")
+        self.search_more_button.clicked.connect(self._start_chat_search)
+        footer.addWidget(self.search_more_button)
+        self.search_more_button.hide()
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.search_toggle.click)
+        footer.addWidget(close_button)
+        panel_layout.addLayout(footer)
+
+        self.search_timer = QTimer(self.search_overlay)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(200)
+        self.search_timer.timeout.connect(self._start_chat_search)
+        self.search_entry.textChanged.connect(self._reset_chat_search)
+        self.search_entry.returnPressed.connect(self._start_chat_search)
+        self.chat_content.installEventFilter(self)
+        self._apply_ui_size_to_widget_tree(self.search_overlay)
+
+    def _on_search_toggled(self, checked: bool) -> None:
+        if not checked:
+            if hasattr(self, "search_overlay"):
+                self._search_generation += 1
+                self._pending_search_jump = None
+                self.search_timer.stop()
+                self._search_media_updates.clear()
+                self.search_overlay.hide()
+                self.message_entry.setFocus()
+            return
+        if not self._dismiss_config_popup():
+            self.search_toggle.setChecked(False)
+            return
+        self._close_drawing_import()
+        if not hasattr(self, "search_overlay"):
+            self._build_search_popup()
+        self.search_heading.setText(f"Search in {self._active_chatroom()['nickname']}")
+        self.search_overlay.setGeometry(self.chat_content.rect())
+        self.search_overlay.show()
+        self.search_overlay.raise_()
+        self.search_entry.setFocus()
+        self._reset_chat_search()
+
+    def _reset_chat_search(self) -> None:
+        self._search_generation += 1
+        self._pending_search_jump = None
+        self._search_before = None
+        self._search_running = False
+        self._search_media_updates.clear()
+        while self.search_results_layout.count():
+            self.search_results_layout.takeAt(0).widget().deleteLater()
+        self.search_more_button.hide()
+        self.search_status.setText("Enter text or select a filter.")
+        self.search_timer.start()
+
+    def _start_chat_search(self) -> None:
+        self.search_timer.stop()
+        if self._search_running or not self.search_overlay.isVisible():
+            return
+        query = self.search_entry.text().strip().casefold()
+        filters = {name for name, box in self.search_filters.items() if box.isChecked()}
+        if not query and not filters:
+            return
+        if self.search_results_layout.count() and self._search_before is None:
+            return
+        self._search_running = True
+        self.search_more_button.hide()
+        self.search_status.setText("Searching...")
+        self.history_load_executor.submit(
+            self._chat_search_worker,
+            self._search_generation,
+            normalize_server_url(self.config_data["server_url"]),
+            self._active_chatroom()["key"],
+            query,
+            filters,
+            self._search_before,
+        )
+
+    def _chat_search_worker(
+        self,
+        generation: int,
+        server: str,
+        key: str,
+        query: str,
+        filters: set[str],
+        before: tuple[int, int, str] | None,
+    ) -> None:
+        matches = []
+        next_page = None
+        try:
+            while not self._closing and generation == self._search_generation:
+                batch = load_chatroom_history(server, key, limit=200, before=before)
+                if not batch:
+                    break
+                for index, item in enumerate(reversed(batch)):
+                    text = message_text_for_search(item, query, filters)
+                    if text is None:
+                        continue
+                    message = item["message"]
+                    try:
+                        timestamp = self._display_timestamp_for_item(item)
+                        self._validate_decrypted_message(
+                            message, key, ntfy_time=timestamp or None,
+                        )
+                    except Exception:
+                        continue
+                    matches.append((
+                        self._message_sort_key(item), str(message["i"]),
+                        timestamp, message,
+                    ))
+                    if len(matches) == 25:
+                        cursor = matches[-1][0]
+                        if index + 1 < len(batch) or (
+                            len(batch) == 200
+                            and load_chatroom_history(server, key, limit=1, before=cursor)
+                        ):
+                            next_page = cursor
+                        break
+                if len(matches) == 25:
+                    break
+                before = self._message_sort_key(batch[0])
+        except Exception:
+            matches = None
+        if not self._closing and generation == self._search_generation:
+            self._queue_ui_event(("chat_search_results", (generation, matches, next_page)))
+
+    def _show_chat_search_results(self, generation: int, matches: Any, next_page: Any) -> None:
+        if generation != self._search_generation:
+            return
+        if matches is None:
+            self._search_running = False
+            self.search_more_button.setVisible(self._search_before is not None)
+            self.search_status.setText("Could not read chat history.")
+            return
+        def append_next(index: int) -> None:
+            if generation != self._search_generation or self._closing:
+                return
+            if index == len(matches):
+                self._finish_chat_search_page(next_page)
+                return
+            sort_key, message_id, timestamp, message = matches[index]
+            frame = SearchResultCard()
+            frame.setFrameShape(QFrame.Shape.StyledPanel)
+            frame.setFrameShadow(QFrame.Shadow.Sunken)
+            layout = QVBoxLayout(frame)
+            header = QHBoxLayout()
+            date = QLabel(datetime.fromtimestamp(timestamp).strftime("%b %d, %Y  %H:%M"))
+            header.addWidget(date, 1)
+            jump = QPushButton("Jump")
+            jump.clicked.connect(
+                lambda checked=False, target=message_id, order=sort_key:
+                self._jump_to_search_result(target, order)
+            )
+            header.addWidget(jump)
+            layout.addLayout(header)
+            layout.addWidget(self._search_result_message(message))
+            self._apply_ui_size_to_widget_tree(frame)
+            self.search_results_layout.addWidget(frame)
+            # Yield to scroll, paint and media events between result cards.
+            QTimer.singleShot(24, lambda: append_next(index + 1))
+
+        append_next(0)
+
+    def _finish_chat_search_page(self, next_page: Any) -> None:
+        self._search_running = False
+        self._search_before = next_page
+        self.search_more_button.setVisible(next_page is not None)
+        count = self.search_results_layout.count()
+        if next_page is not None:
+            self.search_status.setText(f"{count}+ results found")
+        elif count == 0:
+            self.search_status.setText("No matches.")
+        else:
+            noun = "result" if count == 1 else "results"
+            self.search_status.setText(f"{count} {noun} found.")
+
+    def _update_search_media_preview(
+        self, url: str, media: RemoteMediaPreview | None,
+    ) -> None:
+        updates = getattr(self, "_search_media_updates", {}).get(url)
+        if not updates:
+            return
+        if media is not None and media.frame is None and not is_likely_nsfw_image_url(url):
+            self._ensure_animated_media_controller(url, media)
+        for update in updates:
+            update()
+
+    def _stop_search_preview_loop(self, url: str) -> None:
+        if url in self.viewport_embedded_image_urls or url == self.current_image_preview_url:
+            return
+        controller = self.animated_media_controllers.pop(url, None)
+        if controller is not None:
+            controller.stop()
+            controller.deleteLater()
+
+    def _search_result_message(self, message: dict[str, Any]) -> SearchResultMessage:
+        body = SearchResultMessage()
+        body.setObjectName("searchResultMessage")
+        background = max(
+            message_row_backgrounds(), key=lambda color: QColor(color).lightness(),
+        )
+        body.setStyleSheet(
+            f"QTextBrowser#searchResultMessage {{ background-color: {background}; }}"
+        )
+        client_id = str(message["c"])
+        is_local = client_id == self._authenticated_client_id()
+        trusted = self._room_preference_ids("trusted_link_and_image_users")
+        text = message_plain_text_with_spoilers_redacted(str(message["m"]))
+        media_urls = [
+            url for url in direct_image_urls_in_message(text)
+            if is_image_url_trusted_for_sender(url, client_id, is_local, trusted)
+        ]
+
+        previous_html = ""
+
+        def update() -> None:
+            nonlocal previous_html
+            html = self._search_result_html(message, media_urls)
+            if html != previous_html:
+                previous_html = html
+                body.setHtml(html)
+                body.updateGeometry()
+
+        update()
+        for url in media_urls:
+            self._search_media_updates.setdefault(url, []).append(update)
+            if url in self.image_preview_cache:
+                media = self.image_preview_cache[url]
+                if media is not None and media.frame is None and not is_likely_nsfw_image_url(url):
+                    self._ensure_animated_media_controller(url, media)
+            else:
+                self._schedule_image_preview_fetch(url)
+        return body
+
+    def _search_result_html(
+        self, message: dict[str, Any], media_urls: list[str],
+    ) -> str:
+        embedded_urls = [
+            url for url in media_urls
+            if url not in self.image_preview_cache or self.image_preview_cache[url] is not None
+        ]
+        document = QTextDocument()
+        cursor = QTextCursor(document)
+        font_name = str(message.get("f", DEFAULT_MESSAGE_FONT))
+        body_color = str(message.get("o", DEFAULT_MESSAGE_TEXT_COLOR))
+        username = str(message["u"])
+        username_format = self._text_format(str(message["k"]), font_name=font_name)
+        body_format = self._text_format(body_color, font_name=font_name)
+        plain_text = message_plain_text(str(message["m"]))
+        visible_text = message_text_without_image_links(plain_text, set(embedded_urls))
+        icon = str(message.get("p", "")) if self._chat_icons_visible() else ""
+        media_row = None
+        drawing = message.get("drawing")
+        show_drawing = bool(drawing) and not (
+            str(message["c"]) != self._authenticated_client_id()
+            and self._is_user_muted(str(message["c"]))
+        )
+        if show_drawing or (embedded_urls and not visible_text.strip()):
+            # Separate cells keep the username at the top regardless of preview height.
+            width = (
+                QFontMetrics(username_format.font()).horizontalAdvance(username)
+                + QFontMetrics(body_format.font()).horizontalAdvance(":  ")
+                + (PROFILE_ICON_SIZE if icon else 0)
+            )
+            table_format = QTextTableFormat()
+            table_format.setBorder(0)
+            table_format.setCellPadding(0)
+            table_format.setCellSpacing(0)
+            table_format.setColumnWidthConstraints([
+                QTextLength(QTextLength.Type.FixedLength, width),
+                QTextLength(QTextLength.Type.VariableLength, 0),
+            ])
+            media_row = cursor.insertTable(1, 2, table_format)
+            cursor = media_row.cellAt(0, 0).firstCursorPosition()
+        if icon and self._insert_profile_icon(
+            cursor,
+            icon,
+            str(message["i"]),
+            line_height_px=self._chat_line_height(font_name),
+            inline_html=True,
+        ):
+            cursor.insertText(" ", body_format)
+        cursor.insertText(username, username_format)
+        cursor.insertText(": ", body_format)
+        if media_row is not None:
+            cursor = media_row.cellAt(0, 1).firstCursorPosition()
+        else:
+            self._insert_message_text_with_links(
+                cursor, str(message["m"]), body_color, font_name,
+                str(message["c"]), str(message["i"]),
+                muted=False, ui_font=False, embedded_image_urls=set(embedded_urls),
+                align_top=False, top_align_height=0, preview=True,
+            )
+            if embedded_urls and not visible_text.rstrip(" \t").endswith(("\n", "\r")):
+                cursor.insertBlock()
+        for url in embedded_urls:
+            media = self.image_preview_cache.get(url)
+            image = (
+                self._embedded_media_preview(url, media)
+                if isinstance(media, RemoteMediaPreview)
+                else self._unloaded_image_placeholder(
+                    EMBEDDED_IMAGE_PLACEHOLDER_SIZE, EMBEDDED_IMAGE_PLACEHOLDER_SIZE, url=url,
+                )
+            )
+            formatting = QTextImageFormat()
+            if self._set_inline_html_image(formatting, image):
+                formatting.setWidth(image.width())
+                formatting.setHeight(image.height())
+                cursor.insertImage(formatting)
+        if show_drawing:
+            self._insert_inline_drawing(cursor, self._inline_drawing_image(drawing))
+        elif drawing:
+            cursor.insertText("[Image]", body_format)
+        return document.toHtml()
+
+    def _jump_to_search_result(self, message_id: str, order: tuple[int, int, str]) -> None:
+        index = bisect_right(self.message_log, order, key=self._message_sort_key) - 1
+        if index < 0 or self._message_id_from_log_item(self.message_log[index]) != message_id:
+            if self._history_load_complete:
+                self.search_status.setText("Message is no longer in history.")
+            else:
+                self._pending_search_jump = message_id, order
+                self.search_status.setText("Loading message…")
+            return
+        self.search_toggle.setChecked(False)
+        if (
+            message_id in self.rendered_message_last_blocks
+            and not self._rendering_message_log
+            and not self._loading_older_history_page
+        ):
+            self._scroll_to_search_result(message_id)
+            return
+        self._older_history_user_request = None
+        self._loading_older_history_page = False
+        self._media_rerender_in_progress = False
+        self.rendered_history_message_limit = INITIAL_HISTORY_RENDER_MESSAGES
+        end = min(len(self.message_log), index + 1 + INITIAL_HISTORY_RENDER_MESSAGES // 2)
+        self._search_history_end = (
+            self._message_sort_key(self.message_log[end - 1])
+            if end < len(self.message_log) else None
+        )
+        self.latest_history_button.setVisible(self._search_history_end is not None)
+        self._set_history_render_updates_suppressed(True)
+        self._render_message_log(
+            scroll_to_bottom=False,
+            on_finished=lambda: self._finish_search_jump(message_id),
+        )
+
+    def _finish_search_jump(self, message_id: str) -> None:
+        self._scroll_to_search_result(message_id)
+        self._history_initial_render_complete = True
+        self._set_history_render_updates_suppressed(False)
+
+    def _scroll_to_search_result(self, message_id: str) -> None:
+        block_number = next(
+            (number for number, value in self.rendered_message_blocks.items() if value == message_id),
+            self.rendered_message_last_blocks.get(message_id),
+        )
+        if block_number is None:
+            return
+        document = self.chat_display.document()
+        block = document.findBlockByNumber(block_number)
+        if block.isValid():
+            scrollbar = self.chat_display.verticalScrollBar()
+            top = document.documentLayout().blockBoundingRect(block).top()
+            scrollbar.setValue(round(top))
+
+    def _show_latest_history(self) -> None:
+        self._search_history_end = None
+        self.latest_history_button.hide()
+        self._older_history_user_request = None
+        self._loading_older_history_page = False
+        self._media_rerender_in_progress = False
+        self.rendered_history_message_limit = INITIAL_HISTORY_RENDER_MESSAGES
+        self._set_history_render_updates_suppressed(False)
+        self._render_message_log(scroll_to_bottom=True)
+
+    def _history_view_end(self) -> int:
+        if self._search_history_end is None:
+            return len(self.message_log)
+        return bisect_right(
+            self.message_log, self._search_history_end, key=self._message_sort_key,
+        )
 
     def _build_config_popup(self) -> None:
         self.config_overlay = ConfigOverlay(self.chat_content)
@@ -10023,7 +11650,6 @@ QComboBox::drop-down {
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        self.config_panel.setStyleSheet(self._config_panel_stylesheet())
         panel_row.addWidget(self.config_panel, 10)
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row, 1)
@@ -10062,9 +11688,6 @@ QComboBox::drop-down {
         self.message_limit_panel.setObjectName("configPanel")
         self.message_limit_panel.setMinimumWidth(430)
         self.message_limit_panel.setMaximumWidth(520)
-        self.message_limit_panel.setStyleSheet(
-            self._config_panel_stylesheet()
-        )
         panel_row.addWidget(self.message_limit_panel)
         panel_row.addStretch(1)
         overlay_layout.addLayout(panel_row)
@@ -10093,6 +11716,7 @@ QComboBox::drop-down {
         self.message_limit_overlay.setGeometry(self.chat_content.rect())
 
     def _show_message_limit_popup(self) -> None:
+        self._ensure_popup("message_limit")
         self.message_size_timer.stop()
         self._run_message_size_check()
         self._update_message_limit_popup()
@@ -10101,6 +11725,8 @@ QComboBox::drop-down {
         self.message_limit_overlay.raise_()
 
     def _hide_message_limit_popup(self) -> None:
+        if not hasattr(self, "message_limit_overlay"):
+            return
         self.message_limit_overlay.hide()
         self.message_entry.setFocus()
 
@@ -10127,6 +11753,7 @@ QComboBox::drop-down {
         overlay_layout.addStretch(1)
 
         panel_row = QHBoxLayout()
+        self.image_preview_panel_row = panel_row
         panel_row.addStretch(1)
         self.image_preview_panel = QFrame()
         self.image_preview_panel.setObjectName("configPanel")
@@ -10134,9 +11761,6 @@ QComboBox::drop-down {
         self.image_preview_panel.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
-        )
-        self.image_preview_panel.setStyleSheet(
-            self._config_panel_stylesheet()
         )
         panel_row.addWidget(self.image_preview_panel, 8)
         panel_row.addStretch(1)
@@ -10151,8 +11775,18 @@ QComboBox::drop-down {
         self.image_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_preview_label.setMinimumHeight(96)
         panel_layout.addWidget(self.image_preview_label, 1)
+        self.video_player: VideoPlayer | None = None
+        # Keep native video surfaces outside QAbstractScrollArea viewport ownership.
+        self.video_mini_panel = QFrame(self.chat_display.parentWidget())
+        self.video_mini_panel.setObjectName("configPanel")
+        mini_layout = QVBoxLayout(self.video_mini_panel)
+        mini_layout.setContentsMargins(4, 4, 4, 4)
+        mini_layout.setSpacing(0)
+        self.video_mini_panel.hide()
 
-        button_row = QHBoxLayout()
+        self.image_preview_footer = QWidget()
+        button_row = QHBoxLayout(self.image_preview_footer)
+        button_row.setContentsMargins(0, 0, 0, 0)
         self.image_preview_button_row = button_row
         self.image_preview_url_label = QLabel()
         self.image_preview_url_label.setMinimumWidth(0)
@@ -10164,10 +11798,15 @@ QComboBox::drop-down {
         open_button = QPushButton("Open in Browser")
         open_button.clicked.connect(self._open_current_image_in_browser)
         button_row.addWidget(open_button)
+        self.image_preview_open_button = open_button
+        self.image_preview_copy_button = QPushButton("Copy")
+        self.image_preview_copy_button.clicked.connect(self._copy_current_drawing)
+        button_row.addWidget(self.image_preview_copy_button)
+        self.image_preview_copy_button.hide()
         dismiss_button = QPushButton("Dismiss")
         dismiss_button.clicked.connect(self._hide_image_preview_popup)
         button_row.addWidget(dismiss_button)
-        panel_layout.addLayout(button_row)
+        panel_layout.addWidget(self.image_preview_footer)
 
         self.image_preview_overlay.hide()
         QTimer.singleShot(0, self._sync_image_preview_overlay_geometry)
@@ -10191,9 +11830,6 @@ QComboBox::drop-down {
         self.link_warning_panel.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
-        )
-        self.link_warning_panel.setStyleSheet(
-            self._config_panel_stylesheet()
         )
         panel_row.addWidget(self.link_warning_panel, 8)
         panel_row.addStretch(1)
@@ -10256,6 +11892,7 @@ QComboBox::drop-down {
         url: str,
         analysis: LinkSafetyAnalysis,
     ) -> None:
+        self._ensure_popup("link_warning")
         self._hide_chat_tooltip()
         self.current_link_warning_url = url
         self.link_warning_url_label.setText(
@@ -10279,7 +11916,7 @@ QComboBox::drop-down {
             bool(suspicious_messages)
         )
         self.link_warning_go_button.setStyleSheet(
-            "color: #c00000;" if analysis.suspicious else ""
+            f"color: {message_display_color('#c00000')};" if analysis.suspicious else ""
         )
         self._sync_link_warning_overlay_geometry()
         self.link_warning_overlay.show()
@@ -10287,6 +11924,8 @@ QComboBox::drop-down {
         self.link_warning_cancel_button.setFocus()
 
     def _hide_link_warning_popup(self) -> None:
+        if not hasattr(self, "link_warning_overlay"):
+            return
         self.link_warning_overlay.hide()
         self.current_link_warning_url = None
         self.link_warning_url_label.clear()
@@ -10301,13 +11940,23 @@ QComboBox::drop-down {
 
     def _sync_image_preview_overlay_geometry(self) -> None:
         self.image_preview_overlay.setGeometry(self.chat_content.rect())
+        self.image_preview_overlay.layout().activate()
+        self.image_preview_panel.layout().activate()
 
     def _ensure_animated_media_controller(
         self,
         url: str,
         media: RemoteMediaPreview,
     ) -> None:
-        if media.kind not in {"animated_gif", "looping_video"}:
+        if media.kind == "video":
+            if (
+                media.video_info is None
+                or media.video_info.link.provider != "direct"
+                or media.frame is not None
+                or media.thumbnail_attempted
+            ):
+                return
+        elif media.kind not in {"animated_gif", "looping_video"}:
             return
         if url in self.animated_media_controllers:
             return
@@ -10322,7 +11971,11 @@ QComboBox::drop-down {
             controller.deleteLater()
             self.last_inline_animation_frame_at.pop(oldest_url, None)
 
-        controller = AnimatedMediaController(url, media, self)
+        if media.kind == "video":
+            media.thumbnail_attempted = True
+            controller = DirectVideoThumbnail(media.source_url, self)
+        else:
+            controller = AnimatedMediaController(url, media, self)
         controller.frame_ready.connect(self._on_animated_media_frame)
         self.animated_media_controllers[url] = controller
         controller.start()
@@ -10337,9 +11990,22 @@ QComboBox::drop-down {
         media = self.image_preview_cache.get(url)
         if not isinstance(media, RemoteMediaPreview):
             return
+        had_frame = media.frame is not None
         media.frame = frame_value
+        if not had_frame:
+            self._update_search_media_preview(url, media)
+            if media.kind == "looping_video" and url in getattr(self, "_search_media_updates", {}):
+                QTimer.singleShot(0, lambda: self._stop_search_preview_loop(url))
+        if media.kind == "video" and media.video_info is not None:
+            controller = self.animated_media_controllers.get(url)
+            if isinstance(controller, DirectVideoThumbnail) and controller.duration:
+                info = media.video_info
+                media.video_info = VideoInfo(
+                    info.link, info.hostname, info.title, info.author,
+                    controller.duration, info.thumbnail_url,
+                )
 
-        if self.current_image_preview_url == url:
+        if self.current_image_preview_url == url and media.kind != "video":
             self._set_large_image_preview_frame(frame_value)
 
         if is_likely_nsfw_image_url(url):
@@ -10354,6 +12020,9 @@ QComboBox::drop-down {
             media,
             frame_value,
         )
+        if media.kind == "video":
+            self._set_rendered_inline_image(url, preview, loaded=True)
+            return
         token = hashlib.sha256(url.encode("utf-8")).hexdigest()
         resource_url = QUrl(f"spritelink-chat-image-resource:{token}")
         document = self.chat_display.document()
@@ -10366,7 +12035,7 @@ QComboBox::drop-down {
             document.markContentsDirty(position, 1)
         self.chat_display.viewport().update()
 
-    def _set_large_image_preview_frame(self, image: QImage) -> None:
+    def _set_large_image_preview_frame(self, image: QImage, *, pixel_art: bool = False) -> None:
         overlay_layout = self.image_preview_overlay.layout()
         panel_layout = self.image_preview_panel.layout()
         overlay_margins = overlay_layout.contentsMargins()
@@ -10402,7 +12071,8 @@ QComboBox::drop-down {
             available_width,
             available_height,
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation if pixel_art
+            else Qt.TransformationMode.SmoothTransformation,
         )
         self.image_preview_label.clear()
         self.image_preview_label.setPixmap(QPixmap.fromImage(preview))
@@ -10415,17 +12085,74 @@ QComboBox::drop-down {
         media = self.image_preview_cache.get(url)
         if not isinstance(media, RemoteMediaPreview):
             return
+        self._ensure_popup("image_preview")
+        if self.video_player is not None:
+            self.video_player.stop()
+            self.video_player.hide()
         self._hide_chat_tooltip()
+        self.current_drawing_preview = None
         self.current_image_preview_url = url
         self.current_image_preview_client_id = client_id
         self._ensure_animated_media_controller(url, media)
         self._sync_image_preview_overlay_geometry()
         self.image_preview_overlay.show()
         self.image_preview_overlay.raise_()
+        if media.kind == "video" and media.video_info is not None:
+            self.image_preview_footer.hide()
+            self.image_preview_panel_row.setStretch(0, 0)
+            self.image_preview_panel_row.setStretch(2, 0)
+            if self.video_player is None:
+                self.video_player = VideoPlayer(self.image_preview_panel, ThemeSlider)
+                self.video_player.duration_available.connect(self._on_video_duration_available)
+                self.video_player.popup_closed.connect(self._hide_image_preview_popup)
+                self.video_player.open_in_browser.connect(self._open_current_image_in_browser)
+                self.video_player.mode_requested.connect(self._set_video_player_mode)
+                self.video_player.mode_changed.connect(self._on_video_player_mode_changed)
+                self.image_preview_panel.layout().insertWidget(0, self.video_player, 1)
+            self.image_preview_label.hide()
+            self.video_player.show()
+            self._apply_ui_size_to_widget_tree(self.video_player)
+            self._apply_video_player_theme()
+            self.video_player.load(media.video_info)
+        else:
+            self.image_preview_footer.show()
+            self.image_preview_panel_row.setStretch(0, 1)
+            self.image_preview_panel_row.setStretch(2, 1)
+            self.image_preview_label.show()
         self._update_image_preview_popup()
         QTimer.singleShot(0, self._update_image_preview_popup)
 
+    def _show_drawing_preview(self, encoded: str) -> None:
+        try:
+            image = drawing_image(*decode_drawing(encoded))
+        except ValueError:
+            return
+        self._ensure_popup("image_preview")
+        self._hide_image_preview_popup()
+        self._hide_chat_tooltip()
+        self.current_drawing_preview = image
+        self.image_preview_footer.show()
+        self.image_preview_panel_row.setStretch(0, 1)
+        self.image_preview_panel_row.setStretch(2, 1)
+        self._sync_image_preview_overlay_geometry()
+        self.image_preview_overlay.show()
+        self.image_preview_overlay.raise_()
+        self._update_image_preview_popup()
+        QTimer.singleShot(0, self._update_image_preview_popup)
+
+    def _copy_current_drawing(self) -> None:
+        if self.current_drawing_preview is not None:
+            QApplication.clipboard().setImage(self.current_drawing_preview)
+
     def _update_image_preview_popup(self) -> None:
+        drawing = self.current_drawing_preview
+        self.image_preview_open_button.setVisible(drawing is None)
+        self.image_preview_copy_button.setVisible(drawing is not None)
+        if drawing is not None:
+            self.image_preview_url_label.clear()
+            self.image_preview_url_label.setToolTip("")
+            self._set_large_image_preview_frame(drawing, pixel_art=True)
+            return
         url = self.current_image_preview_url
         media = self.image_preview_cache.get(url or "")
         if not isinstance(media, RemoteMediaPreview):
@@ -10433,7 +12160,16 @@ QComboBox::drop-down {
             self.image_preview_url_label.clear()
             return
         self._ensure_animated_media_controller(url or "", media)
-        if isinstance(media.frame, QImage) and not media.frame.isNull():
+        if (
+            media.kind == "video" and self.video_player is not None
+        ):
+            margins = self.image_preview_overlay.layout().contentsMargins()
+            self.video_player.fit_viewport(
+                max(100, self.image_preview_overlay.height() - margins.top() - margins.bottom()
+                    - 32),
+                self.video_player.width(),
+            )
+        elif isinstance(media.frame, QImage) and not media.frame.isNull():
             self._set_large_image_preview_frame(media.frame)
         else:
             self.image_preview_label.setPixmap(QPixmap())
@@ -10449,9 +12185,16 @@ QComboBox::drop-down {
         self.image_preview_url_label.setToolTip(url or "")
 
     def _hide_image_preview_popup(self) -> None:
+        if not hasattr(self, "image_preview_overlay"):
+            return
         url = self.current_image_preview_url
         self.image_preview_overlay.hide()
+        if self.video_player is not None:
+            self.video_player.stop()
+            self.video_player.hide()
+        self.image_preview_label.show()
         self.current_image_preview_url = None
+        self.current_drawing_preview = None
         self.current_image_preview_client_id = None
         self.image_preview_label.clear()
         self.image_preview_url_label.clear()
@@ -10463,6 +12206,79 @@ QComboBox::drop-down {
                 controller.deleteLater()
             self.last_inline_animation_frame_at.pop(url, None)
         self.message_entry.setFocus()
+
+    def _set_video_player_mode(self, mode: str) -> None:
+        player = self.video_player
+        if player is None or not self.current_image_preview_url:
+            return
+        player.set_mode(mode, self.video_mini_panel)
+
+    def _on_video_player_mode_changed(self, mode: str) -> None:
+        if mode == "main":
+            self.video_mini_panel.hide()
+            self._sync_image_preview_overlay_geometry()
+            self.image_preview_overlay.show()
+            self.image_preview_overlay.raise_()
+            self._update_image_preview_popup()
+        else:
+            self.image_preview_overlay.hide()
+            if mode == "mini":
+                self._sync_video_mini_geometry()
+                self.video_mini_panel.show()
+                self.video_mini_panel.raise_()
+            else:
+                self.video_mini_panel.hide()
+        self._apply_video_player_theme()
+
+    def _sync_video_mini_geometry(self) -> None:
+        panel = getattr(self, "video_mini_panel", None)
+        if panel is None:
+            return
+        rect = self.chat_display.viewport().rect()
+        margin = 6
+        width = max(1, min(280, rect.width() - margin * 2))
+        player = getattr(self, "video_player", None)
+        if player is None or player._mode != "mini" or player._fullscreen is not None:
+            return
+        # Reserve controls and a 16:9 surface, even when the log is short.
+        origin = self.chat_display.viewport().mapTo(panel.parentWidget(), QPoint(0, margin))
+        frame = panel.frameWidth() * 2
+        margins = panel.layout().contentsMargins()
+        horizontal_chrome = frame + margins.left() + margins.right()
+        vertical_chrome = frame + margins.top() + margins.bottom()
+        available_height = max(1, panel.parentWidget().height() - origin.y() - margin)
+        inner_width, inner_height = player.mini_size(
+            max(1, width - horizontal_chrome), max(1, available_height - vertical_chrome))
+        width, height = inner_width + horizontal_chrome, inner_height + vertical_chrome
+        position = self.chat_display.viewport().mapTo(
+            panel.parentWidget(), QPoint(max(0, rect.width() - width - margin), margin)
+        )
+        panel.setGeometry(position.x(), position.y(), width, height)
+
+    def _apply_video_player_theme(self) -> None:
+        player = getattr(self, "video_player", None)
+        if player is None:
+            return
+        theme = str(self.theme_var.get())
+        position = client_theme_color(self, theme)
+        transform = (
+            (lambda text: classic_theme_stylesheet(text, position))
+            if theme == "Classic"
+            else (lambda text: hue_theme_stylesheet(text, position))
+        )
+        player.set_theme(theme, transform, self._is_tiny_ui())
+        for widget in (player, *player.findChildren(QWidget)):
+            self._set_widget_text_size(widget, "other_ui")
+        if player._mode == "mini" and player._fullscreen is None:
+            self._sync_video_mini_geometry()
+
+    def _on_video_duration_available(self, duration: int) -> None:
+        media = self.image_preview_cache.get(self.current_image_preview_url or "")
+        if isinstance(media, RemoteMediaPreview) and media.video_info is not None:
+            info = media.video_info
+            media.video_info = VideoInfo(
+                info.link, info.hostname, info.title, info.author, duration, info.thumbnail_url,
+            )
 
     def _open_current_image_in_browser(self) -> None:
         if self.current_image_preview_url:
@@ -10642,9 +12458,14 @@ QComboBox::drop-down {
 
         layout.addWidget(QLabel("Chatroom History"), row, 0)
         self.chatroom_history_combo = ThemeComboBox()
-        self.chatroom_history_combo.addItems([
-            str(option) for option in CHATROOM_HISTORY_OPTIONS
-        ])
+        for index, option in enumerate(CHATROOM_HISTORY_OPTIONS):
+            self.chatroom_history_combo.addItem(str(option))
+            megabytes = option * 4 // 1000
+            self.chatroom_history_combo.setItemData(
+                index,
+                f"Chatroom max storage: ~{megabytes} MB",
+                Qt.ItemDataRole.ToolTipRole,
+            )
         self.chatroom_history_combo.setCurrentText(
             str(self.chatroom_history_limit_var.get())
         )
@@ -10762,6 +12583,17 @@ QComboBox::drop-down {
         advanced_layout.setColumnStretch(1, 1)
         advanced_row = 0
 
+        advanced_layout.addWidget(self._heading("Data Management"), advanced_row, 0, 1, 3)
+        advanced_row += 1
+        open_storage_button = QPushButton("Open storage folder")
+        open_storage_button.clicked.connect(self._open_storage_folder)
+        advanced_layout.addWidget(
+            open_storage_button, advanced_row, 0, 1, 3, Qt.AlignmentFlag.AlignLeft,
+        )
+        advanced_row += 1
+        advanced_layout.addWidget(self._separator(), advanced_row, 0, 1, 3)
+        advanced_row += 1
+
         advanced_layout.addWidget(
             self._heading("Server"),
             advanced_row,
@@ -10795,6 +12627,7 @@ QComboBox::drop-down {
 
         advanced_layout.addWidget(QLabel("Server URL"), advanced_row, 0)
         self.server_url_entry = QLineEdit()
+        self.server_url_entry.setObjectName("serverUrl")
         self.server_url_entry.setText(str(self.server_url_var.get()))
         self.server_url_entry.textChanged.connect(self.server_url_var.set)
         self.server_url_var.bind(self.server_url_entry.setText)
@@ -10828,6 +12661,16 @@ QComboBox::drop-down {
             "Advanced ▼" if expanded else "Advanced ▶"
         )
         self.advanced_config_content.setVisible(expanded)
+
+    def _open_storage_folder(self) -> None:
+        try:
+            APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            if QDesktopServices.openUrl(QUrl.fromLocalFile(str(APP_DATA_DIR))):
+                return
+            detail = str(APP_DATA_DIR)
+        except OSError as exc:
+            detail = str(exc)
+        messagebox.showerror("Could not open storage folder", detail, parent=self.root)
 
     def _on_ui_size_changed(self, value: Any) -> None:
         ui_size = normalize_ui_size(value)
@@ -11087,6 +12930,9 @@ QComboBox::drop-down {
 
     def _on_config_toggled(self, checked: bool) -> None:
         if checked:
+            self._close_drawing_import()
+            self.search_toggle.setChecked(False)
+            self._ensure_popup("config")
             self._config_snapshot_at_open = self._config_ui_snapshot()
             self._sync_config_overlay_geometry()
             self.config_overlay.show()
@@ -11101,7 +12947,7 @@ QComboBox::drop-down {
         self._dismiss_config_popup()
 
     def _dismiss_config_popup(self) -> bool:
-        if not self.config_overlay.isVisible():
+        if not hasattr(self, "config_overlay") or not self.config_overlay.isVisible():
             self._set_config_toggle_checked(False)
             return True
 
@@ -11129,7 +12975,10 @@ QComboBox::drop-down {
         return True
 
     def _apply_server_preset_state(self) -> None:
+        if not hasattr(self, "server_url_entry"):
+            return
         preset = str(self.server_preset_var.get())
+        self.server_url_entry.setEnabled(preset == "Custom ntfy server")
         self.server_url_entry.setReadOnly(
             preset != "Custom ntfy server"
         )
@@ -11151,8 +13000,7 @@ QComboBox::drop-down {
         slider.setMinimumWidth(compact_width if classic else 64)
         slider.setMaximumWidth(compact_width if classic else 112)
         self.message_sound_volume_slider.setMaximumWidth(compact_width if classic else 16777215)
-        # Reserve the longest label so dragging between schemes keeps the
-        # controls stationary. Both Classic sliders share the compact width.
+        # Reserve the longest label to prevent slider movement.
         labels = [f"Color: {scheme['name']}" for scheme in CLASSIC_COLOR_SCHEMES]
         labels.append("Volume: 100%")
         self.theme_color_label.setMinimumWidth(
@@ -11166,7 +13014,7 @@ QComboBox::drop-down {
             slider.setPageStep(1 if classic else 15)
             slider.setTickPosition(QSlider.TickPosition.TicksBelow if classic else QSlider.TickPosition.NoTicks)
             slider.setTickInterval(1 if classic else 0)
-            position = client_theme_color(self, theme)
+            position = client_theme_color(self, theme, use_room=False)
             slider.setValue(position)
             slider.setProperty("spritelinkPreviewHue", None)
             slider.setProperty("spritelinkPreviewClassicColor", position if classic else None)
@@ -11189,8 +13037,7 @@ QComboBox::drop-down {
         self.theme_color_slider.setProperty("spritelinkPreviewHue", None if theme == "Classic" else value)
         self.theme_color_slider.setProperty("spritelinkPreviewClassicColor", value if theme == "Classic" else None)
         self.theme_color_slider.update()
-        # Stylesheet repolish and log/blur refreshes are deliberately excluded
-        # from dragging, even if the user pauses while holding the thumb.
+        # Do not repolish or refresh blur/history while dragging.
         if self.theme_color_slider.isSliderDown():
             self.theme_color_save_timer.stop()
         else:
@@ -11203,26 +13050,31 @@ QComboBox::drop-down {
         theme = str(self.theme_var.get())
         position = client_theme_color(self, theme)
         if getattr(self, "_applied_theme_color", None) == (theme, position):
-            self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
+            if hasattr(self, "theme_color_slider"):
+                self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
             return False
+        old_backgrounds = message_row_backgrounds()
         app.setProperty("spritelinkThemeHue", 0 if theme == "Classic" else position)
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
         app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
+        app.setProperty("spritelinkGlassyDark", theme == "Glassy Dark")
         if theme == "Classic":
             palette = self._windows_classic_palette()
             stylesheet = classic_theme_stylesheet(WINDOWS_CLASSIC_STYLESHEET, position)
-        elif theme == "Glassy":
+        elif theme in GLASSY_THEMES:
             palette = self._glassy_palette()
-            stylesheet = hue_theme_stylesheet(GLASSY_STYLESHEET, position)
+            stylesheet = hue_theme_stylesheet(glassy_stylesheet(theme), position)
         else:
             palette = self._modern_palette()
             stylesheet = hue_theme_stylesheet(MODERN_STYLESHEET, position)
-        stylesheet = EncryptedChatClient._ui_density_stylesheet(self, stylesheet, theme)
-        # Repolish can reset explicitly assigned families and NoAntialias.
-        # Keep the existing fonts, including Classic headings and user fonts.
+        stylesheet = EncryptedChatClient._ui_density_stylesheet(self, stylesheet, theme) + self._config_panel_stylesheet()
+        # Repolish can reset font families and NoAntialias; restore explicit fonts.
         application_font = QFont(app.font())
         fonts = [(widget, QFont(widget.font())) for widget in app.allWidgets()
                  if widget.testAttribute(Qt.WidgetAttribute.WA_SetFont)]
+        documents = [(widget.document(), QFont(widget.document().defaultFont()))
+                     for name in ("chat_display", "message_entry")
+                     if (widget := getattr(self, name, None)) is not None]
         root = getattr(self, "root", None)
         updates_enabled = root is not None and root.updatesEnabled()
         if updates_enabled:
@@ -11230,16 +13082,23 @@ QComboBox::drop-down {
         try:
             app.setPalette(palette)
             app.setStyleSheet(stylesheet)
-            panel_stylesheet = self._config_panel_stylesheet()
-            for name in ("config_panel", "message_limit_panel", "image_preview_panel", "link_warning_panel"):
-                panel = getattr(self, name, None)
-                if panel is not None and panel.styleSheet() != panel_stylesheet:
-                    panel.setStyleSheet(panel_stylesheet)
             if app.font() != application_font:
                 app.setFont(application_font)
             for widget, font in fonts:
                 if widget.font() != font:
                     widget.setFont(font)
+            for document, font in documents:
+                if document.defaultFont() != font:
+                    document.setDefaultFont(font)
+            EncryptedChatClient._recolor_chat_rows(self, old_backgrounds)
+            display = getattr(self, "chat_display", None)
+            if display is not None and display.document().isEmpty():
+                frame = display.document().rootFrame()
+                formatting = frame.frameFormat()
+                if formatting.topMargin() != 0.0:
+                    formatting.setTopMargin(0.0)
+                    frame.setFrameFormat(formatting)
+                display.document().markContentsDirty(0, display.document().characterCount())
             if hasattr(self, "message_size_bar"):
                 self._draw_message_size_bar()
         finally:
@@ -11248,20 +13107,47 @@ QComboBox::drop-down {
         for name in ("config_overlay", "message_limit_overlay", "image_preview_overlay", "link_warning_overlay"):
             overlay = getattr(self, name, None)
             if isinstance(overlay, ConfigOverlay):
-                overlay.apply_theme(theme == "Glassy")
-        self._apply_titlebar_theme()
+                overlay.schedule_background_refresh()
+        self._apply_titlebar_theme(color_only=True)
         self._applied_theme_color = (theme, position)
-        self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
+        if hasattr(self, "theme_color_slider"):
+            self.theme_color_slider.setProperty("spritelinkPreviewHue", None)
+        EncryptedChatClient._apply_video_player_theme(self)
         return True
+
+    def _recolor_chat_rows(self, old_backgrounds: tuple[str, str]) -> None:
+        display = getattr(self, "chat_display", None)
+        new_backgrounds = message_row_backgrounds()
+        if display is None or old_backgrounds == new_backgrounds:
+            return
+        replacements = {QColor(old).rgba(): QColor(new)
+                        for old, new in zip(old_backgrounds, new_backgrounds)}
+
+        def recolor(color: QColor) -> QColor:
+            return replacements.get(color.rgba(), color)
+
+        # Repaint stripes without rebuilding text, media, selection, or scroll state.
+        colors = getattr(display, "row_background_blocks", {})
+        colors.update({block: recolor(color) for block, color in colors.items()})
+        padding = getattr(display, "row_background_padding_blocks", {})
+        padding.update({block: (recolor(color), top, bottom)
+                        for block, (color, top, bottom) in padding.items()})
+        job = getattr(self, "_message_render_job", None)
+        if isinstance(job, dict):
+            for selection in job.get("row_selections", []):
+                selection.format.setBackground(recolor(selection.format.background().color()))
+            for step in job.get("render_steps", []):
+                step["background_color"] = recolor(QColor(step["background_color"])).name(QColor.NameFormat.HexArgb)
+                step["separators_after"] = [
+                    (text, recolor(QColor(color)).name(QColor.NameFormat.HexArgb))
+                    for text, color in step["separators_after"]
+                ]
+        display.viewport().update()
 
     def _save_theme_colors(self) -> None:
         if self.theme_color_slider.isSliderDown():
             return
-        changed = self._apply_theme_colors()
-        # Rebuild changed row brushes once after the committed style update,
-        # keeping history, scroll position, and rendered message fonts intact.
-        if changed and hasattr(self, "chat_display"):
-            self._rerender_preserving_scroll()
+        self._apply_theme_colors()
         colors = normalize_theme_colors(self.config_data.get("theme_colors"))
         if getattr(self, "_saved_theme_colors", None) == colors:
             return
@@ -11286,6 +13172,8 @@ QComboBox::drop-down {
         self._apply_theme()
         self._apply_application_font_strategy()
         self._apply_active_composer_style()
+        if hasattr(self, "identity_preset_selector"):
+            self._refresh_identity_preset_selector()
         if hasattr(self, "chat_display"):
             self._rerender_preserving_scroll()
 
@@ -11302,13 +13190,9 @@ QComboBox::drop-down {
     def _on_text_shadows_toggled(self, enabled: bool) -> None:
         self.text_shadows_var.set(bool(enabled))
         self._apply_theme()
-        # Replacing the application style can reset explicitly assigned
-        # widget fonts. Restore the active theme's font family, especially
-        # Tahoma for Windows Classic headings and the chatroom title.
+        # Restore explicit fonts after application-style replacement.
         self._apply_application_font_strategy()
-        # Applying a new application style can discard QTextDocument's
-        # rendered background brushes. Rebuild the log so spoiler blocks
-        # remain visible whether text shadows are enabled or disabled.
+        # Style replacement can drop spoiler brushes; rebuild the log.
         if hasattr(self, "chat_display"):
             self._rerender_preserving_scroll()
 
@@ -11409,7 +13293,7 @@ QComboBox::drop-down {
         self._request_network_refresh(poll_immediately=True)
         return True
 
-    def _build_draft_message(self, text: str) -> dict[str, Any]:
+    def _build_draft_message(self, text: str, drawing: str = "") -> dict[str, Any]:
         profile = self._active_room_profile()
         text = trim_message_text(text)
 
@@ -11423,6 +13307,9 @@ QComboBox::drop-down {
             "t": int(time.time()),
             "m": text,
         }
+        if drawing:
+            message["m"] = ""
+            message["drawing"] = drawing
         if profile["profile_icon"]:
             message["p"] = profile["profile_icon"]
         return sign_message_identity(
@@ -11432,6 +13319,16 @@ QComboBox::drop-down {
         )
 
     def _restore_active_chatroom_draft(self) -> None:
+        canvas = self.image_menu.canvas
+        state = self.drawing_drafts.get(self.active_chatroom_id)
+        canvas.undo_stack.clear()
+        canvas.redo_stack.clear()
+        if state is None:
+            canvas.canvas_size = 0
+            canvas.palette_index = 0
+            canvas.reset()
+        else:
+            canvas.restore(state)
         self._cancel_pending_message_size_check()
         signals_were_blocked = self.message_entry.blockSignals(True)
         try:
@@ -11452,13 +13349,12 @@ QComboBox::drop-down {
         self.message_size_check_pending = True
         self.message_size_timer.start(MESSAGE_SIZE_DEBOUNCE_MS)
 
-        # A stale over-limit result should not block a click after the user
-        # shortens the message. Send performs its own immediate exact check.
+        # Ignore stale size results; Send performs an exact check.
         self.send_button.setEnabled(True)
         self._draw_message_size_bar()
 
     def _resize_message_entry(self) -> None:
-        # Apply stylesheet padding before measuring, including at startup.
+        # Polish before measuring stylesheet padding.
         self.message_entry.ensurePolished()
         document = self.message_entry.document()
         document.setTextWidth(max(1, self.message_entry.viewport().width()))
@@ -11467,7 +13363,7 @@ QComboBox::drop-down {
             QFontMetrics(self.message_entry.font()).lineSpacing(),
         )
         document_margins = int(document.documentMargin() * 2)
-        document.size()  # Force wrapped line layouts to update.
+        document.size()  # Update wrapped line layout.
         display_lines = 0
         line_heights: list[float] = []
         block = document.begin()
@@ -11485,8 +13381,7 @@ QComboBox::drop-down {
             MESSAGE_ENTRY_MIN_LINES,
             min(MESSAGE_ENTRY_MAX_LINES, display_lines),
         )
-        # frameWidth() includes horizontal stylesheet padding and made Glassy
-        # taller than Modern. Only vertical padding belongs in this height.
+        # frameWidth() includes horizontal padding; measure vertical padding separately.
         contents_margins = self.message_entry.contentsMargins()
         margins = contents_margins.top() + contents_margins.bottom() + document_margins + 2
         content_height = math.ceil(sum(line_heights[:visible_lines]))
@@ -11507,12 +13402,21 @@ QComboBox::drop-down {
         self.message_size_timer.stop()
         self.message_size_check_pending = False
 
+    def _drawing_payload(self) -> str:
+        canvas = self.image_menu.canvas
+        if self.image_menu_button.isChecked() and canvas.edited:
+            return encode_drawing(canvas.canvas_size, bytes(canvas.pixels), canvas.palette_index)
+        return ""
+
     def _run_message_size_check(self) -> None:
         self.message_size_check_pending = False
         text = trim_message_text(self.message_entry.to_message_text())
 
         try:
-            draft_message = self._build_draft_message(text)
+            draft_message = self._build_draft_message(
+                "" if self.image_menu_button.isChecked() else text,
+                self._drawing_payload(),
+            )
             self.current_estimated_packet_size = estimate_opaque_packet_size(
                 draft_message
             )
@@ -11599,7 +13503,7 @@ QComboBox::drop-down {
             min(packet_size, NTFY_MAX_BODY_BYTES)
         )
         if self._is_windows_classic_theme():
-            self.message_size_bar.setStyleSheet(
+            stylesheet = (
                 "QProgressBar { background-color: #ffffff;"
                 " border-top: 2px solid #808080;"
                 " border-left: 2px solid #808080;"
@@ -11613,7 +13517,7 @@ QComboBox::drop-down {
                 + "; }"
             )
         elif self._is_glassy_theme():
-            self.message_size_bar.setStyleSheet(
+            stylesheet = (
                 "QProgressBar { background-color: rgba(255,255,255,188);"
                 " border: 1px solid #6f9bb5; border-radius: 4px; color: "
                 + ("#ffffff" if at_or_over_limit else "#172532")
@@ -11632,7 +13536,7 @@ QComboBox::drop-down {
                 + "); border-radius: 3px; }"
             )
         else:
-            self.message_size_bar.setStyleSheet(
+            stylesheet = (
                 "QProgressBar { background-color: #eeeeee; "
                 "border: 1px solid #a8a8a8; color: "
                 + ("#ffffff" if at_or_over_limit else "#202020")
@@ -11642,14 +13546,23 @@ QComboBox::drop-down {
                 + "; border-radius: 3px; }"
             )
 
+        if client_glassy_theme(self) == "Glassy Dark":
+            stylesheet = (
+                "QProgressBar { color:#e1e6eb; background:rgba(25,30,36,112);"
+                " border:1px solid #000000; border-radius:4px; text-align:center; }"
+                "QProgressBar::chunk { border-radius:3px; background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                + ("stop:0 #bb9393,stop:0.48 #946464,stop:0.52 #743d3d,stop:1 #5e3131"
+                   if at_or_over_limit else "stop:0 #9dabb5,stop:0.48 #748b9c,stop:0.52 #4f6c82,stop:1 #3f5a70")
+                + "); }"
+            )
+
         if self._is_windows_classic_theme():
-            self.message_size_bar.setStyleSheet(classic_theme_stylesheet(
-                self.message_size_bar.styleSheet(), client_theme_color(self, "Classic")
-            ))
+            stylesheet = classic_theme_stylesheet(stylesheet, client_theme_color(self, "Classic"))
         elif self._is_glassy_theme():
-            self.message_size_bar.setStyleSheet(hue_theme_stylesheet(
-                self.message_size_bar.styleSheet(), client_theme_color(self, "Glassy")
-            ))
+            stylesheet = hue_theme_stylesheet(stylesheet, client_theme_color(self, client_glassy_theme(self)))
+
+        if self.message_size_bar.styleSheet() != stylesheet:
+            self.message_size_bar.setStyleSheet(stylesheet)
 
         messages_left = self._messages_left_today()
         message_limit_suffix = (
@@ -11669,15 +13582,21 @@ QComboBox::drop-down {
             )
 
         self.send_button.setEnabled(
-            self.message_size_check_pending or not at_or_over_limit
+            (self.message_size_check_pending or not at_or_over_limit)
+            and (not self.image_menu_button.isChecked() or self.image_menu.canvas.edited)
         )
 
     def _send_current_message(self) -> None:
-        text = trim_message_text(self.message_entry.to_message_text())
-        plain_text = message_plain_text(text)
-
-        if not plain_text:
-            return
+        image_mode = self.image_menu_button.isChecked()
+        drawing = self._drawing_payload()
+        if image_mode:
+            if not drawing:
+                return
+            text = ""
+        else:
+            text = trim_message_text(self.message_entry.to_message_text())
+            if not message_plain_text(text):
+                return
 
         if len(text) > MAX_MESSAGE_CHARS:
             messagebox.showwarning(
@@ -11699,7 +13618,7 @@ QComboBox::drop-down {
 
         encryption_key = self._active_chatroom()["key"]
 
-        message = self._build_draft_message(text)
+        message = self._build_draft_message(text, drawing)
         (
             message["i"],
             self._last_outbound_message_order,
@@ -11757,8 +13676,7 @@ QComboBox::drop-down {
                 bypass_rate_limits=True,
             )
 
-        # The network worker consumes this FIFO queue synchronously. A newer
-        # message never starts its POST until every earlier one has finished.
+        # Finish each POST before starting the next queued message.
         self.send_queue.put({
             "server_url": server_url,
             "encryption_key": encryption_key,
@@ -11768,9 +13686,12 @@ QComboBox::drop-down {
         })
         self.network_wakeup_event.set()
 
-        self.message_entry.clear()
-        self.message_entry.clear_formatting_state()
-        self._sync_formatting_buttons()
+        if image_mode:
+            self.image_menu.canvas.reset()
+        else:
+            self.message_entry.clear()
+            self.message_entry.clear_formatting_state()
+            self._sync_formatting_buttons()
         self.draft_message_id = uuid.uuid4().hex
         self._resize_message_entry()
         self._run_message_size_check()
@@ -11822,8 +13743,7 @@ QComboBox::drop-down {
             except Exception:
                 pass
 
-        # Closing a streaming requests response can wait for the socket reader.
-        # Never let a chatroom or server change block Qt's GUI thread.
+        # Streaming response close can block; run it off the GUI thread.
         threading.Thread(
             target=close_response,
             name="SpriteLinkSubscriptionRefreshClose",
@@ -12071,9 +13991,8 @@ QComboBox::drop-down {
             )
             room_to_poll: dict[str, str] | None = None
             repay_background_after_poll = False
-            # Normal presence work shares the chat request cadence. Restoring
-            # from tray requests a tally immediately, then resumes that cadence.
-            # A step sends a ping or fetches a tally, never both at once.
+            # Presence shares request cadence; tray restore requests an immediate tally.
+            # Each step sends a ping or fetches a tally, never both.
             presence_work = (
                 (
                     (
@@ -12179,17 +14098,22 @@ QComboBox::drop-down {
         label = getattr(self, "recently_online_label", None)
         if label is None:
             return
-        label.setVisible(self.active_chatroom_id == GLOBAL_CHATROOM_ID)
-        server = normalize_server_url(self.config_data.get("server_url", ""))
-        pings = self.recently_online_counts.get(server)
-        if pings is not None:
-            self._last_recently_online_count = len(pings)
-        if self._last_recently_online_count is None:
-            label.setText("Recently online: …")
+        if not self.recently_online_counts and not self._last_recently_online_counts:
+            label.clear()
+            label.hide()
             return
-        # Keep the last completed tally throughout tray suspension, refreshes
-        # and server changes. Only a successful response replaces the value.
-        label.setText(f"Recently online: {self._last_recently_online_count}")
+        server = normalize_server_url(self.config_data.get("server_url", ""))
+        topic = derive_ntfy_topic(self._active_chatroom()["key"])
+        counts = self.recently_online_counts.get(server)
+        if counts is not None:
+            self._last_recently_online_counts[topic] = counts.get(topic, 0)
+        count = self._last_recently_online_counts.get(topic)
+        if not count:
+            label.clear()
+            label.hide()
+            return
+        label.setText(f"{count} recently online")
+        label.show()
 
     def _network_recently_online_step(self, *, now: float) -> bool:
         server = normalize_server_url(self.config_data.get("server_url", ""))
@@ -12197,8 +14121,8 @@ QComboBox::drop-down {
             return False
         states = self.config_data.setdefault("recently_online_state", {})
         state = states.get(server)
-        if not isinstance(state, dict):
-            state = {}
+        if not isinstance(state, dict) or state.get("version") != RECENTLY_ONLINE_VERSION:
+            state = {"version": RECENTLY_ONLINE_VERSION}
             states[server] = state
         sent_at = state.get("sent_at", 0)
         if (
@@ -12229,12 +14153,15 @@ QComboBox::drop-down {
                 if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
                     token = secrets.token_hex(16)
                     state["pending_token"] = token
-                # Retrying after a timeout or restart must count as one ping.
+                # Retries must reuse the ping token.
                 save_config(self.config_data)
                 topic, _key = recently_online_transport()
                 response = self.session.post(
                     f"{server}/{topic}",
-                    data=make_recently_online_packet(token).encode("ascii"),
+                    data=make_recently_online_packet(token, [
+                        derive_ntfy_topic(room["key"])
+                        for room in self._chatroom_definitions()
+                    ]).encode("ascii"),
                     headers={
                         "Content-Type": "text/plain; charset=utf-8",
                         "X-Firebase": "no",
@@ -12248,8 +14175,7 @@ QComboBox::drop-down {
                 self._queue_ui_event(("recently_online_sent", None))
                 save_config(self.config_data)
             except Exception:
-                # Retry quietly with the same token; presence failures never
-                # produce chat messages, unread markers or notifications.
+                # Retry silently with the same token; presence failures are not chat events.
                 pass
             return True
 
@@ -12267,15 +14193,14 @@ QComboBox::drop-down {
             topic, _key = recently_online_transport()
             response = self.session.get(
                 f"{server}/{topic}/json",
-                params={"poll": "1", "since": "6h"},
+                params={"poll": "1", "since": "3h"},
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
             pings = recently_online_pings(parse_ntfy_ndjson(response), now=time.time())
-            self._queue_ui_event(("recently_online", (server, pings)))
+            self._queue_ui_event(("recently_online", (server, recently_online_topic_counts(pings))))
         except Exception:
-            # Keep the last completed count on failure. A failed first fetch
-            # remains unknown, rather than suggesting zero users.
+            # Retain the last count on failure; an unknown first count is not zero.
             self.recently_online_poll_attempts[server] = (
                 now - RECENTLY_ONLINE_POLL_SECONDS + RECENTLY_ONLINE_RETRY_SECONDS
             )
@@ -12575,6 +14500,10 @@ QComboBox::drop-down {
             raise ValueError("Username contains unsupported characters.")
         if len(message["m"]) > MAX_MESSAGE_CHARS:
             raise ValueError("Message text is too long.")
+        if "drawing" in message:
+            if message["m"]:
+                raise ValueError("Drawings cannot contain message text.")
+            decode_drawing(message["drawing"])
         if not QColor(message["k"]).isValid():
             raise ValueError("Username color is invalid.")
 
@@ -12618,14 +14547,17 @@ QComboBox::drop-down {
             for _event_index in range(UI_EVENT_BATCH_LIMIT):
                 event_type, payload = self.ui_queue.get_nowait()
 
-                if event_type == "status":
+                if event_type == "startup_error":
+                    messagebox.showerror("Could not start networking", payload, parent=self.root)
+
+                elif event_type == "status":
                     status, _detail, room_id = payload
                     if room_id == self.active_chatroom_id:
                         self.status_var.set(status)
 
                 elif event_type == "recently_online":
-                    server, pings = payload
-                    self.recently_online_counts[server] = pings
+                    server, counts = payload
+                    self.recently_online_counts[server] = counts
                     self._update_recently_online_label()
 
                 elif event_type == "messages":
@@ -12659,14 +14591,13 @@ QComboBox::drop-down {
                             )
 
                     if added_message_ids:
-                        self.message_log.sort(key=self._message_sort_key)
                         self._persist_local_history()
                         self._queue_live_message_render(
                             added_message_ids
                         )
 
                 elif event_type in {"send_succeeded", "recently_online_sent"}:
-                    # Anonymous pings also consume a relay publish request.
+                    # Presence pings consume the relay publish limit.
                     self._record_successful_send()
 
                 elif event_type == "send_failed":
@@ -12677,12 +14608,37 @@ QComboBox::drop-down {
                         f"Message could not be uploaded: {payload['error']}",
                         warning=True,
                     )
+                    if "drawing" in message:
+                        canvas = self.image_menu.canvas
+                        if not canvas.edited:
+                            size, pixels, palette = decode_drawing(message["drawing"])
+                            canvas.replace(size, pixels, palette=palette)
+                        continue
                     self._append_system_message(
                         "Unsent text from "
                         f"{message['u']}: "
                         f"{message_plain_text(str(message['m']))}",
                         warning=True,
                     )
+
+                elif event_type == "chat_search_results":
+                    self._show_chat_search_results(*payload)
+
+                elif event_type == "history_load_finished":
+                    if payload == (self._history_render_generation, self.active_chatroom_id):
+                        self._history_load_complete = True
+                        if self._pending_search_jump is not None:
+                            target, order = self._pending_search_jump
+                            self._pending_search_jump = None
+                            self._jump_to_search_result(target, order)
+
+                elif event_type == "history_load_error":
+                    if payload == (self._history_render_generation, self.active_chatroom_id):
+                        messagebox.showerror(
+                            "Chat history",
+                            "Could not read saved chat history.",
+                            parent=self.root,
+                        )
 
                 elif event_type == "history_chunk_loaded":
                     generation = int(payload.get("generation", -1))
@@ -12715,15 +14671,25 @@ QComboBox::drop-down {
                         self.message_log.extend(accepted_items)
                         self.message_log.sort(key=self._message_sort_key)
                     elif accepted_items:
-                        # The worker emits saved-history chunks newest-first.
-                        # Every later chunk is older than the current prefix,
-                        # so prepend it without repeatedly sorting the growing
-                        # retained history on the GUI thread.
-                        self.message_log[0:0] = accepted_items
+                        # A delayed live message can overlap this older page.
+                        overlap = bisect_right(
+                            self.message_log,
+                            self._message_sort_key(accepted_items[-1]),
+                            key=self._message_sort_key,
+                        )
+                        self.message_log[:overlap] = sorted(
+                            accepted_items + self.message_log[:overlap],
+                            key=self._message_sort_key,
+                        )
+                    if accepted_items:
+                        self._trim_message_log(self._chatroom_history_limit())
+                        if not initial_chunk and self._history_render_pruned:
+                            self._flush_pending_live_message_render()
                     if initial_chunk:
                         if self.message_log and not self._tray_ui_suspended:
                             self._render_message_log(
                                 scroll_to_bottom=True,
+                                initial_message_batch=INITIAL_HISTORY_IMMEDIATE_MESSAGES,
                                 on_finished=lambda: (
                                     self._finish_initial_history_render(
                                         generation,
@@ -12736,6 +14702,11 @@ QComboBox::drop-down {
                                 generation,
                                 room_id,
                             )
+                    if self._pending_search_jump is not None:
+                        target, order = self._pending_search_jump
+                        if any(self._message_id_from_log_item(item) == target for item in accepted_items):
+                            self._jump_to_search_result(target, order)
+
                 elif event_type == "image_preview_loaded":
                     url = str(payload.get("url", ""))
                     data = payload.get("data")
@@ -12745,7 +14716,14 @@ QComboBox::drop-down {
                     if self._tray_ui_suspended:
                         continue
                     media: RemoteMediaPreview | None = None
-                    if isinstance(data, bytes) and data:
+                    video_info = payload.get("video_info")
+                    if kind == "video" and isinstance(video_info, VideoInfo):
+                        frame = QImage.fromData(data) if isinstance(data, bytes) and data else QImage()
+                        media = RemoteMediaPreview(
+                            source_url, data or b"", kind,
+                            frame if not frame.isNull() else None, video_info,
+                        )
+                    elif isinstance(data, bytes) and data:
                         if kind == "looping_video":
                             media = RemoteMediaPreview(
                                 source_url,
@@ -12764,6 +14742,7 @@ QComboBox::drop-down {
                                     candidate,
                                 )
                     self.image_preview_cache[url] = media
+                    self._update_search_media_preview(url, media)
                     while (
                         len(self.image_preview_cache)
                         > IMAGE_PREVIEW_CACHE_LIMIT
@@ -12774,7 +14753,10 @@ QComboBox::drop-down {
                         )
                         > MAX_REMOTE_MEDIA_CACHE_BYTES
                     ):
-                        oldest_url = next(iter(self.image_preview_cache))
+                        oldest_url = next((candidate for candidate in self.image_preview_cache
+                                           if candidate != self.current_image_preview_url), None)
+                        if oldest_url is None:
+                            break
                         self.image_preview_cache.pop(oldest_url, None)
                         controller = (
                             self.animated_media_controllers.pop(
@@ -12832,19 +14814,30 @@ QComboBox::drop-down {
         if not server_url or not encryption_key:
             return
 
-        history = load_chatroom_history(server_url, encryption_key)
-        seen_ntfy_ids = {
-            str(entry.get("ntfy_id"))
-            for entry in history
-            if isinstance(entry.get("ntfy_id"), str)
-            and entry.get("ntfy_id")
-        }
-        seen_client_message_ids = {
-            str(entry["message"].get("i"))
-            for entry in history
-            if isinstance(entry.get("message"), dict)
-            and isinstance(entry["message"].get("i"), str)
-        }
+        history = load_chatroom_history(server_url, encryption_key, limit=2)
+        path = chatroom_history_path(server_url, encryption_key)
+        seen_client_message_ids = set()
+        seen_ntfy_ids = set()
+        if path.exists():
+            with closing(sqlite3.connect(path)) as connection:
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    message = item.get("message")
+                    if not isinstance(message, dict):
+                        continue
+                    message_id = message.get("i")
+                    ntfy_id = item.get("ntfy_id")
+                    if not isinstance(message_id, str) or not isinstance(ntfy_id, str):
+                        continue
+                    match = connection.execute(
+                        "SELECT 1 FROM messages WHERE message_id = ? OR ntfy_id = ?",
+                        (message_id, ntfy_id),
+                    ).fetchone()
+                    if match:
+                        seen_client_message_ids.add(message_id)
+                        seen_ntfy_ids.add(ntfy_id)
+        new_entries = []
         muted_user_ids = self._room_preference_ids_for_key(
             "muted_users",
             encryption_key,
@@ -12883,12 +14876,14 @@ QComboBox::drop-down {
                 ntfy_time=message_ntfy_time,
                 ntfy_id=ntfy_id,
             )
-            history.append({
+            entry = {
                 "message": message,
                 "warning": None,
                 "ntfy_id": ntfy_id,
                 "ntfy_time": message_ntfy_time,
-            })
+            }
+            new_entries.append(entry)
+            history.append(entry)
             added += 1
 
             should_notify = poll_message_should_notify(
@@ -12926,19 +14921,18 @@ QComboBox::drop-down {
                     and not is_muted_notification
                     and duplicate_ordinal <= 2
                 ):
-                    self._play_notification_sound()
+                    self._play_notification_sound(room_id)
             previous_message_id = client_message_id
 
         if not added:
             return
 
-        history.sort(key=self._message_sort_key)
-        # Inactive rooms are pruned by the hourly maintenance timer.
         try:
             save_chatroom_history(
                 server_url,
                 encryption_key,
-                history,
+                new_entries,
+                self._chatroom_history_limit(),
             )
         except Exception:
             pass
@@ -12987,6 +14981,11 @@ QComboBox::drop-down {
             ntfy_time=int(item["ntfy_time"]),
             ntfy_id=str(ntfy_id),
         )
+
+        if play_chime and not is_local and self.root.isVisible() and not self.root.isMinimized():
+            pending = self._message_sort_key(item), str(client_message_id)
+            if self._unseen_live_message is None or pending > self._unseen_live_message:
+                self._unseen_live_message = pending
 
         self._add_message_to_log(
             message,
@@ -13040,7 +15039,7 @@ QComboBox::drop-down {
                     self.active_chatroom_id
                 )
             ):
-                self._play_notification_sound()
+                self._play_notification_sound(self.active_chatroom_id)
 
         return True
 
@@ -13078,19 +15077,16 @@ QComboBox::drop-down {
                 int(item["ntfy_time"]),
                 newest_received_time + 1,
             )
-        self.message_log.append(item)
+        insort_right(self.message_log, item, key=self._message_sort_key)
+        self.pending_history_entries.append(item)
 
-        self.message_log.sort(key=self._message_sort_key)
-        history_limit = self._chatroom_history_limit()
-        if len(self.message_log) > history_limit:
-            del self.message_log[:-history_limit]
-        # The visible history is a growing suffix for the lifetime of this
-        # room view. A newly received message must extend that suffix instead
-        # of pushing its oldest already-loaded message out of the document.
-        self.rendered_history_message_limit = min(
-            len(self.message_log),
-            self.rendered_history_message_limit + 1,
-        )
+        self._trim_message_log(self._chatroom_history_limit())
+        if self._search_history_end is None:
+            # Live arrivals extend the visible suffix without evicting loaded rows.
+            self.rendered_history_message_limit = min(
+                len(self.message_log),
+                self.rendered_history_message_limit + 1,
+            )
         if persist:
             self._persist_local_history()
         if render:
@@ -13111,12 +15107,21 @@ QComboBox::drop-down {
 
     def _flush_pending_live_message_render(self) -> None:
         if (
-            not self._pending_live_render_message_ids
+            not (self._pending_live_render_message_ids or self._history_render_pruned)
             or self._tray_ui_suspended
+            or self._loading_older_history_page
             or self._rendering_message_log
             or self._history_render_updates_suppressed
             or self._media_rerender_in_progress
         ):
+            return
+
+        if self._history_render_pruned:
+            self._rerender_preserving_scroll()
+            return
+
+        if self._search_history_end is not None:
+            self._pending_live_render_message_ids.clear()
             return
 
         pending_ids = list(self._pending_live_render_message_ids)
@@ -13133,10 +15138,11 @@ QComboBox::drop-down {
             return
 
         if not self._append_live_message_items(items):
-            # A delayed or duplicate message can belong inside an existing
-            # rendered group instead of after it. Keep that exceptional case
-            # correct; normal live arrivals never enter the history renderer.
-            self._render_message_log(scroll_to_bottom=True)
+            # Delayed messages may belong inside an existing group; use the rebuild fallback.
+            if self._unseen_live_message is not None and not any(item["is_local"] for item in items):
+                self._rerender_preserving_scroll()
+            else:
+                self._render_message_log(scroll_to_bottom=True)
 
     def _append_live_message_items(
         self,
@@ -13171,9 +15177,7 @@ QComboBox::drop-down {
                 muted_ids,
             )
             if len(boundary_groups) == 1:
-                # Consecutive repeated messages are represented by one row.
-                # Updating that already-rendered row needs the correctness
-                # fallback above instead of appending a second row.
+                # Repeated messages share a row; update it through the rebuild fallback.
                 return False
 
         collapsed_ids = self._room_preference_ids("collapsed_messages")
@@ -13236,6 +15240,13 @@ QComboBox::drop-down {
                     + 1
                 ) % len(message_row_backgrounds())
 
+        preserve_view = (
+            self._unseen_live_message is not None
+            and previous_item is not None
+            and not any(item["is_local"] for item in items)
+        )
+        scrollbar = self.chat_display.verticalScrollBar()
+        previous_scroll = scrollbar.value()
         self._hide_chat_tooltip()
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -13297,13 +15308,15 @@ QComboBox::drop-down {
             for selection in row_selections
             if selection.cursor.block().isValid()
         })
-        self._bottom_align_short_message_log()
+        if not preserve_view:
+            self._bottom_align_short_message_log()
         self.chat_display.setExtraSelections([])
         self._apply_active_unread_divider_block()
         self.chat_display.horizontalScrollBar().setValue(0)
-        scrollbar = self.chat_display.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-        self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
+        scrollbar.setValue(previous_scroll if preserve_view else scrollbar.maximum())
+        self._update_live_unread_edge()
+        if not self.viewport_media_timer.isActive():
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
         self.chat_display.viewport().update()
         return True
 
@@ -13319,6 +15332,7 @@ QComboBox::drop-down {
         generation = self._history_render_generation
         room_id = self.active_chatroom_id
         history_limit = self._chatroom_history_limit()
+        self._history_load_complete = False
         try:
             self.history_load_executor.submit(
                 self._load_saved_history_worker,
@@ -13329,7 +15343,7 @@ QComboBox::drop-down {
                 history_limit,
             )
         except RuntimeError:
-            pass
+            self._history_load_complete = True
 
     def _load_saved_history_worker(
         self,
@@ -13339,18 +15353,31 @@ QComboBox::drop-down {
         encryption_key: str,
         history_limit: int,
     ) -> None:
-        entries = load_chatroom_history(server_url, encryption_key)[
-            -history_limit:
-        ]
         first_chunk = True
-        chunk_end = len(entries)
-        while chunk_end > 0 and not self._closing:
-            chunk_start = max(
-                0,
-                chunk_end - INITIAL_HISTORY_RENDER_MESSAGES,
-            )
+        remaining = history_limit
+        before = None
+        while (
+            remaining > 0 and not self._closing
+            and generation == self._history_render_generation
+        ):
+            try:
+                entries = load_chatroom_history(
+                    server_url,
+                    encryption_key,
+                    limit=min(remaining, INITIAL_HISTORY_RENDER_MESSAGES),
+                    before=before,
+                )
+            except Exception:
+                self._queue_ui_event((
+                    "history_load_error", (generation, room_id),
+                ))
+                break
+            if not entries:
+                break
+            before = self._message_sort_key(entries[0])
+            remaining -= len(entries)
             prepared_items: list[dict[str, Any]] = []
-            for item in entries[chunk_start:chunk_end]:
+            for item in entries:
                 message = item.get("message")
                 if not isinstance(message, dict):
                     continue
@@ -13399,7 +15426,6 @@ QComboBox::drop-down {
                 },
             ))
             first_chunk = False
-            chunk_end = chunk_start
 
         if first_chunk and not self._closing:
             self._queue_ui_event((
@@ -13411,6 +15437,9 @@ QComboBox::drop-down {
                     "initial": True,
                 },
             ))
+
+        if not self._closing and generation == self._history_render_generation:
+            self._queue_ui_event(("history_load_finished", (generation, room_id)))
 
     def _finish_initial_history_render(
         self,
@@ -13458,29 +15487,17 @@ QComboBox::drop-down {
         if not server_url or not encryption_key:
             return
 
-        serializable = []
-        history_limit = self._chatroom_history_limit()
-        for item in self.message_log[-history_limit:]:
-            serializable.append({
-                "message": item["message"],
-                "warning": item.get("warning"),
-                "ntfy_id": item.get("ntfy_id"),
-                "ntfy_time": int(item.get("ntfy_time", 0) or 0),
-                **(
-                    {"display_sort_time": int(item["display_sort_time"])}
-                    if type(item.get("display_sort_time")) is int
-                    else {}
-                ),
-            })
-
         try:
             save_chatroom_history(
                 server_url,
                 encryption_key,
-                serializable,
+                self.pending_history_entries,
+                self._chatroom_history_limit(),
             )
         except Exception:
-            pass
+            self.status_var.set("Could not save chat history")
+        else:
+            self.pending_history_entries.clear()
 
     def _chatroom_history_limit(self) -> int:
         value = (
@@ -13493,13 +15510,34 @@ QComboBox::drop-down {
         )
         return normalize_chatroom_history_limit(value)
 
+    def _trim_message_log(self, limit: int) -> None:
+        excess = len(self.message_log) - limit
+        if excess <= 0:
+            return
+        if self._rendering_message_log or self._loading_older_history_page or any(
+            self._message_id_from_log_item(item) in self.rendered_message_last_blocks
+            for item in self.message_log[:excess]
+        ):
+            self._history_render_pruned = True
+        if self._unseen_live_message is not None and any(
+            self._message_id_from_log_item(item) == self._unseen_live_message[1]
+            for item in self.message_log[:excess]
+        ):
+            self._unseen_live_message = None
+        del self.message_log[:excess]
+        if self._search_history_end is not None and not self._history_view_end():
+            self._search_history_end = None
+            self.latest_history_button.hide()
+            self.rendered_history_message_limit = INITIAL_HISTORY_RENDER_MESSAGES
+        self.rendered_history_message_limit = min(
+            self.rendered_history_message_limit, self._history_view_end()
+        )
+
     def _apply_chatroom_history_limit(self) -> None:
         history_limit = self._chatroom_history_limit()
         self.config_data["chatroom_history_limit"] = history_limit
-        if len(self.message_log) > history_limit:
-            del self.message_log[:-history_limit]
-            if hasattr(self, "chat_display"):
-                self._render_message_log(scroll_to_bottom=True)
+        self._trim_message_log(history_limit)
+        self._flush_pending_live_message_render()
         self._persist_local_history()
         self._prune_background_local_histories()
 
@@ -13672,6 +15710,10 @@ QComboBox::drop-down {
             )
             return
         anchor = self._capture_chat_view_anchor()
+        if self._unseen_live_message is not None:
+            anchor["at_bottom"] = False
+            anchor["live_top_margin"] = self.chat_display.document().rootFrame().frameFormat().topMargin()
+            anchor["fallback_scroll"] = self.chat_display.verticalScrollBar().value()
         generation = self._history_render_generation
         room_id = self.active_chatroom_id
         self._media_rerender_in_progress = True
@@ -13699,10 +15741,20 @@ QComboBox::drop-down {
         cursor = self.chat_display.cursorForPosition(QPoint(0, 0))
         block = cursor.block()
         while block.isValid():
+            if document.documentLayout().blockBoundingRect(block).bottom() <= value:
+                block = block.next()
+                continue
             message_id = self.rendered_message_blocks.get(
                 block.blockNumber()
             )
             if message_id:
+                previous = block.previous()
+                while (
+                    previous.isValid()
+                    and self.rendered_message_blocks.get(previous.blockNumber()) == message_id
+                ):
+                    block = previous
+                    previous = block.previous()
                 block_top = (
                     document.documentLayout()
                     .blockBoundingRect(block)
@@ -13747,9 +15799,15 @@ QComboBox::drop-down {
         ):
             return
 
+        if "live_top_margin" in anchor:
+            frame = self.chat_display.document().rootFrame()
+            formatting = frame.frameFormat()
+            formatting.setTopMargin(anchor["live_top_margin"])
+            frame.setFrameFormat(formatting)
         self._restore_chat_view_anchor(anchor)
         self._media_rerender_in_progress = False
         self._set_history_render_updates_suppressed(False)
+        self._update_live_unread_edge()
         self._flush_pending_live_message_render()
 
     def _restore_chat_view_anchor(
@@ -13780,6 +15838,8 @@ QComboBox::drop-down {
                 scrollbar.setValue(round(
                     block_top - float(anchor.get("viewport_offset", 0.0))
                 ))
+            elif "fallback_scroll" in anchor:
+                scrollbar.setValue(anchor["fallback_scroll"])
             else:
                 scrollbar.setValue(max(
                     scrollbar.minimum(),
@@ -13810,8 +15870,17 @@ QComboBox::drop-down {
         self._pending_tooltip_message_id = None
         if not message_id or message_id != self._hovered_message_id:
             return
-        item = self.rendered_message_items.get(message_id)
-        tooltip = self._tooltip_for_message_item(item) if item else ""
+        if message_id.startswith("video:"):
+            url = message_id[len("video:"):]
+            media = self.image_preview_cache.get(url)
+            tooltip = (
+                media.video_info.tooltip()
+                if isinstance(media, RemoteMediaPreview) and media.video_info is not None
+                else escape(urlsplit(url).hostname or "")
+            )
+        else:
+            item = self.rendered_message_items.get(message_id)
+            tooltip = self._tooltip_for_message_item(item) if item else ""
         if tooltip:
             QToolTip.showText(
                 self._pending_tooltip_global_position,
@@ -13961,8 +16030,17 @@ QComboBox::drop-down {
         self,
         url: str,
         global_position: QPoint,
+        *,
+        embedded_image: bool = False,
     ) -> None:
         menu = QMenu(self.root)
+        if embedded_image:
+            media = self.image_preview_cache.get(url)
+            if isinstance(media, RemoteMediaPreview) and media.kind != "video":
+                frame = media.frame
+                if isinstance(frame, QImage) and not frame.isNull():
+                    copy_image = menu.addAction("Copy Image")
+                    copy_image.triggered.connect(lambda: QApplication.clipboard().setImage(frame))
         copy_action = menu.addAction("Copy Link")
         copy_action.triggered.connect(
             lambda: QApplication.clipboard().setText(url)
@@ -13975,16 +16053,6 @@ QComboBox::drop-down {
             or self._tray_ui_suspended
             or not hasattr(self, "chat_display")
         ):
-            return
-        if (
-            self._rendering_message_log
-            or self._loading_older_history_page
-            or self._history_render_updates_suppressed
-            or self._media_rerender_in_progress
-        ):
-            self.viewport_media_timer.start(
-                VIEWPORT_MEDIA_UPDATE_DELAY_MS
-            )
             return
         viewport = self.chat_display.viewport()
         viewport_height = max(1, viewport.height())
@@ -14010,6 +16078,10 @@ QComboBox::drop-down {
         self.viewport_embedded_image_urls = desired_urls
         for url in desired_urls:
             self._schedule_image_preview_fetch(url)
+
+        if self._history_render_updates_suppressed or self._media_rerender_in_progress:
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
+            return
 
         cached_desired_urls = {
             url
@@ -14081,27 +16153,18 @@ QComboBox::drop-down {
                 geometry_changed = True
                 changed_image_blocks.add(cursor.block().position())
 
-            # Reapply the inline format on every decoded resource swap. Qt can
-            # otherwise retain the placeholder pixels when the real preview
-            # happens to have the same geometry.
+            # Reapply format even at unchanged size; Qt may retain placeholder pixels.
             cursor.setCharFormat(image_format)
             document.markContentsDirty(position, 1)
 
         if geometry_changed:
-            # Image-only messages top-align their username and profile icon
-            # against the preview.  Those text baseline offsets were created
-            # from the placeholder height, so resize them in the same hidden
-            # transaction as the image character instead of waiting for a
-            # later document rebuild.
+            # Update sender baselines with the preview height in the same hidden transaction.
             for block_position in changed_image_blocks:
                 self._realign_inline_image_block_text(
                     document,
                     block_position,
                 )
-            # Inline-object size changes can leave the surrounding block with
-            # stale line geometry until another scroll event. Complete layout
-            # while the viewport transaction is still hidden; its saved
-            # anchor is restored before updates are enabled again.
+            # Force inline-object layout before restoring the anchor and showing updates.
             document.documentLayout().documentSize()
         self.chat_display.viewport().update()
 
@@ -14168,8 +16231,13 @@ QComboBox::drop-down {
         anchor = self._capture_chat_view_anchor()
         generation = self._history_render_generation
         room_id = self.active_chatroom_id
-        self._media_rerender_in_progress = True
-        self._set_history_render_updates_suppressed(True)
+        rendering_history = self._rendering_message_log or self._loading_older_history_page
+        updates_enabled = self.chat_display.updatesEnabled()
+        if rendering_history:
+            self.chat_display.setUpdatesEnabled(False)
+        else:
+            self._media_rerender_in_progress = True
+            self._set_history_render_updates_suppressed(True)
 
         for url in urls_to_unload:
             preview_size = self.embedded_image_preview_sizes.get(url)
@@ -14181,7 +16249,7 @@ QComboBox::drop-down {
                 self.embedded_image_preview_sizes[url] = preview_size
             self._set_rendered_inline_image(
                 url,
-                self._unloaded_image_placeholder(*preview_size),
+                self._unloaded_image_placeholder(*preview_size, url=url),
                 loaded=False,
             )
             if self.current_image_preview_url != url:
@@ -14207,11 +16275,13 @@ QComboBox::drop-down {
             if not is_likely_nsfw_image_url(url):
                 self._ensure_animated_media_controller(url, media)
 
-        self._finish_preserving_scroll_rerender(
-            generation,
-            room_id,
-            anchor,
-        )
+        if rendering_history:
+            # Finish before the next prepend can move this row or its scroll anchor.
+            self.chat_display.document().documentLayout().documentSize()
+            self._restore_chat_view_anchor(anchor)
+            self.chat_display.setUpdatesEnabled(updates_enabled)
+        else:
+            self._finish_preserving_scroll_rerender(generation, room_id, anchor)
 
     def _schedule_image_preview_fetch(self, url: str) -> None:
         if (
@@ -14230,6 +16300,18 @@ QComboBox::drop-down {
             self.pending_image_previews.discard(url)
 
     def _fetch_remote_image_preview(self, url: str) -> None:
+        if is_click_to_play_video_url(url):
+            link = video_link(url, lambda candidate: analyze_link_url(candidate).trusted)
+            if link is not None:
+                info, data = fetch_video_info(
+                    link, lambda candidate: analyze_link_url(candidate).trusted,
+                )
+                if not self._closing:
+                    self._queue_ui_event(("image_preview_loaded", {
+                        "url": url, "source_url": link.source_url, "kind": "video",
+                        "data": data, "video_info": info,
+                    }))
+                return
         image_data: bytes | None = None
         media_kind: str | None = None
         source_url = url
@@ -14423,39 +16505,67 @@ QComboBox::drop-down {
                 },
             ))
 
+    _ui_event_types = frozenset((
+        QEvent.Type.Show,
+        QEvent.Type.WindowActivate,
+        QEvent.Type.WindowDeactivate,
+        QEvent.Type.WindowStateChange,
+        QEvent.Type.Hide,
+        QEvent.Type.Resize,
+        QEvent.Type.Wheel,
+        QEvent.Type.MouseMove,
+        QEvent.Type.Leave,
+        QEvent.Type.MouseButtonPress,
+        QEvent.Type.MouseButtonRelease,
+        QEvent.Type.MouseButtonDblClick,
+        QEvent.Type.ContextMenu,
+    ))
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        event_type = event.type()
+        if event_type not in EncryptedChatClient._ui_event_types:
+            return False
         if (
             isinstance(watched, QDialog)
             and not isinstance(watched, QFileDialog)
-            and event.type() in (
+            and event_type in (
                 QEvent.Type.Show,
                 QEvent.Type.WindowActivate,
+                QEvent.Type.WindowStateChange,
             )
         ):
             self._apply_dialog_window_theme(watched)
             self._apply_ui_size_to_widget_tree(watched)
 
+        if (isinstance(watched, QDialog) and watched.property("spritelinkVideoWindow")
+                and event_type == QEvent.Type.Hide and watched.windowHandle() is not None):
+            set_windows_fullscreen_window(int(watched.winId()), False)
+
         if (
             watched is self.root
             and hasattr(self, "window_focused_event")
         ):
-            if event.type() == QEvent.Type.WindowActivate:
+            if event_type == QEvent.Type.WindowActivate:
                 self.window_focused_event.set()
                 self._sync_connection_error_timer()
                 if hasattr(self, "tray_icon"):
                     self._mark_chatroom_read(self.active_chatroom_id)
-            elif event.type() == QEvent.Type.WindowDeactivate:
+            elif event_type == QEvent.Type.WindowDeactivate:
                 self.window_focused_event.clear()
                 self._sync_connection_error_timer()
-            elif event.type() == QEvent.Type.WindowStateChange:
+            elif event_type == QEvent.Type.WindowStateChange:
                 QTimer.singleShot(0, self._sync_window_activity)
 
         if (
             watched is getattr(self, "chat_content", None)
-            and event.type() == QEvent.Type.Resize
-            and hasattr(self, "config_overlay")
+            and event_type == QEvent.Type.Resize
         ):
-            self._sync_config_overlay_geometry()
+            if hasattr(self, "config_overlay"):
+                self._sync_config_overlay_geometry()
+            if hasattr(self, "search_overlay"):
+                self.search_overlay.setGeometry(self.chat_content.rect())
+            if getattr(self, "drawing_import_overlay", None) is not None:
+                self.drawing_import_overlay.setGeometry(self.chat_content.rect())
             if hasattr(self, "message_limit_overlay"):
                 self._sync_message_limit_overlay_geometry()
             if hasattr(self, "image_preview_overlay"):
@@ -14469,32 +16579,36 @@ QComboBox::drop-down {
             hasattr(self, "chat_display")
             and watched is self.chat_display.viewport()
         ):
-            if event.type() == QEvent.Type.Resize:
+            if event_type == QEvent.Type.Resize:
+                self._sync_video_mini_geometry()
                 self.viewport_media_timer.start(
                     VIEWPORT_MEDIA_UPDATE_DELAY_MS
                 )
 
             elif (
-                event.type() == QEvent.Type.Wheel
+                event_type == QEvent.Type.Wheel
                 and event.angleDelta().y() > 0
                 and self.chat_display.verticalScrollBar().value()
                 <= self.chat_display.verticalScrollBar().minimum()
             ):
-                # A wheel-up at the top is still meaningful when the first
-                # pages do not fill a tall viewport and the scrollbar cannot
-                # emit a changed value.
-                # Use the same tokenized/coalesced entrypoint as the
-                # scrollbar. Calling the request callback directly would omit
-                # its required generation/room token and crash when the user
-                # overscrolls an already-exhausted history.
+                # Wheel-up can request history without a scrollbar range.
+                # Use the coalesced entry point so generation/room tokens are supplied.
                 self._on_chat_history_scroll_action(0)
 
-            elif event.type() == QEvent.Type.MouseMove:
-                anchor = self.chat_display.anchorAt(event.position().toPoint())
+            elif event_type == QEvent.Type.MouseMove:
+                position = event.position().toPoint()
+                anchor = self.chat_display.anchorAt(position)
                 message_id = self._message_id_from_anchor(anchor)
-                spoiler_id = self._spoiler_id_at_position(
-                    event.position().toPoint()
-                )
+                item = self.rendered_message_items.get(message_id or "")
+                if item is not None and "drawing" in item["message"]:
+                    cursor = self.chat_display.cursorForPosition(position)
+                    cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                    top = self.chat_display.cursorRect(cursor).top()
+                    font = str(item["message"].get("f", DEFAULT_MESSAGE_FONT))
+                    if position.y() >= top + self._chat_line_height(font):
+                        anchor = ""
+                        message_id = None
+                spoiler_id = self._spoiler_id_at_position(position)
 
                 if anchor or spoiler_id:
                     self.chat_display.viewport().setCursor(
@@ -14505,6 +16619,10 @@ QComboBox::drop-down {
                             message_id,
                             event.globalPosition().toPoint(),
                         )
+                    elif (image_url := self._image_url_from_anchor(anchor)) and is_click_to_play_video_url(image_url):
+                        self._schedule_chat_tooltip(
+                            "video:" + image_url, event.globalPosition().toPoint(),
+                        )
                     else:
                         self._hide_chat_tooltip()
                 else:
@@ -14513,10 +16631,10 @@ QComboBox::drop-down {
                     )
                     self._hide_chat_tooltip()
 
-            elif event.type() == QEvent.Type.Leave:
+            elif event_type == QEvent.Type.Leave:
                 self._hide_chat_tooltip()
 
-            elif event.type() in (
+            elif event_type in (
                 QEvent.Type.MouseButtonPress,
                 QEvent.Type.MouseButtonRelease,
                 QEvent.Type.MouseButtonDblClick,
@@ -14526,20 +16644,24 @@ QComboBox::drop-down {
                         event.position().toPoint()
                     )
                     if spoiler_id:
-                        if event.type() == QEvent.Type.MouseButtonRelease:
+                        if event_type == QEvent.Type.MouseButtonRelease:
                             self._toggle_rendered_spoiler(spoiler_id)
                         return True
                     anchor = self.chat_display.anchorAt(
                         event.position().toPoint()
                     )
                     if self._message_id_from_anchor(anchor):
-                        # User links are hover/context targets, not clickable
-                        # navigation. Consuming the click prevents Qt from
-                        # drawing a focus outline around the icon or username.
+                        # Consume user-link clicks to prevent navigation and Qt focus outlines.
+                        return True
+                    if anchor.startswith("spritelink-drawing:"):
+                        if event_type == QEvent.Type.MouseButtonRelease:
+                            item = self.rendered_message_items.get(anchor.removeprefix("spritelink-drawing:"))
+                            if item is not None:
+                                self._show_drawing_preview(item["message"]["drawing"])
                         return True
                     image_url = self._image_url_from_anchor(anchor)
                     if image_url:
-                        if event.type() == QEvent.Type.MouseButtonRelease:
+                        if event_type == QEvent.Type.MouseButtonRelease:
                             client_id = (
                                 self.rendered_link_senders.get(anchor)
                                 or self._sender_at_position(
@@ -14553,7 +16675,7 @@ QComboBox::drop-down {
                         return True
                     link_target = self._link_target_from_anchor(anchor)
                     if link_target:
-                        if event.type() == QEvent.Type.MouseButtonRelease:
+                        if event_type == QEvent.Type.MouseButtonRelease:
                             link_url, anchored_client_id = link_target
                             client_id = (
                                 anchored_client_id
@@ -14567,7 +16689,7 @@ QComboBox::drop-down {
                             )
                         return True
 
-            elif event.type() == QEvent.Type.ContextMenu:
+            elif event_type == QEvent.Type.ContextMenu:
                 anchor = self.chat_display.anchorAt(event.pos())
                 message_id = self._message_id_from_anchor(anchor)
                 item = self.rendered_message_items.get(message_id or "")
@@ -14583,6 +16705,7 @@ QComboBox::drop-down {
                         self._show_link_context_menu(
                             link_url,
                             event.globalPos(),
+                            embedded_image=self._image_url_from_anchor(anchor) is not None,
                         )
                     else:
                         clicked_message_id = self._message_id_at_position(
@@ -14597,8 +16720,6 @@ QComboBox::drop-down {
                                 clicked_item,
                                 event.globalPos(),
                             )
-                # Never show QTextBrowser's generic Copy/Copy Link/Select All
-                # menu in the log viewport.
                 return True
 
         return super().eventFilter(watched, event)
@@ -14685,9 +16806,7 @@ QComboBox::drop-down {
             )
             cursor.setCharFormat(formatting)
 
-        # QTextDocument may invalidate only the text-format bounds after a
-        # reveal toggle. Repaint the complete viewport so the old opaque
-        # spoiler block cannot leave a thin edge outside that dirty region.
+        # Reveal toggles may invalidate only text bounds; repaint stale spoiler edges.
         self.chat_display.viewport().update()
 
     def _sender_at_position(
@@ -14706,7 +16825,7 @@ QComboBox::drop-down {
         amount: float = 1.0 - MUTED_CONTENT_OPACITY,
     ) -> str:
         amount = max(0.0, min(1.0, amount))
-        foreground = QColor(color)
+        foreground = QColor(message_display_color(color))
         background = self.chat_display.palette().color(
             self.chat_display.backgroundRole()
         )
@@ -14741,6 +16860,41 @@ QComboBox::drop-down {
 
         return normalized
 
+    @staticmethod
+    def _set_inline_html_image(formatting: QTextImageFormat, image: QImage) -> bool:
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not image.save(buffer, "PNG"):
+            return False
+        encoded = base64.b64encode(bytes(buffer.data())).decode("ascii")
+        formatting.setName(f"data:image/png;base64,{encoded}")
+        return True
+
+    @staticmethod
+    def _inline_drawing_image(encoded: str) -> QImage | None:
+        try:
+            image = drawing_image(*decode_drawing(encoded))
+        except ValueError:
+            return None
+        return image.scaled(image.width() * 2, image.height() * 2)
+
+    def _insert_inline_drawing(
+        self, cursor: QTextCursor, image: QImage | None, *, message_id: str = "",
+    ) -> None:
+        if image is None:
+            cursor.insertText("[Image unavailable]")
+            return
+        formatting = QTextImageFormat()
+        if self._set_inline_html_image(formatting, image):
+            formatting.setWidth(image.width())
+            formatting.setHeight(image.height())
+            formatting.setProperty(QTextFormat.Property.ImageAltText, "Drawing")
+            formatting.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignTop)
+            if message_id:
+                formatting.setAnchor(True)
+                formatting.setAnchorHref(f"spritelink-drawing:{message_id}")
+            cursor.insertImage(formatting)
+
     def _insert_profile_icon(
         self,
         cursor: QTextCursor,
@@ -14750,6 +16904,7 @@ QComboBox::drop-down {
         align_top: bool = False,
         opacity: float = 1.0,
         line_height_px: int = DEFAULT_MESSAGE_LINE_HEIGHT_PX,
+        inline_html: bool = False,
     ) -> bool:
         if not encoded_icon:
             return False
@@ -14759,9 +16914,7 @@ QComboBox::drop-down {
             return False
 
         try:
-            # Let Qt detect GIF from its signature. Some PySide6 Windows
-            # builds reject an explicit format argument despite advertising
-            # that overload.
+            # Detect GIF by signature; some PySide6 builds reject the format overload.
             image = QImage.fromData(gif_data)
         except (TypeError, ValueError):
             return False
@@ -14825,26 +16978,28 @@ QComboBox::drop-down {
             displayed_image = faded_image
             resource_suffix += f"-opacity-{round(opacity * 100)}"
 
-        resource_name = (
-            "spritelink-profile-icon:"
-            + hashlib.sha256(gif_data).hexdigest()
-            + resource_suffix
-        )
-        resource_url = QUrl(resource_name)
-        cursor.document().addResource(
-            QTextDocument.ResourceType.ImageResource,
-            resource_url,
-            displayed_image,
-        )
         image_format = QTextImageFormat()
-        image_format.setName(resource_url.toString())
+        if inline_html:
+            # The search label receives HTML rather than this document's resources.
+            if not self._set_inline_html_image(image_format, displayed_image):
+                return False
+        else:
+            resource_url = QUrl(
+                "spritelink-profile-icon:"
+                + hashlib.sha256(gif_data).hexdigest()
+                + resource_suffix
+            )
+            cursor.document().addResource(
+                QTextDocument.ResourceType.ImageResource,
+                resource_url,
+                displayed_image,
+            )
+            image_format.setName(resource_url.toString())
+            image_format.setAnchor(True)
+            image_format.setAnchorHref(f"spritelink:{message_id}")
         image_format.setWidth(displayed_image.width())
         image_format.setHeight(displayed_image.height())
-        image_format.setAnchor(True)
-        image_format.setAnchorHref(f"spritelink:{message_id}")
-        # Keep the icon vertically centered in the current text row while
-        # retaining the slight upward optical offset used by the default
-        # 24-pixel layout. AlignTop avoids AlignMiddle half-pixel rounding.
+        # Keep the optical offset; AlignTop avoids half-pixel AlignMiddle rounding.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
         )
@@ -14869,7 +17024,7 @@ QComboBox::drop-down {
         trusts_links_and_images = client_id in trusted_ids
 
         menu = QMenu(self.root)
-        trust_action = menu.addAction("Trust Links && Images from User")
+        trust_action = menu.addAction("Trust Links && Embeds from User")
         trust_action.setCheckable(True)
         trust_action.setChecked(is_local or trusts_links_and_images)
         trust_action.setEnabled(not is_local)
@@ -14908,26 +17063,43 @@ QComboBox::drop-down {
         )
 
         menu = QMenu(self.root)
-        copy_action = menu.addAction("Copy Message")
-        copy_action.triggered.connect(
-            lambda: QApplication.clipboard().setText(
-                message_plain_text(str(message["m"]))
-            )
-        )
-
-        collapse_action = menu.addAction(
-            "Expand Message"
-            if is_manually_collapsed
-            else "Collapse Message"
-        )
-        collapse_action.setEnabled(not is_muted)
-        if not is_muted:
-            collapse_action.triggered.connect(
-                lambda: self._set_message_collapsed(
-                    message_id,
-                    not is_manually_collapsed,
+        if "drawing" in message:
+            copy_action = menu.addAction("Copy Image")
+            import_action = menu.addAction("Import Image")
+            try:
+                size, pixels, palette = decode_drawing(message["drawing"])
+            except ValueError:
+                copy_action.setEnabled(False)
+                import_action.setEnabled(False)
+            else:
+                copy_action.triggered.connect(
+                    lambda: QApplication.clipboard().setImage(drawing_image(size, pixels, palette))
+                )
+                import_action.triggered.connect(
+                    lambda: self._import_chat_drawing(size, pixels, palette)
+                )
+        else:
+            copy_action = menu.addAction("Copy Message")
+            copy_action.triggered.connect(
+                lambda: QApplication.clipboard().setText(
+                    message_plain_text(str(message["m"]))
                 )
             )
+
+        if "drawing" not in message:
+            collapse_action = menu.addAction(
+                "Expand Message"
+                if is_manually_collapsed
+                else "Collapse Message"
+            )
+            collapse_action.setEnabled(not is_muted)
+            if not is_muted:
+                collapse_action.triggered.connect(
+                    lambda: self._set_message_collapsed(
+                        message_id,
+                        not is_manually_collapsed,
+                    )
+                )
 
         menu.exec(global_position)
 
@@ -14945,7 +17117,7 @@ QComboBox::drop-down {
         top_align_height: int = 0,
     ) -> QTextCharFormat:
         formatting = QTextCharFormat()
-        formatting.setForeground(QColor(color))
+        formatting.setForeground(QColor(color if ui_font else message_display_color(color)))
         formatting.setFont(
             self._make_ui_font(
                 bold=bold,
@@ -14989,6 +17161,7 @@ QComboBox::drop-down {
         embedded_image_urls: set[str],
         align_top: bool,
         top_align_height: int,
+        preview: bool = False,
     ) -> None:
         plain_text, rich_runs = parse_message_rich_text(text)
         url_spans = message_url_spans(plain_text)
@@ -15068,7 +17241,10 @@ QComboBox::drop-down {
                 if end <= start:
                     return
                 formatting = make_formatting(anchor)
-                cursor.insertText(plain_text[start:end], formatting)
+                content = plain_text[start:end]
+                if preview and run.spoiler is not None:
+                    content = "".join(char if char == "\n" else "█" for char in content)
+                cursor.insertText(content, formatting)
 
             first_spoiler_run = (
                 run.spoiler is not None
@@ -15093,7 +17269,8 @@ QComboBox::drop-down {
                     insert_chunk(
                         overlap_start,
                         overlap_end,
-                        self._register_rendered_link(url, client_id),
+                        (url if run.spoiler is None else None)
+                        if preview else self._register_rendered_link(url, client_id),
                     )
                 position = overlap_end
             insert_chunk(position, run.end)
@@ -15113,6 +17290,8 @@ QComboBox::drop-down {
         media: RemoteMediaPreview,
         frame: QImage,
     ) -> QImage:
+        if media.kind == "video":
+            return video_thumbnail(frame, EMBEDDED_IMAGE_MAX_WIDTH, EMBEDDED_IMAGE_MAX_HEIGHT)
         preserve_native_size = (
             frame.width() <= EMBEDDED_IMAGE_MAX_WIDTH
             and frame.height() <= EMBEDDED_IMAGE_MAX_HEIGHT
@@ -15150,7 +17329,9 @@ QComboBox::drop-down {
         media: RemoteMediaPreview,
     ) -> QImage:
         if is_likely_nsfw_image_url(url):
-            return self._likely_nsfw_image_placeholder()
+            return self._likely_nsfw_image_placeholder(url=url)
+        if media.kind == "video":
+            return video_thumbnail(media.frame, EMBEDDED_IMAGE_MAX_WIDTH, EMBEDDED_IMAGE_MAX_HEIGHT)
         if isinstance(media.frame, QImage) and not media.frame.isNull():
             return self._scaled_inline_media_frame(media, media.frame)
         return self._animated_media_loading_placeholder()
@@ -15159,6 +17340,8 @@ QComboBox::drop-down {
         self,
         width: int,
         height: int,
+        *,
+        url: str = "",
     ) -> QImage:
         placeholder = QImage(
             max(1, int(width)),
@@ -15167,7 +17350,7 @@ QComboBox::drop-down {
         )
         placeholder.fill(QColor("#d0d0d0"))
         painter = QPainter(placeholder)
-        painter.setPen(QColor("#aaaaaa"))
+        painter.setPen(QColor(VIDEO_EMBED_BORDER_COLOR if is_click_to_play_video_url(url) else "#aaaaaa"))
         painter.drawRect(placeholder.rect().adjusted(0, 0, -1, -1))
         painter.end()
         return placeholder
@@ -15200,7 +17383,7 @@ QComboBox::drop-down {
                     EMBEDDED_IMAGE_PLACEHOLDER_SIZE,
                 )
                 self.embedded_image_preview_sizes[url] = preview_size
-            preview = self._unloaded_image_placeholder(*preview_size)
+            preview = self._unloaded_image_placeholder(*preview_size, url=url)
 
         link_token = hashlib.sha256(
             f"{client_id}\0{url}".encode("utf-8")
@@ -15263,7 +17446,7 @@ QComboBox::drop-down {
         painter.end()
         return placeholder
 
-    def _likely_nsfw_image_placeholder(self) -> QImage:
+    def _likely_nsfw_image_placeholder(self, *, url: str = "") -> QImage:
         placeholder = QImage(
             NSFW_IMAGE_PLACEHOLDER_SIZE,
             NSFW_IMAGE_PLACEHOLDER_SIZE,
@@ -15275,7 +17458,7 @@ QComboBox::drop-down {
             QPainter.RenderHint.TextAntialiasing,
             not self._is_windows_classic_theme(),
         )
-        painter.setPen(QColor("#c29a70"))
+        painter.setPen(QColor(VIDEO_EMBED_BORDER_COLOR if is_click_to_play_video_url(url) else "#c29a70"))
         painter.drawRect(placeholder.rect().adjusted(0, 0, -1, -1))
         painter.setPen(QColor("#704825"))
         painter.setFont(self._make_font(
@@ -15303,12 +17486,9 @@ QComboBox::drop-down {
             cursor.insertBlock()
         separator_block = QTextBlockFormat()
         separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # Symmetric padding keeps the text vertically centered. The log's
-        # background painter covers the complete block, including margins.
         separator_block.setTopMargin(7)
         separator_block.setBottomMargin(7)
-        # The full-width row painter owns separators as well as messages.
-        # A QTextBlock background would blend this stripe a second time.
+        # Let the row painter draw the stripe once, including margins.
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
         separator_block_number = cursor.block().blockNumber()
@@ -15400,6 +17580,7 @@ QComboBox::drop-down {
         *,
         scroll_to_bottom: bool,
         on_finished: Any | None = None,
+        initial_message_batch: int = 0,
     ) -> None:
         if self._tray_ui_suspended:
             return
@@ -15426,6 +17607,7 @@ QComboBox::drop-down {
         self._message_render_generation += 1
         generation = self._message_render_generation
         self._rendering_message_log = True
+        self._history_render_pruned = False
         self._hide_chat_tooltip()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
@@ -15453,7 +17635,8 @@ QComboBox::drop-down {
             INITIAL_HISTORY_RENDER_MESSAGES,
             int(self.rendered_history_message_limit),
         )
-        visible_message_items = self.message_log[-visible_message_limit:]
+        end = self._history_view_end()
+        visible_message_items = self.message_log[max(0, end - visible_message_limit):end]
         display_groups = group_messages_for_display(
             visible_message_items,
             muted_ids,
@@ -15480,10 +17663,7 @@ QComboBox::drop-down {
                     boundary_split_groups.append(group)
             display_groups = boundary_split_groups
 
-        # Calculate the final chronological stripe/separator plan once, then
-        # execute it backwards.  The newest row becomes visible immediately;
-        # each later GUI turn prepends one older row while preserving the
-        # completed document's normal oldest-to-newest order.
+        # Render the chronological plan backwards to show the newest row first.
         render_steps: list[dict[str, Any]] = []
         previous_timestamp: int | None = None
         stripe_index = 0
@@ -15514,9 +17694,7 @@ QComboBox::drop-down {
             stripe_index += 1
             previous_timestamp = self._display_timestamp_for_item(group[-1])
 
-        # Expanding the visible suffix can prepend an odd number of message
-        # and separator rows. Anchor the new plan to any message that was
-        # already rendered so existing white/gray stripes never swap places.
+        # Anchor stripes to an existing message so odd prepends do not swap colors.
         background_indices = {
             QColor(color).name().casefold(): index
             for index, color in enumerate(message_row_backgrounds())
@@ -15585,6 +17763,7 @@ QComboBox::drop-down {
             "render_steps": render_steps,
             "unread_boundary_id": unread_boundary_id,
             "newest_first": bool(scroll_to_bottom),
+            "immediate_messages_remaining": max(0, initial_message_batch),
             "cursor": self.chat_display.textCursor(),
             "previous_timestamp": None,
             "previous_message_id": None,
@@ -15705,10 +17884,7 @@ QComboBox::drop-down {
             for selection in row_selections
             if selection.cursor.block().isValid()
         }
-        # Forward rendering is used when a theme/style replacement rebuilds
-        # the log while preserving its anchor. Short documents have no
-        # scrollbar position to restore, so reapply their root-frame margin
-        # explicitly instead of letting the messages snap to the top.
+        # Short logs have no scroll anchor; restore their bottom-aligning root margin.
         self._bottom_align_short_message_log()
         self.chat_display.setExtraSelections([])
         self._message_render_job = None
@@ -15727,9 +17903,8 @@ QComboBox::drop-down {
             controller.deleteLater()
             self.last_inline_animation_frame_at.pop(url, None)
 
-        self.viewport_media_timer.start(
-            VIEWPORT_MEDIA_UPDATE_DELAY_MS
-        )
+        if not self.viewport_media_timer.isActive():
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
         on_finished = job.get("on_finished")
         if callable(on_finished):
             on_finished()
@@ -15742,15 +17917,13 @@ QComboBox::drop-down {
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> int:
-        # Unlike the append-oriented separator helper, this leaves no trailing
-        # empty block: the already-rendered newer content is immediately next.
+        # Leave no trailing empty block when prepending before existing content.
         if cursor.block().text():
             cursor.insertBlock()
         separator_block = QTextBlockFormat()
         separator_block.setAlignment(Qt.AlignmentFlag.AlignCenter)
         separator_block.setTopMargin(7)
         separator_block.setBottomMargin(7)
-        # Match the append path: paint the translucent stripe only once.
         cursor.setBlockFormat(separator_block)
         cursor.insertText(text, self._text_format("#777777"))
         separator_block_number = cursor.block().blockNumber()
@@ -15825,10 +17998,7 @@ QComboBox::drop-down {
                 else None
             )
 
-            # Integer block/character positions do not follow QTextDocument
-            # edits automatically. Preserve the existing newer rows, clear the
-            # live maps to avoid low-number collisions, then shift them by the
-            # exact amount inserted at the front.
+            # Integer positions do not follow document edits; shift newer-row maps after prepend.
             old_message_blocks = dict(self.rendered_message_blocks)
             old_message_last_blocks = dict(
                 self.rendered_message_last_blocks
@@ -15844,7 +18014,7 @@ QComboBox::drop-down {
             old_padding_blocks = dict(
                 self.chat_display.row_background_padding_blocks
             )
-            old_collapsed_blocks = dict(
+            old_collapsed_blocks = set(
                 self.chat_display.collapsed_fade_blocks
             )
             old_row_selections = [
@@ -15866,10 +18036,7 @@ QComboBox::drop-down {
             cursor = QTextCursor(document)
             cursor.movePosition(QTextCursor.MoveOperation.Start)
             if old_message_blocks:
-                # insertBlock() leaves the cursor in the existing block when
-                # splitting at position zero. Move back into the new blank
-                # block so the prepended sender cannot share or reformat the
-                # first already-rendered message.
+                # At position zero, insertBlock() keeps the old block; move into the new one.
                 cursor.insertBlock()
                 cursor.movePosition(
                     QTextCursor.MoveOperation.PreviousBlock
@@ -15924,10 +18091,9 @@ QComboBox::drop-down {
                 block_number + block_delta: value
                 for block_number, value in old_padding_blocks.items()
             })
-            self.chat_display.collapsed_fade_blocks.update({
-                block_number + block_delta: value
-                for block_number, value in old_collapsed_blocks.items()
-            })
+            self.chat_display.collapsed_fade_blocks.update(
+                block_number + block_delta for block_number in old_collapsed_blocks
+            )
             for position, formatting in old_row_selections:
                 selection = QTextEdit.ExtraSelection()
                 selection.cursor = QTextCursor(document)
@@ -15948,6 +18114,10 @@ QComboBox::drop-down {
                     last_separator_block_number
                 )
             index -= 1
+            job["immediate_messages_remaining"] = max(
+                0,
+                int(job.get("immediate_messages_remaining", 0)) - len(group),
+            )
 
         job["index"] = index
 
@@ -15960,12 +18130,7 @@ QComboBox::drop-down {
         }
         self._bottom_align_short_message_log()
         if isinstance(preserve_anchor, dict):
-            # QTextDocument insertion and layout stay on the GUI thread, but
-            # only one displayed group is added per turn. Capture the user's
-            # current viewport immediately before each insertion and restore
-            # that live anchor immediately afterward. Scrolling therefore
-            # remains interactive throughout the page load instead of being
-            # frozen behind one hidden full-document transaction.
+            # Insert one group per GUI turn and restore the current anchor to allow scrolling.
             self.chat_display.document().documentLayout().documentSize()
             self._restore_chat_view_anchor(preserve_anchor)
         if index >= 0:
@@ -15973,6 +18138,9 @@ QComboBox::drop-down {
                 scrollbar = self.chat_display.verticalScrollBar()
                 scrollbar.setValue(scrollbar.maximum())
             self.chat_display.viewport().update()
+            if job.get("immediate_messages_remaining", 0) > 0:
+                self._continue_message_log_render(generation)
+                return
             QTimer.singleShot(
                 MESSAGE_RENDER_STEP_DELAY_MS,
                 lambda: self._continue_message_log_render(generation),
@@ -15999,9 +18167,8 @@ QComboBox::drop-down {
         if bool(job["scroll_to_bottom"]):
             scrollbar = self.chat_display.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
-        self.viewport_media_timer.start(
-            VIEWPORT_MEDIA_UPDATE_DELAY_MS
-        )
+        if not self.viewport_media_timer.isActive():
+            self.viewport_media_timer.start(VIEWPORT_MEDIA_UPDATE_DELAY_MS)
         on_finished = job.get("on_finished")
         if callable(on_finished):
             on_finished()
@@ -16018,12 +18185,9 @@ QComboBox::drop-down {
         background_color: str,
         row_selections: list[QTextEdit.ExtraSelection],
     ) -> None:
-        # Separator replacement and embedded-media paths can leave the cursor
-        # on a populated block. Enforce the row boundary here so one sender's
-        # username can never continue after another sender's message.
+        # Start a new row if media/separator handling left a populated block.
         if cursor.block().text():
             cursor.insertBlock()
-        # Never allow a previous message's character format to carry over.
         cursor.setCharFormat(QTextCharFormat())
         message_start_position = cursor.position()
 
@@ -16036,7 +18200,8 @@ QComboBox::drop-down {
             message.get("o", DEFAULT_MESSAGE_TEXT_COLOR)
         )
         profile_icon = str(message.get("p", ""))
-        text = str(message["m"])
+        drawing = message.get("drawing")
+        text = "[Image]" if drawing else str(message["m"])
         message_id = str(message["i"])
         client_id = str(message["c"])
         user_id_preview = visible_user_id(client_id)
@@ -16052,8 +18217,8 @@ QComboBox::drop-down {
             if is_muted
             else message_plain_text(text)
         )
-        is_collapsed = is_muted or bool(
-            source_message_ids.intersection(collapsed_ids)
+        is_collapsed = is_muted or (
+            not drawing and bool(source_message_ids.intersection(collapsed_ids))
         )
         message_block_format = QTextBlockFormat()
         message_block_format.setNonBreakableLines(is_collapsed)
@@ -16106,11 +18271,7 @@ QComboBox::drop-down {
                 image_url,
                 [],
             ).append(message_start_position)
-        # Every trusted image gets an inline object during its first
-        # message render. Visibility determines whether that object contains
-        # the decoded preview or a 48x48 placeholder; it must never determine
-        # whether the object exists. Otherwise the first decode callback has
-        # no image character to refresh until scrolling rebuilds the row.
+        # Create inline objects before decoding; invisible media still needs a refresh target.
         displayed_image_urls = list(image_urls)
 
         username_color = (
@@ -16145,7 +18306,8 @@ QComboBox::drop-down {
         )
 
         self.rendered_message_items[message_id] = item
-        top_align_height = 0
+        drawing_preview = self._inline_drawing_image(drawing) if drawing and not is_collapsed else None
+        top_align_height = drawing_preview.height() if drawing_preview is not None else 0
         if (
             not is_collapsed
             and bool(displayed_image_urls)
@@ -16261,6 +18423,10 @@ QComboBox::drop-down {
                     top_align_height=top_align_height,
                 ),
             )
+        elif drawing:
+            self._insert_inline_drawing(cursor, drawing_preview, message_id=message_id)
+            if drawing_preview is not None:
+                embedded_media_block_numbers.add(cursor.block().blockNumber())
         else:
             self._insert_message_text_with_links(
                 cursor,
@@ -16295,9 +18461,7 @@ QComboBox::drop-down {
                 self._text_format("#b00020", font_name=font_name),
             )
 
-        # Explicit newlines create additional QTextBlocks. Give every block
-        # the same row color and left edge so continuations align with the
-        # profile icon, or with the username when no icon is present.
+        # Explicit newlines create blocks; preserve row color and sender alignment.
         document = cursor.document()
         block = document.findBlock(message_start_position)
         final_block_number = cursor.block().blockNumber()
@@ -16307,13 +18471,9 @@ QComboBox::drop-down {
             block_format.setLeftMargin(10)
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
-            # Only date/hour separators may contribute vertical margins.
-            # Ordinary message blocks follow the active chat font metrics.
             block_format.setTopMargin(0.0)
             block_format.setBottomMargin(0.0)
-            # The custom full-width painter owns the entire normal stripe.
-            # Clear any inherited QTextBlock background so Qt cannot repaint
-            # the middle with independently rasterized vertical bounds.
+            # Clear inherited block backgrounds; the full-width painter owns the stripe.
             block_format.clearProperty(
                 QTextFormat.Property.BackgroundBrush
             )
@@ -16345,9 +18505,9 @@ QComboBox::drop-down {
         if is_collapsed:
             collapsed_block = document.findBlock(message_start_position)
             if collapsed_block.isValid():
-                self.chat_display.collapsed_fade_blocks[
-                    collapsed_block.blockNumber()
-                ] = QColor(background_color)
+                self.chat_display.collapsed_fade_blocks.add(collapsed_block.blockNumber())
+        if displayed_image_urls:
+            self.viewport_media_timer.start(0)
 
     def _append_system_message(
         self,
@@ -16360,7 +18520,7 @@ QComboBox::drop-down {
         if not self.chat_display.document().isEmpty():
             cursor.insertBlock()
         system_block = cursor.blockFormat()
-        system_block.setBackground(QColor("#ffffff"))
+        system_block.setBackground(QColor("#252a30" if QApplication.instance().property("spritelinkGlassyDark") else "#ffffff"))
         system_block.setLeftMargin(10)
         system_block.setRightMargin(10)
         cursor.setBlockFormat(system_block)
@@ -16375,16 +18535,25 @@ QComboBox::drop-down {
         scrollbar = self.chat_display.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def _clear_visible_room(self) -> None:
+    def _clear_visible_room(self, *, preserve_detached_video: bool = False) -> None:
+        self._close_drawing_import()
+        self.search_toggle.setChecked(False)
+        if hasattr(self, "search_entry"):
+            self.search_entry.clear()
+            self.search_timer.stop()
         self._reset_history_render_window()
         self._hide_chat_tooltip()
-        if self.link_warning_overlay.isVisible():
+        if hasattr(self, "link_warning_overlay") and self.link_warning_overlay.isVisible():
             self._hide_link_warning_popup()
-        if self.image_preview_overlay.isVisible():
+        player = self.video_player
+        keep_video = (preserve_detached_video and player is not None and player.info is not None
+                      and player._mode in ("mini", "popout"))
+        if not keep_video and ((hasattr(self, "image_preview_overlay") and self.image_preview_overlay.isVisible()) or self.current_image_preview_url):
             self._hide_image_preview_popup()
         self.seen_client_message_ids.clear()
         self.seen_ntfy_message_ids.clear()
         self.message_log.clear()
+        self.pending_history_entries.clear()
         self.rendered_message_items.clear()
         self.rendered_message_blocks.clear()
         self.rendered_message_last_blocks.clear()
@@ -16407,10 +18576,13 @@ QComboBox::drop-down {
         self.chat_display.unread_divider_block_number = None
         self.chat_display.setExtraSelections([])
         self._reset_chat_document()
+        if keep_video and player._mode == "mini":
+            self._sync_video_mini_geometry()
+            self.video_mini_panel.raise_()
 
     def _should_play_message_sound(self, room_id: str) -> bool:
         return (
-            str(self.message_sound_var.get()) != "Disabled"
+            client_message_sound_settings(self, room_id)[0] != "Disabled"
             and (
                 room_id != self.active_chatroom_id
                 or not self.window_focused_event.is_set()
@@ -16432,10 +18604,10 @@ QComboBox::drop-down {
         room = self._find_chatroom(room_id)
         if room is None:
             return
-        body = (
-            f"{str(message.get('u', 'Unknown'))}: "
-            f"{message_plain_text(str(message.get('m', '')))}"
+        preview = "[Image]" if "drawing" in message else message_plain_text(
+            str(message.get("m", ""))
         )
+        body = f"{message.get('u', 'Unknown')}: {preview}"
         if len(body) > 1024:
             body = body[:1023] + "…"
         notification = (
@@ -16473,11 +18645,9 @@ QComboBox::drop-down {
             ):
                 self.delivered_desktop_notification_rooms.add(room_id)
 
-    def _message_sound_path(self, sound_name: str) -> Path | None:
+    def _message_sound_path(self, sound_name: str, custom_path: str | None = None) -> Path | None:
         if sound_name == "Custom":
-            custom_path = str(
-                self.custom_message_sound_path_var.get()
-            ).strip()
+            custom_path = str(self.custom_message_sound_path_var.get() if custom_path is None else custom_path).strip()
             return Path(custom_path) if custom_path else None
 
         filename = BUILTIN_MESSAGE_SOUND_FILES.get(sound_name)
@@ -16518,10 +18688,11 @@ QComboBox::drop-down {
         self,
         effect: QSoundEffect,
         sound_name: str,
+        volume: int | None = None,
     ) -> None:
         effect.stop()
         effect.setVolume(
-            int(self.message_sound_volume_var.get()) / 100.0
+            int(self.message_sound_volume_var.get() if volume is None else volume) / 100.0
         )
         self.active_message_sound_effect = effect
         effect.play()
@@ -16541,7 +18712,7 @@ QComboBox::drop-down {
             self.pending_message_sound_effect = None
             self.pending_message_sound_name = ""
             self.pending_message_sound_report_errors = False
-            self._start_message_sound_effect(effect, sound_name)
+            self._start_message_sound_effect(effect, sound_name, self.pending_message_sound_volume)
             return
         if effect.status() != QSoundEffect.Status.Error:
             return
@@ -16598,12 +18769,13 @@ QComboBox::drop-down {
         sound_name: str,
         *,
         report_errors: bool,
+        volume: int | None = None,
     ) -> None:
         player, audio_output = (
             self._ensure_compressed_message_sound_player()
         )
         audio_output.setVolume(
-            int(self.message_sound_volume_var.get()) / 100.0
+            int(self.message_sound_volume_var.get() if volume is None else volume) / 100.0
         )
         self.compressed_message_sound_name = sound_name
         self.compressed_message_sound_report_errors = report_errors
@@ -16686,10 +18858,15 @@ QComboBox::drop-down {
         if audio_output is not None:
             audio_output.deleteLater()
 
-    def _play_message_sound(self, *, report_errors: bool = False) -> None:
-        sound_name = str(self.message_sound_var.get())
+    def _play_message_sound(
+        self, *, report_errors: bool = False, settings: tuple[str, int, str] | None = None,
+    ) -> None:
+        sound_name, volume, custom_path = settings if settings is not None else (
+            str(self.message_sound_var.get()), int(self.message_sound_volume_var.get()),
+            str(self.custom_message_sound_path_var.get()),
+        )
         self._stop_message_sound()
-        sound_path = self._message_sound_path(sound_name)
+        sound_path = self._message_sound_path(sound_name, custom_path)
         if sound_path is None:
             return
         try:
@@ -16705,14 +18882,16 @@ QComboBox::drop-down {
                     sound_path,
                     sound_name,
                     report_errors=report_errors,
+                    volume=volume,
                 )
                 return
             effect = self._message_sound_effect_for_path(sound_path)
             if effect.isLoaded():
-                self._start_message_sound_effect(effect, sound_name)
+                self._start_message_sound_effect(effect, sound_name, volume)
             else:
                 self.pending_message_sound_effect = effect
                 self.pending_message_sound_name = sound_name
+                self.pending_message_sound_volume = volume
                 self.pending_message_sound_report_errors = report_errors
                 if effect.status() == QSoundEffect.Status.Error:
                     self._on_message_sound_effect_status_changed(effect)
@@ -16724,7 +18903,7 @@ QComboBox::drop-down {
                     parent=self.root,
                 )
 
-    def _play_notification_sound(self) -> None:
+    def _play_notification_sound(self, room_id: str | None = None) -> None:
         now = time.monotonic()
         if (
             now - self.last_notification_sound_at
@@ -16732,7 +18911,10 @@ QComboBox::drop-down {
         ):
             return
         self.last_notification_sound_at = now
-        self._play_message_sound()
+        if room_id is None:
+            self._play_message_sound()
+        else:
+            self._play_message_sound(settings=client_message_sound_settings(self, room_id))
 
     def _show_minimize_to_tray_notice(self) -> str | None:
         dialog = QMessageBox(self.root)
@@ -16782,6 +18964,7 @@ QComboBox::drop-down {
                 return False
 
         self._closing = True
+        self.startup_timer.stop()
         self._minimized_to_tray = False
         self.theme_color_save_timer.stop()
         QToolTip.hideText()
@@ -16799,7 +18982,8 @@ QComboBox::drop-down {
 
         try:
             self._copy_ui_to_config()
-            self._apply_chatroom_history_limit()
+            if self._history_startup_ready:
+                self._apply_chatroom_history_limit()
             save_config(self.config_data)
         except Exception:
             pass
@@ -16807,17 +18991,23 @@ QComboBox::drop-down {
         self.stop_event.set()
         self.network_wakeup_event.set()
         self.subscription_refresh_event.set()
-        # Network workers are daemons. Do not block the GUI thread waiting on
-        # a request or streaming response while the application is exiting.
-        self.session.close()
-        threading.Thread(
-            target=self.subscription_session.close,
-            name="SpriteLinkSubscriptionClose",
-            daemon=True,
-        ).start()
+        # Do not wait for daemon network workers during exit.
+        with self._http_session_lock:
+            session = self.session
+            subscription_session = self.subscription_session
+        if session is not None:
+            session.close()
+        if subscription_session is not None:
+            threading.Thread(
+                target=subscription_session.close,
+                name="SpriteLinkSubscriptionClose",
+                daemon=True,
+            ).start()
         for controller in self.animated_media_controllers.values():
             controller.stop()
         self.animated_media_controllers.clear()
+        if self.video_player is not None:
+            self.video_player.stop()
         self.last_inline_animation_frame_at.clear()
         self.history_load_executor.shutdown(
             wait=False,
@@ -16868,6 +19058,128 @@ def acquire_single_instance_lock(kernel32: Any | None = None) -> bool:
     return True
 
 
+class SingleInstanceControl(QObject):
+    def __init__(self, on_restart: Any, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._on_restart = on_restart
+        self._restart_requested = False
+        self.server = QLocalServer(self)
+        self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        self.server.newConnection.connect(self._accept_connections)
+        self.server.listen(SINGLE_INSTANCE_SERVER_NAME)
+
+    def _accept_connections(self) -> None:
+        while self.server.hasPendingConnections():
+            socket = self.server.nextPendingConnection()
+            socket.readyRead.connect(lambda socket=socket: self._read_command(socket))
+            socket.disconnected.connect(socket.deleteLater)
+            self._read_command(socket)
+
+    def _read_command(self, socket: QLocalSocket) -> None:
+        if not socket.canReadLine():
+            return
+        command = bytes(socket.readLine(32))
+        socket.disconnectFromServer()
+        if command == b"restart\n" and not self._restart_requested:
+            self._restart_requested = True
+            QTimer.singleShot(0, self._on_restart)
+
+
+def request_instance_restart() -> bool:
+    socket = QLocalSocket()
+    socket.connectToServer(SINGLE_INSTANCE_SERVER_NAME)
+    if not socket.waitForConnected(1000):
+        return False
+    socket.write(b"restart\n")
+    sent = not socket.bytesToWrite() or socket.waitForBytesWritten(1000)
+    socket.disconnectFromServer()
+    return bool(sent)
+
+
+def show_already_running_dialog() -> bool:
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    previous_quit_on_close = app.quitOnLastWindowClosed()
+    app.setQuitOnLastWindowClosed(False)
+    dialog = QDialog()
+    dialog.setWindowTitle(APP_NAME)
+    dialog.setMinimumWidth(320)
+    dialog.setWindowIcon(QIcon(str(WINDOW_ICON_PATH)))
+    layout = QVBoxLayout(dialog)
+    message_row = QHBoxLayout()
+    icon = QLabel()
+    icon.setPixmap(dialog.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation).pixmap(32, 32))
+    message_row.addWidget(icon)
+    message = QLabel("SpriteLink is already running.")
+    message.setMinimumWidth(message.fontMetrics().horizontalAdvance(message.text()) + 8)
+    message.setWordWrap(True)
+    message_row.addWidget(message, 1)
+    layout.addLayout(message_row)
+    buttons = QHBoxLayout()
+    buttons.addStretch(1)
+    restart = QPushButton("Restart")
+    ok = QPushButton("OK")
+    ok.setDefault(True)
+    buttons.addWidget(restart)
+    buttons.addWidget(ok)
+    layout.addLayout(buttons)
+    ok.clicked.connect(dialog.reject)
+    timer = QTimer(dialog)
+    timer.setInterval(100)
+    lock_acquired = False
+    deadline = 0.0
+
+    def failed() -> None:
+        timer.stop()
+        message.setText("Could not restart SpriteLink. Close the existing instance and try again.")
+        restart.setEnabled(True)
+        ok.setEnabled(True)
+
+    def check_lock() -> None:
+        nonlocal lock_acquired
+        try:
+            lock_acquired = acquire_single_instance_lock()
+        except Exception:
+            failed()
+            return
+        if lock_acquired:
+            timer.stop()
+            dialog.accept()
+        elif time.monotonic() >= deadline:
+            failed()
+
+    def begin_restart() -> None:
+        nonlocal deadline
+        restart.setEnabled(False)
+        ok.setEnabled(False)
+        message.setText("Restarting SpriteLink...")
+        deadline = time.monotonic() + 10.0
+        # The first instance may have exited while the popup was open.
+        check_lock()
+        if lock_acquired or restart.isEnabled():
+            return
+        try:
+            requested = request_instance_restart()
+        except Exception:
+            requested = False
+        if not requested:
+            check_lock()
+            if not lock_acquired:
+                failed()
+            return
+        timer.start()
+
+    restart.clicked.connect(begin_restart)
+    timer.timeout.connect(check_lock)
+    dialog.finished.connect(timer.stop)
+    try:
+        dialog.exec()
+    finally:
+        app.setQuitOnLastWindowClosed(previous_quit_on_close)
+        dialog.deleteLater()
+    return lock_acquired
+
+
 def _write_crash_log(error_text: str) -> Path | None:
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -16879,6 +19191,130 @@ def _write_crash_log(error_text: str) -> Path | None:
 
 
 
+def show_history_upgrade(client: EncryptedChatClient, pending: list[Path]) -> bool:
+    class HistoryUpgradeDialog(QDialog):
+        def reject(self) -> None:
+            # Escape must not interrupt the upgrade worker.
+            pass
+
+    dialog = HistoryUpgradeDialog(client.root)
+    dialog.setWindowTitle("Upgrading chat history")
+    dialog.setWindowFlags(
+        Qt.WindowType.Dialog | Qt.WindowType.CustomizeWindowHint
+        | Qt.WindowType.WindowTitleHint
+    )
+    layout = QVBoxLayout(dialog)
+    label = QLabel(
+        "Chat history is being upgraded to a new format. This shouldn't take long…"
+    )
+    label.setWordWrap(True)
+    label.setMinimumWidth(320)
+    layout.addWidget(label)
+    progress = QProgressBar()
+    progress.setRange(0, len(pending))
+    progress.setValue(0)
+    layout.addWidget(progress)
+    client._apply_dialog_window_theme(dialog)
+
+    updates: queue.Queue = queue.Queue()
+
+    def upgrade() -> None:
+        try:
+            for index, path in enumerate(pending, start=1):
+                _upgrade_chatroom_history(path)
+                updates.put(index)
+        except Exception as exc:
+            updates.put(exc)
+        else:
+            updates.put(None)
+
+    def poll_progress() -> None:
+        while not updates.empty():
+            update = updates.get_nowait()
+            if update is None:
+                dialog.accept()
+                return
+            if isinstance(update, Exception):
+                dialog.done(QDialog.DialogCode.Rejected)
+                return
+            progress.setValue(update)
+
+    timer = QTimer(dialog)
+    timer.timeout.connect(poll_progress)
+    timer.start(25)
+    threading.Thread(
+        target=upgrade, name="SpriteLinkHistoryUpgrade", daemon=True,
+    ).start()
+    result = dialog.exec()
+    timer.stop()
+    return result == QDialog.DialogCode.Accepted
+
+
+def begin_history_startup(client: EncryptedChatClient, notification_room_id: str | None) -> None:
+    # Do not let chat modify history until the legacy-file scan and upgrade finish.
+    root = client.root
+    root.setEnabled(False)
+    results: queue.Queue = queue.Queue(maxsize=1)
+
+    def scan() -> None:
+        try:
+            results.put((True, _pending_history_upgrades()))
+        except Exception:
+            results.put((False, None))
+
+    timer = QTimer(root)
+    timer.setInterval(15)
+
+    def finish_scan() -> None:
+        if client._closing:
+            timer.stop()
+            timer.deleteLater()
+            return
+        try:
+            success, pending = results.get_nowait()
+        except queue.Empty:
+            return
+        timer.stop()
+        timer.deleteLater()
+        root.setEnabled(True)
+        try:
+            upgraded = success and (not pending or show_history_upgrade(client, pending))
+        except Exception:
+            upgraded = False
+        if not upgraded:
+            messagebox.showerror(
+                "Chat history upgrade",
+                "Could not upgrade chat history. Your old history is still available. "
+                "Restart SpriteLink to try again.",
+                parent=root,
+            )
+            client._force_quit = True
+            root.close()
+            return
+        if pending and client._chatroom_history_limit() < DEFAULT_CHATROOM_HISTORY_LIMIT:
+            client.chatroom_history_limit_var.set(DEFAULT_CHATROOM_HISTORY_LIMIT)
+            client.config_data["chatroom_history_limit"] = DEFAULT_CHATROOM_HISTORY_LIMIT
+            try:
+                save_config(client.config_data)
+            except OSError:
+                messagebox.showerror(
+                    "Chatroom History",
+                    "Chat history was upgraded, but the new history limit could not be saved.",
+                    parent=root,
+                )
+        client._history_startup_ready = True
+        QTimer.singleShot(50, client.prepare_after_show)
+        if notification_room_id is not None:
+            QTimer.singleShot(
+                0,
+                lambda: client._open_notification_chatroom(notification_room_id),
+            )
+
+    timer.timeout.connect(finish_scan)
+    timer.start()
+    threading.Thread(target=scan, name="SpriteLinkHistoryScan", daemon=True).start()
+
+
 def main() -> None:
     notification_uri = notification_uri_from_arguments(sys.argv)
     notification_room_id = (
@@ -16887,21 +19323,16 @@ def main() -> None:
         else None
     )
     if os.name == "nt":
-        register_windows_notification_protocol()
         try:
-            if not acquire_single_instance_lock():
-                if notification_room_id is not None:
-                    write_notification_activation(notification_room_id)
-                    return
-                ctypes.windll.user32.MessageBoxW(
-                    None,
-                    "SpriteLink is already running.",
-                    APP_NAME,
-                    0x40,
-                )
-                return
+            already_running = not acquire_single_instance_lock()
         except Exception:
-            pass
+            already_running = False
+        if already_running:
+            if notification_room_id is not None:
+                write_notification_activation(notification_room_id)
+                return
+            if not show_already_running_dialog():
+                return
 
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
@@ -16953,7 +19384,7 @@ def main() -> None:
         return
 
     try:
-        client = EncryptedChatClient(root)
+        client = EncryptedChatClient(root, defer_startup=True)
     except Exception:
         error_text = traceback.format_exc()
         crash_path = _write_crash_log(error_text)
@@ -16969,14 +19400,9 @@ def main() -> None:
         )
         return
 
+    instance_control = SingleInstanceControl(client._quit_from_tray, root)
     root.show()
-    if notification_room_id is not None:
-        QTimer.singleShot(
-            0,
-            lambda: client._open_notification_chatroom(
-                notification_room_id
-            ),
-        )
+    begin_history_startup(client, notification_room_id)
     app.exec()
 
 
