@@ -7111,6 +7111,7 @@ class EncryptedChatClient(QObject):
         self._defer_startup = defer_startup
         self._startup_begun = False
         self._startup_complete = False
+        self._history_startup_ready = not defer_startup
         self._prepared_popups: set[str] = set()
         self._available_font_families: tuple[str, ...] | None = None
         self.video_player: VideoPlayer | None = None
@@ -7392,14 +7393,8 @@ class EncryptedChatClient(QObject):
         self.notification_activation_timer.timeout.connect(
             self._consume_notification_activation
         )
-        self.notification_activation_timer.start()
-        QTimer.singleShot(
-            0,
-            lambda: self._clear_desktop_notification(
-                self.active_chatroom_id,
-                force=True,
-            ),
-        )
+        if not defer_startup:
+            self._start_notification_activation()
 
         self.background_history_prune_timer = QTimer(self)
         self.background_history_prune_timer.setInterval(
@@ -7450,6 +7445,7 @@ class EncryptedChatClient(QObject):
         self.unread_divider_timer.timeout.connect(
             self._update_unread_divider_fade
         )
+        self.unread_divider_timer.start()
 
         self.ui_event_available.connect(self._process_ui_queue)
 
@@ -7468,9 +7464,8 @@ class EncryptedChatClient(QObject):
         if not defer_startup:
             QTimer.singleShot(0, self._check_for_updates)
             self.update_check_timer.start()
-        self.background_history_prune_timer.start()
-        self.timed_mute_timer.start()
-        self.unread_divider_timer.start()
+        if not defer_startup:
+            self._start_periodic_ui_timers()
         self.startup_timer = QTimer(self)
         self.startup_timer.setSingleShot(True)
         self.startup_timer.timeout.connect(self._prepare_next_startup_popup)
@@ -7484,6 +7479,8 @@ class EncryptedChatClient(QObject):
         if self._startup_begun or self._closing:
             return
         self._startup_begun = True
+        self._start_notification_activation()
+        self._start_periodic_ui_timers()
         self.startup_timer.start(50)
         self._load_saved_history_for_current_room()
         threading.Thread(
@@ -7491,6 +7488,20 @@ class EncryptedChatClient(QObject):
             name="SpriteLinkStartupServices",
             daemon=True,
         ).start()
+
+    def _start_periodic_ui_timers(self) -> None:
+        self.background_history_prune_timer.start()
+        self.timed_mute_timer.start()
+
+    def _start_notification_activation(self) -> None:
+        self.notification_activation_timer.start()
+        QTimer.singleShot(
+            0,
+            lambda: self._clear_desktop_notification(
+                self.active_chatroom_id,
+                force=True,
+            ),
+        )
 
     def _prepare_http_sessions(self) -> bool:
         # Import off-thread; publish both sessions together unless exiting.
@@ -8903,9 +8914,13 @@ QComboBox::drop-down {
 
         self.chatrooms_panel.hide()
         root_layout.addWidget(self.chatrooms_panel)
-        self._refresh_chatroom_list()
+        self._chatroom_list_ready = False
+        if not self._defer_startup:
+            self._refresh_chatroom_list()
 
     def _on_chatrooms_toggled(self, expanded: bool) -> None:
+        if expanded and not self._chatroom_list_ready:
+            self._refresh_chatroom_list()
         keep_at_bottom = self._chat_is_scrolled_to_bottom()
         self.chatrooms_toggle.setText("‹" if expanded else "›")
         self.chatrooms_panel.setVisible(expanded)
@@ -9188,6 +9203,7 @@ QComboBox::drop-down {
         return room_id in self._muted_chatroom_ids()
 
     def _refresh_chatroom_list(self) -> None:
+        self._chatroom_list_ready = True
         self.chatrooms_list.clear()
         active_item: QListWidgetItem | None = None
         muted_ids = self._muted_chatroom_ids()
@@ -14081,6 +14097,10 @@ QComboBox::drop-down {
         label = getattr(self, "recently_online_label", None)
         if label is None:
             return
+        if not self.recently_online_counts and not self._last_recently_online_counts:
+            label.clear()
+            label.hide()
+            return
         server = normalize_server_url(self.config_data.get("server_url", ""))
         topic = derive_ntfy_topic(self._active_chatroom()["key"])
         counts = self.recently_online_counts.get(server)
@@ -18951,7 +18971,8 @@ QComboBox::drop-down {
 
         try:
             self._copy_ui_to_config()
-            self._apply_chatroom_history_limit()
+            if self._history_startup_ready:
+                self._apply_chatroom_history_limit()
             save_config(self.config_data)
         except Exception:
             pass
@@ -19218,6 +19239,71 @@ def show_history_upgrade(client: EncryptedChatClient, pending: list[Path]) -> bo
     return result == QDialog.DialogCode.Accepted
 
 
+def begin_history_startup(client: EncryptedChatClient, notification_room_id: str | None) -> None:
+    # Do not let chat modify history until the legacy-file scan and upgrade finish.
+    root = client.root
+    root.setEnabled(False)
+    results: queue.Queue = queue.Queue(maxsize=1)
+
+    def scan() -> None:
+        try:
+            results.put((True, _pending_history_upgrades()))
+        except Exception:
+            results.put((False, None))
+
+    timer = QTimer(root)
+    timer.setInterval(15)
+
+    def finish_scan() -> None:
+        if client._closing:
+            timer.stop()
+            timer.deleteLater()
+            return
+        try:
+            success, pending = results.get_nowait()
+        except queue.Empty:
+            return
+        timer.stop()
+        timer.deleteLater()
+        root.setEnabled(True)
+        try:
+            upgraded = success and (not pending or show_history_upgrade(client, pending))
+        except Exception:
+            upgraded = False
+        if not upgraded:
+            messagebox.showerror(
+                "Chat history upgrade",
+                "Could not upgrade chat history. Your old history is still available. "
+                "Restart SpriteLink to try again.",
+                parent=root,
+            )
+            client._force_quit = True
+            root.close()
+            return
+        if pending and client._chatroom_history_limit() < DEFAULT_CHATROOM_HISTORY_LIMIT:
+            client.chatroom_history_limit_var.set(DEFAULT_CHATROOM_HISTORY_LIMIT)
+            client.config_data["chatroom_history_limit"] = DEFAULT_CHATROOM_HISTORY_LIMIT
+            try:
+                save_config(client.config_data)
+            except OSError:
+                messagebox.showerror(
+                    "Chatroom History",
+                    "Chat history was upgraded, but the new history limit could not be saved.",
+                    parent=root,
+                )
+        client._history_startup_ready = True
+        QTimer.singleShot(50, client.prepare_after_show)
+        if notification_room_id is not None:
+            QTimer.singleShot(
+                0,
+                lambda: client._open_notification_chatroom(notification_room_id),
+            )
+
+    timer.timeout.connect(finish_scan)
+    timer.start()
+    threading.Thread(target=scan, name="SpriteLinkHistoryScan", daemon=True).start()
+
+
 def main() -> None:
     notification_uri = notification_uri_from_arguments(sys.argv)
     notification_room_id = (
@@ -19305,38 +19391,7 @@ def main() -> None:
 
     instance_control = SingleInstanceControl(client._quit_from_tray, root)
     root.show()
-    try:
-        pending = _pending_history_upgrades()
-        upgraded = not pending or show_history_upgrade(client, pending)
-    except Exception:
-        upgraded = False
-    if not upgraded:
-        messagebox.showerror(
-            "Chat history upgrade",
-            "Could not upgrade chat history. Your old history is still available. "
-            "Restart SpriteLink to try again.",
-            parent=root,
-        )
-        return
-    if pending and client._chatroom_history_limit() < DEFAULT_CHATROOM_HISTORY_LIMIT:
-        client.chatroom_history_limit_var.set(DEFAULT_CHATROOM_HISTORY_LIMIT)
-        client.config_data["chatroom_history_limit"] = DEFAULT_CHATROOM_HISTORY_LIMIT
-        try:
-            save_config(client.config_data)
-        except OSError:
-            messagebox.showerror(
-                "Chatroom History",
-                "Chat history was upgraded, but the new history limit could not be saved.",
-                parent=root,
-            )
-    QTimer.singleShot(50, client.prepare_after_show)
-    if notification_room_id is not None:
-        QTimer.singleShot(
-            0,
-            lambda: client._open_notification_chatroom(
-                notification_room_id
-            ),
-        )
+    begin_history_startup(client, notification_room_id)
     app.exec()
 
 

@@ -75,6 +75,115 @@ class DeferredStartupTests(unittest.TestCase):
         self.client._clear_visible_room()
         self.client._suspend_for_tray()
 
+    def test_no_presence_key_is_derived_before_counts_are_available(self):
+        self.client.recently_online_counts.clear()
+        self.client._last_recently_online_counts.clear()
+        with mock.patch.object(S, "derive_ntfy_topic") as derive:
+            self.client._update_recently_online_label()
+        derive.assert_not_called()
+        self.assertTrue(self.client.recently_online_label.isHidden())
+
+    def test_sidebar_rows_are_created_on_first_open(self):
+        self.assertEqual(self.client.chatrooms_list.count(), 0)
+        self.root.show()
+        self.client.chatrooms_toggle.setChecked(True)
+        self.assertEqual(self.client.chatrooms_list.count(), len(self.client._chatroom_definitions()))
+        self.assertEqual(
+            self.client.chatrooms_list.currentItem().data(S.Qt.ItemDataRole.UserRole),
+            self.client.active_chatroom_id,
+        )
+        self.client.chatrooms_toggle.setChecked(False)
+        self.client.chatrooms_toggle.setChecked(True)
+        self.assertEqual(self.client.chatrooms_list.count(), len(self.client._chatroom_definitions()))
+
+    def test_slow_history_scan_allows_paint_and_delays_chat_start(self):
+        entered, release = threading.Event(), threading.Event()
+        def scan():
+            entered.set()
+            release.wait(5)
+            return []
+        with mock.patch.object(S, "_pending_history_upgrades", side_effect=scan), \
+             mock.patch.object(self.client, "_open_notification_chatroom") as open_room:
+            self.root.show()
+            S.begin_history_startup(self.client, "room-1")
+            self.assertTrue(entered.wait(2))
+            ticks = []
+            QTimer.singleShot(0, lambda: ticks.append(self.root.isVisible()))
+            QTest.qWait(50)
+            self.assertEqual(ticks, [True])
+            self.assertFalse(self.root.isEnabled())
+            self.assertFalse(self.client._history_startup_ready)
+            self.assertFalse(self.client.notification_activation_timer.isActive())
+            self.history.assert_not_called()
+            self.network.assert_not_called()
+            open_room.assert_not_called()
+            release.set()
+            for _ in range(100):
+                QTest.qWait(10)
+                if self.history.called and open_room.called:
+                    break
+            self.assertTrue(self.root.isEnabled())
+            self.assertTrue(self.client._history_startup_ready)
+            self.history.assert_called_once()
+            open_room.assert_called_once_with("room-1")
+
+    def test_close_during_history_scan_cannot_start_or_modify_history(self):
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        def scan():
+            entered.set()
+            release.wait(5)
+            finished.set()
+            return [S.Path("legacy.bin")]
+        with mock.patch.object(S, "_pending_history_upgrades", side_effect=scan), \
+             mock.patch.object(S, "show_history_upgrade") as upgrade, \
+             mock.patch.object(self.client, "_apply_chatroom_history_limit") as prune:
+            self.root.show()
+            S.begin_history_startup(self.client, None)
+            self.assertTrue(entered.wait(2))
+            self.client._force_quit = True
+            self.root.close()
+            release.set()
+            self.assertTrue(finished.wait(2))
+            QTest.qWait(100)
+            self.assertTrue(self.client._closing)
+            self.assertFalse(self.client._history_startup_ready)
+            upgrade.assert_not_called()
+            prune.assert_not_called()
+            self.history.assert_not_called()
+            self.network.assert_not_called()
+
+    def test_history_upgrade_finishes_before_startup_and_raises_old_limit(self):
+        legacy = S.Path("legacy.bin")
+        self.client.chatroom_history_limit_var.set(1000)
+        with mock.patch.object(S, "_pending_history_upgrades", return_value=[legacy]), \
+             mock.patch.object(S, "show_history_upgrade", return_value=True) as upgrade:
+            self.root.show()
+            S.begin_history_startup(self.client, None)
+            for _ in range(100):
+                QTest.qWait(10)
+                if self.history.called:
+                    break
+            upgrade.assert_called_once_with(self.client, [legacy])
+            self.assertEqual(self.client._chatroom_history_limit(), S.DEFAULT_CHATROOM_HISTORY_LIMIT)
+            self.assertTrue(self.client._history_startup_ready)
+            self.history.assert_called_once()
+
+    def test_failed_scan_closes_without_loading_or_pruning_history(self):
+        with mock.patch.object(S, "_pending_history_upgrades", side_effect=OSError("unavailable")), \
+             mock.patch.object(S.messagebox, "showerror") as error, \
+             mock.patch.object(self.client, "_apply_chatroom_history_limit") as prune:
+            self.root.show()
+            S.begin_history_startup(self.client, None)
+            for _ in range(100):
+                QTest.qWait(10)
+                if self.client._closing:
+                    break
+            error.assert_called_once()
+            self.assertTrue(self.client._closing)
+            self.history.assert_not_called()
+            self.network.assert_not_called()
+            prune.assert_not_called()
+
     def test_early_config_click_and_other_popups_prepare_once_in_current_theme(self):
         self.root.show()
         self.client._on_theme_changed("Classic")

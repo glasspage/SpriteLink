@@ -554,7 +554,11 @@ class BehaviorSettingsTests(unittest.TestCase):
         init_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient.__init__
         )
-        self.assertIn("background_history_prune_timer.start()", init_source)
+        timer_source = inspect.getsource(
+            SPRITELINK.EncryptedChatClient._start_periodic_ui_timers
+        )
+        self.assertIn("_start_periodic_ui_timers()", init_source)
+        self.assertIn("background_history_prune_timer.start()", timer_source)
         prune_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._prune_background_local_histories
         )
@@ -4665,7 +4669,9 @@ class Version120ReleaseTests(unittest.TestCase):
         self.assertIn("_clear_desktop_notification(room_id)", read_source)
         main_source = inspect.getsource(SPRITELINK.main)
         self.assertIn("write_notification_activation", main_source)
-        self.assertIn("_open_notification_chatroom", main_source)
+        self.assertIn("begin_history_startup(client, notification_room_id)", main_source)
+        startup_source = inspect.getsource(SPRITELINK.begin_history_startup)
+        self.assertIn("_open_notification_chatroom", startup_source)
 
     def test_notification_sounds_have_a_two_second_cooldown(self) -> None:
         client = mock.Mock()
