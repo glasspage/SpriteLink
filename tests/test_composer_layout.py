@@ -117,6 +117,7 @@ class ComposerLayoutTests(unittest.TestCase):
         client = self.client
         client.image_menu_button.setChecked(True)
         self.assertEqual(client.send_button.text(), "Send")
+        self.assertEqual(client.image_composer_label.text(), "Image message")
         client.image_menu.size_combo.setCurrentIndex(S.EMOJI_SIZE)
         self.assertEqual(client.image_menu.size_combo.currentText(), "Emoji (16x16)")
         self.assertEqual(client.send_button.text(), "Save to Emojis")
@@ -284,16 +285,16 @@ class ComposerLayoutTests(unittest.TestCase):
             self.assertIn("data:image/png;base64,", tooltip)
             self.assertIn("happy_cat", tooltip)
 
-    def test_empty_emoji_hint_links_to_emoji_canvas(self):
+    def test_make_emoji_link_stays_visible_and_opens_emoji_canvas(self):
         client = self.client
         client.emojis_menu_button.setChecked(True)
-        self.assertTrue(client.empty_emojis_hint.isVisible())
+        self.assertTrue(client.make_emoji_link.isVisible())
         self.assertFalse(client.emojis_menu.isVisible())
         self.assertEqual(
-            client.empty_emojis_hint.text(),
-            '<a href="image">Emojis can be created from the Image Tab.</a>',
+            client.make_emoji_link.text(),
+            '<a href="image">Make an Emoji</a>',
         )
-        client.empty_emojis_hint.linkActivated.emit("image")
+        client.make_emoji_link.linkActivated.emit("image")
         self.assertTrue(client.image_menu_button.isChecked())
         self.assertFalse(client.emojis_menu_button.isChecked())
         self.assertEqual(client.image_menu.size_combo.currentIndex(), S.EMOJI_SIZE)
@@ -302,7 +303,20 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertTrue(client._store_saved_emojis({"hello": encoded}))
         client.emojis_menu_button.setChecked(True)
         self.assertTrue(client.emojis_menu.isVisible())
-        self.assertFalse(client.empty_emojis_hint.isVisible())
+        self.assertTrue(client.make_emoji_link.isVisible())
+        self.assertEqual(client.emojis_menu.iconSize(), S.QSize(32, 32))
+        self.assertEqual(client.emojis_menu.item(0).icon().actualSize(S.QSize(32, 32)), S.QSize(32, 32))
+        self.assertEqual(client.emojis_menu.selectionMode(), S.QAbstractItemView.SelectionMode.NoSelection)
+        QTest.mouseClick(
+            client.emojis_menu.viewport(), Qt.MouseButton.LeftButton,
+            pos=client.emojis_menu.visualItemRect(client.emojis_menu.item(0)).center(),
+        )
+        self.assertEqual(self.edit.toPlainText(), "\ufffc")
+        self.assertFalse(client.emojis_menu.selectedItems())
+        client.make_emoji_link.linkActivated.emit("image")
+        self.assertEqual(client.image_composer_label.text(), "Creating Emoji")
+        client.image_menu.size_combo.setCurrentIndex(0)
+        self.assertEqual(client.image_composer_label.text(), "Image message")
 
 
 if __name__ == "__main__":

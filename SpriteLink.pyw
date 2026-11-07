@@ -10757,23 +10757,26 @@ QComboBox::drop-down {
         self.emojis_panel = QWidget()
         emojis_layout = QVBoxLayout(self.emojis_panel)
         emojis_layout.setContentsMargins(0, 0, 0, 0)
-        self.empty_emojis_hint = QLabel(
-            '<a href="image">Emojis can be created from the Image Tab.</a>'
+        self.make_emoji_link = QLabel(
+            '<a href="image">Make an Emoji</a>'
         )
-        self.empty_emojis_hint.setTextInteractionFlags(
+        self.make_emoji_link.setTextInteractionFlags(
             Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
         )
-        self.empty_emojis_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty_emojis_hint.setWordWrap(True)
-        self.empty_emojis_hint.linkActivated.connect(self._open_emoji_canvas)
-        emojis_layout.addWidget(self.empty_emojis_hint)
+        self.make_emoji_link.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.make_emoji_link.setWordWrap(True)
+        self.make_emoji_link.linkActivated.connect(self._open_emoji_canvas)
+        emojis_layout.addWidget(self.make_emoji_link)
         self.emojis_menu = QListWidget()
         self.emojis_menu.setViewMode(QListWidget.ViewMode.IconMode)
         self.emojis_menu.setMovement(QListWidget.Movement.Static)
         self.emojis_menu.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.emojis_menu.setGridSize(QSize(32, 32))
-        self.emojis_menu.setIconSize(QSize(PROFILE_ICON_SIZE, PROFILE_ICON_SIZE))
-        self.emojis_menu.setMaximumHeight(76)
+        picker_icon_size = PROFILE_ICON_SIZE * 2
+        cell_size = picker_icon_size + 8
+        self.emojis_menu.setGridSize(QSize(cell_size, cell_size))
+        self.emojis_menu.setIconSize(QSize(picker_icon_size, picker_icon_size))
+        self.emojis_menu.setMaximumHeight(2 * cell_size + 4)
+        self.emojis_menu.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.emojis_menu.setAccessibleName("Saved emojis")
         self.emojis_menu.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.emojis_menu.customContextMenuRequested.connect(self._show_saved_emoji_menu)
@@ -10901,9 +10904,9 @@ QComboBox::drop-down {
         self.emojis_menu.clear()
         emojis = self.config_data.get("saved_emojis", {})
         self.emojis_menu.setVisible(bool(emojis))
-        self.empty_emojis_hint.setVisible(not emojis)
+        icon_size = self.emojis_menu.iconSize().width()
         for name, encoded in emojis.items():
-            item = QListWidgetItem(QIcon(QPixmap.fromImage(emoji_image(encoded))), "")
+            item = QListWidgetItem(QIcon(QPixmap.fromImage(emoji_image(encoded, icon_size))), "")
             item.setToolTip(name)
             item.setData(Qt.ItemDataRole.AccessibleTextRole, name)
             item.setData(Qt.ItemDataRole.UserRole, (name, encoded))
@@ -13891,6 +13894,7 @@ QComboBox::drop-down {
             )
 
         emoji_mode = self._is_emoji_drawing()
+        self.image_composer_label.setText("Creating Emoji" if emoji_mode else "Image message")
         self.send_button.setText("Save to Emojis" if emoji_mode else "Send")
         self.message_size_bar.setVisible(not emoji_mode)
         if emoji_mode:
