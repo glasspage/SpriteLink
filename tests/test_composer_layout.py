@@ -4,7 +4,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QFont, QPalette
+from PySide6.QtGui import QContextMenuEvent, QFont, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QStyleFactory
 from test_security import SPRITELINK as S
@@ -345,6 +345,61 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertEqual(client.image_composer_label.text(), "Creating Emoji")
         client.image_menu.size_combo.setCurrentIndex(0)
         self.assertEqual(client.image_composer_label.text(), "Image message")
+
+    def test_native_image_context_menu_separates_image_and_message_actions(self):
+        client = self.client
+        drawing = S.encode_drawing(1, bytes([2]) * 3600)
+        message = client._build_draft_message("", drawing)
+        item = {"message": message, "is_local": True, "ntfy_time": message["t"]}
+        chat = client.chat_display
+        viewport = chat.viewport()
+        message_id = message["i"]
+
+        def render():
+            chat.document().clear()
+            client._insert_message_item(
+                S.QTextCursor(chat.document()), item, muted_ids=set(),
+                collapsed_ids=client._room_preference_ids("collapsed_messages"),
+                trusted_user_ids=set(), background_color="#ffffff", row_selections=[],
+            )
+            chat.document().size()
+
+        def menu_at(position, trigger=None):
+            labels = []
+
+            class InspectableMenu(S.QMenu):
+                def exec(self, _position):
+                    labels.extend(action.text() for action in self.actions())
+                    if trigger:
+                        next(action for action in self.actions() if action.text() == trigger).trigger()
+
+            event = QContextMenuEvent(
+                QContextMenuEvent.Reason.Mouse, position, viewport.mapToGlobal(position),
+            )
+            with mock.patch.object(S, "QMenu", InspectableMenu):
+                QApplication.sendEvent(viewport, event)
+            return labels
+
+        render()
+        image_point = next(
+            S.QPoint(x, y)
+            for y in range(5, min(120, viewport.height()), 5)
+            for x in range(10, min(300, viewport.width()), 5)
+            if chat.anchorAt(S.QPoint(x, y)) == f"spritelink-drawing:{message_id}"
+        )
+        beside_image = S.QPoint(viewport.width() - 15, image_point.y())
+        self.assertEqual(menu_at(image_point), ["Copy Image", "Import Image"])
+        with mock.patch.object(client, "_rerender_preserving_scroll", side_effect=render):
+            self.assertEqual(
+                menu_at(beside_image, "Collapse Message"), ["Copy Message", "Collapse Message"],
+            )
+            self.assertIn("[Image]", chat.toPlainText())
+            self.assertNotIn("\ufffc", chat.toPlainText())
+            self.assertEqual(
+                menu_at(S.QPoint(beside_image.x(), 10), "Expand Message"),
+                ["Copy Message", "Expand Message"],
+            )
+        self.assertEqual(chat.anchorAt(image_point), f"spritelink-drawing:{message_id}")
 
 
 if __name__ == "__main__":

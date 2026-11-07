@@ -16944,17 +16944,8 @@ QComboBox::drop-down {
 
             elif event_type == QEvent.Type.MouseMove:
                 position = event.position().toPoint()
-                anchor = self.chat_display.anchorAt(position)
+                anchor = self._chat_anchor_at_position(position)
                 message_id = self._message_id_from_anchor(anchor)
-                item = self.rendered_message_items.get(message_id or "")
-                if item is not None and "drawing" in item["message"]:
-                    cursor = self.chat_display.cursorForPosition(position)
-                    cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
-                    top = self.chat_display.cursorRect(cursor).top()
-                    font = str(item["message"].get("f", DEFAULT_MESSAGE_FONT))
-                    if position.y() >= top + self._chat_line_height(font):
-                        anchor = ""
-                        message_id = None
                 spoiler_id = self._spoiler_id_at_position(position)
 
                 if anchor or spoiler_id:
@@ -17043,7 +17034,7 @@ QComboBox::drop-down {
                     return True
 
             elif event_type == QEvent.Type.ContextMenu:
-                anchor = self.chat_display.anchorAt(event.pos())
+                anchor = self._chat_anchor_at_position(event.pos())
                 emoji = EMOJI_MARKUP.fullmatch(anchor.removeprefix("spritelink-emoji:"))
                 if anchor.startswith("spritelink-emoji:") and emoji:
                     self._hide_chat_tooltip()
@@ -17080,6 +17071,7 @@ QComboBox::drop-down {
                             self._show_message_context_menu(
                                 clicked_item,
                                 event.globalPos(),
+                                on_native_image=anchor == f"spritelink-drawing:{clicked_message_id}",
                             )
                 return True
 
@@ -17091,6 +17083,19 @@ QComboBox::drop-down {
         if anchor.startswith(prefix):
             return anchor[len(prefix):]
         return None
+
+    def _chat_anchor_at_position(self, position: QPoint) -> str:
+        anchor = self.chat_display.anchorAt(position)
+        message_id = self._message_id_from_anchor(anchor)
+        item = self.rendered_message_items.get(message_id or "")
+        if item is not None and "drawing" in item["message"]:
+            cursor = self.chat_display.cursorForPosition(position)
+            cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+            top = self.chat_display.cursorRect(cursor).top()
+            font = str(item["message"].get("f", DEFAULT_MESSAGE_FONT))
+            if position.y() >= top + self._chat_line_height(font):
+                return ""
+        return anchor
 
     def _message_id_at_position(self, position: QPoint) -> str | None:
         cursor = self.chat_display.cursorForPosition(position)
@@ -17424,6 +17429,8 @@ QComboBox::drop-down {
         self,
         item: dict[str, Any],
         global_position: Any,
+        *,
+        on_native_image: bool = False,
     ) -> None:
         message = item["message"]
         message_id = str(message["i"])
@@ -17436,7 +17443,7 @@ QComboBox::drop-down {
         )
 
         menu = QMenu(self.root)
-        if "drawing" in message:
+        if on_native_image and "drawing" in message:
             copy_action = menu.addAction("Copy Image")
             import_action = menu.addAction("Import Image")
             try:
@@ -17455,11 +17462,10 @@ QComboBox::drop-down {
             copy_action = menu.addAction("Copy Message")
             copy_action.triggered.connect(
                 lambda: QApplication.clipboard().setText(
-                    message_plain_text(str(message["m"]))
+                    "[Image]" if "drawing" in message else message_plain_text(str(message["m"]))
                 )
             )
 
-        if "drawing" not in message:
             collapse_action = menu.addAction(
                 "Expand Message"
                 if is_manually_collapsed
@@ -18631,9 +18637,7 @@ QComboBox::drop-down {
             if is_muted
             else message_plain_text(text)
         )
-        is_collapsed = is_muted or (
-            not drawing and bool(source_message_ids.intersection(collapsed_ids))
-        )
+        is_collapsed = is_muted or bool(source_message_ids.intersection(collapsed_ids))
         message_block_format = QTextBlockFormat()
         message_block_format.setNonBreakableLines(is_collapsed)
         cursor.setBlockFormat(message_block_format)
