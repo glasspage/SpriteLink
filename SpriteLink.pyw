@@ -80,6 +80,7 @@ try:
         QPolygon,
         QRegion,
         QShortcut,
+        QValidator,
         QTextBlockFormat,
         QTextBlockUserData,
         QTextCharFormat,
@@ -614,6 +615,8 @@ MAX_PROFILE_ICON_GIF_BYTES = 2048
 MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
+CHAT_TOOLTIP_ICON_SIZE = 64
+TINY_CHAT_EMOJI_SIZE = 12
 CHAT_TOOLTIP_DISPLAY_TIME_MS = 2_147_483_647
 TOOLTIP_SPACER_DATA_URI = (
     "data:image/png;base64,"
@@ -1721,7 +1724,7 @@ def profile_icon_tooltip_data_uri(encoded_icon: str) -> str:
         gif_data = decode_profile_icon(encoded_icon)
         with Image.open(io.BytesIO(gif_data)) as icon:
             preview = icon.convert("RGBA").resize(
-                (64, 64),
+                (CHAT_TOOLTIP_ICON_SIZE, CHAT_TOOLTIP_ICON_SIZE),
                 Image.Resampling.NEAREST,
             )
         output = io.BytesIO()
@@ -4561,7 +4564,11 @@ EMOJI_REVEALED_IMAGE_PROPERTY = QTextFormat.Property.UserProperty + 41
 @lru_cache(maxsize=256)
 def emoji_image(encoded: str, size: int = PROFILE_ICON_SIZE) -> QImage:
     image = drawing_image(*decode_drawing(encoded))
-    return image.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio)
+    transformation = (
+        Qt.TransformationMode.SmoothTransformation
+        if size < PROFILE_ICON_SIZE else Qt.TransformationMode.FastTransformation
+    )
+    return image.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, transformation)
 
 
 def message_emoji_markup(message: dict[str, Any]) -> str:
@@ -4603,6 +4610,15 @@ def inline_emoji_format(
     formatting.setProperty(INLINE_EMOJI_PROPERTY, emoji_markup(name, encoded))
     formatting.setToolTip(name)
     return formatting
+
+
+class EmojiNameValidator(QValidator):
+    @staticmethod
+    def normalize(name: str) -> str:
+        return re.sub(r"\s", "_", name)
+
+    def validate(self, text: str, position: int) -> tuple[QValidator.State, str, int]:
+        return QValidator.State.Acceptable, self.normalize(text), position
 
 
 class ComposeTextEdit(QTextEdit):
@@ -10738,6 +10754,19 @@ QComboBox::drop-down {
         formatting_layout.addStretch(1)
         self.formatting_menu.hide()
         content_layout.addWidget(self.formatting_menu)
+        self.emojis_panel = QWidget()
+        emojis_layout = QVBoxLayout(self.emojis_panel)
+        emojis_layout.setContentsMargins(0, 0, 0, 0)
+        self.empty_emojis_hint = QLabel(
+            '<a href="image">Emojis can be created from the Image Tab.</a>'
+        )
+        self.empty_emojis_hint.setTextInteractionFlags(
+            Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
+        )
+        self.empty_emojis_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_emojis_hint.setWordWrap(True)
+        self.empty_emojis_hint.linkActivated.connect(self._open_emoji_canvas)
+        emojis_layout.addWidget(self.empty_emojis_hint)
         self.emojis_menu = QListWidget()
         self.emojis_menu.setViewMode(QListWidget.ViewMode.IconMode)
         self.emojis_menu.setMovement(QListWidget.Movement.Static)
@@ -10753,8 +10782,9 @@ QComboBox::drop-down {
             shortcut = QShortcut(QKeySequence(key), self.emojis_menu)
             shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
             shortcut.activated.connect(self._insert_current_saved_emoji)
-        self.emojis_menu.hide()
-        content_layout.addWidget(self.emojis_menu)
+        emojis_layout.addWidget(self.emojis_menu)
+        self.emojis_panel.hide()
+        content_layout.addWidget(self.emojis_panel)
         self._refresh_saved_emojis()
         self.emoji_edit_sources: dict[str, str] = {}
         self.image_menu = DrawingMenu(ThemeComboBox)
@@ -10859,14 +10889,19 @@ QComboBox::drop-down {
 
     def _on_emojis_menu_toggled(self, checked: bool) -> None:
         keep_at_bottom = self._chat_is_scrolled_to_bottom()
-        self._set_composer_menu_visibility(self.emojis_menu if checked else None)
+        self._set_composer_menu_visibility(self.emojis_panel if checked else None)
         self.message_entry.setFocus()
         self._restore_chat_bottom_after_layout_change(keep_at_bottom)
+
+    def _open_emoji_canvas(self) -> None:
+        self.image_menu_button.setChecked(True)
+        self.image_menu.size_combo.setCurrentIndex(EMOJI_SIZE)
 
     def _refresh_saved_emojis(self) -> None:
         self.emojis_menu.clear()
         emojis = self.config_data.get("saved_emojis", {})
-        self.emojis_menu.setToolTip("" if emojis else "Save a 16×16 drawing from Image.")
+        self.emojis_menu.setVisible(bool(emojis))
+        self.empty_emojis_hint.setVisible(not emojis)
         for name, encoded in emojis.items():
             item = QListWidgetItem(QIcon(QPixmap.fromImage(emoji_image(encoded))), "")
             item.setToolTip(name)
@@ -10904,13 +10939,14 @@ QComboBox::drop-down {
         preview.setPixmap(QPixmap.fromImage(emoji_image(encoded, 64)))
         preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(preview)
-        entry = QLineEdit(name)
+        entry = QLineEdit(EmojiNameValidator.normalize(name))
+        entry.setValidator(EmojiNameValidator(entry))
         entry.setMaxLength(32)
         label = QLabel("Emoji name")
         label.setBuddy(entry)
         layout.addWidget(label)
         layout.addWidget(entry)
-        hint = QLabel()
+        hint = QLabel("Name already used.")
         layout.addWidget(hint)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
@@ -10927,7 +10963,7 @@ QComboBox::drop-down {
             )
             valid = valid_emoji_name(candidate)
             buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(valid and not conflict)
-            hint.setText("Name already used." if conflict else "One or two words.")
+            hint.setVisible(conflict)
 
         def save() -> None:
             emojis = dict(self.config_data.get("saved_emojis", {}))
@@ -11111,7 +11147,7 @@ QComboBox::drop-down {
                 (self.identity_menu, self.identity_menu_button),
                 (self.font_menu, self.font_menu_button),
                 (self.formatting_menu, self.formatting_menu_button),
-                (self.emojis_menu, self.emojis_menu_button),
+                (self.emojis_panel, self.emojis_menu_button),
                 (self.image_menu, self.image_menu_button),
             ):
                 should_show = menu is visible_menu
@@ -16174,7 +16210,10 @@ QComboBox::drop-down {
         self._pending_tooltip_message_id = None
         if not message_id or message_id != self._hovered_message_id:
             return
-        if message_id.startswith("video:"):
+        if message_id.startswith("spritelink-emoji:"):
+            emoji = EMOJI_MARKUP.fullmatch(message_id.removeprefix("spritelink-emoji:"))
+            tooltip = self._tooltip_for_emoji(emoji[1], emoji[2]) if emoji else ""
+        elif message_id.startswith("video:"):
             url = message_id[len("video:"):]
             media = self.image_preview_cache.get(url)
             tooltip = (
@@ -16194,6 +16233,18 @@ QComboBox::drop-down {
                 CHAT_TOOLTIP_DISPLAY_TIME_MS,
             )
 
+    def _tooltip_for_emoji(self, encoded: str, name: str) -> str:
+        image_format = QTextImageFormat()
+        size = CHAT_TOOLTIP_ICON_SIZE
+        if not self._set_inline_html_image(image_format, emoji_image(encoded, size)):
+            return escape(name)
+        return (
+            '<table align="center" cellspacing="0" cellpadding="0">'
+            f'<tr><td align="center"><img src="{image_format.name()}" width="{size}" height="{size}"></td></tr>'
+            f'<tr><td align="center">{escape(name)}</td></tr>'
+            '</table>'
+        )
+
     def _tooltip_for_message_item(
         self,
         item: dict[str, Any],
@@ -16210,7 +16261,7 @@ QComboBox::drop-down {
         )
         icon_row = (
             '<tr><td align="center">'
-            f'<img src="{tooltip_icon_uri}" width="64" height="64">'
+            f'<img src="{tooltip_icon_uri}" width="{CHAT_TOOLTIP_ICON_SIZE}" height="{CHAT_TOOLTIP_ICON_SIZE}">'
             "</td></tr>"
             if tooltip_icon_uri
             else ""
@@ -16918,9 +16969,9 @@ QComboBox::drop-down {
                     self.chat_display.viewport().setCursor(
                         Qt.CursorShape.PointingHandCursor
                     )
-                    if message_id:
+                    if message_id or anchor.startswith("spritelink-emoji:"):
                         self._schedule_chat_tooltip(
-                            message_id,
+                            message_id or anchor,
                             event.globalPosition().toPoint(),
                         )
                     elif (image_url := self._image_url_from_anchor(anchor)) and is_click_to_play_video_url(image_url):
@@ -16996,10 +17047,7 @@ QComboBox::drop-down {
                         return True
 
             elif event_type == QEvent.Type.ToolTip:
-                anchor = self.chat_display.anchorAt(event.pos())
-                emoji = EMOJI_MARKUP.fullmatch(anchor.removeprefix("spritelink-emoji:"))
-                if anchor.startswith("spritelink-emoji:") and emoji:
-                    QToolTip.showText(event.globalPos(), emoji[2], self.chat_display)
+                if self.chat_display.anchorAt(event.pos()).startswith("spritelink-emoji:"):
                     return True
 
             elif event_type == QEvent.Type.ContextMenu:
@@ -17505,11 +17553,10 @@ QComboBox::drop-down {
         )
         url_spans = message_url_spans(link_text)
         emoji_size = PROFILE_ICON_SIZE
-        if standalone_emoji:
+        if render_emojis and self._is_tiny_ui():
+            emoji_size = TINY_CHAT_EMOJI_SIZE
+        elif standalone_emoji:
             emoji_size *= 2
-        elif render_emojis and self._is_tiny_ui():
-            font = self._make_message_font(font_name, role="chat_log")
-            emoji_size = min(PROFILE_ICON_SIZE - 2, max(1, math.floor(QFontMetricsF(font).ascent())))
         link_color = (
             "#0000ee"
             if self._is_windows_classic_theme()
@@ -17597,8 +17644,7 @@ QComboBox::drop-down {
                             continue
                         cursor.insertText(content[offset:match.start()], formatting)
                         image_format = inline_emoji_format(cursor, name, encoded, emoji_size, formatting)
-                        if standalone_emoji:
-                            image_format.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignTop)
+                        image_format.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignMiddle)
                         if preview:
                             self._set_inline_html_image(image_format, emoji_image(encoded, emoji_size))
                         else:
@@ -18685,12 +18731,10 @@ QComboBox::drop-down {
 
         self.rendered_message_items[message_id] = item
         drawing_preview = self._inline_drawing_image(drawing) if drawing and not is_collapsed else None
-        standalone_emoji = not is_collapsed and (
+        standalone_emoji = not is_collapsed and not self._is_tiny_ui() and (
             item.get("standalone_emoji") or message_is_standalone_emoji(message)
         )
         top_align_height = drawing_preview.height() if drawing_preview is not None else 0
-        if standalone_emoji:
-            top_align_height = PROFILE_ICON_SIZE * 2
         if (
             not is_collapsed
             and bool(displayed_image_urls)

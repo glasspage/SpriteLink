@@ -84,7 +84,8 @@ def decode_drawing(encoded: str) -> tuple[int, bytes, int]:
     return size, bytes(pixels), PALETTE_HEADERS.index(palette_header)
 
 
-EMOJI_NAME_PATTERN = r"[^\W_]+(?:['’_-][^\W_]+)*(?: [^\W_]+(?:['’_-][^\W_]+)*)?"
+LEGACY_EMOJI_NAME_PATTERN = r"[^\W_]+(?:['’_-][^\W_]+)*(?: [^\W_]+(?:['’_-][^\W_]+)*)?"
+EMOJI_NAME_PATTERN = r"_*[^\W_]+(?:(?:['’-]|_+)[^\W_]+)*_*"
 EMOJI_MARKUP = re.compile(r"<sl-emoji:([A-Za-z0-9+/=]{4,132}):([^<>:\r\n]{1,32})>")
 
 
@@ -95,7 +96,10 @@ def valid_emoji_name(name: str) -> bool:
 
 
 def valid_emoji(name: str, encoded: str) -> bool:
-    if not valid_emoji_name(name) or not isinstance(encoded, str) or len(encoded) > 132:
+    legacy_name = isinstance(name, str) and len(name) <= 32 and re.fullmatch(
+        LEGACY_EMOJI_NAME_PATTERN, name
+    )
+    if not (valid_emoji_name(name) or legacy_name) or not isinstance(encoded, str) or len(encoded) > 132:
         return False
     try:
         size, _, _ = decode_drawing(encoded)

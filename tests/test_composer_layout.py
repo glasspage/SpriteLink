@@ -192,10 +192,12 @@ class ComposerLayoutTests(unittest.TestCase):
                 formatting = image_format()
                 self.assertFalse(formatting.isAnchor())
                 if ui_size == "Tiny":
-                    font = client._make_message_font(S.DEFAULT_MESSAGE_FONT, role="chat_log")
-                    self.assertLessEqual(formatting.height(), S.QFontMetrics(font).ascent())
+                    self.assertEqual(formatting.height(), 12)
                 else:
                     self.assertEqual(formatting.height(), 16)
+                self.assertEqual(
+                    formatting.verticalAlignment(), S.QTextCharFormat.VerticalAlignment.AlignMiddle,
+                )
                 client._toggle_rendered_spoiler("message:1")
                 self.assertTrue(image_format().isAnchor())
                 self.assertEqual(image_format().toolTip(), "sleepy cat")
@@ -215,7 +217,13 @@ class ComposerLayoutTests(unittest.TestCase):
         restored_image = self.edit.document().begin().begin().fragment().charFormat().toImageFormat()
         self.assertEqual(restored_image.height(), 16)
 
-        for text, expected_size in ((markup, 32), (f"hi {markup}", 14), (f"{markup} {markup}", 14)):
+        cases = (
+            ("Small", markup, 32), ("Small", f"hi {markup}", 16),
+            ("Tiny", markup, 12), ("Tiny", f"hi {markup}", 12),
+            ("Tiny", f"{markup} {markup}", 12),
+        )
+        for ui_size, text, expected_size in cases:
+            client.config_data["ui_size"] = ui_size
             with self.subTest(text=text):
                 message = client._build_draft_message(text)
                 item = {"message": message, "is_local": True, "ntfy_time": message["t"]}
@@ -239,6 +247,62 @@ class ComposerLayoutTests(unittest.TestCase):
                         document.begin().blockFormat().lineHeightType(),
                         S.QTextBlockFormat.LineHeightTypes.FixedHeight.value,
                     )
+
+    def test_save_emoji_turns_spaces_into_underscores(self):
+        client = self.client
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+
+        def edit_dialog(dialog):
+            entry = dialog.findChild(S.QLineEdit)
+            self.assertEqual(entry.text(), "sleepy_cat")
+            self.assertNotIn("One or two words.", [label.text() for label in dialog.findChildren(S.QLabel)])
+            entry.setText("happy")
+            entry.setCursorPosition(5)
+            QTest.keyClick(entry, Qt.Key.Key_Space)
+            QTest.keyClicks(entry, "cat")
+            self.assertEqual(entry.text(), "happy_cat")
+            buttons = dialog.findChild(S.QDialogButtonBox)
+            buttons.button(S.QDialogButtonBox.StandardButton.Save).click()
+            return dialog.result()
+
+        with mock.patch.object(S.QDialog, "exec", edit_dialog):
+            self.assertTrue(client._save_emoji_dialog(encoded, "sleepy cat"))
+        self.assertEqual(client.config_data["saved_emojis"], {"happy_cat": encoded})
+        self.assertFalse(S.valid_emoji_name("happy cat"))
+
+    def test_emoji_tooltip_uses_chat_hover_delay_and_profile_preview_size(self):
+        client = self.client
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+        anchor = f"spritelink-emoji:{S.emoji_markup('happy_cat', encoded)}"
+        with mock.patch.object(S.QToolTip, "showText") as show:
+            client._schedule_chat_tooltip(anchor, S.QPoint(10, 20))
+            self.assertEqual(client.chat_tooltip_timer.interval(), S.CHAT_TOOLTIP_HOVER_DELAY_MS)
+            show.assert_not_called()
+            client._show_pending_chat_tooltip()
+            tooltip = show.call_args.args[1]
+            self.assertIn('width="64" height="64"', tooltip)
+            self.assertIn("data:image/png;base64,", tooltip)
+            self.assertIn("happy_cat", tooltip)
+
+    def test_empty_emoji_hint_links_to_emoji_canvas(self):
+        client = self.client
+        client.emojis_menu_button.setChecked(True)
+        self.assertTrue(client.empty_emojis_hint.isVisible())
+        self.assertFalse(client.emojis_menu.isVisible())
+        self.assertEqual(
+            client.empty_emojis_hint.text(),
+            '<a href="image">Emojis can be created from the Image Tab.</a>',
+        )
+        client.empty_emojis_hint.linkActivated.emit("image")
+        self.assertTrue(client.image_menu_button.isChecked())
+        self.assertFalse(client.emojis_menu_button.isChecked())
+        self.assertEqual(client.image_menu.size_combo.currentIndex(), S.EMOJI_SIZE)
+        self.assertEqual(client.send_button.text(), "Save to Emojis")
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes(256))
+        self.assertTrue(client._store_saved_emojis({"hello": encoded}))
+        client.emojis_menu_button.setChecked(True)
+        self.assertTrue(client.emojis_menu.isVisible())
+        self.assertFalse(client.empty_emojis_hint.isVisible())
 
 
 if __name__ == "__main__":
