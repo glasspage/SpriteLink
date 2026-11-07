@@ -164,22 +164,13 @@ class ComposerLayoutTests(unittest.TestCase):
                 client.config_data["ui_size"] = ui_size
                 document = client.chat_display.document()
                 document.clear()
-                def render(text):
-                    document.clear()
-                    document.setTextWidth(400)
-                    client._insert_message_text_with_links(
-                        S.QTextCursor(document), text, "#000000",
-                        S.DEFAULT_MESSAGE_FONT, "user", "message",
-                        muted=False, ui_font=False, embedded_image_urls=set(),
-                        align_top=False, top_align_height=0, render_emojis=True,
-                    )
-                    document.size()
-                    return document.begin().layout().lineAt(0).height()
-
-                emoji_height = render(f"before {markup} after")
-                if ui_size == "Tiny":
-                    self.assertLessEqual(emoji_height, client._chat_line_height(S.DEFAULT_MESSAGE_FONT))
-                render(f"before <sp>{markup}</sp> after")
+                document.setTextWidth(400)
+                client._insert_message_text_with_links(
+                    S.QTextCursor(document), f"before <sp>{markup}</sp> after", "#000000",
+                    S.DEFAULT_MESSAGE_FONT, "user", "message",
+                    muted=False, ui_font=False, embedded_image_urls=set(),
+                    align_top=False, top_align_height=0, render_emojis=True,
+                )
 
                 def image_format():
                     iterator = document.begin().begin()
@@ -191,13 +182,11 @@ class ComposerLayoutTests(unittest.TestCase):
                     self.fail("No inline image")
                 formatting = image_format()
                 self.assertFalse(formatting.isAnchor())
-                if ui_size == "Tiny":
-                    self.assertEqual(formatting.height(), 14)
-                else:
-                    self.assertEqual(formatting.height(), 16)
-                self.assertEqual(
-                    formatting.verticalAlignment(), S.QTextCharFormat.VerticalAlignment.AlignMiddle,
-                )
+                self.assertEqual(formatting.height(), 16)
+                if ui_size == "Small":
+                    self.assertEqual(
+                        formatting.verticalAlignment(), S.QTextCharFormat.VerticalAlignment.AlignMiddle,
+                    )
                 client._toggle_rendered_spoiler("message:1")
                 self.assertTrue(image_format().isAnchor())
                 self.assertEqual(image_format().toolTip(), "sleepy cat")
@@ -219,8 +208,8 @@ class ComposerLayoutTests(unittest.TestCase):
 
         cases = (
             ("Small", markup, 16), ("Small", f"hi {markup}", 16),
-            ("Tiny", markup, 14), ("Tiny", f"hi {markup}", 14),
-            ("Tiny", f"{markup} {markup}", 14),
+            ("Tiny", markup, 16), ("Tiny", f"hi {markup}", 16),
+            ("Tiny", f"{markup} {markup}", 16),
         )
         for ui_size, text, expected_size in cases:
             client.config_data["ui_size"] = ui_size
@@ -246,6 +235,44 @@ class ComposerLayoutTests(unittest.TestCase):
                     document.begin().blockFormat().lineHeight(),
                     client._chat_line_height(S.DEFAULT_MESSAGE_FONT),
                 )
+
+    def test_full_size_emoji_pixels_fit_between_tiny_chat_rows(self):
+        client = self.client
+        client.config_data["ui_size"] = "Tiny"
+        client._apply_ui_size()
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+        emoji = S.emoji_markup("cat", encoded)
+        color = S.emoji_image(encoded).pixel(0, 0)
+        for font in (S.DEFAULT_MESSAGE_FONT, "Segoe UI"):
+            with self.subTest(font=font):
+                document = client.chat_display.document()
+                document.clear()
+                document.setTextWidth(400)
+                cursor = S.QTextCursor(document)
+                for text in ("previous", f"before {emoji} after", "next"):
+                    message = client._build_draft_message(text)
+                    message["f"] = font
+                    item = {"message": message, "is_local": True, "ntfy_time": message["t"]}
+                    client._insert_message_item(
+                        cursor, item, muted_ids=set(), collapsed_ids=set(),
+                        trusted_user_ids=set(), background_color="#ffffff", row_selections=[],
+                    )
+                layout = document.documentLayout()
+                emoji_block = document.begin().next()
+                top = layout.blockBoundingRect(emoji_block).top()
+                bottom = layout.blockBoundingRect(emoji_block.next()).top()
+                image = S.QImage(400, 100, S.QImage.Format.Format_RGB32)
+                image.fill(S.QColor("white"))
+                painter = S.QPainter(image)
+                document.drawContents(painter)
+                painter.end()
+                colored_rows = [
+                    y for y in range(image.height())
+                    if any(image.pixel(x, y) == color for x in range(image.width()))
+                ]
+                self.assertEqual(len(colored_rows), 16)
+                self.assertGreaterEqual(colored_rows[0], top)
+                self.assertLess(colored_rows[-1], bottom)
 
     def test_save_emoji_turns_spaces_into_underscores(self):
         client = self.client

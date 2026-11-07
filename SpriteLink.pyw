@@ -616,7 +616,6 @@ MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
 CHAT_TOOLTIP_ICON_SIZE = 64
-TINY_CHAT_EMOJI_SIZE = 14
 CHAT_TOOLTIP_DISPLAY_TIME_MS = 2_147_483_647
 TOOLTIP_SPACER_DATA_URI = (
     "data:image/png;base64,"
@@ -4564,11 +4563,7 @@ EMOJI_REVEALED_IMAGE_PROPERTY = QTextFormat.Property.UserProperty + 41
 @lru_cache(maxsize=256)
 def emoji_image(encoded: str, size: int = PROFILE_ICON_SIZE) -> QImage:
     image = drawing_image(*decode_drawing(encoded))
-    transformation = (
-        Qt.TransformationMode.SmoothTransformation
-        if size < PROFILE_ICON_SIZE else Qt.TransformationMode.FastTransformation
-    )
-    return image.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, transformation)
+    return image.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio)
 
 
 def message_emoji_markup(message: dict[str, Any]) -> str:
@@ -17549,8 +17544,10 @@ QComboBox::drop-down {
         )
         url_spans = message_url_spans(link_text)
         emoji_size = PROFILE_ICON_SIZE
-        if render_emojis and self._is_tiny_ui():
-            emoji_size = TINY_CHAT_EMOJI_SIZE
+        emoji_alignment = QTextCharFormat.VerticalAlignment.AlignMiddle
+        if render_emojis and self._is_tiny_ui() and self._chat_line_height(font_name) <= emoji_size + 2:
+            # Qt's middle alignment can extend into the next row with very short fonts.
+            emoji_alignment = QTextCharFormat.VerticalAlignment.AlignTop
         link_color = (
             "#0000ee"
             if self._is_windows_classic_theme()
@@ -17638,7 +17635,7 @@ QComboBox::drop-down {
                             continue
                         cursor.insertText(content[offset:match.start()], formatting)
                         image_format = inline_emoji_format(cursor, name, encoded, emoji_size, formatting)
-                        image_format.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignMiddle)
+                        image_format.setVerticalAlignment(emoji_alignment)
                         if preview:
                             self._set_inline_html_image(image_format, emoji_image(encoded, emoji_size))
                         else:
