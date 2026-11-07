@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from spritelink_image_codec import IMAGE_PALETTES, IMAGE_SIZES
+from spritelink_image_codec import EMOJI_SIZE, IMAGE_PALETTES, IMAGE_SIZES
 
 
 PALETTE_ORDER = (0, 3, 2, 4, 1)
@@ -43,7 +43,7 @@ def palette_translation(source: int, target: int) -> bytes:
     return bytes(new_slots[old_slots.index(index)] for index in range(8)) + bytes(range(8, 256))
 
 
-SIZE_LABELS = [f"{width} × {height}" for width, height in IMAGE_SIZES]
+SIZE_LABELS = ("Wide (90x60)", "Square (60x60)", "Tall (60x90)", "Emoji (16x16)")
 PATTERNS = (
     lambda x, y: False,
     lambda x, y: (x + y) % 2,
@@ -611,7 +611,7 @@ class DrawingImportPanel(QFrame):
     dismissed = Signal()
 
     def __init__(
-        self, source: Image.Image, combo_type, *, icon_size: int | None = None, icon_encoder=None,
+        self, source: Image.Image, combo_type, *, icon_size: int | None = None, icon_encoder=None, emoji: bool = False,
     ) -> None:
         super().__init__()
         self.setObjectName("configPanel")
@@ -634,8 +634,8 @@ class DrawingImportPanel(QFrame):
             self.size_combo.addItems(SIZE_LABELS)
             self.size_combo.setAccessibleName("Canvas size")
             ratio = source.width / source.height
-            self.size_combo.setCurrentIndex(min(
-                range(len(IMAGE_SIZES)),
+            self.size_combo.setCurrentIndex(EMOJI_SIZE if emoji else min(
+                range(EMOJI_SIZE),
                 key=lambda i: abs(math.log(ratio * IMAGE_SIZES[i][1] / IMAGE_SIZES[i][0])),
             ))
             settings.addWidget(self.size_combo)

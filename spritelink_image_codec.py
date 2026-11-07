@@ -1,9 +1,12 @@
 """Wire format for SpriteLink drawings."""
 import base64
 import binascii
+import re
 import zlib
 
-IMAGE_SIZES = ((90, 60), (60, 60), (60, 90))
+EMOJI_SIZE = 3
+MAX_MESSAGE_EMOJIS = 128
+IMAGE_SIZES = ((90, 60), (60, 60), (60, 90), (16, 16))
 IMAGE_PALETTES = (
     (
         "#000000", "#FFFFFF", "#E85154", "#F4CB4E",
@@ -79,3 +82,69 @@ def decode_drawing(encoded: str) -> tuple[int, bytes, int]:
         word = int.from_bytes(packed[start:start + 3], "big")
         pixels.extend((word >> shift) & 7 for shift in range(21, -1, -3))
     return size, bytes(pixels), PALETTE_HEADERS.index(palette_header)
+
+
+LEGACY_EMOJI_NAME_PATTERN = r"[^\W_]+(?:['’_-][^\W_]+)*(?: [^\W_]+(?:['’_-][^\W_]+)*)?"
+EMOJI_NAME_PATTERN = r"_*[^\W_]+(?:(?:['’-]|_+)[^\W_]+)*_*"
+EMOJI_MARKUP = re.compile(r"<sl-emoji:([A-Za-z0-9+/=]{4,132}):([^<>:\r\n]{1,32})>")
+
+
+def valid_emoji_name(name: str) -> bool:
+    return isinstance(name, str) and len(name) <= 32 and bool(
+        re.fullmatch(EMOJI_NAME_PATTERN, name)
+    )
+
+
+def valid_emoji(name: str, encoded: str) -> bool:
+    legacy_name = isinstance(name, str) and len(name) <= 32 and re.fullmatch(
+        LEGACY_EMOJI_NAME_PATTERN, name
+    )
+    if not (valid_emoji_name(name) or legacy_name) or not isinstance(encoded, str) or len(encoded) > 132:
+        return False
+    try:
+        size, _, _ = decode_drawing(encoded)
+    except ValueError:
+        return False
+    return size == EMOJI_SIZE
+
+
+def emoji_markup(name: str, encoded: str) -> str:
+    return f"<sl-emoji:{encoded}:{name}>"
+
+
+def pack_message_emojis(markup: str) -> tuple[str, list[list]]:
+    """Use offsets into the signed message text, which carries readable names."""
+    parts = []
+    entries = []
+    end = length = 0
+    for match in EMOJI_MARKUP.finditer(markup):
+        encoded, name = match.groups()
+        if not valid_emoji(name, encoded):
+            continue
+        parts.append(markup[end:match.start()])
+        length += match.start() - end
+        entries.append([length, name, encoded])
+        parts.append(f":{name}:")
+        length += len(name) + 2
+        end = match.end()
+    parts.append(markup[end:])
+    return "".join(parts), entries
+
+
+def unpack_message_emojis(text: str, entries: list) -> str:
+    if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_MESSAGE_EMOJIS:
+        raise ValueError("Invalid message emojis.")
+    parts = []
+    end = 0
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) != 3:
+            raise ValueError("Invalid message emoji.")
+        start, name, encoded = entry
+        if type(start) is not int or start < end or not valid_emoji(name, encoded):
+            raise ValueError("Invalid message emoji.")
+        if not text.startswith(f":{name}:", start):
+            raise ValueError("Emoji name does not match message text.")
+        parts.extend((text[end:start], emoji_markup(name, encoded)))
+        end = start + len(name) + 2
+    parts.append(text[end:])
+    return "".join(parts)
