@@ -176,10 +176,9 @@ class ComposerLayoutTests(unittest.TestCase):
                     document.size()
                     return document.begin().layout().lineAt(0).height()
 
-                plain_height = render("before after")
                 emoji_height = render(f"before {markup} after")
                 if ui_size == "Tiny":
-                    self.assertEqual(emoji_height, plain_height)
+                    self.assertLessEqual(emoji_height, client._chat_line_height(S.DEFAULT_MESSAGE_FONT))
                 render(f"before <sp>{markup}</sp> after")
 
                 def image_format():
@@ -193,7 +192,7 @@ class ComposerLayoutTests(unittest.TestCase):
                 formatting = image_format()
                 self.assertFalse(formatting.isAnchor())
                 if ui_size == "Tiny":
-                    self.assertEqual(formatting.height(), 12)
+                    self.assertEqual(formatting.height(), 14)
                 else:
                     self.assertEqual(formatting.height(), 16)
                 self.assertEqual(
@@ -205,7 +204,7 @@ class ComposerLayoutTests(unittest.TestCase):
                 client._toggle_rendered_spoiler("message:1")
                 self.assertFalse(image_format().isAnchor())
 
-    def test_standalone_emoji_uses_double_size_only_in_chat(self):
+    def test_standalone_and_inline_emoji_use_same_chat_size(self):
         client = self.client
         client.config_data["ui_size"] = "Tiny"
         client._apply_ui_size()
@@ -219,9 +218,9 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertEqual(restored_image.height(), 16)
 
         cases = (
-            ("Small", markup, 32), ("Small", f"hi {markup}", 16),
-            ("Tiny", markup, 12), ("Tiny", f"hi {markup}", 12),
-            ("Tiny", f"{markup} {markup}", 12),
+            ("Small", markup, 16), ("Small", f"hi {markup}", 16),
+            ("Tiny", markup, 14), ("Tiny", f"hi {markup}", 14),
+            ("Tiny", f"{markup} {markup}", 14),
         )
         for ui_size, text, expected_size in cases:
             client.config_data["ui_size"] = ui_size
@@ -243,11 +242,10 @@ class ComposerLayoutTests(unittest.TestCase):
                     iterator += 1
                 self.assertTrue(sizes)
                 self.assertEqual(set(sizes), {expected_size})
-                if expected_size == 32:
-                    self.assertNotEqual(
-                        document.begin().blockFormat().lineHeightType(),
-                        S.QTextBlockFormat.LineHeightTypes.FixedHeight.value,
-                    )
+                self.assertEqual(
+                    document.begin().blockFormat().lineHeight(),
+                    client._chat_line_height(S.DEFAULT_MESSAGE_FONT),
+                )
 
     def test_save_emoji_turns_spaces_into_underscores(self):
         client = self.client
@@ -307,11 +305,14 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertEqual(client.emojis_menu.iconSize(), S.QSize(32, 32))
         self.assertEqual(client.emojis_menu.item(0).icon().actualSize(S.QSize(32, 32)), S.QSize(32, 32))
         self.assertEqual(client.emojis_menu.selectionMode(), S.QAbstractItemView.SelectionMode.NoSelection)
-        QTest.mouseClick(
-            client.emojis_menu.viewport(), Qt.MouseButton.LeftButton,
-            pos=client.emojis_menu.visualItemRect(client.emojis_menu.item(0)).center(),
-        )
+        self.assertIsInstance(client.emojis_menu.itemDelegate(), S.NoFocusRectItemDelegate)
+        viewport = client.emojis_menu.viewport()
+        position = client.emojis_menu.visualItemRect(client.emojis_menu.item(0)).center()
+        QTest.mouseClick(viewport, Qt.MouseButton.LeftButton, pos=position)
         self.assertEqual(self.edit.toPlainText(), "\ufffc")
+        QTest.mouseDClick(viewport, Qt.MouseButton.LeftButton, pos=position)
+        QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=position)
+        self.assertEqual(self.edit.toPlainText(), "\ufffc\ufffc")
         self.assertFalse(client.emojis_menu.selectedItems())
         client.make_emoji_link.linkActivated.emit("image")
         self.assertEqual(client.image_composer_label.text(), "Creating Emoji")

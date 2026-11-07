@@ -616,7 +616,7 @@ MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
 CHAT_TOOLTIP_ICON_SIZE = 64
-TINY_CHAT_EMOJI_SIZE = 12
+TINY_CHAT_EMOJI_SIZE = 14
 CHAT_TOOLTIP_DISPLAY_TIME_MS = 2_147_483_647
 TOOLTIP_SPACER_DATA_URI = (
     "data:image/png;base64,"
@@ -4579,15 +4579,6 @@ def message_emoji_markup(message: dict[str, Any]) -> str:
         except ValueError:
             pass
     return text
-
-
-def message_is_standalone_emoji(message: dict[str, Any]) -> bool:
-    entries = message.get("emojis")
-    return (
-        isinstance(entries, list)
-        and len(entries) == 1
-        and EMOJI_MARKUP.fullmatch(message_plain_text(message_emoji_markup(message)).strip()) is not None
-    )
 
 
 def inline_emoji_format(
@@ -10777,10 +10768,12 @@ QComboBox::drop-down {
         self.emojis_menu.setIconSize(QSize(picker_icon_size, picker_icon_size))
         self.emojis_menu.setMaximumHeight(2 * cell_size + 4)
         self.emojis_menu.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.emojis_menu.setItemDelegate(NoFocusRectItemDelegate(self.emojis_menu))
         self.emojis_menu.setAccessibleName("Saved emojis")
         self.emojis_menu.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.emojis_menu.customContextMenuRequested.connect(self._show_saved_emoji_menu)
         self.emojis_menu.itemClicked.connect(self._insert_saved_emoji)
+        self.emojis_menu.itemDoubleClicked.connect(self._insert_saved_emoji)
         for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             shortcut = QShortcut(QKeySequence(key), self.emojis_menu)
             shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
@@ -17548,7 +17541,6 @@ QComboBox::drop-down {
         top_align_height: int,
         preview: bool = False,
         render_emojis: bool = False,
-        standalone_emoji: bool = False,
     ) -> None:
         plain_text, rich_runs = parse_message_rich_text(text)
         link_text = (
@@ -17559,8 +17551,6 @@ QComboBox::drop-down {
         emoji_size = PROFILE_ICON_SIZE
         if render_emojis and self._is_tiny_ui():
             emoji_size = TINY_CHAT_EMOJI_SIZE
-        elif standalone_emoji:
-            emoji_size *= 2
         link_color = (
             "#0000ee"
             if self._is_windows_classic_theme()
@@ -17991,7 +17981,6 @@ QComboBox::drop-down {
             message.pop("emojis", None)
         elif len(group) > 1:
             if "emojis" in message:
-                item["standalone_emoji"] = message_is_standalone_emoji(message)
                 prefix_length = len(self._repeat_prefixed_message_text("", len(group)))
                 message["emojis"] = [
                     [start + prefix_length, name, encoded]
@@ -18735,9 +18724,6 @@ QComboBox::drop-down {
 
         self.rendered_message_items[message_id] = item
         drawing_preview = self._inline_drawing_image(drawing) if drawing and not is_collapsed else None
-        standalone_emoji = not is_collapsed and not self._is_tiny_ui() and (
-            item.get("standalone_emoji") or message_is_standalone_emoji(message)
-        )
         top_align_height = drawing_preview.height() if drawing_preview is not None else 0
         if (
             not is_collapsed
@@ -18872,10 +18858,7 @@ QComboBox::drop-down {
                 align_top=align_message_top,
                 top_align_height=top_align_height,
                 render_emojis="emojis" in message,
-                standalone_emoji=standalone_emoji,
             )
-            if standalone_emoji:
-                embedded_media_block_numbers.add(cursor.block().blockNumber())
         cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
         if add_image_line_break:
             cursor.insertBlock()
