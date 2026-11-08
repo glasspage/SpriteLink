@@ -1,12 +1,15 @@
 """Portable, authenticated SpriteLink data archives.
 
-An .sldata file is encrypted with a user-provided passphrase, not Windows
-DPAPI, so it can be restored on a different computer. Category names are
-visible in the header so the import picker can disable absent categories.
+A .sldata file is portable across computers. Password-protected archives
+are encrypted with AES-GCM and Scrypt rather than local Windows DPAPI.
+Password-free archives are explicitly unencrypted. Category names remain
+visible so the import picker can disable absent categories.
 """
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 import zlib
@@ -74,7 +77,8 @@ def inspect_archive(blob: bytes) -> tuple[dict[str, Any], tuple[str, ...]]:
         raise ValueError("Not a SpriteLink data file.")
     if envelope.get("version") != ARCHIVE_VERSION:
         raise ValueError("Unsupported .sldata format version.")
-    if envelope.get("cipher") != "AES-256-GCM/Scrypt":
+    cipher = envelope.get("cipher")
+    if cipher not in ("AES-256-GCM/Scrypt", "none"):
         raise ValueError("Unsupported .sldata encryption.")
     categories = envelope.get("categories")
     if (
@@ -83,25 +87,32 @@ def inspect_archive(blob: bytes) -> tuple[dict[str, Any], tuple[str, ...]]:
         or len(set(categories)) != len(categories)
     ):
         raise ValueError("Invalid .sldata contents.")
-    if (
-        len(_decode_bytes(envelope.get("salt"))) != 16
-        or len(_decode_bytes(envelope.get("nonce"))) != 12
-        or len(_decode_bytes(envelope.get("data"))) < 16
-    ):
-        raise ValueError("Invalid .sldata encryption data.")
+    raw_data = _decode_bytes(envelope.get("data"))
+    if cipher == "AES-256-GCM/Scrypt":
+        if (
+            len(_decode_bytes(envelope.get("salt"))) != 16
+            or len(_decode_bytes(envelope.get("nonce"))) != 12
+            or len(raw_data) < 16
+        ):
+            raise ValueError("Invalid .sldata encryption data.")
+    else:
+        if (
+            envelope.get("salt", "") != ""
+            or envelope.get("nonce", "") != ""
+            or not raw_data
+            or not isinstance(envelope.get("checksum"), str)
+            or len(envelope["checksum"]) != 64
+        ):
+            raise ValueError("Invalid password-free .sldata data.")
     return envelope, tuple(categories)
 
 
-def create_archive(data: dict[str, Any], password: str) -> bytes:
-    if len(password) < 8:
-        raise ValueError("The export password must contain at least 8 characters.")
+def create_archive(data: dict[str, Any], password: str = "") -> bytes:
     categories = [category for category in ARCHIVE_CATEGORIES if category in data]
     if not categories:
         raise ValueError("Select at least one data type.")
     if any(key not in ARCHIVE_CATEGORIES for key in data):
         raise ValueError("Invalid data type.")
-    salt, nonce = os.urandom(16), os.urandom(12)
-    salt_text, nonce_text = _encode_bytes(salt), _encode_bytes(nonce)
     raw = json.dumps(
         {category: data[category] for category in categories},
         ensure_ascii=False, separators=(",", ":"),
@@ -109,32 +120,55 @@ def create_archive(data: dict[str, Any], password: str) -> bytes:
     if len(raw) > MAX_DECOMPRESSED_BYTES:
         raise ValueError("The selected data is too large to export.")
     compressed = zlib.compress(raw, level=6)
-    encrypted = AESGCM(_derive_key(password, salt)).encrypt(
-        nonce, compressed, _header_data(categories, salt_text, nonce_text),
-    )
-    archive = {
-        "magic": ARCHIVE_MAGIC, "version": ARCHIVE_VERSION,
-        "cipher": "AES-256-GCM/Scrypt", "categories": categories,
-        "salt": salt_text, "nonce": nonce_text,
-        "data": _encode_bytes(encrypted),
-    }
+    if password:
+        salt, nonce = os.urandom(16), os.urandom(12)
+        salt_text, nonce_text = _encode_bytes(salt), _encode_bytes(nonce)
+        encrypted = AESGCM(_derive_key(password, salt)).encrypt(
+            nonce, compressed, _header_data(categories, salt_text, nonce_text),
+        )
+        archive = {
+            "magic": ARCHIVE_MAGIC, "version": ARCHIVE_VERSION,
+            "cipher": "AES-256-GCM/Scrypt", "categories": categories,
+            "salt": salt_text, "nonce": nonce_text,
+            "data": _encode_bytes(encrypted),
+        }
+    else:
+        # Do not disguise a passwordless archive as cryptographically secure.
+        # This checksum detects accidental corruption, not malicious edits.
+        archive = {
+            "magic": ARCHIVE_MAGIC, "version": ARCHIVE_VERSION,
+            "cipher": "none", "categories": categories,
+            "salt": "", "nonce": "",
+            "data": _encode_bytes(compressed),
+            "checksum": hashlib.sha256(
+                _header_data(categories, "", "") + compressed
+            ).hexdigest(),
+        }
     packed = json.dumps(archive, separators=(",", ":")).encode("utf-8")
     if len(packed) > MAX_ARCHIVE_BYTES:
         raise ValueError("The selected data is too large to export.")
     return packed
 
 
-def open_archive(blob: bytes, password: str) -> dict[str, Any]:
+def open_archive(blob: bytes, password: str = "") -> dict[str, Any]:
     envelope, categories = inspect_archive(blob)
     salt_text, nonce_text = envelope["salt"], envelope["nonce"]
-    salt, nonce = _decode_bytes(salt_text), _decode_bytes(nonce_text)
-    try:
-        compressed = AESGCM(_derive_key(password, salt)).decrypt(
-            nonce, _decode_bytes(envelope["data"]),
-            _header_data(list(categories), salt_text, nonce_text),
-        )
-    except InvalidTag as exc:
-        raise ValueError("Incorrect password or damaged .sldata file.") from exc
+    if envelope["cipher"] == "none":
+        compressed = _decode_bytes(envelope["data"])
+        expected = hashlib.sha256(
+            _header_data(list(categories), "", "") + compressed
+        ).hexdigest()
+        if not hmac.compare_digest(expected, envelope["checksum"]):
+            raise ValueError("The .sldata file is damaged.")
+    else:
+        salt, nonce = _decode_bytes(salt_text), _decode_bytes(nonce_text)
+        try:
+            compressed = AESGCM(_derive_key(password, salt)).decrypt(
+                nonce, _decode_bytes(envelope["data"]),
+                _header_data(list(categories), salt_text, nonce_text),
+            )
+        except InvalidTag as exc:
+            raise ValueError("Incorrect password or damaged .sldata file.") from exc
     decompressor = zlib.decompressobj()
     raw = decompressor.decompress(compressed, MAX_DECOMPRESSED_BYTES + 1)
     if (
