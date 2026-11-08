@@ -442,7 +442,7 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertFalse(hasattr(client, "make_emoji_link"))
         self.assertFalse(hasattr(client, "new_emoji_button"))
         self.assertIsInstance(menu.new_style_button, S.QPushButton)
-        self.assertEqual(menu.new_style_button.text(), "New")
+        self.assertEqual(menu.new_style_button.text(), "+")
         self.assertEqual(menu.new_style_button.size(), S.QSize(32, 32))
         self.assertTrue(menu.new_style_button.isHidden())
         # Trigger the live view painting path, not only delegate painting,
