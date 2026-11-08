@@ -153,6 +153,42 @@ class ChatroomPreferenceTests(unittest.TestCase):
         error.assert_called_once()
         self.assertEqual(self.config["room_settings"]["room-a"]["theme_colors"], {"Glassy": 70})
 
+    def test_dynamic_key_security_feedback(self):
+        create = S.ChatroomDetailsDialog(self.client.root)
+        self.dialogs.append(create)
+        self.assertEqual(len(create.chatroom_key()), 48)
+        self.assertEqual(create.key_security_label.text(), "Key Security: Excellent")
+        self.assertFalse(create.key_security_label.isHidden())
+        create.key_entry.setText("a" * 48)
+        self.assertEqual(create.key_security_label.text(), "Key Security: Unsecure")
+
+        edit = self.dialog()
+        original = edit.chatroom_key()
+        self.assertTrue(edit.key_security_label.isHidden())
+        edit.key_entry.setText("Ag4!vP6@Km2?Q7x$")
+        self.assertEqual(edit.key_security_label.text(), "Key Security: Strong")
+        self.assertFalse(edit.key_security_label.isHidden())
+        edit.key_entry.setText(original)
+        self.assertTrue(edit.key_security_label.isHidden())
+
+    def test_edit_key_warning_can_cancel_without_accepting(self):
+        edit = self.dialog()
+        edit.key_entry.setText("NewKey123!ForConfirming")
+        with mock.patch.object(S.QMessageBox, "exec", return_value=S.QMessageBox.StandardButton.Cancel) as warning:
+            edit.accept()
+            warning.assert_called_once()
+        self.assertNotEqual(edit.result(), QDialog.DialogCode.Accepted)
+
+        with mock.patch.object(S.QMessageBox, "exec", return_value=S.QMessageBox.StandardButton.Ok) as warning:
+            edit.accept()
+            warning.assert_called_once()
+        self.assertEqual(edit.result(), QDialog.DialogCode.Accepted)
+
+        unchanged = self.dialog("room-b")
+        with mock.patch.object(S.QMessageBox, "exec", side_effect=AssertionError("Unexpected warning")):
+            unchanged.accept()
+        self.assertEqual(unchanged.result(), QDialog.DialogCode.Accepted)
+
     def test_active_edit_applies_and_global_can_override(self):
         self.client._activate_chatroom("room-a")
         d = self.dialog()
@@ -164,6 +200,9 @@ class ChatroomPreferenceTests(unittest.TestCase):
         d = self.dialog(S.GLOBAL_CHATROOM_ID)
         self.assertFalse(d.name_entry.isEnabled())
         self.assertFalse(d.key_entry.isEnabled())
+        self.assertEqual(d.name_entry.objectName(), "lockedChatroomDetail")
+        self.assertEqual(d.key_entry.objectName(), "lockedChatroomDetail")
+        self.assertTrue(d.key_security_label.isHidden())
         d.settings["theme_colors"] = {"Glassy": 210}
         with mock.patch.object(S, "EditChatroomDialog", return_value=d), \
              mock.patch.object(d, "exec", return_value=QDialog.DialogCode.Accepted):
