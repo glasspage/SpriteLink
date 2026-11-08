@@ -4162,6 +4162,49 @@ class SignedClientIdentityTests(unittest.TestCase):
         with self.assertRaises(Exception):
             SPRITELINK.verify_message_identity(message, self.ROOM_TWO)
 
+    def test_rekeyed_local_history_keeps_signature_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with mock.patch.object(
+                SPRITELINK, "CHATROOM_HISTORY_DIRECTORY",
+                Path(temporary_directory),
+            ), mock.patch.object(
+                SPRITELINK, "dpapi_encrypt",
+                side_effect=lambda data, _entropy: data,
+            ), mock.patch.object(
+                SPRITELINK, "dpapi_decrypt",
+                side_effect=lambda data, _entropy: data,
+            ):
+                message = self._signed_message(self.ROOM_ONE)
+                server = "https://ntfy.sh"
+                SPRITELINK.save_chatroom_history(
+                    server, self.ROOM_ONE, [{"message": message}],
+                )
+                self.assertTrue(SPRITELINK.copy_chatroom_history_for_key_change(
+                    server, self.ROOM_ONE, self.ROOM_TWO,
+                ))
+                moved = SPRITELINK.load_chatroom_history(
+                    server, self.ROOM_TWO,
+                )[0]
+                self.assertEqual(
+                    moved["history_origin_topic"],
+                    SPRITELINK.derive_ntfy_topic(self.ROOM_ONE),
+                )
+                SPRITELINK.EncryptedChatClient._validate_decrypted_message(
+                    moved["message"],
+                    self.ROOM_TWO,
+                    history_origin_topic=moved["history_origin_topic"],
+                )
+                with self.assertRaises(Exception):
+                    SPRITELINK.EncryptedChatClient._validate_decrypted_message(
+                        moved["message"], self.ROOM_TWO,
+                    )
+                forged = dict(moved["message"], m="tampered")
+                with self.assertRaises(Exception):
+                    SPRITELINK.EncryptedChatClient._validate_decrypted_message(
+                        forged, self.ROOM_TWO,
+                        history_origin_topic=moved["history_origin_topic"],
+                    )
+
     def test_unsigned_messages_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
             SPRITELINK.EncryptedChatClient._validate_decrypted_message(
