@@ -539,6 +539,7 @@ def shift_theme_color(color: Any, degrees: int | None = None) -> QColor:
     return QColor.fromHslF((hue + degrees / 360.0) % 1.0, saturation, lightness, alpha)
 
 
+@lru_cache(maxsize=64)
 def hue_theme_stylesheet(stylesheet: str, degrees: int) -> str:
     if degrees == 0:
         return stylesheet
@@ -561,6 +562,7 @@ def hue_theme_stylesheet(stylesheet: str, degrees: int) -> str:
     return re.sub(r"#[0-9a-fA-F]{6}\b|\brgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+(?:\s*,\s*\d+)?\s*\)", replace, stylesheet)
 
 
+@lru_cache(maxsize=32)
 def classic_theme_stylesheet(stylesheet: str, position: int) -> str:
     if position == 0:
         return stylesheet
@@ -9082,6 +9084,11 @@ QComboBox::drop-down {
         app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
         app.setProperty("spritelinkGlassyDark", theme == "Glassy Dark")
 
+        # Full theme changes must replace the app stylesheet. Clear any room
+        # color override first so it cannot mask the newly selected theme.
+        if hasattr(self, "root") and self.root.styleSheet():
+            self.root.setStyleSheet("")
+
         available_styles = {
             name.casefold(): name for name in QStyleFactory.keys()
         }
@@ -13602,7 +13609,10 @@ QComboBox::drop-down {
             root.setUpdatesEnabled(False)
         try:
             app.setPalette(palette)
-            app.setStyleSheet(stylesheet)
+            # Updating QApplication's stylesheet on every room switch makes
+            # Qt repolish every widget (including unrelated windows). Limit
+            # color-only changes to this window's widget tree instead.
+            self.root.setStyleSheet(stylesheet)
             if app.font() != application_font:
                 app.setFont(application_font)
             for widget, font in fonts:
