@@ -5293,9 +5293,9 @@ class ChatroomDetailsDialog(QDialog):
         hint_color = "#aab4bd" if app is not None and app.property("spritelinkGlassyDark") else "#777777"
         self.key_security_label.setStyleSheet(f"color: {hint_color}; font-size: 8pt;")
         form.addWidget(self.key_security_label, 2, 1, 1, 2)
+        layout.addLayout(form)
         self.key_entry.textChanged.connect(self._update_key_security)
         self._update_key_security(self._initial_key)
-        layout.addLayout(form)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
