@@ -1,6 +1,7 @@
 import copy
 import os
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -216,6 +217,65 @@ class ChatroomPreferenceTests(unittest.TestCase):
             "locally but others must update their chatroom key to keep "
             "chatting with you.",
         )
+
+    def test_key_edit_moves_saved_history_to_new_key(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            new_key = "NewKeyWith48Characters0123456789AbCdEfGhIjKlMnO"
+            old_key = self.config["chatrooms"][0]["key"]
+            server = self.config["server_url"]
+            entry = {"message": {"i": "old-message", "t": 123, "m": "Retained locally"}}
+            with mock.patch.object(S, "CHATROOM_HISTORY_DIRECTORY", Path(temporary_directory)), \
+                 mock.patch.object(S, "room_scope_id", side_effect=lambda _server, key: key), \
+                 mock.patch.object(S, "dpapi_encrypt", side_effect=lambda data, _entropy: data), \
+                 mock.patch.object(S, "dpapi_decrypt", side_effect=lambda data, _entropy: data):
+                # An inactive room must migrate its full saved history too.
+                S.save_chatroom_history(server, old_key, [entry])
+                edit = self.dialog()
+                edit.key_entry.setText(new_key)
+                with mock.patch.object(S, "EditChatroomDialog", return_value=edit), \
+                     mock.patch.object(edit, "exec", return_value=QDialog.DialogCode.Accepted):
+                    self.client._edit_chatroom("room-a")
+                self.assertEqual(self.config["chatrooms"][0]["key"], new_key)
+                self.assertFalse(S.chatroom_history_path(server, old_key).exists())
+                self.assertEqual(S.load_chatroom_history(server, new_key), [entry])
+
+    def test_active_room_key_edit_flushes_pending_history_before_moving(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            old_key = self.config["chatrooms"][0]["key"]
+            new_key = "AnotherLongNewKey1234!@#$"
+            server = self.config["server_url"]
+            stored = {"message": {"i": "saved", "t": 100}}
+            pending = {"message": {"i": "pending", "t": 101}}
+            with mock.patch.object(S, "CHATROOM_HISTORY_DIRECTORY", Path(temporary_directory)), \
+                 mock.patch.object(S, "room_scope_id", side_effect=lambda _server, key: key), \
+                 mock.patch.object(S, "dpapi_encrypt", side_effect=lambda data, _entropy: data), \
+                 mock.patch.object(S, "dpapi_decrypt", side_effect=lambda data, _entropy: data):
+                S.save_chatroom_history(server, old_key, [stored])
+                self.client.active_chatroom_id = "room-a"
+                self.client.pending_history_entries = [pending]
+                edit = self.dialog()
+                edit.key_entry.setText(new_key)
+                with mock.patch.object(S, "EditChatroomDialog", return_value=edit), \
+                     mock.patch.object(edit, "exec", return_value=QDialog.DialogCode.Accepted):
+                    self.client._edit_chatroom("room-a")
+                self.assertEqual(self.config["chatrooms"][0]["key"], new_key)
+                self.assertFalse(S.chatroom_history_path(server, old_key).exists())
+                self.assertEqual(
+                    S.load_chatroom_history(server, new_key),
+                    [stored, pending],
+                )
+
+    def test_key_edit_does_not_switch_or_remove_history_on_migration_error(self):
+        original_key = self.config["chatrooms"][0]["key"]
+        edit = self.dialog()
+        edit.key_entry.setText("new-room-key-1234567890")
+        with mock.patch.object(S, "EditChatroomDialog", return_value=edit), \
+             mock.patch.object(edit, "exec", return_value=QDialog.DialogCode.Accepted), \
+             mock.patch.object(S, "copy_chatroom_history_for_key_change", side_effect=OSError("disk full")), \
+             mock.patch.object(S.messagebox, "showerror") as error:
+            self.client._edit_chatroom("room-a")
+        error.assert_called_once()
+        self.assertEqual(self.config["chatrooms"][0]["key"], original_key)
 
     def test_active_edit_applies_and_global_can_override(self):
         self.client._activate_chatroom("room-a")
