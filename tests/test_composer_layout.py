@@ -432,6 +432,9 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertEqual(menu.gridSize(), S.QSize(40, 40))
         self.assertFalse(hasattr(client, "make_emoji_link"))
         self.assertFalse(hasattr(client, "new_emoji_button"))
+        # Trigger the live view painting path, not only delegate painting,
+        # so missing Qt imports fail the test instead of crashing the app.
+        self.assertFalse(menu.viewport().grab().toImage().isNull())
 
         # The New control is painted at 32x32 inside the 40px emoji cell;
         # the surrounding pixels stay transparent (no square tile backdrop).
@@ -464,6 +467,7 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertEqual(menu.count(), 2)
         self.assertIs(menu.new_item, menu.item(1))
         self.assertIsNone(menu.itemWidget(menu.new_item))
+        self.assertFalse(menu.viewport().grab().toImage().isNull())
         self.assertEqual(menu.iconSize(), S.QSize(32, 32))
         self.assertEqual(menu.item(0).icon().actualSize(S.QSize(32, 32)), S.QSize(32, 32))
         self.assertEqual(menu.selectionMode(), S.QAbstractItemView.SelectionMode.SingleSelection)
