@@ -3,7 +3,7 @@ import unittest
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QRect, QTimer, Qt
 from PySide6.QtGui import QContextMenuEvent, QFont, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QStyleFactory
@@ -345,6 +345,38 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertEqual(client.image_composer_label.text(), "Creating Emoji")
         client.image_menu.size_combo.setCurrentIndex(0)
         self.assertEqual(client.image_composer_label.text(), "Image message")
+
+    def test_canvas_selection_outline_only_appears_for_select_or_move(self):
+        client = self.client
+        client.image_menu_button.setChecked(True)
+        canvas = client.image_menu.canvas
+        canvas.selection = QRect(3, 3, 12, 12)
+        self.app.processEvents()
+
+        buttons = {
+            button.text(): button
+            for button in client.image_menu.findChildren(S.QPushButton)
+            if button.text() in ("Pencil", "Line", "Bucket", "Select", "Move")
+        }
+        self.assertEqual(set(buttons), {"Pencil", "Line", "Bucket", "Select", "Move"})
+
+        buttons["Select"].click()
+        selected = canvas.grab().toImage()
+        for tool in ("Pencil", "Line", "Bucket"):
+            with self.subTest(tool=tool):
+                buttons[tool].click()
+                self.assertEqual(canvas.tool, tool)
+                self.assertEqual(canvas.selection, QRect(3, 3, 12, 12))
+                no_outline = canvas.grab().toImage()
+                self.assertNotEqual(selected, no_outline)
+                canvas.selection = QRect()
+                self.assertEqual(canvas.grab().toImage(), no_outline)
+                canvas.selection = QRect(3, 3, 12, 12)
+
+        buttons["Move"].click()
+        self.assertEqual(canvas.grab().toImage(), selected)
+        buttons["Pencil"].click()
+        self.assertNotEqual(canvas.grab().toImage(), selected)
 
     def test_native_image_context_menu_separates_image_and_message_actions(self):
         client = self.client
