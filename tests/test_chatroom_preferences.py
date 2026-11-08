@@ -237,7 +237,10 @@ class ChatroomPreferenceTests(unittest.TestCase):
                     self.client._edit_chatroom("room-a")
                 self.assertEqual(self.config["chatrooms"][0]["key"], new_key)
                 self.assertFalse(S.chatroom_history_path(server, old_key).exists())
-                self.assertEqual(S.load_chatroom_history(server, new_key), [entry])
+                self.assertEqual(S.load_chatroom_history(server, new_key), [{
+                    **entry,
+                    "history_origin_topic": S.derive_ntfy_topic(old_key),
+                }])
 
     def test_active_room_key_edit_flushes_pending_history_before_moving(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -262,7 +265,10 @@ class ChatroomPreferenceTests(unittest.TestCase):
                 self.assertFalse(S.chatroom_history_path(server, old_key).exists())
                 self.assertEqual(
                     S.load_chatroom_history(server, new_key),
-                    [stored, pending],
+                    [
+                        {**stored, "history_origin_topic": S.derive_ntfy_topic(old_key)},
+                        {**pending, "history_origin_topic": S.derive_ntfy_topic(old_key)},
+                    ],
                 )
 
     def test_key_edit_preserves_original_history_if_config_save_fails(self):
