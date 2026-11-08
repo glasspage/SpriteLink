@@ -5218,6 +5218,44 @@ class RemoveChatroomDialog(QDialog):
         layout.addLayout(buttons)
 
 
+class ChangeChatroomKeyDialog(QDialog):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Change Chatroom Key")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+
+        layout = QVBoxLayout(self)
+        message_row = QHBoxLayout()
+        warning_icon = QLabel()
+        warning_icon.setPixmap(
+            self.style().standardIcon(
+                QStyle.StandardPixmap.SP_MessageBoxWarning
+            ).pixmap(32, 32)
+        )
+        message_row.addWidget(warning_icon, 0, Qt.AlignmentFlag.AlignTop)
+        self.warning_message = QLabel(
+            "The chatroom key will be changed. Log history will persist "
+            "locally but others must update their chatroom key to keep "
+            "chatting with you."
+        )
+        self.warning_message.setWordWrap(True)
+        message_row.addWidget(self.warning_message, 1)
+        layout.addLayout(message_row)
+
+        self.button_row = QHBoxLayout()
+        self.button_row.addStretch(1)
+        self.change_key_button = QPushButton("Change Key")
+        self.change_key_button.clicked.connect(self.accept)
+        self.button_row.addWidget(self.change_key_button)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setDefault(True)
+        self.cancel_button.clicked.connect(self.reject)
+        self.button_row.addWidget(self.cancel_button)
+        layout.addLayout(self.button_row)
+        self.cancel_button.setFocus()
+
+
 class AddChatroomChoiceDialog(QDialog):
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
@@ -5290,8 +5328,9 @@ class ChatroomDetailsDialog(QDialog):
         self.key_security_label = QLabel()
         self.key_security_label.setWordWrap(True)
         app = QApplication.instance()
-        hint_color = "#aab4bd" if app is not None and app.property("spritelinkGlassyDark") else "#777777"
-        self.key_security_label.setStyleSheet(f"color: {hint_color}; font-size: 8pt;")
+        dark = app is not None and app.property("spritelinkGlassyDark")
+        self._security_hint_color = "#aab4bd" if dark else "#777777"
+        self._weak_security_hint_color = "#efa34c" if dark else "#cb781f"
         form.addWidget(self.key_security_label, 2, 1, 1, 2)
         layout.addLayout(form)
         self.key_entry.textChanged.connect(self._update_key_security)
@@ -5311,9 +5350,14 @@ class ChatroomDetailsDialog(QDialog):
         self.name_entry.setFocus()
 
     def _update_key_security(self, key: str) -> None:
-        self.key_security_label.setText(
-            f"Key Security: {chatroom_key_security_level(key)}"
+        level = chatroom_key_security_level(key)
+        self.key_security_label.setText(f"Security: {level}")
+        color = (
+            self._weak_security_hint_color
+            if level in ("Unsecure", "Weak")
+            else self._security_hint_color
         )
+        self.key_security_label.setStyleSheet(f"color: {color}; font-size: 8pt;")
         self.key_security_label.setVisible(
             not self._security_on_change_only or key != self._initial_key
         )
@@ -5403,21 +5447,9 @@ class EditChatroomDialog(ChatroomDetailsDialog):
 
     def accept(self) -> None:
         if self.key_entry.isEnabled() and self.chatroom_key() != self._initial_key:
-            warning = QMessageBox(self)
-            warning.setIcon(QMessageBox.Icon.Warning)
-            warning.setWindowTitle("Change Chatroom Key")
-            warning.setText(
-                "The chatroom key will be changed. Log history will persist "
-                "locally but others must update their chatroom key to keep "
-                "chatting with you."
-            )
-            warning.setStandardButtons(
-                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok
-            )
-            warning.setDefaultButton(QMessageBox.StandardButton.Cancel)
-            warning.button(QMessageBox.StandardButton.Ok).setText("Change Key")
+            warning = ChangeChatroomKeyDialog(self)
             self.client._apply_window_titlebar_theme(warning)
-            if warning.exec() != QMessageBox.StandardButton.Ok:
+            if warning.exec() != QDialog.DialogCode.Accepted:
                 return
         super().accept()
 
