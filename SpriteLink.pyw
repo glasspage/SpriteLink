@@ -5405,7 +5405,7 @@ class ChatroomDetailsDialog(QDialog):
         app = QApplication.instance()
         dark = app is not None and app.property("spritelinkGlassyDark")
         self._security_hint_color = "#aab4bd" if dark else "#777777"
-        self._weak_security_hint_color = "#efa34c" if dark else "#cb781f"
+        self._weak_security_hint_color = "#bb5555" if dark else "#a94444"
         form.addWidget(self.key_security_label, 2, 1, 1, 2)
         layout.addLayout(form)
         self.key_entry.textChanged.connect(self._update_key_security)
