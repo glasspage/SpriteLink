@@ -10976,6 +10976,7 @@ QComboBox::drop-down {
         self.make_emoji_link.setTextInteractionFlags(
             Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
         )
+        self.make_emoji_link.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.make_emoji_link.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.make_emoji_link.setWordWrap(True)
         self.make_emoji_link.linkActivated.connect(self._open_emoji_canvas)
