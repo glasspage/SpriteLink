@@ -612,7 +612,6 @@ NTFY_DAILY_MESSAGE_LIMIT = 250
 MESSAGE_LIMIT_BAR_THRESHOLD = 50
 PACKET_PADDING_BLOCK = 128
 PROFILE_ICON_SIZE = 16
-PROFILE_ICON_VERTICAL_OFFSET_PX = 2
 PROFILE_ICON_MAX_COLORS = 16
 MAX_PROFILE_ICON_GIF_BYTES = 2048
 MAX_IDENTITY_PRESETS = 64
@@ -630,7 +629,6 @@ EMBEDDED_IMAGE_MAX_WIDTH = 256
 EMBEDDED_IMAGE_MAX_HEIGHT = 96
 EMBEDDED_IMAGE_PLACEHOLDER_SIZE = 48
 NSFW_IMAGE_PLACEHOLDER_SIZE = 64
-TOP_ALIGNED_PROFILE_ICON_PADDING = 3
 IMAGE_PREVIEW_MAX_WIDTH = CONFIG_POPUP_MAX_WIDTH - 32
 IMAGE_PREVIEW_MAX_HEIGHT = 480
 MAX_REMOTE_IMAGE_BYTES = 50 * 1024 * 1024
@@ -8232,10 +8230,7 @@ class EncryptedChatClient(QObject):
             self._update_chatrooms_toggle_unread_style()
 
     def _chat_icons_visible(self) -> bool:
-        return (
-            self._text_size("chat_log")
-            >= DEFAULT_TEXT_SIZES["chat_log"]
-        )
+        return not self._is_tiny_ui()
 
     def _chat_line_height(
         self,
@@ -12054,7 +12049,6 @@ QComboBox::drop-down {
             cursor,
             icon,
             str(message["i"]),
-            line_height_px=self._chat_line_height(font_name),
             inline_html=True,
         ):
             cursor.insertText(" ", body_format)
@@ -17520,9 +17514,7 @@ QComboBox::drop-down {
         encoded_icon: str,
         message_id: str,
         *,
-        align_top: bool = False,
         opacity: float = 1.0,
-        line_height_px: int = DEFAULT_MESSAGE_LINE_HEIGHT_PX,
         inline_html: bool = False,
     ) -> bool:
         if not encoded_icon:
@@ -17541,45 +17533,14 @@ QComboBox::drop-down {
             return False
         image.setDevicePixelRatio(1.0)
 
+        # The GIF is guaranteed to be 16x16 by decode_profile_icon.
+        # Do not add transparent padding here: rich-text image formats use
+        # the resource's dimensions, and fixed-height chat rows can clip or
+        # rescale padded images.
+        if image.width() != PROFILE_ICON_SIZE or image.height() != PROFILE_ICON_SIZE:
+            return False
         displayed_image = image
         resource_suffix = ""
-        top_padding = (
-            max(
-                0,
-                TOP_ALIGNED_PROFILE_ICON_PADDING
-                - PROFILE_ICON_VERTICAL_OFFSET_PX,
-            )
-            if align_top
-            else max(
-                0,
-                round(
-                    (max(PROFILE_ICON_SIZE, line_height_px)
-                     - PROFILE_ICON_SIZE)
-                    / 2.0
-                    - PROFILE_ICON_VERTICAL_OFFSET_PX
-                ),
-            )
-        )
-        bottom_padding = (
-            0
-            if align_top
-            else PROFILE_ICON_VERTICAL_OFFSET_PX
-        )
-        if top_padding or bottom_padding:
-            padded_image = QImage(
-                image.width(),
-                image.height() + top_padding + bottom_padding,
-                QImage.Format.Format_ARGB32,
-            )
-            padded_image.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(padded_image)
-            painter.drawImage(0, top_padding, image)
-            painter.end()
-            padded_image.setDevicePixelRatio(1.0)
-            displayed_image = padded_image
-            resource_suffix = (
-                f"-vertical-offset-{PROFILE_ICON_VERTICAL_OFFSET_PX}"
-            )
 
         opacity = max(0.0, min(1.0, opacity))
         if opacity < 1.0:
@@ -17616,9 +17577,9 @@ QComboBox::drop-down {
             image_format.setName(resource_url.toString())
             image_format.setAnchor(True)
             image_format.setAnchorHref(f"spritelink:{message_id}")
-        image_format.setWidth(displayed_image.width())
-        image_format.setHeight(displayed_image.height())
-        # Keep the optical offset; AlignTop avoids half-pixel AlignMiddle rounding.
+        image_format.setWidth(PROFILE_ICON_SIZE)
+        image_format.setHeight(PROFILE_ICON_SIZE)
+        # Pixel-aligned placement keeps the 16x16 resource unscaled.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
         )
@@ -19010,8 +18971,6 @@ QComboBox::drop-down {
                 cursor,
                 "" if is_muted else profile_icon,
                 message_id,
-                align_top=align_message_top,
-                line_height_px=message_line_height,
             )
         if has_profile_icon:
             cursor.insertText(
