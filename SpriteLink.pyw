@@ -6331,6 +6331,60 @@ class NoFocusRectItemDelegate(QStyledItemDelegate):
         super().paint(painter, clean_option, index)
 
 
+class EmojiItemDelegate(NoFocusRectItemDelegate):
+    """Keep drag selection functional without highlighting clicked emojis."""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
+        clean_option = QStyleOptionViewItem(option)
+        clean_option.state &= ~(
+            QStyle.StateFlag.State_Selected
+            | QStyle.StateFlag.State_HasFocus
+        )
+        super().paint(painter, clean_option, index)
+
+
+class EmojiListWidget(QListWidget):
+    reordered = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.new_item: QListWidgetItem | None = None
+
+    def move_saved_emoji(self, source_row: int, insert_row: int) -> bool:
+        # The final item is the fixed New button, never a draggable emoji.
+        last_emoji_row = self.count() - 2
+        if source_row < 0 or source_row > last_emoji_row:
+            return False
+        insert_row = max(0, min(last_emoji_row + 1, insert_row))
+        target_row = insert_row - (1 if insert_row > source_row else 0)
+        if target_row == source_row:
+            return False
+        item = self.takeItem(source_row)
+        self.insertItem(target_row, item)
+        self.setCurrentItem(item)
+        self.reordered.emit()
+        return True
+
+    def dropEvent(self, event: Any) -> None:
+        dragged = self.selectedItems()
+        if not dragged or dragged[0] is self.new_item or event.source() is not self:
+            event.ignore()
+            return
+        source_row = self.row(dragged[0])
+        destination = self.itemAt(event.position().toPoint())
+        if destination is None or destination is self.new_item:
+            insert_row = self.count() - 1
+        else:
+            insert_row = self.row(destination)
+            bounds = self.visualItemRect(destination)
+            if event.position().x() >= bounds.center().x():
+                insert_row += 1
+        if self.move_saved_emoji(source_row, insert_row):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
 class IdentityPresetSelector(QPushButton):
     presetSelected = Signal(str)
     removeRequested = Signal(str)
@@ -10970,18 +11024,7 @@ QComboBox::drop-down {
         self.emojis_panel = QWidget()
         emojis_layout = QVBoxLayout(self.emojis_panel)
         emojis_layout.setContentsMargins(0, 0, 0, 0)
-        self.make_emoji_link = QLabel(
-            '<a href="image">Make an Emoji</a>'
-        )
-        self.make_emoji_link.setTextInteractionFlags(
-            Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
-        )
-        self.make_emoji_link.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        self.make_emoji_link.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.make_emoji_link.setWordWrap(True)
-        self.make_emoji_link.linkActivated.connect(self._open_emoji_canvas)
-        emojis_layout.addWidget(self.make_emoji_link)
-        self.emojis_menu = QListWidget()
+        self.emojis_menu = EmojiListWidget()
         self.emojis_menu.setViewMode(QListWidget.ViewMode.IconMode)
         self.emojis_menu.setMovement(QListWidget.Movement.Static)
         self.emojis_menu.setResizeMode(QListWidget.ResizeMode.Adjust)
@@ -10990,8 +11033,15 @@ QComboBox::drop-down {
         self.emojis_menu.setGridSize(QSize(cell_size, cell_size))
         self.emojis_menu.setIconSize(QSize(picker_icon_size, picker_icon_size))
         self.emojis_menu.setMaximumHeight(2 * cell_size + 4)
-        self.emojis_menu.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.emojis_menu.setItemDelegate(NoFocusRectItemDelegate(self.emojis_menu))
+        # Dragging needs a selection, but the delegate hides its highlight.
+        self.emojis_menu.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.emojis_menu.setItemDelegate(EmojiItemDelegate(self.emojis_menu))
+        self.emojis_menu.setDragEnabled(True)
+        self.emojis_menu.setAcceptDrops(True)
+        self.emojis_menu.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.emojis_menu.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.emojis_menu.setDropIndicatorShown(True)
+        self.emojis_menu.reordered.connect(self._persist_saved_emoji_order)
         self.emojis_menu.setAccessibleName("Saved emojis")
         self.emojis_menu.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.emojis_menu.customContextMenuRequested.connect(self._show_saved_emoji_menu)
@@ -11118,8 +11168,8 @@ QComboBox::drop-down {
 
     def _refresh_saved_emojis(self) -> None:
         self.emojis_menu.clear()
+        self.emojis_menu.new_item = None
         emojis = self.config_data.get("saved_emojis", {})
-        self.emojis_menu.setVisible(bool(emojis))
         icon_size = self.emojis_menu.iconSize().width()
         for name, encoded in emojis.items():
             item = QListWidgetItem(QIcon(QPixmap.fromImage(emoji_image(encoded, icon_size))), "")
@@ -11128,13 +11178,51 @@ QComboBox::drop-down {
             item.setData(Qt.ItemDataRole.UserRole, (name, encoded))
             self.emojis_menu.addItem(item)
 
+        # 32x32 button centered inside the final 40x40 emoji cell.
+        new_item = QListWidgetItem()
+        new_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+        new_item.setSizeHint(self.emojis_menu.gridSize())
+        self.emojis_menu.addItem(new_item)
+        self.emojis_menu.new_item = new_item
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(4, 4, 4, 4)
+        button = QPushButton("New")
+        button.setFixedSize(32, 32)
+        button.setStyleSheet("padding: 0;")
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.clicked.connect(self._open_emoji_canvas)
+        layout.addWidget(button, 0, Qt.AlignmentFlag.AlignCenter)
+        self.emojis_menu.setItemWidget(new_item, container)
+        self.new_emoji_button = button
+
+    def _persist_saved_emoji_order(self) -> None:
+        saved = self.config_data.get("saved_emojis", {})
+        order = [
+            data[0]
+            for index in range(self.emojis_menu.count())
+            if isinstance((data := self.emojis_menu.item(index).data(Qt.ItemDataRole.UserRole)), tuple)
+        ]
+        if len(order) != len(saved) or set(order) != set(saved):
+            self._refresh_saved_emojis()
+            return
+        if order != list(saved):
+            if not self._store_saved_emojis({name: saved[name] for name in order}):
+                self._refresh_saved_emojis()
+
     def _insert_current_saved_emoji(self) -> None:
         item = self.emojis_menu.currentItem()
         if item is not None:
             self._insert_saved_emoji(item)
 
     def _insert_saved_emoji(self, item: QListWidgetItem) -> None:
-        self.message_entry.insert_emoji(*item.data(Qt.ItemDataRole.UserRole))
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if item is self.emojis_menu.new_item:
+            self._open_emoji_canvas()
+        elif isinstance(data, tuple):
+            self.message_entry.insert_emoji(*data)
+        # Keep the current item for keyboard navigation, not visual selection.
+        self.emojis_menu.clearSelection()
 
     def _store_saved_emojis(self, emojis: dict[str, str]) -> bool:
         previous = self.config_data.get("saved_emojis", {})
@@ -11216,7 +11304,7 @@ QComboBox::drop-down {
 
     def _show_saved_emoji_menu(self, position: QPoint) -> None:
         item = self.emojis_menu.itemAt(position)
-        if item is None:
+        if item is None or item is self.emojis_menu.new_item:
             return
         name, encoded = item.data(Qt.ItemDataRole.UserRole)
         menu = QMenu(self.emojis_menu)
@@ -17417,7 +17505,7 @@ QComboBox::drop-down {
                 image_format = formatting.toImageFormat()
                 if reveal:
                     image_format.setName(str(formatting.property(EMOJI_REVEALED_IMAGE_PROPERTY)))
-                    image_format.setToolTip(str(formatting.property(QTextFormat.Property.ImageAltText)))
+                    image_format.setToolTip("")
                 else:
                     hidden = QImage(int(image_format.width()), int(image_format.height()), QImage.Format.Format_RGB32)
                     hidden.fill(QColor(SPOILER_BLOCK_COLOR))
@@ -17861,6 +17949,9 @@ QComboBox::drop-down {
                         if preview:
                             self._set_inline_html_image(image_format, emoji_image(encoded, emoji_size))
                         else:
+                            # Keep only the rich preview popup. Qt's built-in
+                            # tooltip can show the name over adjacent text.
+                            image_format.setToolTip("")
                             image_format.setAnchor(True)
                             image_format.setAnchorHref(f"spritelink-emoji:{match[0]}")
                         if run.spoiler is not None:
