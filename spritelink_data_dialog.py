@@ -17,6 +17,7 @@ class DataTransferDialog(QDialog):
         self, mode: str, available: tuple[str, ...],
         rooms: list[dict[str, str]] | None = None,
         parent: QWidget | None = None,
+        password_required: bool = True,
     ) -> None:
         super().__init__(parent)
         if mode not in ("export", "import"):
@@ -30,6 +31,10 @@ class DataTransferDialog(QDialog):
         layout.addWidget(title)
 
         self.category_checks: dict[str, QCheckBox] = {}
+        self.specific_rooms: QCheckBox | None = None
+        self.room_checks: dict[str, QCheckBox] = {}
+        self.rooms_area: QScrollArea | None = None
+
         for category in ARCHIVE_CATEGORIES:
             check = QCheckBox(category)
             check.setEnabled(category in available)
@@ -37,53 +42,47 @@ class DataTransferDialog(QDialog):
             self.category_checks[category] = check
             layout.addWidget(check)
 
-        self.specific_rooms: QCheckBox | None = None
-        self.room_checks: dict[str, QCheckBox] = {}
-        self.rooms_area: QScrollArea | None = None
-        if mode == "export":
-            self.specific_rooms = QCheckBox("Specific chatrooms only")
-            layout.addWidget(self.specific_rooms)
-            self.rooms_area = QScrollArea()
-            self.rooms_area.setWidgetResizable(True)
-            self.rooms_area.setMaximumHeight(190)
-            self.rooms_area.setFrameShape(QFrame.Shape.NoFrame)
-            room_panel = QWidget()
-            room_layout = QVBoxLayout(room_panel)
-            room_layout.setContentsMargins(16, 0, 0, 0)
-            room_layout.setSpacing(2)
-            for room in rooms or []:
-                check = QCheckBox(room["nickname"])
-                check.setChecked(True)
-                check.setToolTip(room["nickname"])
-                room_layout.addWidget(check)
-                self.room_checks[room["id"]] = check
-                check.toggled.connect(self._update_save_enabled)
-            room_layout.addStretch()
-            self.rooms_area.setWidget(room_panel)
-            layout.addWidget(self.rooms_area)
-            self.specific_rooms.toggled.connect(self._update_room_selection)
-            self.category_checks["Chatrooms"].toggled.connect(
-                self._update_room_selection
-            )
-            self._update_room_selection()
-        else:
-            disabled = [
-                name for name in ARCHIVE_CATEGORIES if name not in available
-            ]
-            if disabled:
-                layout.addWidget(QLabel(
-                    "Unavailable categories are not included in this file."
-                ))
+            if category == "Chatrooms" and mode == "export":
+                # Room selection belongs directly beneath its Chatrooms
+                # checkbox, not below the unrelated categories.
+                room_options = QWidget()
+                options_layout = QVBoxLayout(room_options)
+                options_layout.setContentsMargins(20, 0, 0, 4)
+                options_layout.setSpacing(4)
+                self.specific_rooms = QCheckBox("Specific chatrooms only")
+                options_layout.addWidget(self.specific_rooms)
+                self.rooms_area = QScrollArea()
+                self.rooms_area.setWidgetResizable(True)
+                self.rooms_area.setMaximumHeight(190)
+                self.rooms_area.setFrameShape(QFrame.Shape.NoFrame)
+                room_panel = QWidget()
+                room_layout = QVBoxLayout(room_panel)
+                room_layout.setContentsMargins(20, 0, 0, 0)
+                room_layout.setSpacing(2)
+                for room in rooms or []:
+                    room_check = QCheckBox(room["nickname"])
+                    room_check.setChecked(True)
+                    room_check.setToolTip(room["nickname"])
+                    room_layout.addWidget(room_check)
+                    self.room_checks[room["id"]] = room_check
+                    room_check.toggled.connect(self._update_save_enabled)
+                room_layout.addStretch()
+                self.rooms_area.setWidget(room_panel)
+                options_layout.addWidget(self.rooms_area)
+                layout.addWidget(room_options)
+                self.specific_rooms.toggled.connect(self._update_room_selection)
+                check.toggled.connect(self._update_room_selection)
+                self._update_room_selection()
 
-        note = QLabel(
-            "Archives are password-encrypted, including chatroom keys "
-            "and identity data. Keep your password safe."
-            if mode == "export" else
-            "The file is password-encrypted. Existing chatroom names "
-            "and messages will be preserved."
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        if mode == "import" and any(
+            name not in available for name in ARCHIVE_CATEGORIES
+        ):
+            unavailable = QLabel(
+                "Unavailable categories are not included in this file."
+            )
+            unavailable.setWordWrap(True)
+            layout.addWidget(unavailable)
+
         if mode == "import":
             self.identity_warning = QLabel(
                 "Importing Identity replaces your signing key and changes "
@@ -97,21 +96,23 @@ class DataTransferDialog(QDialog):
             self.identity_warning.setVisible(
                 self.category_checks["Identity"].isChecked()
             )
-        layout.addWidget(QLabel("Archive password"))
         self.password_entry = QLineEdit()
         self.password_entry.setEchoMode(QLineEdit.EchoMode.Password)
         self.password_entry.setPlaceholderText(
-            "At least 8 characters" if mode == "export" else "Password"
+            "Recommended" if mode == "export" else "Password"
         )
-        layout.addWidget(self.password_entry)
-
-        self.confirm_entry: QLineEdit | None = None
         if mode == "export":
-            layout.addWidget(QLabel("Confirm password"))
-            self.confirm_entry = QLineEdit()
-            self.confirm_entry.setEchoMode(QLineEdit.EchoMode.Password)
-            layout.addWidget(self.confirm_entry)
-            self.confirm_entry.textChanged.connect(self._update_save_enabled)
+            layout.addWidget(QLabel("Password (optional)"))
+            self.password_entry.setToolTip(
+                "Without a password, the export is not encrypted and "
+                "can reveal chatroom keys and identity data."
+            )
+            layout.addWidget(self.password_entry)
+        elif password_required:
+            layout.addWidget(QLabel("Password"))
+            layout.addWidget(self.password_entry)
+        # Password-free .sldata files require no password prompt.
+        self.password_required = mode == "import" and password_required
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -160,11 +161,10 @@ class DataTransferDialog(QDialog):
         if not hasattr(self, "action_button"):
             return
         selected = self.selected_categories()
-        valid = bool(selected) and bool(self.password())
+        valid = bool(selected)
+        if self.password_required:
+            valid = valid and bool(self.password())
         if self.mode == "export":
-            valid = valid and len(self.password()) >= 8
-            valid = valid and self.confirm_entry is not None
-            valid = valid and self.password() == self.confirm_entry.text()
             if (
                 "Chatrooms" in selected
                 and self.specific_rooms is not None
