@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import binascii
 from bisect import bisect_right, insort_right
+from collections import Counter
 import ctypes
 from contextlib import closing
 from ctypes import wintypes
@@ -1033,7 +1034,9 @@ QLineEdit, QTextEdit#messageEntry, QTextBrowser, QListWidget, QComboBox {
     selection-background-color: #007f82;
     selection-color: #000000;
 }
-QLineEdit#serverUrl:disabled { background-color: #c0c0c0; color: #808080; }
+QLineEdit#serverUrl:disabled, QLineEdit#lockedChatroomDetail:disabled {
+    background-color: #c0c0c0; color: #808080;
+}
 QComboBox {
     padding: 2px 4px;
 }
@@ -1272,7 +1275,7 @@ QLineEdit, QTextEdit#messageEntry, QTextBrowser, QListWidget, QComboBox {
     selection-background-color: #5ba7d5;
     selection-color: #ffffff;
 }
-QLineEdit#serverUrl:disabled {
+QLineEdit#serverUrl:disabled, QLineEdit#lockedChatroomDetail:disabled {
     color: rgba(49, 68, 82, 125); background-color: rgba(216, 226, 233, 156);
     border-color: rgba(99, 132, 151, 110);
 }
@@ -1516,7 +1519,7 @@ QLineEdit, QTextEdit#messageEntry, QTextBrowser, QListWidget, QComboBox {
     color: #e1e6eb; background-color: rgba(22, 26, 31, 136);
     border-color: #000000; selection-background-color: #586e80; selection-color: #ffffff;
 }
-QLineEdit#serverUrl:disabled {
+QLineEdit#serverUrl:disabled, QLineEdit#lockedChatroomDetail:disabled {
     color: #858d96; background-color: rgba(51, 56, 63, 104); border-color: #000000;
 }
 QLineEdit:focus, QTextEdit#messageEntry:focus, QTextBrowser:focus, QListWidget:focus, QComboBox:focus {
@@ -3043,7 +3046,69 @@ def is_image_url_trusted_for_sender(
 
 
 def generate_chatroom_key() -> str:
-    return secrets.token_urlsafe(24)
+    # 36 random bytes produce exactly 48 URL-safe characters.
+    return secrets.token_urlsafe(36)
+
+
+def chatroom_key_security_level(key: str) -> str:
+    """Heuristic guidance for user-entered keys, not a measure of true entropy."""
+    if not key:
+        return "Unsecure"
+
+    character_types = (
+        any(character.islower() for character in key),
+        any(character.isupper() for character in key),
+        any(character.isdigit() for character in key),
+        any(not character.isalnum() for character in key),
+    )
+    alphabet_size = sum(
+        size for present, size in zip(character_types, (26, 26, 10, 32))
+        if present
+    )
+    estimated_bits = len(key) * math.log2(max(1, alphabet_size))
+
+    counts = Counter(key)
+    most_common_count = max(counts.values())
+    longest_run = 1
+    current_run = 1
+    longest_sequence = 1
+    current_sequence = 1
+    for previous, character in zip(key, key[1:]):
+        current_run = current_run + 1 if character == previous else 1
+        longest_run = max(longest_run, current_run)
+        current_sequence = (
+            current_sequence + 1
+            if character.isalnum() and previous.isalnum()
+            and abs(ord(character) - ord(previous)) == 1
+            else 1
+        )
+        longest_sequence = max(longest_sequence, current_sequence)
+
+    repeated_pattern = any(
+        all(key[index] == key[index % period]
+            for index in range(period, len(key)))
+        for period in range(1, min(12, len(key) // 2) + 1)
+    )
+    if len(key) < 12 or len(counts) < 3 or longest_run >= max(8, len(key) // 2):
+        return "Unsecure"
+    if (
+        len(key) < 16
+        or estimated_bits < 80
+        or len(counts) < 6
+        or most_common_count * 2 > len(key)
+        or repeated_pattern
+        or longest_sequence >= 8
+    ):
+        return "Weak"
+    if (
+        len(key) < 32
+        or estimated_bits < 120
+        or len(counts) < 9
+        or most_common_count * 3 > len(key)
+        or longest_run >= 7
+    ):
+        return "Strong"
+    return "Excellent"
 
 
 INVITE_CODE_PREFIX = "SL-"
@@ -5184,7 +5249,7 @@ class ChatroomDetailsDialog(QDialog):
         submit_label: str = "Create Chatroom",
         name: str = "",
         chatroom_key: str | None = None,
-        history_note: str = "",
+        show_security_on_change_only: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -5220,15 +5285,16 @@ class ChatroomDetailsDialog(QDialog):
         )
         form.addWidget(show_key, 1, 2)
 
-        key_hint = QLabel(
-            "32+ characters recommended."
-            + (f" {history_note}" if history_note else "")
-        )
-        key_hint.setWordWrap(True)
+        self._initial_key = self.key_entry.text()
+        self._security_on_change_only = show_security_on_change_only
+        self.key_security_label = QLabel()
+        self.key_security_label.setWordWrap(True)
         app = QApplication.instance()
         hint_color = "#aab4bd" if app is not None and app.property("spritelinkGlassyDark") else "#777777"
-        key_hint.setStyleSheet(f"color: {hint_color}; font-size: 8pt;")
-        form.addWidget(key_hint, 2, 1, 1, 2)
+        self.key_security_label.setStyleSheet(f"color: {hint_color}; font-size: 8pt;")
+        form.addWidget(self.key_security_label, 2, 1, 1, 2)
+        self.key_entry.textChanged.connect(self._update_key_security)
+        self._update_key_security(self._initial_key)
         layout.addLayout(form)
 
         buttons = QHBoxLayout()
@@ -5244,6 +5310,14 @@ class ChatroomDetailsDialog(QDialog):
 
         self.name_entry.setFocus()
 
+    def _update_key_security(self, key: str) -> None:
+        self.key_security_label.setText(
+            f"Key Security: {chatroom_key_security_level(key)}"
+        )
+        self.key_security_label.setVisible(
+            not self._security_on_change_only or key != self._initial_key
+        )
+
     def name(self) -> str:
         return self.name_entry.text().strip()
 
@@ -5253,12 +5327,16 @@ class ChatroomDetailsDialog(QDialog):
 
 class EditChatroomDialog(ChatroomDetailsDialog):
     def __init__(self, client: Any, room_id: str, **kwargs: Any) -> None:
-        super().__init__(client.root, title="Edit Chatroom", submit_label="Save", **kwargs)
+        super().__init__(
+            client.root, title="Edit Chatroom", submit_label="Save",
+            show_security_on_change_only=True, **kwargs
+        )
         self.client = client
         self.settings = client_room_settings(client, room_id)
         if room_id == GLOBAL_CHATROOM_ID:
-            self.name_entry.setEnabled(False)
-            self.key_entry.setEnabled(False)
+            for entry in (self.name_entry, self.key_entry):
+                entry.setObjectName("lockedChatroomDetail")
+                entry.setEnabled(False)
 
         panel = QWidget(self)
         form = QGridLayout(panel)
@@ -5322,6 +5400,26 @@ class EditChatroomDialog(ChatroomDetailsDialog):
         self.volume_slider.valueChanged.connect(self._set_volume)
         self.finished.connect(client._stop_message_sound)
         self._sync_color()
+
+    def accept(self) -> None:
+        if self.key_entry.isEnabled() and self.chatroom_key() != self._initial_key:
+            warning = QMessageBox(self)
+            warning.setIcon(QMessageBox.Icon.Warning)
+            warning.setWindowTitle("Change Chatroom Key")
+            warning.setText(
+                "The chatroom key will be changed. Log history will persist "
+                "locally but others must update their chatroom key to keep "
+                "chatting with you."
+            )
+            warning.setStandardButtons(
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok
+            )
+            warning.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            warning.button(QMessageBox.StandardButton.Ok).setText("Change Key")
+            self.client._apply_window_titlebar_theme(warning)
+            if warning.exec() != QMessageBox.StandardButton.Ok:
+                return
+        super().accept()
 
     def _theme(self) -> str:
         return str(self.client.theme_var.get())
@@ -9800,10 +9898,6 @@ QComboBox::drop-down {
             room_id,
             name=old_name,
             chatroom_key=old_key,
-            history_note=(
-                "All locally stored history will remain here even if the "
-                "chatroom key is changed."
-            ),
         )
         self._apply_window_titlebar_theme(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
