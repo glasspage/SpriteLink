@@ -432,6 +432,10 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertEqual(menu.gridSize(), S.QSize(40, 40))
         self.assertFalse(hasattr(client, "make_emoji_link"))
         self.assertFalse(hasattr(client, "new_emoji_button"))
+        self.assertIsInstance(menu.new_style_button, S.QPushButton)
+        self.assertEqual(menu.new_style_button.text(), "New")
+        self.assertEqual(menu.new_style_button.size(), S.QSize(32, 32))
+        self.assertTrue(menu.new_style_button.isHidden())
         # Trigger the live view painting path, not only delegate painting,
         # so missing Qt imports fail the test instead of crashing the app.
         self.assertFalse(menu.viewport().grab().toImage().isNull())
@@ -443,6 +447,9 @@ class ComposerLayoutTests(unittest.TestCase):
         option = S.QStyleOptionViewItem()
         option.rect = S.QRect(0, 0, 40, 40)
         option.widget = menu
+        button_rect = menu.itemDelegate()._new_button_rect(option, menu)
+        self.assertEqual(button_rect.size(), S.QSize(32, 32))
+        self.assertEqual(button_rect.top(), option.rect.top())
         painter = QPainter(icon)
         menu.itemDelegate().paint(painter, option, menu.model().index(0, 0))
         painter.end()
@@ -474,6 +481,22 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertIsInstance(menu.itemDelegate(), S.EmojiItemDelegate)
         self.assertEqual(menu.dragDropMode(), S.QAbstractItemView.DragDropMode.InternalMove)
         self.assertEqual(menu.movement(), S.QListWidget.Movement.Snap)
+
+        new_bounds = menu.visualItemRect(menu.new_item)
+        option = S.QStyleOptionViewItem()
+        option.rect = new_bounds
+        option.widget = menu
+        emoji_option = S.QStyleOptionViewItem(option)
+        delegate = menu.itemDelegate()
+        delegate.initStyleOption(emoji_option, menu.model().index(0, 0))
+        emoji_option.rect = S.QRect(new_bounds)
+        icon_bounds = menu.style().subElementRect(
+            S.QStyle.SubElement.SE_ItemViewItemDecoration, emoji_option, menu,
+        )
+        self.assertFalse(icon_bounds.isEmpty())
+        new_button_bounds = delegate._new_button_rect(option, menu)
+        self.assertEqual(new_button_bounds.size(), S.QSize(32, 32))
+        self.assertEqual(new_button_bounds.center(), icon_bounds.center())
 
         viewport = menu.viewport()
         position = menu.visualItemRect(menu.item(0)).center()
