@@ -80,6 +80,36 @@ class ChatroomPreferenceTests(unittest.TestCase):
         self.client._activate_chatroom("room-b")
         self.assertEqual(self.client._applied_theme_color, ("Modern", 175))
 
+    def test_room_color_switch_restylizes_only_main_window(self):
+        self.config["room_settings"] = {
+            "room-a": {"theme_colors": {"Glassy": 70}},
+            "room-b": {"theme_colors": {"Glassy": 210}},
+        }
+        application_stylesheet = self.app.styleSheet()
+        self.client._activate_chatroom("room-a")
+        first_window_stylesheet = self.root.styleSheet()
+        self.assertTrue(first_window_stylesheet)
+        self.assertEqual(self.app.styleSheet(), application_stylesheet)
+        self.assertEqual(self.client._applied_theme_color, ("Glassy", 70))
+
+        self.client._activate_chatroom("room-b")
+        self.assertNotEqual(self.root.styleSheet(), first_window_stylesheet)
+        self.assertEqual(self.app.styleSheet(), application_stylesheet)
+        self.assertEqual(self.client._applied_theme_color, ("Glassy", 210))
+
+        # Changing the application theme still replaces the full app style.
+        self.client._on_theme_changed("Modern")
+        self.assertEqual(self.root.styleSheet(), "")
+        self.assertEqual(self.client._applied_theme_color, ("Modern", 0))
+
+    def test_hue_style_revisits_use_cached_result(self):
+        S.hue_theme_stylesheet.cache_clear()
+        stylesheet = "QPushButton { background: #438eaf; color: #222222; }"
+        first = S.hue_theme_stylesheet(stylesheet, 65)
+        self.assertEqual(S.hue_theme_stylesheet.cache_info().misses, 1)
+        self.assertEqual(S.hue_theme_stylesheet(stylesheet, 65), first)
+        self.assertGreaterEqual(S.hue_theme_stylesheet.cache_info().hits, 1)
+
     def test_default_color_follows_config_for_selected_theme(self):
         self.client._on_theme_changed("Classic")
         self.client.active_chatroom_id = "room-a"
