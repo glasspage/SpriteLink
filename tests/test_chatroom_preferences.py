@@ -200,14 +200,14 @@ class ChatroomPreferenceTests(unittest.TestCase):
             unchanged.accept()
         self.assertEqual(unchanged.result(), QDialog.DialogCode.Accepted)
 
-    def test_key_warning_buttons_are_change_then_cancel(self):
+    def test_key_warning_buttons_are_cancel_then_change(self):
         dialog = S.ChangeChatroomKeyDialog(self.client.root)
         self.dialogs.append(dialog)
         self.assertEqual(dialog.change_key_button.text(), "Change Key")
         self.assertEqual(dialog.cancel_button.text(), "Cancel")
         self.assertLess(
-            dialog.button_row.indexOf(dialog.change_key_button),
             dialog.button_row.indexOf(dialog.cancel_button),
+            dialog.button_row.indexOf(dialog.change_key_button),
         )
         self.assertTrue(dialog.cancel_button.isDefault())
         self.assertEqual(
