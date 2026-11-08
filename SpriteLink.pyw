@@ -168,6 +168,11 @@ def ensure_qt_multimedia_loaded() -> None:
 
 
 from spritelink_http import requests
+from spritelink_data_dialog import DataTransferDialog
+from spritelink_data_transfer import (
+    ARCHIVE_CATEGORIES, CONFIG_EXPORT_FIELDS, MAX_ARCHIVE_BYTES,
+    config_for_export, create_archive, inspect_archive, open_archive,
+)
 
 from spritelink_update import (
     ReleaseInfo,
@@ -13377,6 +13382,17 @@ QComboBox::drop-down {
 
         advanced_layout.addWidget(self._heading("Data Management"), advanced_row, 0, 1, 3)
         advanced_row += 1
+        data_buttons = QHBoxLayout()
+        data_buttons.setContentsMargins(0, 0, 0, 0)
+        self.export_data_button = QPushButton("Export Data")
+        self.export_data_button.clicked.connect(self._export_data)
+        data_buttons.addWidget(self.export_data_button)
+        self.import_data_button = QPushButton("Import Data")
+        self.import_data_button.clicked.connect(self._import_data)
+        data_buttons.addWidget(self.import_data_button)
+        data_buttons.addStretch()
+        advanced_layout.addLayout(data_buttons, advanced_row, 0, 1, 3)
+        advanced_row += 1
         open_storage_button = QPushButton("Open storage folder")
         open_storage_button.clicked.connect(self._open_storage_folder)
         advanced_layout.addWidget(
@@ -13453,6 +13469,347 @@ QComboBox::drop-down {
             "Advanced ▼" if expanded else "Advanced ▶"
         )
         self.advanced_config_content.setVisible(expanded)
+
+    def _export_data(self) -> None:
+        dialog = DataTransferDialog(
+            "export", ARCHIVE_CATEGORIES, self._chatroom_definitions(), self.root,
+        )
+        self._apply_window_titlebar_theme(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        filename, _filter = QFileDialog.getSaveFileName(
+            self.root, "Export SpriteLink data", "SpriteLink Backup.sldata",
+            "SpriteLink Data (*.sldata)",
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        if path.suffix.lower() != ".sldata":
+            path = path.with_suffix(".sldata")
+        try:
+            categories = dialog.selected_categories()
+            payload: dict[str, Any] = {}
+            if "Chatrooms" in categories:
+                if not self._persist_local_history():
+                    raise OSError("Could not save the current chatroom history.")
+                server_url = normalize_server_url(str(self.config_data["server_url"]))
+                selected_ids = dialog.selected_room_ids()
+                rooms = []
+                for room in self._chatroom_definitions():
+                    if selected_ids is not None and room["id"] not in selected_ids:
+                        continue
+                    key = room["key"]
+                    legacy = chatroom_history_path(server_url, key).with_suffix(".bin")
+                    if legacy.exists():
+                        _upgrade_chatroom_history(legacy)
+                    rooms.append({
+                        "nickname": room["nickname"], "key": key,
+                        "history": load_chatroom_history(server_url, key),
+                    })
+                payload["Chatrooms"] = rooms
+            if "Config" in categories:
+                payload["Config"] = config_for_export(self.config_data)
+            if "Emoji" in categories:
+                payload["Emoji"] = dict(self.config_data.get("saved_emojis", {}))
+            if "Identity" in categories:
+                payload["Identity"] = {
+                    "private_key": self._identity_private_key(),
+                    "presets": self._identity_presets(),
+                    "active_preset_id": self._room_profile(
+                        GLOBAL_CHATROOM_ID
+                    ).get("identity_preset_id", ""),
+                }
+
+            packed = create_archive(payload, dialog.password())
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".sldata.tmp")
+            try:
+                temporary.write_bytes(packed)
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        except Exception as exc:
+            messagebox.showerror("Could not export data", str(exc), parent=self.root)
+            return
+        messagebox.showinfo(
+            "Data exported", f"Data saved to {path}", parent=self.root,
+        )
+
+    def _prepare_data_import(
+        self, payload: dict[str, Any], categories: tuple[str, ...],
+    ) -> tuple[dict[str, Any], list[tuple[str, list[dict[str, Any]]]], dict[str, int]]:
+        # Complete validation before changing settings or writing history.
+        staged = json.loads(json.dumps(self.config_data))
+        history_jobs: list[tuple[str, list[dict[str, Any]]]] = []
+        counts = {"chatrooms": 0, "messages": 0, "emojis": 0, "identities": 0}
+
+        if "Config" in categories:
+            values = payload["Config"]
+            if not isinstance(values, dict):
+                raise ValueError("Invalid Config data in archive.")
+            for key in CONFIG_EXPORT_FIELDS:
+                if key in values:
+                    staged[key] = values[key]
+            preset = staged.get("server_preset", DEFAULT_SERVER_PRESET)
+            if preset not in SERVER_PRESETS:
+                preset = "Custom ntfy server"
+            staged["server_preset"] = preset
+            if preset in SERVER_PRESETS:
+                staged["server_url"] = SERVER_PRESETS[preset]
+            server_url = normalize_server_url(str(staged.get("server_url", "")))
+            if not server_url.startswith(("http://", "https://")):
+                raise ValueError("Invalid server URL in Config.")
+            staged["server_url"] = server_url
+            staged["theme"] = (
+                staged.get("theme") if staged.get("theme") in THEMES else DEFAULT_THEME
+            )
+            staged["theme_colors"] = normalize_theme_colors(
+                staged.get("theme_colors")
+            )
+            staged["ui_size"] = normalize_ui_size(staged.get("ui_size"))
+            staged["chatroom_history_limit"] = normalize_chatroom_history_limit(
+                staged.get("chatroom_history_limit")
+            )
+            staged["message_sound"] = (
+                staged.get("message_sound")
+                if staged.get("message_sound") in MESSAGE_SOUND_OPTIONS
+                else DEFAULT_MESSAGE_SOUND
+            )
+            try:
+                staged["message_sound_volume"] = max(
+                    10, min(100, int(staged.get("message_sound_volume", 100)))
+                )
+            except (ValueError, TypeError):
+                staged["message_sound_volume"] = 100
+            for key in ("text_shadows", "desktop_notifications",
+                        "minimize_to_tray", "start_with_windows"):
+                staged[key] = bool(staged.get(key, False))
+            if os.name != "nt":
+                staged["start_with_windows"] = False
+            width, height = normalize_window_size(
+                staged.get("window_width"), staged.get("window_height"),
+                staged["ui_size"],
+            )
+            staged["window_width"], staged["window_height"] = width, height
+            staged["custom_message_sound_path"] = str(
+                staged.get("custom_message_sound_path", "")
+            )
+
+        if "Chatrooms" in categories:
+            imported_rooms = payload["Chatrooms"]
+            if not isinstance(imported_rooms, list) or len(imported_rooms) > 1000:
+                raise ValueError("Invalid Chatrooms list in archive.")
+            existing_keys = {
+                room["key"] for room in self._chatroom_definitions()
+            }
+            already_seen: set[str] = set()
+            new_rooms = staged.setdefault("chatrooms", [])
+            profiles = staged.setdefault("room_profiles", {})
+            global_profile = dict(profiles.get(GLOBAL_CHATROOM_ID, {}))
+            for room in imported_rooms:
+                if not isinstance(room, dict):
+                    raise ValueError("Invalid chatroom entry.")
+                name, key = room.get("nickname"), room.get("key")
+                history = room.get("history")
+                if (
+                    not isinstance(name, str) or not isinstance(key, str)
+                    or not isinstance(history, list)
+                ):
+                    raise ValueError("Invalid chatroom entry.")
+                if key != GLOBAL_CHATROOM_KEY:
+                    make_chatroom_invite_code(name, key)
+                if key in already_seen:
+                    raise ValueError("Duplicate chatroom key in archive.")
+                already_seen.add(key)
+                for item in history:
+                    if (
+                        not isinstance(item, dict)
+                        or not isinstance(item.get("message"), dict)
+                        or not isinstance(item["message"].get("i"), str)
+                        or not item["message"]["i"]
+                        or len(item["message"]["i"]) > 128
+                    ):
+                        raise ValueError("Invalid chatroom history entry.")
+                    try:
+                        message_item_sort_key(item)
+                    except (ValueError, TypeError, OverflowError) as exc:
+                        raise ValueError("Invalid chatroom history timestamp.") from exc
+                if key not in existing_keys:
+                    room_id = uuid.uuid4().hex
+                    new_rooms.append({
+                        "id": room_id, "nickname": name, "key": key,
+                    })
+                    # Room appearance, identity assignment and notification
+                    # preferences are intentionally not transferred.
+                    profiles[room_id] = dict(global_profile)
+                    existing_keys.add(key)
+                    counts["chatrooms"] += 1
+                history_jobs.append((key, history))
+                counts["messages"] += len(history)
+
+        if "Emoji" in categories:
+            imported_emojis = payload["Emoji"]
+            if not isinstance(imported_emojis, dict):
+                raise ValueError("Invalid Emoji data in archive.")
+            local_emojis = staged.setdefault("saved_emojis", {})
+            folded = {name.casefold() for name in local_emojis}
+            for name, encoded in imported_emojis.items():
+                if not valid_emoji(name, encoded):
+                    raise ValueError("Invalid emoji in archive.")
+                candidate = name
+                if candidate.casefold() in folded:
+                    if local_emojis.get(candidate) == encoded:
+                        continue
+                    for n in range(1, 10001):
+                        suffix = "_imported" if n == 1 else f"_imported{n}"
+                        candidate = name[:32 - len(suffix)] + suffix
+                        if candidate.casefold() not in folded:
+                            break
+                    else:
+                        raise ValueError("Too many emojis with the same name.")
+                local_emojis[candidate] = encoded
+                folded.add(candidate.casefold())
+                counts["emojis"] += 1
+
+        if "Identity" in categories:
+            imported = payload["Identity"]
+            if not isinstance(imported, dict):
+                raise ValueError("Invalid Identity data in archive.")
+            private_key = imported.get("private_key")
+            if not isinstance(private_key, str):
+                raise ValueError("Invalid identity key in archive.")
+            identity_public_key_bytes(private_key)
+            raw_presets = imported.get("presets")
+            if not isinstance(raw_presets, list) or not raw_presets:
+                raise ValueError("Invalid identity presets in archive.")
+            presets = list(staged.get("identity_presets", []))
+            by_id = {preset["id"]: i for i, preset in enumerate(presets)}
+            for raw in raw_presets:
+                if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
+                    raise ValueError("Invalid identity preset in archive.")
+                preset = normalize_identity_preset(raw)
+                if preset["id"] in by_id:
+                    presets[by_id[preset["id"]]] = preset
+                elif len(presets) < MAX_IDENTITY_PRESETS:
+                    by_id[preset["id"]] = len(presets)
+                    presets.append(preset)
+                    counts["identities"] += 1
+            staged["identity_presets"] = presets
+            staged["identity_private_key"] = private_key
+            active_id = imported.get("active_preset_id", "")
+            if active_id in by_id:
+                profile = staged.setdefault("room_profiles", {}).setdefault(
+                    GLOBAL_CHATROOM_ID, {}
+                )
+                apply_identity_preset_to_profile(profile, presets[by_id[active_id]])
+
+        return staged, history_jobs, counts
+
+    def _import_data(self) -> None:
+        filename, _filter = QFileDialog.getOpenFileName(
+            self.root, "Import SpriteLink data", "",
+            "SpriteLink Data (*.sldata)",
+        )
+        if not filename:
+            return
+        try:
+            path = Path(filename)
+            if path.stat().st_size > MAX_ARCHIVE_BYTES:
+                raise ValueError("The .sldata file is too large.")
+            blob = path.read_bytes()
+            _envelope, available = inspect_archive(blob)
+        except Exception as exc:
+            messagebox.showerror("Could not open data", str(exc), parent=self.root)
+            return
+
+        dialog = DataTransferDialog("import", available, parent=self.root)
+        self._apply_window_titlebar_theme(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            payload = open_archive(blob, dialog.password())
+            categories = dialog.selected_categories()
+            if not self._persist_local_history():
+                raise OSError("Could not save the current chatroom history.")
+            staged, history_jobs, counts = self._prepare_data_import(
+                payload, categories,
+            )
+            old_config = self.config_data
+            old_server = normalize_server_url(
+                str(old_config.get("server_url", ""))
+            )
+            self.config_data = staged
+            try:
+                save_config(staged)
+            except Exception:
+                self.config_data = old_config
+                raise
+
+            server_url = normalize_server_url(
+                str(self.config_data.get("server_url", ""))
+            )
+            for key, history in history_jobs:
+                # INSERT ... ON CONFLICT DO NOTHING: preserve existing
+                # messages, local names and all room-specific preferences.
+                save_chatroom_history(server_url, key, history)
+
+            if "Config" in categories:
+                self._apply_imported_config_controls()
+                if not set_start_with_windows(
+                    bool(self.config_data.get("start_with_windows", False))
+                ):
+                    raise OSError("Could not apply the imported startup setting.")
+            if "Emoji" in categories:
+                self._refresh_saved_emojis()
+            if "Identity" in categories:
+                self._load_active_room_profile_into_controls()
+            if "Chatrooms" in categories or server_url != old_server:
+                self.initial_history_pending_rooms.update(
+                    room["id"] for room in self._chatroom_definitions()
+                )
+                self._switch_active_chatroom(
+                    poll_immediately=True, refresh_subscription=True,
+                )
+            elif "Identity" in categories:
+                self._refresh_identity_preset_selector()
+            if hasattr(self, "config_overlay") and self.config_overlay.isVisible():
+                self._config_snapshot_at_open = self._config_ui_snapshot()
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not import data",
+                f"{exc}\n\nRetrying an import will not duplicate chat history.",
+                parent=self.root,
+            )
+            return
+        messagebox.showinfo(
+            "Data imported",
+            f"Imported {counts['chatrooms']} new chatrooms, "
+            f"{counts['messages']} history records, "
+            f"{counts['emojis']} emojis, and "
+            f"{counts['identities']} new identity presets.",
+            parent=self.root,
+        )
+
+    def _apply_imported_config_controls(self) -> None:
+        settings = self.config_data
+        self.server_preset_var.set(str(settings["server_preset"]))
+        self.server_url_var.set(str(settings["server_url"]))
+        self.text_shadows_var.set(bool(settings["text_shadows"]))
+        self.ui_size_var.set(settings["ui_size"])
+        self.message_sound_var.set(str(settings["message_sound"]))
+        self.message_sound_volume_var.set(int(settings["message_sound_volume"]))
+        self.custom_message_sound_path_var.set(
+            str(settings["custom_message_sound_path"])
+        )
+        self.desktop_notifications_var.set(bool(settings["desktop_notifications"]))
+        self.chatroom_history_limit_var.set(int(settings["chatroom_history_limit"]))
+        self.minimize_to_tray_var.set(bool(settings["minimize_to_tray"]))
+        self.start_with_windows_var.set(bool(settings["start_with_windows"]))
+        self.theme_var.set(str(settings["theme"]))
+        self._apply_theme()
+        self._apply_application_font_strategy()
+        self._apply_ui_size()
+        self._saved_theme_colors = dict(settings["theme_colors"])
 
     def _open_storage_folder(self) -> None:
         try:
