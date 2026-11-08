@@ -84,6 +84,19 @@ class DataTransferDialog(QDialog):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
+        if mode == "import":
+            self.identity_warning = QLabel(
+                "Importing Identity replaces your signing key and changes "
+                "your user ID. Export a backup first."
+            )
+            self.identity_warning.setWordWrap(True)
+            layout.addWidget(self.identity_warning)
+            self.category_checks["Identity"].toggled.connect(
+                self.identity_warning.setVisible
+            )
+            self.identity_warning.setVisible(
+                self.category_checks["Identity"].isChecked()
+            )
         layout.addWidget(QLabel("Archive password"))
         self.password_entry = QLineEdit()
         self.password_entry.setEchoMode(QLineEdit.EchoMode.Password)
