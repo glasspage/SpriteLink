@@ -3438,10 +3438,11 @@ def _signed_message_payload(
     encryption_key: str,
     *,
     include_emojis: bool = False,
+    signed_topic: str | None = None,
 ) -> bytes:
     values = [
         SIGNED_MESSAGE_CONTEXT,
-        derive_ntfy_topic(encryption_key),
+        signed_topic if signed_topic is not None else derive_ntfy_topic(encryption_key),
         message["a"],
         message["v"],
         message["i"],
@@ -3503,6 +3504,8 @@ def sign_message_identity(
 def verify_message_identity(
     message: dict[str, Any],
     encryption_key: str,
+    *,
+    signed_topic: str | None = None,
 ) -> None:
     if message.get("a") != MESSAGE_AUTH_VERSION:
         raise ValueError("Message authentication version is unsupported.")
@@ -3523,7 +3526,11 @@ def verify_message_identity(
         "Message signature",
     )
     verifier = Ed25519PublicKey.from_public_bytes(public_key)
-    verifier.verify(signature, _signed_message_payload(message, encryption_key))
+    if signed_topic is not None and not re.fullmatch(r"e2chat-[a-z2-7]+", signed_topic):
+        raise ValueError("Stored signature topic is invalid.")
+    verifier.verify(signature, _signed_message_payload(
+        message, encryption_key, signed_topic=signed_topic,
+    ))
     if "emojis" in message or "emoji_signature" in message:
         if "emojis" not in message:
             raise ValueError("Missing signed emoji data.")
@@ -3531,7 +3538,10 @@ def verify_message_identity(
             message.get("emoji_signature"), ED25519_SIGNATURE_BYTES, "Emoji signature",
         )
         verifier.verify(
-            emoji_signature, _signed_message_payload(message, encryption_key, include_emojis=True),
+            emoji_signature, _signed_message_payload(
+                message, encryption_key, include_emojis=True,
+                signed_topic=signed_topic,
+            ),
         )
 
 
@@ -3600,9 +3610,14 @@ def _open_chatroom_history(path: Path) -> sqlite3.Connection:
                 ntfy_id TEXT,
                 sort_time INTEGER NOT NULL,
                 sent_time INTEGER NOT NULL,
-                payload BLOB NOT NULL
+                payload BLOB NOT NULL,
+                origin_topic TEXT
             )
         """)
+        if "origin_topic" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(messages)")
+        }:
+            connection.execute("ALTER TABLE messages ADD COLUMN origin_topic TEXT")
         connection.execute("""
             CREATE INDEX IF NOT EXISTS messages_by_time
             ON messages (sort_time, sent_time, message_id)
@@ -3623,13 +3638,19 @@ def _history_rows(entries: Iterable[dict[str, Any]]) -> Iterable[tuple]:
         if not isinstance(message, dict) or not message.get("i"):
             continue
         sort_time, sent_time, message_id = message_item_sort_key(item)
-        entry = {key: value for key, value in item.items() if key != "is_local"}
+        entry = {
+            key: value for key, value in item.items()
+            if key not in ("is_local", "history_origin_topic")
+        }
         raw = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
         payload = dpapi_encrypt(
             zlib.compress(raw.encode("utf-8"), level=1),
             CHATROOM_HISTORY_DPAPI_ENTROPY,
         )
-        yield message_id, item.get("ntfy_id"), sort_time, sent_time, payload
+        yield (
+            message_id, item.get("ntfy_id"), sort_time, sent_time, payload,
+            item.get("history_origin_topic"),
+        )
 
 
 def _insert_chatroom_history(
@@ -3637,8 +3658,8 @@ def _insert_chatroom_history(
     entries: Iterable[dict[str, Any]],
 ) -> None:
     connection.executemany("""
-        INSERT INTO messages (message_id, ntfy_id, sort_time, sent_time, payload)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO messages (message_id, ntfy_id, sort_time, sent_time, payload, origin_topic)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(message_id) DO NOTHING
     """, _history_rows(entries))
 
@@ -3676,17 +3697,29 @@ def load_chatroom_history(
     if not path.exists():
         return []
     with closing(sqlite3.connect(path)) as connection:
-        query = "SELECT payload FROM messages"
+        has_origin_topic = any(
+            row[1] == "origin_topic"
+            for row in connection.execute("PRAGMA table_info(messages)")
+        )
+        query = (
+            "SELECT payload, origin_topic FROM messages"
+            if has_origin_topic else "SELECT payload, NULL FROM messages"
+        )
         params = ()
         if before is not None:
             query += " WHERE (sort_time, sent_time, message_id) < (?, ?, ?)"
             params = before
         query += " ORDER BY sort_time DESC, sent_time DESC, message_id DESC LIMIT ?"
         rows = connection.execute(query, (*params, limit)).fetchall()
-    return [
-        json.loads(zlib.decompress(dpapi_decrypt(payload, CHATROOM_HISTORY_DPAPI_ENTROPY)))
-        for (payload,) in reversed(rows)
-    ]
+    entries = []
+    for payload, origin_topic in reversed(rows):
+        entry = json.loads(zlib.decompress(
+            dpapi_decrypt(payload, CHATROOM_HISTORY_DPAPI_ENTROPY)
+        ))
+        if origin_topic is not None:
+            entry["history_origin_topic"] = origin_topic
+        entries.append(entry)
+    return entries
 
 
 def save_chatroom_history(
@@ -3725,6 +3758,10 @@ def copy_chatroom_history_for_key_change(
     if not old_path.exists():
         return False
 
+    # Ensure pre-migration databases have the provenance column.
+    with closing(_open_chatroom_history(old_path)):
+        pass
+
     # Merge rather than replace: users may have previously used the new key.
     # This preserves both histories while deduplicating message IDs.
     with closing(_open_chatroom_history(new_path)) as connection:
@@ -3733,10 +3770,11 @@ def copy_chatroom_history_for_key_change(
             with connection:
                 connection.execute("""
                     INSERT OR IGNORE INTO messages
-                    (message_id, ntfy_id, sort_time, sent_time, payload)
-                    SELECT message_id, ntfy_id, sort_time, sent_time, payload
+                    (message_id, ntfy_id, sort_time, sent_time, payload, origin_topic)
+                    SELECT message_id, ntfy_id, sort_time, sent_time, payload,
+                           COALESCE(origin_topic, ?)
                     FROM previous_history.messages
-                """)
+                """, (derive_ntfy_topic(old_key),))
         finally:
             connection.execute("DETACH DATABASE previous_history")
     return True
@@ -14980,6 +15018,7 @@ QComboBox::drop-down {
         encryption_key: str,
         *,
         ntfy_time: int | None = None,
+        history_origin_topic: str | None = None,
     ) -> None:
         required = {
             "a": int,
@@ -15042,7 +15081,9 @@ QComboBox::drop-down {
         if profile_icon:
             decode_profile_icon(profile_icon)
 
-        verify_message_identity(message, encryption_key)
+        verify_message_identity(
+            message, encryption_key, signed_topic=history_origin_topic,
+        )
 
         if ntfy_time is not None:
             if type(ntfy_time) is not int:
@@ -15913,6 +15954,7 @@ QComboBox::drop-down {
                             if stored_ntfy_time > 0
                             else None
                         ),
+                        history_origin_topic=item.get("history_origin_topic"),
                     )
                 except Exception:
                     continue
