@@ -3705,6 +3705,43 @@ def save_chatroom_history(
                 _prune_history_rows(connection, maximum_messages)
 
 
+def copy_chatroom_history_for_key_change(
+    server_url: str, old_key: str, new_key: str,
+) -> bool:
+    """Copy saved history into the new key's scope without removing the old copy.
+
+    History payloads use local DPAPI encryption rather than the chatroom key,
+    so the encrypted SQLite records can be transferred without re-encoding.
+    The caller removes the old history only after settings are saved.
+    """
+    old_path = chatroom_history_path(server_url, old_key)
+    new_path = chatroom_history_path(server_url, new_key)
+    if old_path == new_path:
+        return False
+
+    legacy_path = old_path.with_suffix(".bin")
+    if legacy_path.exists():
+        _upgrade_chatroom_history(legacy_path)
+    if not old_path.exists():
+        return False
+
+    # Merge rather than replace: users may have previously used the new key.
+    # This preserves both histories while deduplicating message IDs.
+    with closing(_open_chatroom_history(new_path)) as connection:
+        connection.execute("ATTACH DATABASE ? AS previous_history", (str(old_path),))
+        try:
+            with connection:
+                connection.execute("""
+                    INSERT OR IGNORE INTO messages
+                    (message_id, ntfy_id, sort_time, sent_time, payload)
+                    SELECT message_id, ntfy_id, sort_time, sent_time, payload
+                    FROM previous_history.messages
+                """)
+        finally:
+            connection.execute("DETACH DATABASE previous_history")
+    return True
+
+
 def _prune_history_rows(connection: sqlite3.Connection, limit: int) -> bool:
     boundary = connection.execute("""
         SELECT sort_time, sent_time, message_id FROM messages
@@ -5245,13 +5282,13 @@ class ChangeChatroomKeyDialog(QDialog):
 
         self.button_row = QHBoxLayout()
         self.button_row.addStretch(1)
-        self.change_key_button = QPushButton("Change Key")
-        self.change_key_button.clicked.connect(self.accept)
-        self.button_row.addWidget(self.change_key_button)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setDefault(True)
         self.cancel_button.clicked.connect(self.reject)
         self.button_row.addWidget(self.cancel_button)
+        self.change_key_button = QPushButton("Change Key")
+        self.change_key_button.clicked.connect(self.accept)
+        self.button_row.addWidget(self.change_key_button)
         layout.addLayout(self.button_row)
         self.cancel_button.setFocus()
 
@@ -9976,7 +10013,29 @@ QComboBox::drop-down {
             room_id in self.initial_history_pending_rooms
         )
         if key_changed and room_id == self.active_chatroom_id:
-            self._persist_local_history()
+            if not self._persist_local_history():
+                messagebox.showerror(
+                    "Could not change chatroom key",
+                    "Could not save pending chat history. The key was not changed.",
+                    parent=self.root,
+                )
+                return
+        migrated_history = False
+        if key_changed:
+            try:
+                server_url = normalize_server_url(
+                    str(self.config_data.get("server_url", ""))
+                )
+                migrated_history = copy_chatroom_history_for_key_change(
+                    server_url, old_key, key,
+                )
+            except Exception as exc:
+                messagebox.showerror(
+                    "Could not change chatroom key",
+                    f"Could not transfer local history: {exc}",
+                    parent=self.root,
+                )
+                return
         room["nickname"] = name
         room["key"] = key
         room_settings = self.config_data.setdefault("room_settings", {})
@@ -10003,6 +10062,8 @@ QComboBox::drop-down {
             return
 
         if key_changed:
+            if migrated_history:
+                delete_local_chatroom_history(server_url, old_key)
             self._request_subscription_refresh()
         if room_id == self.active_chatroom_id and key_changed:
             self._switch_active_chatroom()
@@ -15936,14 +15997,14 @@ QComboBox::drop-down {
         self._history_initial_render_complete = True
         self._flush_pending_live_message_render()
 
-    def _persist_local_history(self) -> None:
+    def _persist_local_history(self) -> bool:
         server_url = normalize_server_url(
             str(self.config_data.get("server_url", ""))
         )
         encryption_key = self._active_chatroom()["key"]
 
         if not server_url or not encryption_key:
-            return
+            return not self.pending_history_entries
 
         try:
             save_chatroom_history(
@@ -15954,8 +16015,10 @@ QComboBox::drop-down {
             )
         except Exception:
             self.status_var.set("Could not save chat history")
+            return False
         else:
             self.pending_history_entries.clear()
+            return True
 
     def _chatroom_history_limit(self) -> int:
         value = (
