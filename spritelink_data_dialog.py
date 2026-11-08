@@ -12,6 +12,22 @@ from PySide6.QtWidgets import (
 from spritelink_data_transfer import ARCHIVE_CATEGORIES
 
 
+class _ChatroomsCheckBox(QCheckBox):
+    """Clicking a partial category selects all rooms, not the next Qt tristate."""
+
+    def __init__(self) -> None:
+        super().__init__("Chatrooms")
+        self.setTristate(True)
+
+    def nextCheckState(self) -> None:
+        state = (
+            Qt.CheckState.Unchecked
+            if self.checkState() == Qt.CheckState.Checked
+            else Qt.CheckState.Checked
+        )
+        self.setCheckState(state)
+
+
 class DataTransferDialog(QDialog):
     def __init__(
         self, mode: str, available: tuple[str, ...],
@@ -27,61 +43,46 @@ class DataTransferDialog(QDialog):
         self.setWindowTitle(f"{action} Data")
         self.setMinimumWidth(330)
         layout = QVBoxLayout(self)
-        title = QLabel(f"Select data to {mode.lower()}:")
-        layout.addWidget(title)
+        layout.addWidget(QLabel(f"Select data to {mode.lower()}:"))
 
         self.category_checks: dict[str, QCheckBox] = {}
-        self.specific_rooms: QCheckBox | None = None
         self.room_checks: dict[str, QCheckBox] = {}
         self.rooms_area: QScrollArea | None = None
+        self._syncing_rooms = False
 
         for category in ARCHIVE_CATEGORIES:
-            check = QCheckBox(category)
+            check = (
+                _ChatroomsCheckBox() if category == "Chatrooms"
+                else QCheckBox(category)
+            )
             check.setEnabled(category in available)
             check.setChecked(category in available)
             self.category_checks[category] = check
             layout.addWidget(check)
 
-            if category == "Chatrooms" and mode == "export":
-                # Room selection belongs directly beneath its Chatrooms
-                # checkbox, not below the unrelated categories.
-                room_options = QWidget()
-                options_layout = QVBoxLayout(room_options)
-                options_layout.setContentsMargins(20, 0, 0, 4)
-                options_layout.setSpacing(4)
-                self.specific_rooms = QCheckBox("Specific chatrooms only")
-                options_layout.addWidget(self.specific_rooms)
+            if category == "Chatrooms" and rooms is not None:
+                # Room selection is part of the main Chatrooms checkbox
+                # for both importing and exporting.
                 self.rooms_area = QScrollArea()
                 self.rooms_area.setWidgetResizable(True)
                 self.rooms_area.setMaximumHeight(190)
                 self.rooms_area.setFrameShape(QFrame.Shape.NoFrame)
                 room_panel = QWidget()
                 room_layout = QVBoxLayout(room_panel)
-                room_layout.setContentsMargins(20, 0, 0, 0)
+                room_layout.setContentsMargins(20, 0, 0, 4)
                 room_layout.setSpacing(2)
-                for room in rooms or []:
+                for room in rooms:
                     room_check = QCheckBox(room["nickname"])
                     room_check.setChecked(True)
                     room_check.setToolTip(room["nickname"])
                     room_layout.addWidget(room_check)
                     self.room_checks[room["id"]] = room_check
-                    room_check.toggled.connect(self._update_save_enabled)
+                    room_check.toggled.connect(self._sync_chatroom_category)
                 room_layout.addStretch()
                 self.rooms_area.setWidget(room_panel)
-                options_layout.addWidget(self.rooms_area)
-                layout.addWidget(room_options)
-                self.specific_rooms.toggled.connect(self._update_room_selection)
-                check.toggled.connect(self._update_room_selection)
+                layout.addWidget(self.rooms_area)
+                check.stateChanged.connect(self._set_all_room_checks)
                 self._update_room_selection()
-
-        if mode == "import" and any(
-            name not in available for name in ARCHIVE_CATEGORIES
-        ):
-            unavailable = QLabel(
-                "Unavailable categories are not included in this file."
-            )
-            unavailable.setWordWrap(True)
-            layout.addWidget(unavailable)
 
         if mode == "import":
             self.identity_warning = QLabel(
@@ -96,17 +97,14 @@ class DataTransferDialog(QDialog):
             self.identity_warning.setVisible(
                 self.category_checks["Identity"].isChecked()
             )
+
         self.password_entry = QLineEdit()
         self.password_entry.setEchoMode(QLineEdit.EchoMode.Password)
         self.password_entry.setPlaceholderText(
-            "Recommended" if mode == "export" else "Password"
+            "Optional, recommended" if mode == "export" else "Password"
         )
         if mode == "export":
-            layout.addWidget(QLabel("Password (optional)"))
-            self.password_entry.setToolTip(
-                "Without a password, the export is not encrypted and "
-                "can reveal chatroom keys and identity data."
-            )
+            layout.addWidget(QLabel("Password"))
             layout.addWidget(self.password_entry)
         elif password_required:
             layout.addWidget(QLabel("Password"))
@@ -126,16 +124,45 @@ class DataTransferDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
         for check in self.category_checks.values():
-            check.toggled.connect(self._update_save_enabled)
+            check.stateChanged.connect(self._update_save_enabled)
         self.password_entry.textChanged.connect(self._update_save_enabled)
         self._update_save_enabled()
 
-    def _update_room_selection(self, _checked: bool = False) -> None:
-        if self.specific_rooms is None or self.rooms_area is None:
+    def _set_all_room_checks(self, state: int) -> None:
+        if self._syncing_rooms:
             return
-        enabled = self.category_checks["Chatrooms"].isChecked()
-        self.specific_rooms.setEnabled(enabled)
-        self.rooms_area.setVisible(enabled and self.specific_rooms.isChecked())
+        self._syncing_rooms = True
+        try:
+            checked = state != Qt.CheckState.Unchecked.value
+            for room_check in self.room_checks.values():
+                room_check.setChecked(checked)
+        finally:
+            self._syncing_rooms = False
+        self._update_room_selection()
+
+    def _sync_chatroom_category(self, _checked: bool = False) -> None:
+        if self._syncing_rooms:
+            return
+        selected_count = sum(check.isChecked() for check in self.room_checks.values())
+        total = len(self.room_checks)
+        state = (
+            Qt.CheckState.Checked if selected_count == total
+            else Qt.CheckState.PartiallyChecked if selected_count
+            else Qt.CheckState.Unchecked
+        )
+        self._syncing_rooms = True
+        try:
+            self.category_checks["Chatrooms"].setCheckState(state)
+        finally:
+            self._syncing_rooms = False
+        self._update_room_selection()
+
+    def _update_room_selection(self) -> None:
+        if self.rooms_area is None:
+            return
+        chatrooms = self.category_checks["Chatrooms"]
+        self.rooms_area.setVisible(chatrooms.isEnabled())
+        self.rooms_area.setEnabled(chatrooms.isChecked())
         self._update_save_enabled()
 
     def selected_categories(self) -> tuple[str, ...]:
@@ -145,7 +172,10 @@ class DataTransferDialog(QDialog):
         )
 
     def selected_room_ids(self) -> set[str] | None:
-        if self.specific_rooms is None or not self.specific_rooms.isChecked():
+        # None means all rooms; this also preserves the existing export API.
+        if not self.room_checks or all(
+            check.isChecked() for check in self.room_checks.values()
+        ):
             return None
         return {
             room_id for room_id, check in self.room_checks.items()
@@ -155,20 +185,16 @@ class DataTransferDialog(QDialog):
     def password(self) -> str:
         return self.password_entry.text()
 
-    def _update_save_enabled(self, _checked: Any = None) -> None:
-        # Called during construction of the category widgets, before the
-        # button box exists.
+    def _update_save_enabled(self, _changed: Any = None) -> None:
+        # Called during construction before the button box exists.
         if not hasattr(self, "action_button"):
             return
         selected = self.selected_categories()
         valid = bool(selected)
         if self.password_required:
             valid = valid and bool(self.password())
-        if self.mode == "export":
-            if (
-                "Chatrooms" in selected
-                and self.specific_rooms is not None
-                and self.specific_rooms.isChecked()
-            ):
-                valid = valid and bool(self.selected_room_ids())
+        if "Chatrooms" in selected and self.room_checks:
+            valid = valid and bool(
+                self.selected_room_ids() is None or self.selected_room_ids()
+            )
         self.action_button.setEnabled(valid)
