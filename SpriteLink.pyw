@@ -11201,14 +11201,21 @@ QComboBox::drop-down {
         order = [
             data[0]
             for index in range(self.emojis_menu.count())
-            if isinstance((data := self.emojis_menu.item(index).data(Qt.ItemDataRole.UserRole)), tuple)
+            if isinstance((data := self.emojis_menu.item(index).data(Qt.ItemDataRole.UserRole)), (tuple, list))
         ]
         if len(order) != len(saved) or set(order) != set(saved):
             self._refresh_saved_emojis()
             return
         if order != list(saved):
-            if not self._store_saved_emojis({name: saved[name] for name in order}):
-                self._refresh_saved_emojis()
+            # Do not rebuild QListWidget while Qt is completing a drag drop.
+            reordered = {name: saved[name] for name in order}
+            self.config_data["saved_emojis"] = reordered
+            try:
+                save_config(self.config_data)
+            except Exception as exc:
+                self.config_data["saved_emojis"] = saved
+                QTimer.singleShot(0, self._refresh_saved_emojis)
+                messagebox.showerror("Could not save emojis", str(exc), parent=self.root)
 
     def _insert_current_saved_emoji(self) -> None:
         item = self.emojis_menu.currentItem()
@@ -11219,7 +11226,7 @@ QComboBox::drop-down {
         data = item.data(Qt.ItemDataRole.UserRole)
         if item is self.emojis_menu.new_item:
             self._open_emoji_canvas()
-        elif isinstance(data, tuple):
+        elif isinstance(data, (tuple, list)) and len(data) == 2:
             self.message_entry.insert_emoji(*data)
         # Keep the current item for keyboard navigation, not visual selection.
         self.emojis_menu.clearSelection()
