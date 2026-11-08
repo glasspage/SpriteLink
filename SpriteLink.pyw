@@ -11215,7 +11215,11 @@ QComboBox::drop-down {
             except Exception as exc:
                 self.config_data["saved_emojis"] = saved
                 QTimer.singleShot(0, self._refresh_saved_emojis)
-                messagebox.showerror("Could not save emojis", str(exc), parent=self.root)
+                QTimer.singleShot(
+                    0, lambda error=str(exc): messagebox.showerror(
+                        "Could not save emojis", error, parent=self.root,
+                    ),
+                )
 
     def _insert_current_saved_emoji(self) -> None:
         item = self.emojis_menu.currentItem()
@@ -11295,9 +11299,15 @@ QComboBox::drop-down {
                 return
             # Editing and saving under a new name creates another emoji.
             # Only an explicit Rename action removes the original name.
-            if rename_original:
-                emojis.pop(replace_name, None)
-            emojis[candidate] = encoded
+            if rename_original and replace_name in emojis:
+                # Renaming an existing emoji should not disturb a custom order.
+                emojis = {
+                    (candidate if old_name == replace_name else old_name):
+                    (encoded if old_name == replace_name else old_encoded)
+                    for old_name, old_encoded in emojis.items()
+                }
+            else:
+                emojis[candidate] = encoded
             if self._store_saved_emojis(emojis):
                 dialog.accept()
 
@@ -17952,13 +17962,14 @@ QComboBox::drop-down {
                             continue
                         cursor.insertText(content[offset:match.start()], formatting)
                         image_format = inline_emoji_format(cursor, name, encoded, emoji_size, formatting)
+                        # The editor retains name tooltips, but chat/search
+                        # emojis use the custom preview instead of Qt's
+                        # name-only tooltips over surrounding message text.
+                        image_format.setToolTip("")
                         image_format.setVerticalAlignment(emoji_alignment)
                         if preview:
                             self._set_inline_html_image(image_format, emoji_image(encoded, emoji_size))
                         else:
-                            # Keep only the rich preview popup. Qt's built-in
-                            # tooltip can show the name over adjacent text.
-                            image_format.setToolTip("")
                             image_format.setAnchor(True)
                             image_format.setAnchorHref(f"spritelink-emoji:{match[0]}")
                         if run.spoiler is not None:
