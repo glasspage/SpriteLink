@@ -13723,7 +13723,10 @@ QComboBox::drop-down {
             messagebox.showerror("Could not open data", str(exc), parent=self.root)
             return
 
-        dialog = DataTransferDialog("import", available, parent=self.root)
+        dialog = DataTransferDialog(
+            "import", available, parent=self.root,
+            password_required=_envelope["cipher"] != "none",
+        )
         self._apply_window_titlebar_theme(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
