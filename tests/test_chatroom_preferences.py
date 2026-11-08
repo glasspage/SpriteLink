@@ -157,16 +157,24 @@ class ChatroomPreferenceTests(unittest.TestCase):
         create = S.ChatroomDetailsDialog(self.client.root)
         self.dialogs.append(create)
         self.assertEqual(len(create.chatroom_key()), 48)
-        self.assertEqual(create.key_security_label.text(), "Key Security: Excellent")
+        self.assertEqual(create.key_security_label.text(), "Security: Excellent")
+        self.assertIn("#777777", create.key_security_label.styleSheet())
         self.assertFalse(create.key_security_label.isHidden())
         create.key_entry.setText("a" * 48)
-        self.assertEqual(create.key_security_label.text(), "Key Security: Unsecure")
+        self.assertEqual(create.key_security_label.text(), "Security: Unsecure")
+        self.assertIn("#cb781f", create.key_security_label.styleSheet())
+        create.key_entry.setText("abc" * 16)
+        self.assertEqual(create.key_security_label.text(), "Security: Weak")
+        self.assertIn("#cb781f", create.key_security_label.styleSheet())
+        create.key_entry.setText(S.generate_chatroom_key())
+        self.assertEqual(create.key_security_label.text(), "Security: Excellent")
+        self.assertIn("#777777", create.key_security_label.styleSheet())
 
         edit = self.dialog()
         original = edit.chatroom_key()
         self.assertTrue(edit.key_security_label.isHidden())
         edit.key_entry.setText("Ag4!vP6@Km2?Q7x$")
-        self.assertEqual(edit.key_security_label.text(), "Key Security: Strong")
+        self.assertEqual(edit.key_security_label.text(), "Security: Strong")
         self.assertFalse(edit.key_security_label.isHidden())
         edit.key_entry.setText(original)
         self.assertTrue(edit.key_security_label.isHidden())
@@ -174,20 +182,37 @@ class ChatroomPreferenceTests(unittest.TestCase):
     def test_edit_key_warning_can_cancel_without_accepting(self):
         edit = self.dialog()
         edit.key_entry.setText("NewKey123!ForConfirming")
-        with mock.patch.object(S.QMessageBox, "exec", return_value=S.QMessageBox.StandardButton.Cancel) as warning:
+        with mock.patch.object(S.ChangeChatroomKeyDialog, "exec", return_value=QDialog.DialogCode.Rejected) as warning:
             edit.accept()
             warning.assert_called_once()
         self.assertNotEqual(edit.result(), QDialog.DialogCode.Accepted)
 
-        with mock.patch.object(S.QMessageBox, "exec", return_value=S.QMessageBox.StandardButton.Ok) as warning:
+        with mock.patch.object(S.ChangeChatroomKeyDialog, "exec", return_value=QDialog.DialogCode.Accepted) as warning:
             edit.accept()
             warning.assert_called_once()
         self.assertEqual(edit.result(), QDialog.DialogCode.Accepted)
 
         unchanged = self.dialog("room-b")
-        with mock.patch.object(S.QMessageBox, "exec", side_effect=AssertionError("Unexpected warning")):
+        with mock.patch.object(S.ChangeChatroomKeyDialog, "exec", side_effect=AssertionError("Unexpected warning")):
             unchanged.accept()
         self.assertEqual(unchanged.result(), QDialog.DialogCode.Accepted)
+
+    def test_key_warning_buttons_are_change_then_cancel(self):
+        dialog = S.ChangeChatroomKeyDialog(self.client.root)
+        self.dialogs.append(dialog)
+        self.assertEqual(dialog.change_key_button.text(), "Change Key")
+        self.assertEqual(dialog.cancel_button.text(), "Cancel")
+        self.assertLess(
+            dialog.button_row.indexOf(dialog.change_key_button),
+            dialog.button_row.indexOf(dialog.cancel_button),
+        )
+        self.assertTrue(dialog.cancel_button.isDefault())
+        self.assertEqual(
+            dialog.warning_message.text(),
+            "The chatroom key will be changed. Log history will persist "
+            "locally but others must update their chatroom key to keep "
+            "chatting with you.",
+        )
 
     def test_active_edit_applies_and_global_can_override(self):
         self.client._activate_chatroom("room-a")
