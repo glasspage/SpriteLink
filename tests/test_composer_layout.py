@@ -739,6 +739,54 @@ class ComposerLayoutTests(unittest.TestCase):
             client.config_data["saved_emojis"]["imported_cat"], encoded,
         )
 
+    def test_password_free_data_export_and_import_ui_flow(self):
+        client = self.client
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+        self.assertTrue(client._store_saved_emojis({"from_export": encoded}))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "without-password.sldata"
+
+            def export_dialog(dialog):
+                for category in ("Chatrooms", "Config", "Identity"):
+                    dialog.category_checks[category].setChecked(False)
+                self.assertEqual(dialog.selected_categories(), ("Emoji",))
+                self.assertEqual(dialog.password_entry.placeholderText(), "Recommended")
+                self.assertEqual(dialog.password(), "")
+                self.assertTrue(dialog.action_button.isEnabled())
+                return S.QDialog.DialogCode.Accepted
+
+            with (
+                mock.patch.object(S.DataTransferDialog, "exec", export_dialog),
+                mock.patch.object(S.QFileDialog, "getSaveFileName",
+                                  return_value=(str(path), "")),
+                mock.patch.object(S.messagebox, "showinfo"),
+            ):
+                client._export_data()
+
+            archive, available = S.inspect_archive(path.read_bytes())
+            self.assertEqual(archive["cipher"], "none")
+            self.assertEqual(available, ("Emoji",))
+            self.assertTrue(client._store_saved_emojis({}))
+
+            def import_dialog(dialog):
+                self.assertFalse(dialog.password_required)
+                self.assertFalse(dialog.password_entry.isVisible())
+                self.assertFalse(dialog.category_checks["Chatrooms"].isEnabled())
+                self.assertTrue(dialog.action_button.isEnabled())
+                return S.QDialog.DialogCode.Accepted
+
+            with (
+                mock.patch.object(S.DataTransferDialog, "exec", import_dialog),
+                mock.patch.object(S.QFileDialog, "getOpenFileName",
+                                  return_value=(str(path), "")),
+                mock.patch.object(S.messagebox, "showinfo"),
+            ):
+                client._import_data()
+
+            self.assertEqual(client.config_data["saved_emojis"], {
+                "from_export": encoded,
+            })
+
     def test_canvas_selection_outline_only_appears_for_select_or_move(self):
         client = self.client
         client.image_menu_button.setChecked(True)
