@@ -6389,7 +6389,7 @@ class EmojiListWidget(QListWidget):
         super().__init__()
         self.new_item: QListWidgetItem | None = None
         self._new_pressed = False
-        self.new_style_button = QPushButton("New", self)
+        self.new_style_button = QPushButton("+", self)
         self.new_style_button.setFixedSize(32, 32)
         # Keep the theme's button colors/borders but fit text inside 32px.
         self.new_style_button.setStyleSheet(
@@ -11342,7 +11342,7 @@ QComboBox::drop-down {
         # background behind the 32x32 New button.
         new_item = QListWidgetItem()
         new_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-        new_item.setData(Qt.ItemDataRole.AccessibleTextRole, "New")
+        new_item.setData(Qt.ItemDataRole.AccessibleTextRole, "Create emoji")
         new_item.setSizeHint(self.emojis_menu.gridSize())
         self.emojis_menu.addItem(new_item)
         self.emojis_menu.new_item = new_item
