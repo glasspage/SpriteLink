@@ -430,6 +430,15 @@ class ComposerLayoutTests(unittest.TestCase):
         menu = client.emojis_menu
         self.assertIsNone(menu.itemWidget(menu.new_item))
         self.assertEqual(menu.gridSize(), S.QSize(40, 40))
+        self.assertEqual(menu.viewport().height(), 2 * menu.gridSize().height())
+        self.assertEqual(
+            menu.height(), 2 * menu.gridSize().height() + 2 * menu.frameWidth()
+        )
+        self.assertEqual(menu.spacing(), 0)
+        self.assertEqual(
+            menu.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
         self.assertFalse(hasattr(client, "make_emoji_link"))
         self.assertFalse(hasattr(client, "new_emoji_button"))
         self.assertIsInstance(menu.new_style_button, S.QPushButton)
@@ -449,7 +458,8 @@ class ComposerLayoutTests(unittest.TestCase):
         option.widget = menu
         button_rect = menu.itemDelegate()._new_button_rect(option, menu)
         self.assertEqual(button_rect.size(), S.QSize(32, 32))
-        self.assertEqual(button_rect.top(), option.rect.top())
+        self.assertEqual(button_rect.top(), option.rect.top() + 4)
+        self.assertEqual(button_rect.center(), option.rect.center())
         painter = QPainter(icon)
         menu.itemDelegate().paint(painter, option, menu.model().index(0, 0))
         painter.end()
@@ -476,6 +486,8 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertIsNone(menu.itemWidget(menu.new_item))
         self.assertFalse(menu.viewport().grab().toImage().isNull())
         self.assertEqual(menu.iconSize(), S.QSize(32, 32))
+        self.assertEqual(menu.viewport().height(), 2 * menu.gridSize().height())
+        self.assertEqual(menu.item(0).sizeHint(), S.QSize(40, 40))
         self.assertEqual(menu.item(0).icon().actualSize(S.QSize(32, 32)), S.QSize(32, 32))
         self.assertEqual(menu.selectionMode(), S.QAbstractItemView.SelectionMode.SingleSelection)
         self.assertIsInstance(menu.itemDelegate(), S.EmojiItemDelegate)
@@ -486,17 +498,19 @@ class ComposerLayoutTests(unittest.TestCase):
         option = S.QStyleOptionViewItem()
         option.rect = new_bounds
         option.widget = menu
-        emoji_option = S.QStyleOptionViewItem(option)
         delegate = menu.itemDelegate()
-        delegate.initStyleOption(emoji_option, menu.model().index(0, 0))
-        emoji_option.rect = S.QRect(new_bounds)
-        icon_bounds = menu.style().subElementRect(
-            S.QStyle.SubElement.SE_ItemViewItemDecoration, emoji_option, menu,
-        )
-        self.assertFalse(icon_bounds.isEmpty())
         new_button_bounds = delegate._new_button_rect(option, menu)
         self.assertEqual(new_button_bounds.size(), S.QSize(32, 32))
-        self.assertEqual(new_button_bounds.center(), icon_bounds.center())
+        self.assertEqual(new_button_bounds.center(), new_bounds.center())
+        icon_cell = menu.visualItemRect(menu.item(0))
+        icon_option = S.QStyleOptionViewItem(option)
+        icon_option.rect = icon_cell
+        icon_bounds = delegate._icon_rect(icon_option, menu)
+        self.assertEqual(icon_bounds.size(), S.QSize(32, 32))
+        self.assertEqual(icon_bounds.center(), icon_cell.center())
+        self.assertEqual(new_button_bounds.center().y(), icon_bounds.center().y())
+        self.assertEqual(icon_cell.size(), S.QSize(40, 40))
+        self.assertEqual(new_bounds.size(), S.QSize(40, 40))
 
         viewport = menu.viewport()
         position = menu.visualItemRect(menu.item(0)).center()
@@ -513,6 +527,29 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertEqual(client.image_composer_label.text(), "Creating Emoji")
         client.image_menu.size_combo.setCurrentIndex(0)
         self.assertEqual(client.image_composer_label.text(), "Image message")
+
+    def test_emoji_grid_viewport_stays_two_rows_after_theme_change(self):
+        client = self.client
+        client.emojis_menu_button.setChecked(True)
+        menu = client.emojis_menu
+        icons = {
+            f"emoji_{i}": S.encode_drawing(S.EMOJI_SIZE, bytes([i % 8]) * 256)
+            for i in range(12)
+        }
+        self.assertTrue(client._store_saved_emojis(icons))
+        for theme in ("Modern", "Glassy", "Glassy Dark"):
+            with self.subTest(theme=theme):
+                client._on_theme_changed(theme)
+                self.app.processEvents()
+                self.assertEqual(menu.gridSize(), S.QSize(40, 40))
+                self.assertEqual(menu.viewport().height(), 80)
+                self.assertEqual(
+                    menu.height(), 80 + 2 * menu.frameWidth(),
+                )
+                for row in range(min(3, menu.count())):
+                    cell = menu.visualItemRect(menu.item(row))
+                    self.assertEqual(cell.size(), S.QSize(40, 40))
+                self.assertIs(menu.item(menu.count() - 1), menu.new_item)
 
     def test_emoji_drag_order_is_persisted_and_new_item_stays_last(self):
         client = self.client
