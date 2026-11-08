@@ -4969,25 +4969,12 @@ class Version120ReleaseTests(unittest.TestCase):
         icon_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_profile_icon
         )
-        self.assertEqual(SPRITELINK.PROFILE_ICON_VERTICAL_OFFSET_PX, 2)
-        self.assertIn("line_height_px", icon_source)
-        self.assertIn("PROFILE_ICON_VERTICAL_OFFSET_PX", icon_source)
-        self.assertNotIn(
-            "VerticalAlignment.AlignMiddle",
-            icon_source,
-        )
-        self.assertIn(
-            "VerticalAlignment.AlignTop",
-            icon_source,
-        )
-        self.assertIn(
-            "TOP_ALIGNED_PROFILE_ICON_PADDING",
-            icon_source,
-        )
-        self.assertIn(
-            "- PROFILE_ICON_VERTICAL_OFFSET_PX",
-            icon_source,
-        )
+        self.assertNotIn("top_padding", icon_source)
+        self.assertNotIn("bottom_padding", icon_source)
+        self.assertNotIn("padded_image", icon_source)
+        self.assertIn("image_format.setWidth(PROFILE_ICON_SIZE)", icon_source)
+        self.assertIn("image_format.setHeight(PROFILE_ICON_SIZE)", icon_source)
+        self.assertIn("VerticalAlignment.AlignTop", icon_source)
 
         separator_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_log_separator
