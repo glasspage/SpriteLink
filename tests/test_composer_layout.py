@@ -1,5 +1,7 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -654,6 +656,88 @@ class ComposerLayoutTests(unittest.TestCase):
         tooltip = client._tooltip_for_emoji(encoded, "sleepy")
         self.assertIn("data:image/png;base64,", tooltip)
         self.assertIn("sleepy", tooltip)
+
+    def test_export_data_dialog_selects_only_requested_chatrooms(self):
+        client = self.client
+        client.config_data["chatrooms"] = [
+            {"id": "one", "nickname": "One", "key": "key-one"},
+            {"id": "two", "nickname": "Two", "key": "key-two"},
+        ]
+        client.config_data["room_settings"] = {
+            "one": {"message_sound": "Blip"},
+        }
+        password = "portable backup password"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "backup.sldata"
+
+            def export_dialog(dialog):
+                self.assertEqual(
+                    dialog.selected_categories(), S.ARCHIVE_CATEGORIES,
+                )
+                for category in ("Config", "Emoji", "Identity"):
+                    dialog.category_checks[category].setChecked(False)
+                dialog.specific_rooms.setChecked(True)
+                for room_id, check in dialog.room_checks.items():
+                    check.setChecked(room_id == "two")
+                dialog.password_entry.setText(password)
+                dialog.confirm_entry.setText(password)
+                self.assertTrue(dialog.action_button.isEnabled())
+                return S.QDialog.DialogCode.Accepted
+
+            with (
+                mock.patch.object(S.DataTransferDialog, "exec", export_dialog),
+                mock.patch.object(S.QFileDialog, "getSaveFileName",
+                                  return_value=(str(path), "")),
+                mock.patch.object(S, "load_chatroom_history", return_value=[]),
+                mock.patch.object(S.messagebox, "showinfo"),
+            ):
+                client._export_data()
+
+            self.assertTrue(path.is_file())
+            payload = S.open_archive(path.read_bytes(), password)
+            self.assertEqual(list(payload), ["Chatrooms"])
+            self.assertEqual(len(payload["Chatrooms"]), 1)
+            self.assertEqual(payload["Chatrooms"][0]["key"], "key-two")
+            self.assertEqual(
+                set(payload["Chatrooms"][0]), {"nickname", "key", "history"},
+            )
+            self.assertNotIn("room_settings", str(payload))
+
+    def test_import_data_dialog_can_skip_present_categories(self):
+        client = self.client
+        password = "portable backup password"
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+        payload = {
+            "Chatrooms": [{
+                "nickname": "Do Not Import", "key": "not-imported",
+                "history": [],
+            }],
+            "Emoji": {"imported_cat": encoded},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "backup.sldata"
+            path.write_bytes(S.create_archive(payload, password))
+
+            def import_dialog(dialog):
+                self.assertFalse(dialog.category_checks["Config"].isEnabled())
+                self.assertFalse(dialog.category_checks["Identity"].isEnabled())
+                dialog.category_checks["Chatrooms"].setChecked(False)
+                dialog.password_entry.setText(password)
+                self.assertTrue(dialog.action_button.isEnabled())
+                return S.QDialog.DialogCode.Accepted
+
+            with (
+                mock.patch.object(S.DataTransferDialog, "exec", import_dialog),
+                mock.patch.object(S.QFileDialog, "getOpenFileName",
+                                  return_value=(str(path), "")),
+                mock.patch.object(S.messagebox, "showinfo"),
+            ):
+                client._import_data()
+
+        self.assertEqual(client.config_data["chatrooms"], [])
+        self.assertEqual(
+            client.config_data["saved_emojis"]["imported_cat"], encoded,
+        )
 
     def test_canvas_selection_outline_only_appears_for_select_or_move(self):
         client = self.client
