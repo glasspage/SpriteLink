@@ -115,7 +115,8 @@ class PixelView(QWidget):
             for y in range(1, height):
                 offset = rect.top() + y * scale
                 painter.drawLine(QPointF(rect.left(), offset), QPointF(rect.right(), offset))
-        if not self.selection.isEmpty():
+        if (not self.selection.isEmpty()
+                and getattr(self, "tool", "Select") in ("Select", "Move")):
             box = QRectF(
                 rect.left() + self.selection.x() * scale,
                 rect.top() + self.selection.y() * scale,
@@ -148,6 +149,13 @@ class DrawingCanvas(PixelView):
         self.redo_stack = deque(maxlen=64)
         self._before = None
         self.reset()
+
+    def set_tool(self, name: str) -> None:
+        if self.tool != name:
+            self.tool = name
+            # Keep the selection for later Move/Select use, but immediately
+            # hide its border when switching to a drawing tool.
+            self.update()
 
     def maximum_scale(self) -> int:
         width, height = IMAGE_SIZES[self.canvas_size]
@@ -355,7 +363,7 @@ class DrawingMenu(QFrame):
             button = QPushButton(label)
             button.setCheckable(True)
             button.setChecked(label == "Pencil")
-            button.clicked.connect(lambda _checked, name=label: setattr(self.canvas, "tool", name))
+            button.clicked.connect(lambda _checked, name=label: self.canvas.set_tool(name))
             tool_group.addButton(button)
             tools.addWidget(button)
             if label == "Move":
