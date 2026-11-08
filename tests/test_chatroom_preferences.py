@@ -265,6 +265,28 @@ class ChatroomPreferenceTests(unittest.TestCase):
                     [stored, pending],
                 )
 
+    def test_key_edit_preserves_original_history_if_config_save_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            old_key = self.config["chatrooms"][0]["key"]
+            new_key = "RekeyedRoom0123456789"
+            server = self.config["server_url"]
+            entry = {"message": {"i": "retained", "t": 10}}
+            with mock.patch.object(S, "CHATROOM_HISTORY_DIRECTORY", Path(temporary_directory)), \
+                 mock.patch.object(S, "room_scope_id", side_effect=lambda _server, key: key), \
+                 mock.patch.object(S, "dpapi_encrypt", side_effect=lambda data, _entropy: data), \
+                 mock.patch.object(S, "dpapi_decrypt", side_effect=lambda data, _entropy: data):
+                S.save_chatroom_history(server, old_key, [entry])
+                edit = self.dialog()
+                edit.key_entry.setText(new_key)
+                with mock.patch.object(S, "EditChatroomDialog", return_value=edit), \
+                     mock.patch.object(edit, "exec", return_value=QDialog.DialogCode.Accepted), \
+                     mock.patch.object(S, "save_config", side_effect=OSError("disk full")), \
+                     mock.patch.object(S.messagebox, "showerror") as error:
+                    self.client._edit_chatroom("room-a")
+                error.assert_called_once()
+                self.assertEqual(self.config["chatrooms"][0]["key"], old_key)
+                self.assertEqual(S.load_chatroom_history(server, old_key), [entry])
+
     def test_key_edit_does_not_switch_or_remove_history_on_migration_error(self):
         original_key = self.config["chatrooms"][0]["key"]
         edit = self.dialog()
