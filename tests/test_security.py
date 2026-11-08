@@ -354,6 +354,73 @@ class BehaviorSettingsTests(unittest.TestCase):
                     background_entries,
                 )
 
+    def test_changing_key_copies_and_merges_history_without_reencrypting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            patches = self._history_storage_patches(directory)
+            with patches[0], patches[1], patches[2], patches[3]:
+                server = "https://ntfy.sh"
+                old_key, new_key = "active-key", "background-key"
+                old_messages = [
+                    {"message": {"i": "old-1", "t": 1, "m": "Old chat"}},
+                    {"message": {"i": "shared", "t": 2, "m": "Old copy"}},
+                ]
+                new_messages = [
+                    {"message": {"i": "shared", "t": 2, "m": "New copy"}},
+                    {"message": {"i": "new-1", "t": 3, "m": "Previously saved"}},
+                ]
+                SPRITELINK.save_chatroom_history(server, old_key, old_messages)
+                SPRITELINK.save_chatroom_history(server, new_key, new_messages)
+                self.assertTrue(SPRITELINK.copy_chatroom_history_for_key_change(
+                    server, old_key, new_key,
+                ))
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(server, new_key),
+                    [old_messages[0], *new_messages],
+                )
+                # A settings-write failure must still leave the original data intact.
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(server, old_key),
+                    old_messages,
+                )
+                SPRITELINK.delete_local_chatroom_history(server, old_key)
+                self.assertFalse(SPRITELINK.chatroom_history_path(server, old_key).exists())
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(server, new_key),
+                    [old_messages[0], *new_messages],
+                )
+
+    def test_changing_key_upgrades_legacy_history_before_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            patches = self._history_storage_patches(directory)
+            with patches[0], patches[1], patches[2], patches[3]:
+                server = "https://ntfy.sh"
+                old_key, new_key = "active-key", "other-key"
+                original = [{"message": {"i": "legacy-1", "t": 1}}]
+                legacy = SPRITELINK.chatroom_history_path(
+                    server, old_key,
+                ).with_suffix(".bin")
+                SPRITELINK._write_dpapi_json(
+                    legacy, original, SPRITELINK.CHATROOM_HISTORY_DPAPI_ENTROPY,
+                )
+                self.assertTrue(SPRITELINK.copy_chatroom_history_for_key_change(
+                    server, old_key, new_key,
+                ))
+                self.assertEqual(SPRITELINK.load_chatroom_history(server, new_key), original)
+                self.assertTrue(legacy.exists())
+
+    def test_changing_key_without_history_creates_no_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            patches = self._history_storage_patches(Path(temporary_directory))
+            with patches[0], patches[1], patches[2], patches[3]:
+                self.assertFalse(SPRITELINK.copy_chatroom_history_for_key_change(
+                    "https://ntfy.sh", "active-key", "other-key",
+                ))
+                self.assertFalse(SPRITELINK.chatroom_history_path(
+                    "https://ntfy.sh", "other-key",
+                ).exists())
+
     def test_history_pruning_is_per_chatroom(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
