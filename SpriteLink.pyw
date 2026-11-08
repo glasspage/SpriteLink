@@ -6332,9 +6332,28 @@ class NoFocusRectItemDelegate(QStyledItemDelegate):
 
 
 class EmojiItemDelegate(NoFocusRectItemDelegate):
-    """Keep drag selection functional without highlighting clicked emojis."""
+    """Draw the New control as a single 32px button, without an item backdrop."""
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
+        list_widget = self.parent()
+        if (
+            isinstance(list_widget, EmojiListWidget)
+            and list_widget.new_item is list_widget.itemFromIndex(index)
+        ):
+            button_option = QStyleOptionButton()
+            button_option.rect = QRect(QPoint(0, 0), QSize(32, 32))
+            button_option.rect.moveCenter(option.rect.center())
+            button_option.text = "New"
+            button_option.palette = option.palette
+            button_option.fontMetrics = option.fontMetrics
+            button_option.state = QStyle.StateFlag.State_Enabled | QStyle.StateFlag.State_Raised
+            if option.state & QStyle.StateFlag.State_MouseOver:
+                button_option.state |= QStyle.StateFlag.State_MouseOver
+            widget = option.widget or list_widget
+            widget.style().drawControl(
+                QStyle.ControlElement.CE_PushButton, button_option, painter, widget,
+            )
+            return
         clean_option = QStyleOptionViewItem(option)
         clean_option.state &= ~(
             QStyle.StateFlag.State_Selected
@@ -6349,6 +6368,8 @@ class EmojiListWidget(QListWidget):
     def __init__(self) -> None:
         super().__init__()
         self.new_item: QListWidgetItem | None = None
+        self._dragged_item: QListWidgetItem | None = None
+        self._drop_insert_row: int | None = None
 
     def move_saved_emoji(self, source_row: int, insert_row: int) -> bool:
         # The final item is the fixed New button, never a draggable emoji.
@@ -6362,27 +6383,96 @@ class EmojiListWidget(QListWidget):
         item = self.takeItem(source_row)
         self.insertItem(target_row, item)
         self.setCurrentItem(item)
+        self.clearSelection()
+        self.doItemsLayout()
         self.reordered.emit()
         return True
 
+    def _insertion_row_at(self, position: QPoint) -> int:
+        destination = self.itemAt(position)
+        if destination is None or destination is self.new_item:
+            return self.count() - 1
+        row = self.row(destination)
+        bounds = self.visualItemRect(destination)
+        if position.x() >= bounds.center().x():
+            row += 1
+        return row
+
+    def startDrag(self, supported_actions: Any) -> None:
+        item = self.currentItem()
+        if item is None or item is self.new_item:
+            return
+        self._dragged_item = item
+        try:
+            mime_data = self.model().mimeData([self.currentIndex()])
+            if mime_data is None:
+                return
+            drag = QDrag(self)
+            drag.setMimeData(mime_data)
+            pixmap = item.icon().pixmap(self.iconSize())
+            pixmap.setDevicePixelRatio(1.0)
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
+            drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+        finally:
+            self._dragged_item = None
+            self._drop_insert_row = None
+            self.viewport().update()
+
+    def _internal_emoji_drag(self, event: Any) -> bool:
+        return event.source() is self and self._dragged_item is not None
+
+    def dragEnterEvent(self, event: Any) -> None:
+        if self._internal_emoji_drag(event):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: Any) -> None:
+        if self._internal_emoji_drag(event):
+            self._drop_insert_row = self._insertion_row_at(event.position().toPoint())
+            self.viewport().update()
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event: Any) -> None:
+        self._drop_insert_row = None
+        self.viewport().update()
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: Any) -> None:
-        dragged = self.selectedItems()
-        if not dragged or dragged[0] is self.new_item or event.source() is not self:
+        if not self._internal_emoji_drag(event):
             event.ignore()
             return
-        source_row = self.row(dragged[0])
-        destination = self.itemAt(event.position().toPoint())
-        if destination is None or destination is self.new_item:
-            insert_row = self.count() - 1
-        else:
-            insert_row = self.row(destination)
-            bounds = self.visualItemRect(destination)
-            if event.position().x() >= bounds.center().x():
-                insert_row += 1
-        if self.move_saved_emoji(source_row, insert_row):
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+        item = self._dragged_item
+        source_row = self.row(item)
+        insert_row = self._insertion_row_at(event.position().toPoint())
+        self._drop_insert_row = None
+        self.move_saved_emoji(source_row, insert_row)
+        self.viewport().update()
+        # Always accept internal drops, even a no-op. No native model move
+        # runs here, so the New item remains anchored at the end.
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    def paintEvent(self, event: Any) -> None:
+        super().paintEvent(event)
+        insert_row = self._drop_insert_row
+        if insert_row is None or insert_row >= self.count():
+            return
+        target = self.item(insert_row)
+        bounds = self.visualItemRect(target)
+        if not bounds.isValid():
+            return
+        painter = QPainter(self.viewport())
+        pen = QPen(self.palette().highlight().color(), 2)
+        painter.setPen(pen)
+        x = bounds.left() + 1
+        painter.drawLine(x, bounds.top() + 4, x, bounds.bottom() - 4)
+        painter.end()
 
 
 class IdentityPresetSelector(QPushButton):
@@ -11026,7 +11116,7 @@ QComboBox::drop-down {
         emojis_layout.setContentsMargins(0, 0, 0, 0)
         self.emojis_menu = EmojiListWidget()
         self.emojis_menu.setViewMode(QListWidget.ViewMode.IconMode)
-        self.emojis_menu.setMovement(QListWidget.Movement.Static)
+        self.emojis_menu.setMovement(QListWidget.Movement.Snap)
         self.emojis_menu.setResizeMode(QListWidget.ResizeMode.Adjust)
         picker_icon_size = PROFILE_ICON_SIZE * 2
         cell_size = picker_icon_size + 8
@@ -11173,28 +11263,23 @@ QComboBox::drop-down {
         icon_size = self.emojis_menu.iconSize().width()
         for name, encoded in emojis.items():
             item = QListWidgetItem(QIcon(QPixmap.fromImage(emoji_image(encoded, icon_size))), "")
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsDragEnabled
+            )
             item.setToolTip(name)
             item.setData(Qt.ItemDataRole.AccessibleTextRole, name)
             item.setData(Qt.ItemDataRole.UserRole, (name, encoded))
             self.emojis_menu.addItem(item)
 
-        # 32x32 button centered inside the final 40x40 emoji cell.
+        # Painted directly by EmojiItemDelegate: no QWidget or stylesheet
+        # background behind the 32x32 New button.
         new_item = QListWidgetItem()
-        new_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+        new_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        new_item.setData(Qt.ItemDataRole.AccessibleTextRole, "New")
         new_item.setSizeHint(self.emojis_menu.gridSize())
         self.emojis_menu.addItem(new_item)
         self.emojis_menu.new_item = new_item
-        container = QWidget()
-        layout = QHBoxLayout(container)
-        layout.setContentsMargins(4, 4, 4, 4)
-        button = QPushButton("New")
-        button.setFixedSize(32, 32)
-        button.setStyleSheet("padding: 0;")
-        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        button.clicked.connect(self._open_emoji_canvas)
-        layout.addWidget(button, 0, Qt.AlignmentFlag.AlignCenter)
-        self.emojis_menu.setItemWidget(new_item, container)
-        self.new_emoji_button = button
 
     def _persist_saved_emoji_order(self) -> None:
         saved = self.config_data.get("saved_emojis", {})
