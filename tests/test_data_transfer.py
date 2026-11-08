@@ -6,7 +6,8 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QLabel
 
 from spritelink_data_dialog import DataTransferDialog
 from spritelink_data_transfer import (
@@ -108,35 +109,84 @@ class DataTransferDialogTests(unittest.TestCase):
         finally:
             dialog.close()
 
-    def test_export_can_select_specific_rooms(self):
+    def test_export_room_selection_uses_tristate_checkbox(self):
         rooms = [
             {"id": "global", "nickname": "Global"},
             {"id": "abc", "nickname": "Room"},
         ]
         dialog = DataTransferDialog("export", ARCHIVE_CATEGORIES, rooms)
         try:
-            # An export can be created with no password or confirmation.
             self.assertTrue(dialog.action_button.isEnabled())
-            self.assertEqual(dialog.password_entry.placeholderText(), "Recommended")
+            self.assertEqual(
+                dialog.password_entry.placeholderText(), "Optional, recommended"
+            )
+            self.assertEqual(dialog.password_entry.toolTip(), "")
             self.assertFalse(hasattr(dialog, "confirm_entry"))
+            self.assertFalse(hasattr(dialog, "specific_rooms"))
             layout = dialog.layout()
             chatrooms_position = layout.indexOf(dialog.category_checks["Chatrooms"])
-            self.assertEqual(chatrooms_position + 1, layout.indexOf(
-                dialog.specific_rooms.parentWidget()
-            ))
-            self.assertEqual(chatrooms_position + 2, layout.indexOf(
-                dialog.category_checks["Config"]
-            ))
-            dialog.password_entry.setText("x")
-            self.assertTrue(dialog.action_button.isEnabled())
+            self.assertEqual(chatrooms_position + 1, layout.indexOf(dialog.rooms_area))
+            self.assertEqual(
+                chatrooms_position + 2, layout.indexOf(dialog.category_checks["Config"])
+            )
+            password_position = layout.indexOf(dialog.password_entry)
+            self.assertEqual(layout.itemAt(password_position - 1).widget().text(),
+                             "Password")
+
+            category = dialog.category_checks["Chatrooms"]
+            self.assertEqual(category.checkState(), Qt.CheckState.Checked)
             self.assertIsNone(dialog.selected_room_ids())
-            dialog.specific_rooms.setChecked(True)
+
             dialog.room_checks["global"].setChecked(False)
+            self.assertEqual(category.checkState(), Qt.CheckState.PartiallyChecked)
             self.assertEqual(dialog.selected_room_ids(), {"abc"})
-            dialog.room_checks["abc"].setChecked(False)
-            self.assertFalse(dialog.action_button.isEnabled())
-            dialog.category_checks["Chatrooms"].setChecked(False)
             self.assertTrue(dialog.action_button.isEnabled())
+
+            # Clicking the dashed category checkbox restores all rooms.
+            category.click()
+            self.assertEqual(category.checkState(), Qt.CheckState.Checked)
+            self.assertTrue(all(check.isChecked() for check in dialog.room_checks.values()))
+            self.assertIsNone(dialog.selected_room_ids())
+
+            # Unchecking the category clears every room; checking it restores all.
+            category.click()
+            self.assertEqual(category.checkState(), Qt.CheckState.Unchecked)
+            self.assertFalse(any(check.isChecked() for check in dialog.room_checks.values()))
+            self.assertNotIn("Chatrooms", dialog.selected_categories())
+            self.assertTrue(dialog.action_button.isEnabled())  # Other categories.
+            category.click()
+            self.assertTrue(all(check.isChecked() for check in dialog.room_checks.values()))
+        finally:
+            dialog.close()
+
+    def test_import_can_select_specific_rooms(self):
+        rooms = [
+            {"id": "0", "nickname": "Room A"},
+            {"id": "1", "nickname": "Room B"},
+        ]
+        dialog = DataTransferDialog(
+            "import", ("Chatrooms", "Emoji"), rooms, password_required=False,
+        )
+        try:
+            self.assertEqual(dialog.layout().indexOf(dialog.rooms_area),
+                             dialog.layout().indexOf(dialog.category_checks["Chatrooms"]) + 1)
+            self.assertFalse(any(
+                "Unavailable categories" in label.text()
+                for label in dialog.findChildren(QLabel)
+            ))
+            category = dialog.category_checks["Chatrooms"]
+            dialog.room_checks["0"].setChecked(False)
+            self.assertEqual(category.checkState(), Qt.CheckState.PartiallyChecked)
+            self.assertEqual(dialog.selected_room_ids(), {"1"})
+            self.assertIn("Chatrooms", dialog.selected_categories())
+            self.assertTrue(dialog.action_button.isEnabled())
+            dialog.room_checks["1"].setChecked(False)
+            self.assertEqual(category.checkState(), Qt.CheckState.Unchecked)
+            self.assertNotIn("Chatrooms", dialog.selected_categories())
+            self.assertEqual(dialog.selected_categories(), ("Emoji",))
+            category.click()
+            self.assertEqual(category.checkState(), Qt.CheckState.Checked)
+            self.assertIsNone(dialog.selected_room_ids())
         finally:
             dialog.close()
 
