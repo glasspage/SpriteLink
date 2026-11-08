@@ -296,6 +296,92 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertEqual(client.config_data["saved_emojis"], {"happy_cat": encoded})
         self.assertFalse(S.valid_emoji_name("happy cat"))
 
+    def test_edit_emoji_saved_under_new_name_keeps_original(self):
+        client = self.client
+        original = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+        edited = S.encode_drawing(S.EMOJI_SIZE, bytes([3]) * 256)
+        self.assertTrue(client._store_saved_emojis({"original": original}))
+
+        def save_new_name(dialog):
+            entry = dialog.findChild(S.QLineEdit)
+            buttons = dialog.findChild(S.QDialogButtonBox)
+            self.assertEqual(entry.text(), "original")
+            entry.setText("edited_copy")
+            self.assertTrue(buttons.button(S.QDialogButtonBox.StandardButton.Save).isEnabled())
+            buttons.button(S.QDialogButtonBox.StandardButton.Save).click()
+            return dialog.result()
+
+        with mock.patch.object(S.QDialog, "exec", save_new_name):
+            self.assertTrue(client._save_emoji_dialog(
+                edited, "original", replace_name="original",
+            ))
+        self.assertEqual(
+            client.config_data["saved_emojis"],
+            {"original": original, "edited_copy": edited},
+        )
+
+        def overwrite_same_name(dialog):
+            buttons = dialog.findChild(S.QDialogButtonBox)
+            buttons.button(S.QDialogButtonBox.StandardButton.Save).click()
+            return dialog.result()
+
+        with mock.patch.object(S.QDialog, "exec", overwrite_same_name):
+            self.assertTrue(client._save_emoji_dialog(
+                edited, "original", replace_name="original",
+            ))
+        self.assertEqual(client.config_data["saved_emojis"]["original"], edited)
+        self.assertIn("edited_copy", client.config_data["saved_emojis"])
+
+    def test_chat_emoji_save_requires_unique_name_even_if_image_is_identical(self):
+        client = self.client
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+        self.assertTrue(client._store_saved_emojis({"Existing": encoded}))
+
+        def save_from_chat(dialog):
+            entry = dialog.findChild(S.QLineEdit)
+            buttons = dialog.findChild(S.QDialogButtonBox)
+            save = buttons.button(S.QDialogButtonBox.StandardButton.Save)
+            hint = next(
+                label for label in dialog.findChildren(S.QLabel)
+                if label.text() == "Name already used."
+            )
+            self.assertEqual(entry.text(), "Existing")
+            self.assertFalse(save.isEnabled())
+            self.assertTrue(hint.isVisibleTo(dialog))
+            entry.setText("existing")
+            self.assertFalse(save.isEnabled())
+            entry.setText("NewEmoji")
+            self.assertTrue(save.isEnabled())
+            self.assertFalse(hint.isVisibleTo(dialog))
+            save.click()
+            return dialog.result()
+
+        with mock.patch.object(S.QDialog, "exec", save_from_chat):
+            self.assertTrue(client._save_emoji_dialog(encoded, "Existing"))
+        self.assertEqual(
+            client.config_data["saved_emojis"],
+            {"Existing": encoded, "NewEmoji": encoded},
+        )
+
+    def test_explicit_rename_emoji_changes_original_name(self):
+        client = self.client
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([4]) * 256)
+        self.assertTrue(client._store_saved_emojis({"old": encoded}))
+
+        def rename(dialog):
+            dialog.findChild(S.QLineEdit).setText("new")
+            dialog.findChild(S.QDialogButtonBox).button(
+                S.QDialogButtonBox.StandardButton.Save
+            ).click()
+            return dialog.result()
+
+        with mock.patch.object(S.QDialog, "exec", rename):
+            self.assertTrue(client._save_emoji_dialog(
+                encoded, "old", replace_name="old",
+                title="Rename Emoji", rename_original=True,
+            ))
+        self.assertEqual(client.config_data["saved_emojis"], {"new": encoded})
+
     def test_emoji_tooltip_uses_chat_hover_delay_and_profile_preview_size(self):
         client = self.client
         encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
