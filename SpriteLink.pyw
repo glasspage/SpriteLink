@@ -11148,7 +11148,8 @@ QComboBox::drop-down {
         return True
 
     def _save_emoji_dialog(
-        self, encoded: str, name: str = "", *, replace_name: str = "", title: str = "Save to Emojis",
+        self, encoded: str, name: str = "", *, replace_name: str = "",
+        title: str = "Save to Emojis", rename_original: bool = False,
     ) -> bool:
         dialog = QDialog(self.root)
         dialog.setWindowTitle(title)
@@ -11171,14 +11172,21 @@ QComboBox::drop-down {
         )
         layout.addWidget(buttons)
 
+        def name_conflicts(candidate: str, saved: dict[str, str]) -> bool:
+            return any(
+                other.casefold() == candidate.casefold()
+                and other != replace_name
+                for other in saved
+            ) or (
+                candidate.casefold() == replace_name.casefold()
+                and candidate != replace_name
+                and not rename_original
+            )
+
         def update() -> None:
             candidate = entry.text().strip()
             saved = self.config_data.get("saved_emojis", {})
-            conflict = any(
-                other.casefold() == candidate.casefold()
-                and other != replace_name and saved[other] != encoded
-                for other in saved
-            )
+            conflict = name_conflicts(candidate, saved)
             valid = valid_emoji_name(candidate)
             buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(valid and not conflict)
             hint.setVisible(conflict)
@@ -11186,11 +11194,13 @@ QComboBox::drop-down {
         def save() -> None:
             emojis = dict(self.config_data.get("saved_emojis", {}))
             candidate = entry.text().strip()
-            if replace_name:
+            if not valid_emoji_name(candidate) or name_conflicts(candidate, emojis):
+                update()
+                return
+            # Editing and saving under a new name creates another emoji.
+            # Only an explicit Rename action removes the original name.
+            if rename_original:
                 emojis.pop(replace_name, None)
-            for other in tuple(emojis):
-                if other.casefold() == candidate.casefold():
-                    emojis.pop(other)
             emojis[candidate] = encoded
             if self._store_saved_emojis(emojis):
                 dialog.accept()
@@ -11214,7 +11224,10 @@ QComboBox::drop-down {
         delete = menu.addAction("Delete")
         selected = menu.exec(self.emojis_menu.viewport().mapToGlobal(position))
         if selected == rename:
-            self._save_emoji_dialog(encoded, name, replace_name=name, title="Rename Emoji")
+            self._save_emoji_dialog(
+                encoded, name, replace_name=name,
+                title="Rename Emoji", rename_original=True,
+            )
         elif selected == edit:
             self._import_chat_drawing(*decode_drawing(encoded))
             self.emoji_edit_sources[self.active_chatroom_id] = name
