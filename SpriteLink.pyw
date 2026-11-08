@@ -50,6 +50,7 @@ try:
         QObject,
         QPoint,
         QPointF,
+        QRect,
         QRectF,
         QSize,
         QTimer,
