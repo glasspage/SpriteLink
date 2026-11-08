@@ -161,7 +161,7 @@ class ChatroomPreferenceTests(unittest.TestCase):
         self.assertEqual(create.key_security_label.text(), "Security: Excellent")
         dark = bool(self.app.property("spritelinkGlassyDark"))
         normal_color = "#aab4bd" if dark else "#777777"
-        weak_color = "#efa34c" if dark else "#cb781f"
+        weak_color = "#bb5555" if dark else "#a94444"
         self.assertIn(normal_color, create.key_security_label.styleSheet())
         self.assertFalse(create.key_security_label.isHidden())
         create.key_entry.setText("a" * 48)
