@@ -47,13 +47,29 @@ class PortableDataArchiveTests(unittest.TestCase):
         import json
         with self.assertRaisesRegex(ValueError, "valid"):
             inspect_archive(b"not json")
-        with self.assertRaisesRegex(ValueError, "at least 8"):
-            create_archive({"Config": {}}, "short")
+        # Passwords of any length are allowed.
+        short = create_archive({"Config": {}}, "x")
+        self.assertEqual(open_archive(short, "x"), {"Config": {}})
         blob = create_archive({"Config": {}}, "secure password")
         data = json.loads(blob)
         data["version"] = 2
         with self.assertRaisesRegex(ValueError, "Unsupported"):
             inspect_archive(json.dumps(data).encode("utf-8"))
+
+    def test_password_free_archive_is_unencrypted_and_imports_without_a_password(self):
+        import json
+        payload = {"Chatrooms": [{"nickname": "My Room", "key": "secret key", "history": []}]}
+        blob = create_archive(payload)
+        envelope, categories = inspect_archive(blob)
+        self.assertEqual(envelope["cipher"], "none")
+        self.assertEqual(categories, ("Chatrooms",))
+        self.assertEqual(open_archive(blob), payload)
+        self.assertEqual(open_archive(blob, "ignored"), payload)
+        self.assertEqual(len(envelope["checksum"]), 64)
+        tampered = json.loads(blob)
+        tampered["checksum"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "damaged"):
+            open_archive(json.dumps(tampered).encode("utf-8"))
 
     def test_global_config_export_excludes_chatroom_and_identity_data(self):
         config = S.default_config()
@@ -99,11 +115,19 @@ class DataTransferDialogTests(unittest.TestCase):
         ]
         dialog = DataTransferDialog("export", ARCHIVE_CATEGORIES, rooms)
         try:
-            self.assertFalse(dialog.action_button.isEnabled())
-            dialog.password_entry.setText("secure password")
-            dialog.confirm_entry.setText("different password")
-            self.assertFalse(dialog.action_button.isEnabled())
-            dialog.confirm_entry.setText("secure password")
+            # An export can be created with no password or confirmation.
+            self.assertTrue(dialog.action_button.isEnabled())
+            self.assertEqual(dialog.password_entry.placeholderText(), "Recommended")
+            self.assertFalse(hasattr(dialog, "confirm_entry"))
+            layout = dialog.layout()
+            chatrooms_position = layout.indexOf(dialog.category_checks["Chatrooms"])
+            self.assertEqual(chatrooms_position + 1, layout.indexOf(
+                dialog.specific_rooms.parentWidget()
+            ))
+            self.assertEqual(chatrooms_position + 2, layout.indexOf(
+                dialog.category_checks["Config"]
+            ))
+            dialog.password_entry.setText("x")
             self.assertTrue(dialog.action_button.isEnabled())
             self.assertIsNone(dialog.selected_room_ids())
             dialog.specific_rooms.setChecked(True)
@@ -112,6 +136,17 @@ class DataTransferDialogTests(unittest.TestCase):
             dialog.room_checks["abc"].setChecked(False)
             self.assertFalse(dialog.action_button.isEnabled())
             dialog.category_checks["Chatrooms"].setChecked(False)
+            self.assertTrue(dialog.action_button.isEnabled())
+        finally:
+            dialog.close()
+
+    def test_password_free_import_does_not_prompt_for_password(self):
+        dialog = DataTransferDialog(
+            "import", ("Chatrooms",), password_required=False
+        )
+        try:
+            self.assertFalse(dialog.password_entry.isVisible())
+            self.assertFalse(dialog.password_required)
             self.assertTrue(dialog.action_button.isEnabled())
         finally:
             dialog.close()
