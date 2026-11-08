@@ -13494,13 +13494,14 @@ QComboBox::drop-down {
                     raise OSError("Could not save the current chatroom history.")
                 server_url = normalize_server_url(str(self.config_data["server_url"]))
                 selected_ids = dialog.selected_room_ids()
+                pending_upgrades = set(_pending_history_upgrades())
                 rooms = []
                 for room in self._chatroom_definitions():
                     if selected_ids is not None and room["id"] not in selected_ids:
                         continue
                     key = room["key"]
                     legacy = chatroom_history_path(server_url, key).with_suffix(".bin")
-                    if legacy.exists():
+                    if legacy in pending_upgrades:
                         _upgrade_chatroom_history(legacy)
                     rooms.append({
                         "nickname": room["nickname"], "key": key,
@@ -13729,7 +13730,10 @@ QComboBox::drop-down {
         try:
             payload = open_archive(blob, dialog.password())
             categories = dialog.selected_categories()
-            if not self._persist_local_history():
+            if (
+                ("Chatrooms" in categories or "Config" in categories)
+                and not self._persist_local_history()
+            ):
                 raise OSError("Could not save the current chatroom history.")
             staged, history_jobs, counts = self._prepare_data_import(
                 payload, categories,
@@ -13748,7 +13752,13 @@ QComboBox::drop-down {
             server_url = normalize_server_url(
                 str(self.config_data.get("server_url", ""))
             )
+            pending_upgrades = set(_pending_history_upgrades()) if history_jobs else set()
             for key, history in history_jobs:
+                # Migrate any old local history *before* filling gaps, so
+                # local copies always win on duplicate message IDs.
+                legacy = chatroom_history_path(server_url, key).with_suffix(".bin")
+                if legacy in pending_upgrades:
+                    _upgrade_chatroom_history(legacy)
                 # INSERT ... ON CONFLICT DO NOTHING: preserve existing
                 # messages, local names and all room-specific preferences.
                 save_chatroom_history(server_url, key, history)
