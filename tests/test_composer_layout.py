@@ -4,7 +4,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QRect, QTimer, Qt
-from PySide6.QtGui import QContextMenuEvent, QFont, QPalette
+from PySide6.QtGui import QContextMenuEvent, QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont, QPainter, QPalette, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QStyleFactory
 from test_security import SPRITELINK as S
@@ -427,11 +427,30 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertTrue(client.emojis_menu.isVisible())
         self.assertEqual(client.emojis_menu.count(), 1)
         self.assertIs(client.emojis_menu.new_item, client.emojis_menu.item(0))
-        self.assertEqual(client.new_emoji_button.text(), "New")
-        self.assertEqual(client.new_emoji_button.size(), S.QSize(32, 32))
+        menu = client.emojis_menu
+        self.assertIsNone(menu.itemWidget(menu.new_item))
+        self.assertEqual(menu.gridSize(), S.QSize(40, 40))
         self.assertFalse(hasattr(client, "make_emoji_link"))
+        self.assertFalse(hasattr(client, "new_emoji_button"))
 
-        client.new_emoji_button.click()
+        # The New control is painted at 32x32 inside the 40px emoji cell;
+        # the surrounding pixels stay transparent (no square tile backdrop).
+        icon = QPixmap(40, 40)
+        icon.fill(Qt.GlobalColor.transparent)
+        option = S.QStyleOptionViewItem()
+        option.rect = S.QRect(0, 0, 40, 40)
+        option.widget = menu
+        painter = QPainter(icon)
+        menu.itemDelegate().paint(painter, option, menu.model().index(0, 0))
+        painter.end()
+        image = icon.toImage()
+        self.assertEqual(image.pixelColor(1, 1).alpha(), 0)
+        self.assertGreater(image.pixelColor(20, 20).alpha(), 0)
+
+        QTest.mouseClick(
+            menu.viewport(), Qt.MouseButton.LeftButton,
+            pos=menu.visualItemRect(menu.new_item).center(),
+        )
         self.assertTrue(client.image_menu_button.isChecked())
         self.assertFalse(client.emojis_menu_button.isChecked())
         self.assertEqual(client.image_menu.size_combo.currentIndex(), S.EMOJI_SIZE)
@@ -444,12 +463,13 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertTrue(menu.isVisible())
         self.assertEqual(menu.count(), 2)
         self.assertIs(menu.new_item, menu.item(1))
-        self.assertEqual(client.new_emoji_button.size(), S.QSize(32, 32))
+        self.assertIsNone(menu.itemWidget(menu.new_item))
         self.assertEqual(menu.iconSize(), S.QSize(32, 32))
         self.assertEqual(menu.item(0).icon().actualSize(S.QSize(32, 32)), S.QSize(32, 32))
         self.assertEqual(menu.selectionMode(), S.QAbstractItemView.SelectionMode.SingleSelection)
         self.assertIsInstance(menu.itemDelegate(), S.EmojiItemDelegate)
         self.assertEqual(menu.dragDropMode(), S.QAbstractItemView.DragDropMode.InternalMove)
+        self.assertEqual(menu.movement(), S.QListWidget.Movement.Snap)
 
         viewport = menu.viewport()
         position = menu.visualItemRect(menu.item(0)).center()
@@ -459,7 +479,10 @@ class ComposerLayoutTests(unittest.TestCase):
         QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=position)
         self.assertEqual(self.edit.toPlainText(), "\ufffc\ufffc")
         self.assertFalse(menu.selectedItems())
-        client.new_emoji_button.click()
+        QTest.mouseClick(
+            menu.viewport(), Qt.MouseButton.LeftButton,
+            pos=menu.visualItemRect(menu.new_item).center(),
+        )
         self.assertEqual(client.image_composer_label.text(), "Creating Emoji")
         client.image_menu.size_combo.setCurrentIndex(0)
         self.assertEqual(client.image_composer_label.text(), "Image message")
@@ -493,6 +516,51 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertIs(menu.item(3), menu.new_item)
         self.assertTrue(menu.move_saved_emoji(2, 0))
         self.assertEqual(list(client.config_data["saved_emojis"]), ["first", "second", "third"])
+
+    def test_internal_emoji_drag_events_accept_move_and_reorder(self):
+        client = self.client
+        emojis = {
+            name: S.encode_drawing(S.EMOJI_SIZE, bytes([color]) * 256)
+            for name, color in (("a", 2), ("b", 3), ("c", 4))
+        }
+        self.assertTrue(client._store_saved_emojis(emojis))
+        client.emojis_menu_button.setChecked(True)
+        menu = client.emojis_menu
+        self.assertTrue(menu.isVisible())
+        self.assertTrue(menu.item(0).flags() & Qt.ItemFlag.ItemIsDragEnabled)
+        self.assertFalse(menu.new_item.flags() & Qt.ItemFlag.ItemIsDragEnabled)
+        start = menu.item(0)
+        menu.setCurrentItem(start)
+        menu._dragged_item = start
+        mime = menu.model().mimeData([menu.currentIndex()])
+        destination = menu.visualItemRect(menu.new_item).center()
+        with mock.patch.object(menu, "_internal_emoji_drag", return_value=True):
+            enter = QDragEnterEvent(
+                destination, Qt.DropAction.MoveAction, mime,
+                Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+            )
+            menu.dragEnterEvent(enter)
+            self.assertTrue(enter.isAccepted())
+            move = QDragMoveEvent(
+                destination, Qt.DropAction.MoveAction, mime,
+                Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+            )
+            menu.dragMoveEvent(move)
+            self.assertTrue(move.isAccepted())
+            self.assertEqual(menu._drop_insert_row, 3)
+            drop = QDropEvent(
+                S.QPointF(destination), Qt.DropAction.MoveAction, mime,
+                Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+            )
+            menu.dropEvent(drop)
+            self.assertTrue(drop.isAccepted())
+        menu._dragged_item = None
+        self.assertEqual(list(client.config_data["saved_emojis"]), ["b", "c", "a"])
+        self.assertEqual(
+            [menu.item(row).data(Qt.ItemDataRole.UserRole)[0] for row in range(3)],
+            ["b", "c", "a"],
+        )
+        self.assertIs(menu.item(3), menu.new_item)
 
     def test_chat_log_emoji_has_no_builtin_name_only_tooltip(self):
         client = self.client
