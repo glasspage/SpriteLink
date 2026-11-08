@@ -6333,7 +6333,28 @@ class NoFocusRectItemDelegate(QStyledItemDelegate):
 
 
 class EmojiItemDelegate(NoFocusRectItemDelegate):
-    """Draw the New control as a single 32px button, without an item backdrop."""
+    """Draw New with the QPushButton stylesheet and emoji icon alignment."""
+
+    def _new_button_rect(
+        self, option: QStyleOptionViewItem, list_widget: "EmojiListWidget",
+    ) -> QRect:
+        size = list_widget.new_style_button.size()
+        rect = QRect(option.rect.topLeft(), size)
+        rect.moveLeft(option.rect.left() + (option.rect.width() - size.width()) // 2)
+        # Icons occupy the decoration area near the top of the cell, not
+        # the entire grid cell. Match Qt's actual emoji decoration geometry.
+        if list_widget.count() > 1:
+            emoji_option = QStyleOptionViewItem(option)
+            self.initStyleOption(emoji_option, list_widget.model().index(0, 0))
+            emoji_option.rect = QRect(option.rect)
+            decoration = list_widget.style().subElementRect(
+                QStyle.SubElement.SE_ItemViewItemDecoration,
+                emoji_option,
+                list_widget,
+            )
+            if decoration.isValid() and not decoration.isEmpty():
+                rect.moveCenter(decoration.center())
+        return rect
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
         list_widget = self.parent()
@@ -6341,18 +6362,22 @@ class EmojiItemDelegate(NoFocusRectItemDelegate):
             isinstance(list_widget, EmojiListWidget)
             and list_widget.new_item is list_widget.itemFromIndex(index)
         ):
+            # Drawing with a QListWidget's style bypasses QPushButton QSS
+            # selectors. Use an actual (hidden) QPushButton as the style
+            # context, while still painting only a 32x32 control in the cell.
+            button = list_widget.new_style_button
             button_option = QStyleOptionButton()
-            button_option.rect = QRect(QPoint(0, 0), QSize(32, 32))
-            button_option.rect.moveCenter(option.rect.center())
-            button_option.text = "New"
-            button_option.palette = option.palette
-            button_option.fontMetrics = option.fontMetrics
-            button_option.state = QStyle.StateFlag.State_Enabled | QStyle.StateFlag.State_Raised
+            button_option.initFrom(button)
+            button_option.rect = self._new_button_rect(option, list_widget)
+            button_option.text = button.text()
+            button_option.state |= QStyle.StateFlag.State_Raised
             if option.state & QStyle.StateFlag.State_MouseOver:
                 button_option.state |= QStyle.StateFlag.State_MouseOver
-            widget = option.widget or list_widget
-            widget.style().drawControl(
-                QStyle.ControlElement.CE_PushButton, button_option, painter, widget,
+            if list_widget._new_pressed:
+                button_option.state |= QStyle.StateFlag.State_Sunken
+                button_option.state &= ~QStyle.StateFlag.State_Raised
+            button.style().drawControl(
+                QStyle.ControlElement.CE_PushButton, button_option, painter, button,
             )
             return
         clean_option = QStyleOptionViewItem(option)
@@ -6369,8 +6394,32 @@ class EmojiListWidget(QListWidget):
     def __init__(self) -> None:
         super().__init__()
         self.new_item: QListWidgetItem | None = None
+        self._new_pressed = False
+        self.new_style_button = QPushButton("New", self)
+        self.new_style_button.setFixedSize(32, 32)
+        # Keep the theme's button colors/borders but fit text inside 32px.
+        self.new_style_button.setStyleSheet(
+            "padding: 0px; min-width: 0px; min-height: 0px;"
+        )
+        self.new_style_button.hide()
         self._dragged_item: QListWidgetItem | None = None
         self._drop_insert_row: int | None = None
+
+    def mousePressEvent(self, event: Any) -> None:
+        self._new_pressed = (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.itemAt(event.position().toPoint()) is self.new_item
+        )
+        if self._new_pressed:
+            self.viewport().update()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        was_pressed = self._new_pressed
+        self._new_pressed = False
+        super().mouseReleaseEvent(event)
+        if was_pressed:
+            self.viewport().update()
 
     def move_saved_emoji(self, source_row: int, insert_row: int) -> bool:
         # The final item is the fixed New button, never a draggable emoji.
