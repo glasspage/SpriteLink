@@ -680,7 +680,7 @@ class ComposerLayoutTests(unittest.TestCase):
                 for room_id, check in dialog.room_checks.items():
                     check.setChecked(room_id == "two")
                 dialog.password_entry.setText(password)
-                dialog.confirm_entry.setText(password)
+                self.assertFalse(hasattr(dialog, "confirm_entry"))
                 self.assertTrue(dialog.action_button.isEnabled())
                 return S.QDialog.DialogCode.Accepted
 
