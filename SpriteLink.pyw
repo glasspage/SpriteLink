@@ -6333,28 +6333,19 @@ class NoFocusRectItemDelegate(QStyledItemDelegate):
 
 
 class EmojiItemDelegate(NoFocusRectItemDelegate):
-    """Draw New with the QPushButton stylesheet and emoji icon alignment."""
+    """Center both the New button and 32px emojis inside square grid cells."""
+
+    def _icon_rect(
+        self, option: QStyleOptionViewItem, list_widget: "EmojiListWidget",
+    ) -> QRect:
+        rect = QRect(QPoint(0, 0), list_widget.iconSize())
+        rect.moveCenter(option.rect.center())
+        return rect
 
     def _new_button_rect(
         self, option: QStyleOptionViewItem, list_widget: "EmojiListWidget",
     ) -> QRect:
-        size = list_widget.new_style_button.size()
-        rect = QRect(option.rect.topLeft(), size)
-        rect.moveLeft(option.rect.left() + (option.rect.width() - size.width()) // 2)
-        # Icons occupy the decoration area near the top of the cell, not
-        # the entire grid cell. Match Qt's actual emoji decoration geometry.
-        if list_widget.count() > 1:
-            emoji_option = QStyleOptionViewItem(option)
-            self.initStyleOption(emoji_option, list_widget.model().index(0, 0))
-            emoji_option.rect = QRect(option.rect)
-            decoration = list_widget.style().subElementRect(
-                QStyle.SubElement.SE_ItemViewItemDecoration,
-                emoji_option,
-                list_widget,
-            )
-            if decoration.isValid() and not decoration.isEmpty():
-                rect.moveCenter(decoration.center())
-        return rect
+        return self._icon_rect(option, list_widget)
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
         list_widget = self.parent()
@@ -6380,12 +6371,15 @@ class EmojiItemDelegate(NoFocusRectItemDelegate):
                 QStyle.ControlElement.CE_PushButton, button_option, painter, button,
             )
             return
-        clean_option = QStyleOptionViewItem(option)
-        clean_option.state &= ~(
-            QStyle.StateFlag.State_Selected
-            | QStyle.StateFlag.State_HasFocus
-        )
-        super().paint(painter, clean_option, index)
+        # Qt's built-in IconMode decoration layout includes font metrics and
+        # item stylesheet padding, causing icons to sit higher than New.
+        # Paint each pre-scaled 32x32 icon directly into the same centered rect.
+        if isinstance(list_widget, EmojiListWidget):
+            item = list_widget.itemFromIndex(index)
+            if item is not None:
+                pixmap = item.icon().pixmap(list_widget.iconSize())
+                if not pixmap.isNull():
+                    painter.drawPixmap(self._icon_rect(option, list_widget).topLeft(), pixmap)
 
 
 class EmojiListWidget(QListWidget):
@@ -6404,6 +6398,27 @@ class EmojiListWidget(QListWidget):
         self.new_style_button.hide()
         self._dragged_item: QListWidgetItem | None = None
         self._drop_insert_row: int | None = None
+        self.setSpacing(0)
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.setViewportMargins(0, 0, 0, 0)
+
+    def sync_grid_viewport_height(self) -> None:
+        cell_height = self.gridSize().height()
+        if cell_height > 0:
+            # Fixed outer height must account for the frame so the *viewport*
+            # shows precisely two rows, regardless of theme border width.
+            self.setFixedHeight(cell_height * 2 + self.frameWidth() * 2)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.StyleChange:
+            self.sync_grid_viewport_height()
+
+    def showEvent(self, event: QEvent) -> None:
+        self.sync_grid_viewport_height()
+        super().showEvent(event)
 
     def mousePressEvent(self, event: Any) -> None:
         self._new_pressed = (
@@ -11172,7 +11187,7 @@ QComboBox::drop-down {
         cell_size = picker_icon_size + 8
         self.emojis_menu.setGridSize(QSize(cell_size, cell_size))
         self.emojis_menu.setIconSize(QSize(picker_icon_size, picker_icon_size))
-        self.emojis_menu.setMaximumHeight(2 * cell_size + 4)
+        self.emojis_menu.sync_grid_viewport_height()
         # Dragging needs a selection, but the delegate hides its highlight.
         self.emojis_menu.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.emojis_menu.setItemDelegate(EmojiItemDelegate(self.emojis_menu))
@@ -11317,6 +11332,7 @@ QComboBox::drop-down {
                 Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
                 | Qt.ItemFlag.ItemIsDragEnabled
             )
+            item.setSizeHint(self.emojis_menu.gridSize())
             item.setToolTip(name)
             item.setData(Qt.ItemDataRole.AccessibleTextRole, name)
             item.setData(Qt.ItemDataRole.UserRole, (name, encoded))
