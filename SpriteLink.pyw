@@ -111,6 +111,7 @@ try:
         QGraphicsScene,
         QGridLayout,
         QHBoxLayout,
+        QInputDialog,
         QLabel,
         QLineEdit,
         QListWidget,
@@ -13723,16 +13724,63 @@ QComboBox::drop-down {
             messagebox.showerror("Could not open data", str(exc), parent=self.root)
             return
 
+        # Room names and keys are encrypted, so unlock the archive before
+        # building the room picker. Keep this data out of the public header.
+        try:
+            if _envelope["cipher"] == "none":
+                payload = open_archive(blob)
+            else:
+                unlock = QInputDialog(self.root)
+                unlock.setWindowTitle("Import Data")
+                unlock.setLabelText("Password")
+                unlock.setTextEchoMode(QLineEdit.EchoMode.Password)
+                self._apply_window_titlebar_theme(unlock)
+                while True:
+                    if unlock.exec() != QDialog.DialogCode.Accepted:
+                        return
+                    try:
+                        payload = open_archive(blob, unlock.textValue())
+                        break
+                    except ValueError as exc:
+                        messagebox.showerror(
+                            "Could not unlock data", str(exc), parent=self.root,
+                        )
+                        unlock.setTextValue("")
+
+            room_options = []
+            if "Chatrooms" in available:
+                imported_rooms = payload["Chatrooms"]
+                if not isinstance(imported_rooms, list) or len(imported_rooms) > 1000:
+                    raise ValueError("Invalid Chatrooms list in archive.")
+                for index, room in enumerate(imported_rooms):
+                    if (
+                        not isinstance(room, dict)
+                        or not isinstance(room.get("nickname"), str)
+                    ):
+                        raise ValueError("Invalid chatroom entry.")
+                    room_options.append({
+                        "id": str(index), "nickname": room["nickname"],
+                    })
+        except Exception as exc:
+            messagebox.showerror("Could not open data", str(exc), parent=self.root)
+            return
+
         dialog = DataTransferDialog(
-            "import", available, parent=self.root,
-            password_required=_envelope["cipher"] != "none",
+            "import", available, room_options, parent=self.root,
+            password_required=False,
         )
         self._apply_window_titlebar_theme(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            payload = open_archive(blob, dialog.password())
             categories = dialog.selected_categories()
+            if "Chatrooms" in categories:
+                selected_ids = dialog.selected_room_ids()
+                if selected_ids is not None:
+                    payload["Chatrooms"] = [
+                        room for index, room in enumerate(payload["Chatrooms"])
+                        if str(index) in selected_ids
+                    ]
             if (
                 ("Chatrooms" in categories or "Config" in categories)
                 and not self._persist_local_history()
