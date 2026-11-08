@@ -146,6 +146,8 @@ class DataTransferDialogTests(unittest.TestCase):
         )
         try:
             self.assertFalse(dialog.password_entry.isVisible())
+            self.assertEqual(dialog.layout().indexOf(dialog.password_entry), -1)
+            self.assertIsNone(dialog.password_entry.parentWidget())
             self.assertFalse(dialog.password_required)
             self.assertTrue(dialog.action_button.isEnabled())
         finally:
