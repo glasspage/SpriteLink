@@ -382,6 +382,31 @@ class ComposerLayoutTests(unittest.TestCase):
             ))
         self.assertEqual(client.config_data["saved_emojis"], {"new": encoded})
 
+    def test_renaming_saved_emoji_preserves_custom_position(self):
+        client = self.client
+        emojis = {
+            name: S.encode_drawing(S.EMOJI_SIZE, bytes([color]) * 256)
+            for name, color in (("first", 2), ("middle", 3), ("last", 4))
+        }
+        self.assertTrue(client._store_saved_emojis(emojis))
+
+        def rename(dialog):
+            dialog.findChild(S.QLineEdit).setText("renamed")
+            dialog.findChild(S.QDialogButtonBox).button(
+                S.QDialogButtonBox.StandardButton.Save
+            ).click()
+            return dialog.result()
+
+        with mock.patch.object(S.QDialog, "exec", rename):
+            self.assertTrue(client._save_emoji_dialog(
+                emojis["middle"], "middle", replace_name="middle",
+                title="Rename Emoji", rename_original=True,
+            ))
+        self.assertEqual(
+            list(client.config_data["saved_emojis"]),
+            ["first", "renamed", "last"],
+        )
+
     def test_emoji_tooltip_uses_chat_hover_delay_and_profile_preview_size(self):
         client = self.client
         encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
