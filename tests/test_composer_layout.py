@@ -405,6 +405,10 @@ class ComposerLayoutTests(unittest.TestCase):
             client.make_emoji_link.text(),
             '<a href="image">Make an Emoji</a>',
         )
+        self.assertEqual(
+            client.make_emoji_link.contextMenuPolicy(),
+            Qt.ContextMenuPolicy.NoContextMenu,
+        )
         client.make_emoji_link.linkActivated.emit("image")
         self.assertTrue(client.image_menu_button.isChecked())
         self.assertFalse(client.emojis_menu_button.isChecked())
