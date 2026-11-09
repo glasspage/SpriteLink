@@ -110,6 +110,19 @@ class HistoryMergeTests(unittest.TestCase):
             self.merge(self.item("id2", time=0, ntfy_time=503)), 0
         )
 
+    def test_unknown_timestamp_does_not_mask_valid_sent_timestamp(self):
+        # Zero is a missing timestamp, not a real moment to compare with.
+        self.insert_local(self.item("unknown-time", time=0, ntfy_time=500))
+        self.assertEqual(
+            self.merge(self.item("real-time", time=1, ntfy_time=700)), 1
+        )
+
+    def test_zero_arrival_timestamp_is_not_a_fuzzy_match(self):
+        self.insert_local(self.item("id1", time=0, ntfy_time=0))
+        self.assertEqual(
+            self.merge(self.item("id2", time=0, ntfy_time=2)), 1
+        )
+
     def test_same_ntfy_id_catches_changed_timestamps(self):
         self.insert_local(self.item("id1", time=100, ntfy_id="same-ntfy"))
         self.assertEqual(
