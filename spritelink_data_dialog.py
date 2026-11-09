@@ -5,7 +5,7 @@ from typing import Any
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFrame, QLabel, QLineEdit,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QLabel, QLineEdit,
     QScrollArea, QVBoxLayout, QWidget,
 )
 
@@ -43,6 +43,21 @@ class DataTransferDialog(QDialog):
         self.setWindowTitle(f"{action} Data")
         self.setMinimumWidth(330)
         layout = QVBoxLayout(self)
+        if mode == "import":
+            layout.addWidget(QLabel("Import behavior"))
+            self.import_behavior_combo = QComboBox()
+            self.import_behavior_combo.addItems(("Merge (Default)", "Overwrite"))
+            layout.addWidget(self.import_behavior_combo)
+            self.overwrite_warning = QLabel(
+                "Overwrite replaces selected local data instead of merging it."
+            )
+            self.overwrite_warning.setWordWrap(True)
+            layout.addWidget(self.overwrite_warning)
+            self.import_behavior_combo.currentIndexChanged.connect(
+                self._update_import_behavior
+            )
+            self._update_import_behavior()
+
         layout.addWidget(QLabel(f"Select data to {mode.lower()}:"))
 
         self.category_checks: dict[str, QCheckBox] = {}
@@ -85,14 +100,15 @@ class DataTransferDialog(QDialog):
                 self._update_room_selection()
 
         if mode == "import":
-            self.identity_warning = QLabel(
-                "Importing Identity replaces your signing key and changes "
-                "your user ID. Export a backup first."
-            )
+            self.identity_warning = QLabel()
+            self._update_identity_warning()
             self.identity_warning.setWordWrap(True)
             layout.addWidget(self.identity_warning)
             self.category_checks["Identity"].toggled.connect(
                 self.identity_warning.setVisible
+            )
+            self.import_behavior_combo.currentIndexChanged.connect(
+                self._update_identity_warning
             )
             self.identity_warning.setVisible(
                 self.category_checks["Identity"].isChecked()
@@ -127,6 +143,28 @@ class DataTransferDialog(QDialog):
             check.stateChanged.connect(self._update_save_enabled)
         self.password_entry.textChanged.connect(self._update_save_enabled)
         self._update_save_enabled()
+
+    def import_behavior(self) -> str:
+        """The export dialog has no import-mode setting."""
+        return (
+            "overwrite"
+            if self.mode == "import" and self.import_behavior_combo.currentIndex() == 1
+            else "merge"
+        )
+
+    def _update_import_behavior(self, _index: int = 0) -> None:
+        self.overwrite_warning.setVisible(self.import_behavior() == "overwrite")
+
+    def _update_identity_warning(self, _value: Any = None) -> None:
+        if self.import_behavior() == "overwrite":
+            self.identity_warning.setText(
+                "Overwriting Identity replaces your signing key and changes "
+                "your user ID. Export a backup first."
+            )
+        else:
+            self.identity_warning.setText(
+                "Merging Identity preserves your signing key and user ID."
+            )
 
     def _set_all_room_checks(self, state: int) -> None:
         if self._syncing_rooms:
