@@ -246,13 +246,31 @@ class DataTransferDialogTests(unittest.TestCase):
                             QStyle.SubElement.SE_CheckBoxIndicator, option, checkbox,
                         )
                         self.assertTrue(indicator.isValid())
-                        pixmap = checkbox.grab()
-                        ratio = pixmap.devicePixelRatio()
+                        mixed_pixmap = checkbox.grab()
+                        ratio = mixed_pixmap.devicePixelRatio()
                         center = indicator.center()
-                        pixel = pixmap.toImage().pixelColor(
+                        mixed_image = mixed_pixmap.toImage()
+                        pixel = mixed_image.pixelColor(
                             int(center.x() * ratio), int(center.y() * ratio),
                         )
-                        self.assertLess(max(pixel.red(), pixel.green(), pixel.blue()), 120)
+                        self.assertLess(
+                            max(pixel.red(), pixel.green(), pixel.blue()), 120,
+                            "The mixed indicator must contain a dark dash.",
+                        )
+
+                        # Outside the dash, the mixed indicator must look
+                        # identical to a normal *unchecked* checkbox, not the
+                        # native Classic filled/indeterminate indicator.
+                        checkbox.setCheckState(Qt.CheckState.Unchecked)
+                        unchecked_image = checkbox.grab().toImage()
+                        for y_offset in (-4, 4):
+                            with self.subTest(y_offset=y_offset):
+                                x = int(center.x() * ratio)
+                                y = int((center.y() + y_offset) * ratio)
+                                self.assertEqual(
+                                    mixed_image.pixelColor(x, y),
+                                    unchecked_image.pixelColor(x, y),
+                                )
                     finally:
                         dialog.close()
         finally:
