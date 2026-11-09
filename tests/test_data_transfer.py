@@ -190,7 +190,7 @@ class DataTransferDialogTests(unittest.TestCase):
         finally:
             dialog.close()
 
-    def test_import_behavior_defaults_to_merge_and_explains_overwrite(self):
+    def test_import_behavior_defaults_to_merge_and_has_no_overwrite_description(self):
         dialog = DataTransferDialog(
             "import", ("Emoji", "Identity"), password_required=False,
         )
@@ -206,7 +206,11 @@ class DataTransferDialogTests(unittest.TestCase):
             )
             dialog.import_behavior_combo.setCurrentIndex(1)
             self.assertEqual(dialog.import_behavior(), "overwrite")
-            self.assertTrue(dialog.overwrite_warning.isVisibleTo(dialog))
+            self.assertFalse(hasattr(dialog, "overwrite_warning"))
+            self.assertFalse(any(
+                "Overwrite replaces selected local" in label.text()
+                for label in dialog.findChildren(QLabel)
+            ))
             self.assertIn("replaces your signing key", dialog.identity_warning.text())
             dialog.import_behavior_combo.setCurrentIndex(0)
             self.assertEqual(dialog.import_behavior(), "merge")
