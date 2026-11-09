@@ -126,7 +126,12 @@ def merge_imported_history(
                         sent_time + DUPLICATE_TIME_TOLERANCE + 1,
                     )
                 )
-            if not duplicate and sort_time > 0:
+            # Signed send time is authoritative whenever present. Two
+            # messages sent far apart can share an arrival timestamp when
+            # a server delivers a delayed batch, so that alone must not
+            # collapse them. Fall back to arrival time only for records
+            # without a usable send timestamp.
+            if not duplicate and sent_time <= 0 and sort_time > 0:
                 duplicate = any(
                     fingerprint in cached_fingerprints(
                         sort_cache, second, "sort_time"
