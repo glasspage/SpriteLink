@@ -190,6 +190,29 @@ class DataTransferDialogTests(unittest.TestCase):
         finally:
             dialog.close()
 
+    def test_import_behavior_defaults_to_merge_and_explains_overwrite(self):
+        dialog = DataTransferDialog(
+            "import", ("Emoji", "Identity"), password_required=False,
+        )
+        try:
+            self.assertEqual(dialog.import_behavior(), "merge")
+            self.assertEqual(
+                [dialog.import_behavior_combo.itemText(i) for i in range(2)],
+                ["Merge (Default)", "Overwrite"],
+            )
+            self.assertEqual(
+                dialog.identity_warning.text(),
+                "Merging Identity preserves your signing key and user ID.",
+            )
+            dialog.import_behavior_combo.setCurrentIndex(1)
+            self.assertEqual(dialog.import_behavior(), "overwrite")
+            self.assertTrue(dialog.overwrite_warning.isVisibleTo(dialog))
+            self.assertIn("replaces your signing key", dialog.identity_warning.text())
+            dialog.import_behavior_combo.setCurrentIndex(0)
+            self.assertEqual(dialog.import_behavior(), "merge")
+        finally:
+            dialog.close()
+
     def test_password_free_import_does_not_prompt_for_password(self):
         dialog = DataTransferDialog(
             "import", ("Chatrooms",), password_required=False
