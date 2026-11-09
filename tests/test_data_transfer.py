@@ -7,7 +7,9 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import (
+    QApplication, QLabel, QStyle, QStyleOptionButton, QStyleOptionComboBox,
+)
 
 from spritelink_data_dialog import DataTransferDialog
 from spritelink_data_transfer import (
@@ -216,6 +218,80 @@ class DataTransferDialogTests(unittest.TestCase):
             self.assertEqual(dialog.import_behavior(), "merge")
         finally:
             dialog.close()
+
+    def test_classic_partially_checked_indicator_draws_a_dash_in_both_dialogs(self):
+        previous = self.app.property("spritelinkWindowsClassic")
+        self.app.setProperty("spritelinkWindowsClassic", True)
+        try:
+            rooms = [
+                {"id": "one", "nickname": "One"},
+                {"id": "two", "nickname": "Two"},
+            ]
+            for mode in ("import", "export"):
+                with self.subTest(mode=mode):
+                    dialog = DataTransferDialog(
+                        mode, ARCHIVE_CATEGORIES, rooms, password_required=False,
+                    )
+                    try:
+                        dialog.show()
+                        self.app.processEvents()
+                        dialog.room_checks["one"].setChecked(False)
+                        checkbox = dialog.category_checks["Chatrooms"]
+                        self.assertEqual(
+                            checkbox.checkState(), Qt.CheckState.PartiallyChecked,
+                        )
+                        option = QStyleOptionButton()
+                        checkbox.initStyleOption(option)
+                        indicator = checkbox.style().subElementRect(
+                            QStyle.SubElement.SE_CheckBoxIndicator, option, checkbox,
+                        )
+                        self.assertTrue(indicator.isValid())
+                        pixmap = checkbox.grab()
+                        ratio = pixmap.devicePixelRatio()
+                        center = indicator.center()
+                        pixel = pixmap.toImage().pixelColor(
+                            int(center.x() * ratio), int(center.y() * ratio),
+                        )
+                        self.assertLess(max(pixel.red(), pixel.green(), pixel.blue()), 120)
+                    finally:
+                        dialog.close()
+        finally:
+            self.app.setProperty("spritelinkWindowsClassic", previous)
+
+    def test_import_dropdown_draws_arrow_when_stylesheet_hides_native_arrow(self):
+        previous_classic = self.app.property("spritelinkWindowsClassic")
+        previous_modern = self.app.property("spritelinkModern")
+        self.app.setProperty("spritelinkWindowsClassic", True)
+        self.app.setProperty("spritelinkModern", False)
+        dialog = DataTransferDialog(
+            "import", ("Chatrooms",), password_required=False,
+        )
+        try:
+            combo = dialog.import_behavior_combo
+            combo.setStyleSheet(
+                "QComboBox::down-arrow { image: none; width: 0px; height: 0px; }"
+            )
+            dialog.show()
+            self.app.processEvents()
+            option = QStyleOptionComboBox()
+            combo.initStyleOption(option)
+            arrow = combo.style().subControlRect(
+                QStyle.ComplexControl.CC_ComboBox,
+                option, QStyle.SubControl.SC_ComboBoxArrow, combo,
+            )
+            center = arrow.center()
+            image = combo.grab()
+            ratio = image.devicePixelRatio()
+            # The custom Classic arrow is a filled triangle with a dark
+            # horizontal top at two pixels above the arrow-region center.
+            pixel = image.toImage().pixelColor(
+                int(center.x() * ratio), int((center.y() - 2) * ratio),
+            )
+            self.assertLess(max(pixel.red(), pixel.green(), pixel.blue()), 120)
+        finally:
+            dialog.close()
+            self.app.setProperty("spritelinkWindowsClassic", previous_classic)
+            self.app.setProperty("spritelinkModern", previous_modern)
 
     def test_password_free_import_does_not_prompt_for_password(self):
         dialog = DataTransferDialog(
