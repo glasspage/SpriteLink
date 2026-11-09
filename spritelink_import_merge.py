@@ -21,6 +21,16 @@ def merge_emoji_data(
         if not validate(name, encoded):
             raise ValueError("Invalid emoji in archive.")
 
+    def numbered_name(name: str, suffix: str, encoded: str) -> str:
+        # The 32-character limit may split a hyphen/apostrophe in a
+        # multiword name. Trim that dangling punctuation too.
+        base = name[:32 - len(suffix)]
+        while base and not validate(base + suffix, encoded):
+            base = base[:-1]
+        if not base:
+            raise ValueError("Could not give imported emoji a valid name.")
+        return base + suffix
+
     result = dict(local)
     names = {name.casefold(): name for name in result}
     added = 0
@@ -46,7 +56,7 @@ def merge_emoji_data(
             if match is None:
                 continue
             suffix = match.group()
-            expected_name = name[:32 - len(suffix)] + suffix
+            expected_name = numbered_name(name, suffix, encoded)
             if existing_name.casefold() == expected_name.casefold():
                 already_imported = True
                 break
@@ -55,7 +65,7 @@ def merge_emoji_data(
 
         for number in range(2, 10001):
             suffix = f"_{number}"
-            candidate = name[:32 - len(suffix)] + suffix
+            candidate = numbered_name(name, suffix, encoded)
             existing = names.get(candidate.casefold())
             if existing is not None:
                 if result[existing] == encoded:
