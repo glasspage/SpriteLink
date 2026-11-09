@@ -122,7 +122,7 @@ def merge_imported_history(
                         sent_cache, second, "sent_time"
                     )
                     for second in range(
-                        sent_time - DUPLICATE_TIME_TOLERANCE,
+                        max(1, sent_time - DUPLICATE_TIME_TOLERANCE),
                         sent_time + DUPLICATE_TIME_TOLERANCE + 1,
                     )
                 )
@@ -137,7 +137,7 @@ def merge_imported_history(
                         sort_cache, second, "sort_time"
                     )
                     for second in range(
-                        sort_time - DUPLICATE_TIME_TOLERANCE,
+                        max(1, sort_time - DUPLICATE_TIME_TOLERANCE),
                         sort_time + DUPLICATE_TIME_TOLERANCE + 1,
                     )
                 )
