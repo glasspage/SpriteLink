@@ -186,6 +186,50 @@ class IdentityImportTests(unittest.TestCase):
         self.assertEqual(merged[0], existing[0])
         self.assertEqual(merged[1]["id"], "new-unique")
 
+    def test_duplicate_named_presets_do_not_update_an_arbitrary_identity(self):
+        local = [
+            {"id": "a", "username": "User",
+             "username_color": "#ff0000", "profile_icon": ""},
+            {"id": "b", "username": "User",
+             "username_color": "#00ff00", "profile_icon": ""},
+        ]
+        imported = [
+            {"id": "remote", "username": "user",
+             "username_color": "#0000ff", "profile_icon": ""},
+        ]
+        merged, added, updated = merge_identity_data(
+            local, imported, S.normalize_identity_preset,
+            lambda: "unique", S.MAX_IDENTITY_PRESETS,
+        )
+        self.assertEqual((added, updated), (1, 0))
+        self.assertEqual(merged[:2], local)
+        self.assertEqual(merged[2]["id"], "remote")
+        again, added, updated = merge_identity_data(
+            merged, imported, S.normalize_identity_preset,
+            lambda: "unique", S.MAX_IDENTITY_PRESETS,
+        )
+        self.assertEqual((added, updated), (0, 0))
+        self.assertEqual(again, merged)
+
+    def test_duplicate_named_identities_use_id_to_select_exact_preset(self):
+        local = [
+            {"id": "a", "username": "User",
+             "username_color": "#ff0000", "profile_icon": ""},
+            {"id": "b", "username": "User",
+             "username_color": "#00ff00", "profile_icon": ""},
+        ]
+        imported = [
+            {"id": "b", "username": "USER",
+             "username_color": "#0000ff", "profile_icon": ""},
+        ]
+        merged, added, updated = merge_identity_data(
+            local, imported, S.normalize_identity_preset,
+            lambda: "unique", S.MAX_IDENTITY_PRESETS,
+        )
+        self.assertEqual((added, updated), (0, 1))
+        self.assertEqual(merged[0], local[0])
+        self.assertEqual(merged[1]["username_color"], "#0000ff")
+
     def test_overwrite_replaces_key_presets_and_active_global_profile(self):
         client = _Client()
         client.config_data["identity_presets"] = [{
