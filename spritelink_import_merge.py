@@ -98,11 +98,11 @@ def merge_identity_data(
     if not isinstance(incoming, list) or not incoming:
         raise ValueError("Invalid identity presets in archive.")
     result = [dict(preset) for preset in local]
-    by_name = {
-        preset["username"].casefold(): i
-        for i, preset in enumerate(result)
-    }
+    by_name: dict[str, list[int]] = {}
+    for i, preset in enumerate(result):
+        by_name.setdefault(preset["username"].casefold(), []).append(i)
     existing_ids = {preset["id"] for preset in result}
+    matched_indices: set[int] = set()
     added = 0
     updated_ids: set[str] = set()
     for raw in incoming:
@@ -114,8 +114,22 @@ def merge_identity_data(
             raise ValueError("Invalid identity preset in archive.")
         preset = normalize(raw)
         name = preset["username"].casefold()
-        index = by_name.get(name)
+        all_matches = by_name.get(name, [])
+        candidates = [i for i in all_matches if i not in matched_indices]
+        index = next(
+            (i for i in candidates if result[i]["id"] == preset["id"]), None
+        )
+        if index is None:
+            index = next((
+                i for i in candidates
+                if result[i]["username_color"] == preset["username_color"]
+                and result[i]["profile_icon"] == preset["profile_icon"]
+            ), None)
+        if index is None and len(all_matches) == 1 and len(candidates) == 1:
+            # Only an unambiguous username match may modify a local preset.
+            index = candidates[0]
         if index is not None:
+            matched_indices.add(index)
             current = result[index]
             if (
                 current["username_color"] != preset["username_color"]
@@ -125,6 +139,9 @@ def merge_identity_data(
                 current["profile_icon"] = preset["profile_icon"]
                 updated_ids.add(current["id"])
             continue
+        # Duplicate usernames can legitimately exist. Never choose one
+        # arbitrarily: import another preset instead of destroying an
+        # unrelated local preset with the same name.
         if len(result) >= maximum:
             raise ValueError("Too many identities to import.")
         if preset["id"] in existing_ids:
@@ -132,7 +149,9 @@ def merge_identity_data(
             while preset["id"] in existing_ids:
                 preset["id"] = new_id()
         existing_ids.add(preset["id"])
-        by_name[name] = len(result)
+        index = len(result)
+        by_name.setdefault(name, []).append(index)
         result.append(preset)
+        matched_indices.add(index)
         added += 1
     return result, added, len(updated_ids)
