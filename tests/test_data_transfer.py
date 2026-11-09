@@ -254,11 +254,75 @@ class DataTransferHistoryTests(unittest.TestCase):
             ):
                 S.save_chatroom_history("https://ntfy.sh", "same-chatroom-key", [original])
                 for key, entries in jobs:
-                    S.save_chatroom_history("https://ntfy.sh", key, entries)
+                    S.merge_imported_chatroom_history("https://ntfy.sh", key, entries)
                 history = S.load_chatroom_history("https://ntfy.sh", "same-chatroom-key")
                 self.assertEqual(len(history), 2)
                 by_id = {item["message"]["i"]: item["message"]["m"] for item in history}
                 self.assertEqual(by_id, {"m1": "Original", "m2": "New"})
+
+    def test_import_merging_deduplicates_real_stored_history(self):
+        server, key = "https://ntfy.sh", "merge-regression-room"
+        original = {
+            "message": {"i": "original", "c": "sender-1", "t": 100,
+                        "m": "keep this local", "drawing": "image-pixels"},
+            "ntfy_time": 100, "ntfy_id": "ntfy-original",
+            "warning": None,
+        }
+        incoming = [
+            # Different ID and timestamp, but identical author and drawing.
+            {"message": {"i": "changed-id", "c": "sender-1", "t": 102,
+                         "m": "keep this local", "drawing": "image-pixels"},
+             "ntfy_time": 102, "ntfy_id": "other-ntfy"},
+            # Same user and text but a different image must be preserved.
+            {"message": {"i": "different-image", "c": "sender-1", "t": 101,
+                         "m": "keep this local", "drawing": "other-pixels"}},
+            # Same user and image but more than three seconds away.
+            {"message": {"i": "later-message", "c": "sender-1", "t": 110,
+                         "m": "keep this local", "drawing": "image-pixels"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(S, "CHATROOM_HISTORY_DIRECTORY", Path(tmp)),
+                mock.patch.object(S, "dpapi_encrypt", side_effect=lambda raw, entropy: raw),
+                mock.patch.object(S, "dpapi_decrypt", side_effect=lambda raw, entropy: raw),
+            ):
+                S.save_chatroom_history(server, key, [original])
+                self.assertEqual(
+                    S.merge_imported_chatroom_history(server, key, incoming), 2
+                )
+                self.assertEqual(
+                    S.merge_imported_chatroom_history(server, key, incoming), 0
+                )
+                stored = S.load_chatroom_history(server, key)
+                by_id = {item["message"]["i"]: item for item in stored}
+                self.assertEqual(
+                    set(by_id), {"original", "different-image", "later-message"}
+                )
+                self.assertEqual(by_id["original"], original)
+
+    def test_history_import_failure_does_not_partially_merge_a_room(self):
+        server, key = "https://ntfy.sh", "rollback-regression-room"
+        original = {"message": {
+            "i": "original", "c": "sender", "t": 100, "m": "same",
+        }}
+        incoming = [
+            {"message": {"i": "new", "c": "sender", "t": 500, "m": "new"}},
+            {"message": {"i": "near", "c": "sender", "t": 101, "m": "same"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(S, "CHATROOM_HISTORY_DIRECTORY", Path(tmp)),
+                mock.patch.object(S, "dpapi_encrypt", side_effect=lambda raw, entropy: raw),
+                mock.patch.object(S, "dpapi_decrypt", side_effect=lambda raw, entropy: raw),
+            ):
+                S.save_chatroom_history(server, key, [original])
+                with mock.patch.object(
+                    S, "dpapi_decrypt", side_effect=ValueError("bad payload")
+                ):
+                    with self.assertRaisesRegex(ValueError, "bad payload"):
+                        S.merge_imported_chatroom_history(server, key, incoming)
+                stored = S.load_chatroom_history(server, key)
+                self.assertEqual(stored, [original])
 
     def test_import_without_chatrooms_leaves_room_settings_untouched(self):
         class Client:
