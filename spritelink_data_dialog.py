@@ -30,31 +30,38 @@ class _ChatroomsCheckBox(QCheckBox):
         self.setCheckState(state)
 
     def paintEvent(self, event: Any) -> None:
-        super().paintEvent(event)
         app = QApplication.instance()
         if (
             self.checkState() != Qt.CheckState.PartiallyChecked
             or app is None
             or not bool(app.property("spritelinkWindowsClassic"))
         ):
+            super().paintEvent(event)
             return
 
-        # Qt's Classic indicator omits the mixed-state mark. Draw the dash
-        # inside the indicator itself; the same widget is used by both dialogs.
+        # Draw the normal *empty* Classic checkbox before adding the dash.
+        # Painting the native partial state first leaves its filled indicator
+        # underneath the dash, which makes the mixed state hard to read.
         option = QStyleOptionButton()
         self.initStyleOption(option)
+        option.state &= ~(
+            QStyle.StateFlag.State_On | QStyle.StateFlag.State_NoChange
+        )
+        option.state |= QStyle.StateFlag.State_Off
+        painter = QPainter(self)
+        self.style().drawControl(
+            QStyle.ControlElement.CE_CheckBox, option, painter, self,
+        )
         indicator = self.style().subElementRect(
             QStyle.SubElement.SE_CheckBoxIndicator, option, self,
         )
-        if not indicator.isValid():
-            return
-        width = max(3, min(9, indicator.width() - 6))
-        center = indicator.center()
-        painter = QPainter(self)
-        painter.fillRect(
-            center.x() - width // 2, center.y() - 1, width, 3,
-            QColor("#000000" if self.isEnabled() else "#808080"),
-        )
+        if indicator.isValid():
+            width = max(3, min(9, indicator.width() - 6))
+            center = indicator.center()
+            painter.fillRect(
+                center.x() - width // 2, center.y() - 1, width, 3,
+                QColor("#000000" if self.isEnabled() else "#808080"),
+            )
         painter.end()
 
 
