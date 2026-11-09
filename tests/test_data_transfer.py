@@ -324,6 +324,37 @@ class DataTransferHistoryTests(unittest.TestCase):
                 stored = S.load_chatroom_history(server, key)
                 self.assertEqual(stored, [original])
 
+    def test_import_rejects_invalid_history_metadata_before_writing(self):
+        class Client:
+            def __init__(self):
+                self.config_data = S.default_config()
+
+            def _chatroom_definitions(self):
+                return []
+
+        client = Client()
+        examples = [
+            {"ntfy_id": ["not a string"]},
+            {"history_origin_topic": {"not": "a string"}},
+            {"ntfy_time": "not a number"},
+            {"display_sort_time": 2**80},
+            {"message": {"i": "message", "t": 2**80, "m": "text"}},
+        ]
+        for bad_fields in examples:
+            with self.subTest(bad_fields=bad_fields):
+                entry = {"message": {"i": "message", "t": 10, "m": "text"}}
+                entry.update(bad_fields)
+                archive = {"Chatrooms": [{
+                    "nickname": "Room", "key": "metadata-regression-key",
+                    "history": [entry],
+                }]}
+                before = json.loads(json.dumps(client.config_data))
+                with self.assertRaises(ValueError):
+                    S.EncryptedChatClient._prepare_data_import(
+                        client, archive, ("Chatrooms",),
+                    )
+                self.assertEqual(client.config_data, before)
+
     def test_import_without_chatrooms_leaves_room_settings_untouched(self):
         class Client:
             def __init__(self):
