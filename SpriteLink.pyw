@@ -13825,15 +13825,10 @@ QComboBox::drop-down {
             old_server = normalize_server_url(
                 str(old_config.get("server_url", ""))
             )
-            self.config_data = staged
-            try:
-                save_config(staged)
-            except Exception:
-                self.config_data = old_config
-                raise
-
+            # Merge history before committing imported settings. A failed
+            # history merge must not change the user's live configuration.
             server_url = normalize_server_url(
-                str(self.config_data.get("server_url", ""))
+                str(staged.get("server_url", ""))
             )
             pending_upgrades = set(_pending_history_upgrades()) if history_jobs else set()
             for key, history in history_jobs:
@@ -13847,6 +13842,13 @@ QComboBox::drop-down {
                 counts["messages"] += merge_imported_chatroom_history(
                     server_url, key, history,
                 )
+
+            self.config_data = staged
+            try:
+                save_config(staged)
+            except Exception:
+                self.config_data = old_config
+                raise
 
             if "Config" in categories:
                 self._apply_imported_config_controls()
