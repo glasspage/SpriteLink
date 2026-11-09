@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QColor, QPainter, QPen, QPolygon
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QLabel, QLineEdit,
-    QScrollArea, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame,
+    QLabel, QLineEdit, QScrollArea, QStyle, QStyleOptionButton,
+    QStyleOptionComboBox, QVBoxLayout, QWidget,
 )
 
 from spritelink_data_transfer import ARCHIVE_CATEGORIES
@@ -27,6 +29,79 @@ class _ChatroomsCheckBox(QCheckBox):
         )
         self.setCheckState(state)
 
+    def paintEvent(self, event: Any) -> None:
+        super().paintEvent(event)
+        app = QApplication.instance()
+        if (
+            self.checkState() != Qt.CheckState.PartiallyChecked
+            or app is None
+            or not bool(app.property("spritelinkWindowsClassic"))
+        ):
+            return
+
+        # Qt's Classic indicator omits the mixed-state mark. Draw the dash
+        # inside the indicator itself; the same widget is used by both dialogs.
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        indicator = self.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator, option, self,
+        )
+        if not indicator.isValid():
+            return
+        width = max(3, min(9, indicator.width() - 6))
+        center = indicator.center()
+        painter = QPainter(self)
+        painter.fillRect(
+            center.x() - width // 2, center.y() - 1, width, 3,
+            QColor("#000000" if self.isEnabled() else "#808080"),
+        )
+        painter.end()
+
+
+class _ImportBehaviorComboBox(QComboBox):
+    """Use the same theme-visible arrow as SpriteLink's other dropdowns."""
+
+    def paintEvent(self, event: Any) -> None:
+        super().paintEvent(event)
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        arrow_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            option, QStyle.SubControl.SC_ComboBoxArrow, self,
+        )
+        center = arrow_rect.center() if arrow_rect.isValid() else QPoint(
+            self.width() - 11, self.height() // 2,
+        )
+        x, y = center.x(), center.y()
+        painter = QPainter(self)
+        if bool(app.property("spritelinkModern")):
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(
+                QColor("#454545" if self.isEnabled() else "#888888"), 1.2,
+            ))
+            painter.drawPolyline(QPolygon([
+                QPoint(x - 4, y - 2), QPoint(x, y + 2), QPoint(x + 4, y - 2),
+            ]))
+        else:
+            classic = bool(app.property("spritelinkWindowsClassic"))
+            dark = bool(app.property("spritelinkGlassyDark"))
+            color = (
+                "#000000" if classic else
+                "#dce5ed" if dark else "#24485f"
+            )
+            if not self.isEnabled():
+                color = "#808080"
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(color))
+            painter.drawPolygon(QPolygon([
+                QPoint(x - 4, y - 2), QPoint(x + 4, y - 2), QPoint(x, y + 3),
+            ]))
+        painter.end()
+
 
 class DataTransferDialog(QDialog):
     def __init__(
@@ -45,18 +120,9 @@ class DataTransferDialog(QDialog):
         layout = QVBoxLayout(self)
         if mode == "import":
             layout.addWidget(QLabel("Import behavior"))
-            self.import_behavior_combo = QComboBox()
+            self.import_behavior_combo = _ImportBehaviorComboBox()
             self.import_behavior_combo.addItems(("Merge (Default)", "Overwrite"))
             layout.addWidget(self.import_behavior_combo)
-            self.overwrite_warning = QLabel(
-                "Overwrite replaces selected local data instead of merging it."
-            )
-            self.overwrite_warning.setWordWrap(True)
-            layout.addWidget(self.overwrite_warning)
-            self.import_behavior_combo.currentIndexChanged.connect(
-                self._update_import_behavior
-            )
-            self._update_import_behavior()
 
         layout.addWidget(QLabel(f"Select data to {mode.lower()}:"))
 
@@ -151,9 +217,6 @@ class DataTransferDialog(QDialog):
             if self.mode == "import" and self.import_behavior_combo.currentIndex() == 1
             else "merge"
         )
-
-    def _update_import_behavior(self, _index: int = 0) -> None:
-        self.overwrite_warning.setVisible(self.import_behavior() == "overwrite")
 
     def _update_identity_warning(self, _value: Any = None) -> None:
         if self.import_behavior() == "overwrite":
