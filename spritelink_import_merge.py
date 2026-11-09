@@ -38,12 +38,19 @@ def merge_emoji_data(
         # Avoid duplicate images that previous merges already renamed.
         # Matching is by the original name family AND image data; different
         # names may intentionally refer to the same drawing.
-        base = re.escape(name)
-        variant = re.compile(rf"^{base}_[2-9][0-9]*$", re.IGNORECASE)
-        if any(
-            value == encoded and variant.fullmatch(candidate)
-            for candidate, value in result.items()
-        ):
+        already_imported = False
+        for existing_name, existing_image in result.items():
+            if existing_image != encoded:
+                continue
+            match = re.search(r"_[2-9][0-9]*$", existing_name)
+            if match is None:
+                continue
+            suffix = match.group()
+            expected_name = name[:32 - len(suffix)] + suffix
+            if existing_name.casefold() == expected_name.casefold():
+                already_imported = True
+                break
+        if already_imported:
             continue
 
         for number in range(2, 10001):
