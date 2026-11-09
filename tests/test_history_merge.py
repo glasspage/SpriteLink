@@ -96,10 +96,18 @@ class HistoryMergeTests(unittest.TestCase):
         )
         self.assertEqual(len(self.messages()), 2)
 
-    def test_near_server_timestamp_catches_changed_sent_timestamp(self):
+    def test_delayed_batch_does_not_merge_different_send_times(self):
+        # An old message and a newly sent one can arrive together.
+        # If their signed timestamps differ, keep both.
         self.insert_local(self.item("id1", time=100, ntfy_time=500))
         self.assertEqual(
-            self.merge(self.item("id2", time=150, ntfy_time=503)), 0
+            self.merge(self.item("id2", time=150, ntfy_time=503)), 1
+        )
+
+    def test_arrival_timestamp_fallback_when_send_time_is_missing(self):
+        self.insert_local(self.item("id1", time=0, ntfy_time=500))
+        self.assertEqual(
+            self.merge(self.item("id2", time=0, ntfy_time=503)), 0
         )
 
     def test_same_ntfy_id_catches_changed_timestamps(self):
