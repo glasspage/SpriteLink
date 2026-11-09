@@ -176,6 +176,33 @@ class HistoryMergeTests(unittest.TestCase):
             self.merge(different, duplicate_candidate, decode=faulty_decode)
         self.assertEqual(set(self.messages()), {"existing"})
 
+    def test_thousands_of_distinct_messages_in_the_same_second(self):
+        # A dense timestamp bucket must not degrade into scanning every
+        # already inserted record for each new message.
+        messages = [
+            self.item(f"first-{i}", time=100, text=f"unique-{i}")
+            for i in range(5000)
+        ]
+        self.assertEqual(self.merge(*messages), 5000)
+        duplicates = [
+            self.item(f"second-{i}", time=102, text=f"unique-{i}")
+            for i in range(5000)
+        ]
+        self.assertEqual(self.merge(*duplicates), 0)
+        self.assertEqual(len(self.messages()), 5000)
+
+    def test_cache_eviction_still_detects_old_imported_messages(self):
+        messages = [
+            self.item(f"original-{i}", time=1000 + i * 20,
+                      text=f"unique-{i}")
+            for i in range(1200)
+        ]
+        messages.append(self.item(
+            "duplicate-earliest", time=1002, text="unique-0",
+        ))
+        self.assertEqual(self.merge(*messages), 1200)
+        self.assertEqual(len(self.messages()), 1200)
+
     def test_large_overlapping_histories_and_time_index(self):
         originals = [
             self.item(f"local-{i}", time=1000 + i * 10, text=f"message-{i}")
