@@ -170,6 +170,7 @@ def ensure_qt_multimedia_loaded() -> None:
 
 from spritelink_http import requests
 from spritelink_data_dialog import DataTransferDialog
+from spritelink_history_merge import merge_imported_history
 from spritelink_data_transfer import (
     ARCHIVE_CATEGORIES, CONFIG_EXPORT_FIELDS, MAX_ARCHIVE_BYTES,
     config_for_export, create_archive, inspect_archive, open_archive,
@@ -3743,6 +3744,38 @@ def save_chatroom_history(
             _insert_chatroom_history(connection, entries)
             if maximum_messages is not None:
                 _prune_history_rows(connection, maximum_messages)
+
+
+def merge_imported_chatroom_history(
+    server_url: str,
+    encryption_key: str,
+    entries: list[dict[str, Any]],
+) -> int:
+    """Fill history gaps while preserving every existing local message.
+
+    A single write transaction covers duplicate detection and insertion,
+    so concurrent chat messages cannot slip between the two operations.
+    Never prune history during import: transferred records must survive.
+    """
+    if not entries:
+        return 0
+
+    def encode_entry(item: dict[str, Any]) -> tuple:
+        return next(_history_rows((item,)))
+
+    def decode_entry(payload: bytes) -> dict[str, Any]:
+        return json.loads(zlib.decompress(
+            dpapi_decrypt(payload, CHATROOM_HISTORY_DPAPI_ENTROPY)
+        ))
+
+    path = chatroom_history_path(server_url, encryption_key)
+    with closing(_open_chatroom_history(path)) as connection:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return merge_imported_history(
+                connection, entries,
+                encode_entry=encode_entry, decode_entry=decode_entry,
+            )
 
 
 def copy_chatroom_history_for_key_change(
@@ -13647,7 +13680,6 @@ QComboBox::drop-down {
                     existing_keys.add(key)
                     counts["chatrooms"] += 1
                 history_jobs.append((key, history))
-                counts["messages"] += len(history)
 
         if "Emoji" in categories:
             imported_emojis = payload["Emoji"]
@@ -13810,9 +13842,11 @@ QComboBox::drop-down {
                 legacy = chatroom_history_path(server_url, key).with_suffix(".bin")
                 if legacy in pending_upgrades:
                     _upgrade_chatroom_history(legacy)
-                # INSERT ... ON CONFLICT DO NOTHING: preserve existing
-                # messages, local names and all room-specific preferences.
-                save_chatroom_history(server_url, key, history)
+                # Preserve local copies, including near-identical messages
+                # whose IDs changed during relay or earlier exports.
+                counts["messages"] += merge_imported_chatroom_history(
+                    server_url, key, history,
+                )
 
             if "Config" in categories:
                 self._apply_imported_config_controls()
