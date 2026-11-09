@@ -226,28 +226,29 @@ class ChatroomOverwriteTests(unittest.TestCase):
         server, key = "https://ntfy.sh", "history-overwrite-test"
         existing = {"message": {"i": "old", "c": "u", "t": 1, "m": "old"}}
         replacement = {"message": {"i": "new", "c": "u", "t": 2, "m": "new"}}
-        with tempfile.TemporaryDirectory() as tmp, (
-            mock.patch.object(S, "CHATROOM_HISTORY_DIRECTORY", Path(tmp)),
-            mock.patch.object(S, "dpapi_encrypt", side_effect=lambda raw, e: raw),
-            mock.patch.object(S, "dpapi_decrypt", side_effect=lambda raw, e: raw),
-        ):
-            S.save_chatroom_history(server, key, [existing])
-            self.assertEqual(S.overwrite_imported_chatroom_history(
-                server, key, [replacement],
-            ), 1)
-            self.assertEqual(S.load_chatroom_history(server, key), [replacement])
-            with mock.patch.object(
-                S, "dpapi_encrypt", side_effect=ValueError("write failed"),
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(S, "CHATROOM_HISTORY_DIRECTORY", Path(tmp)),
+                mock.patch.object(S, "dpapi_encrypt", side_effect=lambda raw, e: raw),
+                mock.patch.object(S, "dpapi_decrypt", side_effect=lambda raw, e: raw),
             ):
-                with self.assertRaisesRegex(ValueError, "write failed"):
-                    S.overwrite_imported_chatroom_history(
-                        server, key, [existing],
-                    )
-            self.assertEqual(S.load_chatroom_history(server, key), [replacement])
-            self.assertEqual(S.overwrite_imported_chatroom_history(
-                server, key, [],
-            ), 0)
-            self.assertEqual(S.load_chatroom_history(server, key), [])
+                S.save_chatroom_history(server, key, [existing])
+                self.assertEqual(S.overwrite_imported_chatroom_history(
+                    server, key, [replacement],
+                ), 1)
+                self.assertEqual(S.load_chatroom_history(server, key), [replacement])
+                with mock.patch.object(
+                    S, "dpapi_encrypt", side_effect=ValueError("write failed"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "write failed"):
+                        S.overwrite_imported_chatroom_history(
+                            server, key, [existing],
+                        )
+                self.assertEqual(S.load_chatroom_history(server, key), [replacement])
+                self.assertEqual(S.overwrite_imported_chatroom_history(
+                    server, key, [],
+                ), 0)
+                self.assertEqual(S.load_chatroom_history(server, key), [])
 
 
 if __name__ == "__main__":
