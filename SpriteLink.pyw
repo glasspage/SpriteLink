@@ -171,6 +171,7 @@ def ensure_qt_multimedia_loaded() -> None:
 from spritelink_http import requests
 from spritelink_data_dialog import DataTransferDialog
 from spritelink_history_merge import merge_imported_history
+from spritelink_import_merge import merge_emoji_data, merge_identity_data
 from spritelink_data_transfer import (
     ARCHIVE_CATEGORIES, CONFIG_EXPORT_FIELDS, MAX_ARCHIVE_BYTES,
     config_for_export, create_archive, inspect_archive, open_archive,
@@ -3779,6 +3780,22 @@ def merge_imported_chatroom_history(
                 connection, entries,
                 encode_entry=encode_entry, decode_entry=decode_entry,
             )
+
+
+def overwrite_imported_chatroom_history(
+    server_url: str,
+    encryption_key: str,
+    entries: list[dict[str, Any]],
+) -> int:
+    """Atomically replace one selected chatroom history, including empty lists."""
+    path = chatroom_history_path(server_url, encryption_key)
+    with closing(_open_chatroom_history(path)) as connection:
+        connection.execute("PRAGMA busy_timeout = 30000")
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM messages")
+            _insert_chatroom_history(connection, entries)
+            return connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
 
 
 def copy_chatroom_history_for_key_change(
@@ -13575,7 +13592,10 @@ QComboBox::drop-down {
 
     def _prepare_data_import(
         self, payload: dict[str, Any], categories: tuple[str, ...],
+        *, behavior: str = "merge",
     ) -> tuple[dict[str, Any], list[tuple[str, list[dict[str, Any]]]], dict[str, int]]:
+        if behavior not in ("merge", "overwrite"):
+            raise ValueError("Unknown import behavior.")
         # Complete validation before changing settings or writing history.
         staged = json.loads(json.dumps(self.config_data))
         history_jobs: list[tuple[str, list[dict[str, Any]]]] = []
@@ -13640,6 +13660,9 @@ QComboBox::drop-down {
             existing_keys = {
                 room["key"] for room in self._chatroom_definitions()
             }
+            existing_rooms = {
+                room["key"]: room for room in staged.get("chatrooms", [])
+            }
             already_seen: set[str] = set()
             new_rooms = staged.setdefault("chatrooms", [])
             profiles = staged.setdefault("room_profiles", {})
@@ -13695,31 +13718,28 @@ QComboBox::drop-down {
                     profiles[room_id] = dict(global_profile)
                     existing_keys.add(key)
                     counts["chatrooms"] += 1
+                elif behavior == "overwrite" and key in existing_rooms:
+                    # Only an explicit overwrite replaces a local room name.
+                    # Room appearance/notification settings remain local.
+                    existing_rooms[key]["nickname"] = name
                 history_jobs.append((key, history))
 
         if "Emoji" in categories:
             imported_emojis = payload["Emoji"]
             if not isinstance(imported_emojis, dict):
                 raise ValueError("Invalid Emoji data in archive.")
-            local_emojis = staged.setdefault("saved_emojis", {})
-            folded = {name.casefold() for name in local_emojis}
-            for name, encoded in imported_emojis.items():
-                if not valid_emoji(name, encoded):
-                    raise ValueError("Invalid emoji in archive.")
-                candidate = name
-                if candidate.casefold() in folded:
-                    if local_emojis.get(candidate) == encoded:
-                        continue
-                    for n in range(1, 10001):
-                        suffix = "_imported" if n == 1 else f"_imported{n}"
-                        candidate = name[:32 - len(suffix)] + suffix
-                        if candidate.casefold() not in folded:
-                            break
-                    else:
-                        raise ValueError("Too many emojis with the same name.")
-                local_emojis[candidate] = encoded
-                folded.add(candidate.casefold())
-                counts["emojis"] += 1
+            if behavior == "overwrite":
+                for name, encoded in imported_emojis.items():
+                    if not valid_emoji(name, encoded):
+                        raise ValueError("Invalid emoji in archive.")
+                staged["saved_emojis"] = dict(imported_emojis)
+                counts["emojis"] = len(imported_emojis)
+            else:
+                staged["saved_emojis"], counts["emojis"] = merge_emoji_data(
+                    staged.setdefault("saved_emojis", {}),
+                    imported_emojis,
+                    valid_emoji,
+                )
 
         if "Identity" in categories:
             imported = payload["Identity"]
@@ -13732,26 +13752,58 @@ QComboBox::drop-down {
             raw_presets = imported.get("presets")
             if not isinstance(raw_presets, list) or not raw_presets:
                 raise ValueError("Invalid identity presets in archive.")
-            presets = list(staged.get("identity_presets", []))
-            by_id = {preset["id"]: i for i, preset in enumerate(presets)}
-            for raw in raw_presets:
-                if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
-                    raise ValueError("Invalid identity preset in archive.")
-                preset = normalize_identity_preset(raw)
-                if preset["id"] in by_id:
-                    presets[by_id[preset["id"]]] = preset
-                elif len(presets) < MAX_IDENTITY_PRESETS:
-                    by_id[preset["id"]] = len(presets)
-                    presets.append(preset)
-                    counts["identities"] += 1
-            staged["identity_presets"] = presets
-            staged["identity_private_key"] = private_key
-            active_id = imported.get("active_preset_id", "")
-            if active_id in by_id:
-                profile = staged.setdefault("room_profiles", {}).setdefault(
-                    GLOBAL_CHATROOM_ID, {}
+
+            if behavior == "merge":
+                # The signing key is a single global value, not part of the
+                # named identity presets. Never replace it during a merge.
+                presets, added, updated = merge_identity_data(
+                    staged.get("identity_presets", []),
+                    raw_presets, normalize_identity_preset,
+                    lambda: uuid.uuid4().hex, MAX_IDENTITY_PRESETS,
                 )
-                apply_identity_preset_to_profile(profile, presets[by_id[active_id]])
+                staged["identity_presets"] = presets
+                counts["identities"] = added + updated
+                updated_profiles = staged.setdefault("room_profiles", {})
+                by_id = {preset["id"]: preset for preset in presets}
+                for profile in updated_profiles.values():
+                    if not isinstance(profile, dict):
+                        continue
+                    preset = by_id.get(profile.get("identity_preset_id"))
+                    if preset is not None:
+                        apply_identity_preset_to_profile(profile, preset)
+            else:
+                if len(raw_presets) > MAX_IDENTITY_PRESETS:
+                    raise ValueError("Too many identities in archive.")
+                presets = []
+                used_ids: set[str] = set()
+                for raw in raw_presets:
+                    if (
+                        not isinstance(raw, dict)
+                        or not isinstance(raw.get("id"), str)
+                        or not isinstance(raw.get("username"), str)
+                    ):
+                        raise ValueError("Invalid identity preset in archive.")
+                    preset = normalize_identity_preset(raw)
+                    if preset["id"] in used_ids:
+                        raise ValueError("Duplicate identity ID in archive.")
+                    used_ids.add(preset["id"])
+                    presets.append(preset)
+                staged["identity_presets"] = presets
+                staged["identity_private_key"] = private_key
+                counts["identities"] = len(presets)
+                by_id = {preset["id"]: preset for preset in presets}
+                active_id = imported.get("active_preset_id")
+                default_preset = by_id.get(active_id, presets[0])
+                profiles = staged.setdefault("room_profiles", {})
+                for profile in profiles.values():
+                    if not isinstance(profile, dict):
+                        continue
+                    selected = by_id.get(profile.get("identity_preset_id"))
+                    apply_identity_preset_to_profile(
+                        profile, selected or default_preset,
+                    )
+                global_profile = profiles.setdefault(GLOBAL_CHATROOM_ID, {})
+                apply_identity_preset_to_profile(global_profile, default_preset)
 
         return staged, history_jobs, counts
 
@@ -13820,6 +13872,18 @@ QComboBox::drop-down {
         self._apply_window_titlebar_theme(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        behavior = dialog.import_behavior()
+        if behavior == "overwrite":
+            answer = QMessageBox.warning(
+                self.root, "Overwrite local data",
+                "Overwrite replaces selected local chatroom histories, "
+                "emojis, and identities with the data in this file. "
+                "Existing messages and presets may be lost. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         try:
             categories = dialog.selected_categories()
             if "Chatrooms" in categories:
@@ -13835,7 +13899,7 @@ QComboBox::drop-down {
             ):
                 raise OSError("Could not save the current chatroom history.")
             staged, history_jobs, counts = self._prepare_data_import(
-                payload, categories,
+                payload, categories, behavior=behavior,
             )
             old_config = self.config_data
             old_server = normalize_server_url(
@@ -13853,11 +13917,16 @@ QComboBox::drop-down {
                 legacy = chatroom_history_path(server_url, key).with_suffix(".bin")
                 if legacy in pending_upgrades:
                     _upgrade_chatroom_history(legacy)
-                # Preserve local copies, including near-identical messages
-                # whose IDs changed during relay or earlier exports.
-                counts["messages"] += merge_imported_chatroom_history(
-                    server_url, key, history,
-                )
+                if behavior == "overwrite":
+                    counts["messages"] += overwrite_imported_chatroom_history(
+                        server_url, key, history,
+                    )
+                else:
+                    # Preserve local copies, including near-identical messages
+                    # whose IDs changed during relay or earlier exports.
+                    counts["messages"] += merge_imported_chatroom_history(
+                        server_url, key, history,
+                    )
 
             self.config_data = staged
             try:
@@ -13899,7 +13968,7 @@ QComboBox::drop-down {
             f"Imported {counts['chatrooms']} new chatrooms, "
             f"{counts['messages']} history records, "
             f"{counts['emojis']} emojis, and "
-            f"{counts['identities']} new identity presets.",
+            f"{counts['identities']} identity presets added or updated.",
             parent=self.root,
         )
 
