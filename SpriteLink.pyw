@@ -3770,6 +3770,9 @@ def merge_imported_chatroom_history(
 
     path = chatroom_history_path(server_url, encryption_key)
     with closing(_open_chatroom_history(path)) as connection:
+        # Network polling may briefly write to this room at the same time.
+        # Wait for that write rather than reporting a spurious lock error.
+        connection.execute("PRAGMA busy_timeout = 30000")
         with connection:
             connection.execute("BEGIN IMMEDIATE")
             return merge_imported_history(
@@ -13665,8 +13668,21 @@ QComboBox::drop-down {
                         or len(item["message"]["i"]) > 128
                     ):
                         raise ValueError("Invalid chatroom history entry.")
+                    for field in ("ntfy_id", "history_origin_topic"):
+                        value = item.get(field)
+                        if value is not None and not isinstance(value, str):
+                            raise ValueError("Invalid chatroom history metadata.")
+                    for field in ("ntfy_time", "display_sort_time"):
+                        value = item.get(field)
+                        if value is not None and type(value) is not int:
+                            raise ValueError("Invalid chatroom history timestamp.")
                     try:
-                        message_item_sort_key(item)
+                        sort_time, sent_time, _message_id = message_item_sort_key(item)
+                        if (
+                            not 0 <= sort_time <= 2**63 - 1
+                            or not 0 <= sent_time <= 2**63 - 1
+                        ):
+                            raise ValueError("Timestamp outside SQLite's range.")
                     except (ValueError, TypeError, OverflowError) as exc:
                         raise ValueError("Invalid chatroom history timestamp.") from exc
                 if key not in existing_keys:
