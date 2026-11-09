@@ -71,6 +71,20 @@ class EmojiImportTests(unittest.TestCase):
             (merged, 0),
         )
 
+    def test_suffix_trims_dangling_punctuation_at_character_limit(self):
+        original = "a" * 29 + "-bc"
+        first, second = emoji(1), emoji(2)
+        merged, count = merge_emoji_data(
+            {original: first}, {original: second}, S.valid_emoji,
+        )
+        renamed = "a" * 29 + "_2"
+        self.assertEqual(count, 1)
+        self.assertEqual(merged[renamed], second)
+        self.assertEqual(
+            merge_emoji_data(merged, {original: second}, S.valid_emoji),
+            (merged, 0),
+        )
+
     def test_name_and_image_both_matter(self):
         data = emoji(1)
         merged, count = merge_emoji_data(
