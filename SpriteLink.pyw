@@ -11082,6 +11082,11 @@ QComboBox::drop-down {
         self.search_toggle = QPushButton("Search")
         self.search_toggle.setCheckable(True)
         self.search_toggle.toggled.connect(self._on_search_toggled)
+        self.search_shortcut = QShortcut(
+            QKeySequence(QKeySequence.StandardKey.Find), self.root,
+        )
+        self.search_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.search_shortcut.activated.connect(self._focus_chat_search)
         status_layout.addWidget(self.search_toggle)
 
         self.config_toggle = QPushButton("Config")
@@ -11638,8 +11643,6 @@ QComboBox::drop-down {
     def _qimage_import_source(image: QImage) -> Image.Image:
         if image.isNull():
             raise ValueError("The image is empty.")
-        if image.width() * image.height() > 24_000_000:
-            raise ValueError("Choose an image under 24 megapixels.")
         rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
         return Image.frombytes(
             "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
@@ -12144,6 +12147,9 @@ QComboBox::drop-down {
     def _build_search_popup(self) -> None:
         self.search_overlay = ConfigOverlay(self.chat_content)
         self.search_overlay.dismissed.connect(self.search_toggle.click)
+        escape = QShortcut(Qt.Key.Key_Escape, self.search_overlay)
+        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        escape.activated.connect(lambda: self.search_toggle.setChecked(False))
         overlay_layout = QVBoxLayout(self.search_overlay)
         overlay_layout.setContentsMargins(24, 24, 24, 24)
         panel = QFrame()
@@ -12208,6 +12214,12 @@ QComboBox::drop-down {
         self.search_entry.returnPressed.connect(self._start_chat_search)
         self.chat_content.installEventFilter(self)
         self._apply_ui_size_to_widget_tree(self.search_overlay)
+
+    def _focus_chat_search(self) -> None:
+        if self.search_toggle.isChecked():
+            self.search_entry.setFocus()
+        else:
+            self.search_toggle.setChecked(True)
 
     def _on_search_toggled(self, checked: bool) -> None:
         if not checked:
@@ -12576,6 +12588,9 @@ QComboBox::drop-down {
     def _build_config_popup(self) -> None:
         self.config_overlay = ConfigOverlay(self.chat_content)
         self.config_overlay.dismissed.connect(self._dismiss_config_popup)
+        escape = QShortcut(Qt.Key.Key_Escape, self.config_overlay)
+        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        escape.activated.connect(self._dismiss_config_popup)
 
         overlay_layout = QVBoxLayout(self.config_overlay)
         overlay_layout.setContentsMargins(24, 24, 24, 24)
