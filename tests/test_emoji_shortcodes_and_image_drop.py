@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QTimer, QUrl, Qt
-from PySide6.QtGui import QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage
+from PySide6.QtGui import QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage, QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -44,6 +44,7 @@ class EmojiShortcodesAndImageDropTests(unittest.TestCase):
         self.client.history_load_executor.shutdown(wait=False, cancel_futures=True)
         self.client.image_fetch_executor.shutdown(wait=False, cancel_futures=True)
         self.root.close_callback = None
+        self.app.clipboard().clear()
         self.root.close()
         self.root.deleteLater()
         self.app.processEvents()
@@ -125,6 +126,64 @@ class EmojiShortcodesAndImageDropTests(unittest.TestCase):
         panel = self._send_drop(mime)
         self.assertEqual(panel.source.size, (5, 4))
         self.assertEqual(panel.source.getpixel((1, 1))[:3], (30, 90, 200))
+
+    def test_ctrl_v_with_clipboard_bitmap_opens_import_preview(self):
+        image = QImage(13, 7, QImage.Format.Format_RGBA8888)
+        image.fill(QColor(70, 140, 20))
+        self.app.clipboard().setImage(image)
+        self.edit.setPlainText("keep this draft")
+        self.edit.setFocus()
+
+        QTest.keyClick(self.edit, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+
+        panel = self.client.drawing_import_overlay.panel
+        self.assertIsInstance(panel, S.DrawingImportPanel)
+        self.assertEqual(panel.source.size, (13, 7))
+        self.assertTrue(self.client.image_menu_button.isChecked())
+        self.assertEqual(self.edit.to_message_text(), "keep this draft")
+
+    def test_pasting_image_from_composer_context_menu_uses_same_importer(self):
+        image = QImage(4, 6, QImage.Format.Format_RGBA8888)
+        image.fill(QColor(80, 40, 190))
+        mime = QMimeData()
+        mime.setImageData(image)
+        self.edit.insertFromMimeData(mime)
+        panel = self.client.drawing_import_overlay.panel
+        self.assertIsInstance(panel, S.DrawingImportPanel)
+        self.assertEqual(panel.source.size, (4, 6))
+
+    def test_clipboard_image_file_url_opens_preview_with_paste_shortcut(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "pasted.png"
+            Image.new("RGB", (11, 5), (20, 60, 80)).save(path)
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(str(path))])
+            self.app.clipboard().setMimeData(mime)
+            self.edit.setFocus()
+            QTest.keyClick(self.edit, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+            self.assertEqual(self.client.drawing_import_overlay.panel.source.size, (11, 5))
+
+    def test_text_clipboard_paste_remains_text(self):
+        self.app.clipboard().setText("plain text :unknown:")
+        self.edit.setFocus()
+        QTest.keyClick(self.edit, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual(self.edit.to_message_text(), "plain text :unknown:")
+        self.assertIsNone(getattr(self.client, "drawing_import_overlay", None))
+
+    def test_shortcut_for_image_clipboard_ignored_outside_main_window(self):
+        image = QImage(3, 5, QImage.Format.Format_RGBA8888)
+        image.fill(QColor(20, 30, 40))
+        self.app.clipboard().setImage(image)
+        event = QKeyEvent(
+            QKeyEvent.Type.KeyPress, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier,
+        )
+        from PySide6.QtWidgets import QDialog
+        dialog = QDialog()
+        try:
+            self.assertFalse(self.client.eventFilter(dialog, event))
+            self.assertIsNone(getattr(self.client, "drawing_import_overlay", None))
+        finally:
+            dialog.deleteLater()
 
     def test_other_dragged_content_is_ignored(self):
         self.assertTrue(self.root.acceptDrops())
