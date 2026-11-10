@@ -186,6 +186,60 @@ class EmojiShortcodesAndImageDropTests(unittest.TestCase):
         finally:
             dialog.deleteLater()
 
+    def test_ctrl_f_opens_search_and_escape_closes_it(self):
+        self.edit.setFocus()
+        QTest.keyClick(self.edit, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+        self.app.processEvents()
+        self.assertTrue(self.client.search_toggle.isChecked())
+        self.assertTrue(self.client.search_overlay.isVisible())
+        self.assertTrue(self.client.search_entry.hasFocus())
+
+        QTest.keyClick(self.client.search_entry, Qt.Key.Key_Escape)
+        self.app.processEvents()
+        self.assertFalse(self.client.search_toggle.isChecked())
+        self.assertFalse(self.client.search_overlay.isVisible())
+
+    def test_ctrl_f_refocuses_already_open_search(self):
+        self.client.search_toggle.setChecked(True)
+        self.edit.setFocus()
+        QTest.keyClick(self.edit, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+        self.app.processEvents()
+        self.assertTrue(self.client.search_overlay.isVisible())
+        self.assertTrue(self.client.search_entry.hasFocus())
+
+    def test_escape_closes_config_panel(self):
+        self.client.config_toggle.setChecked(True)
+        self.app.processEvents()
+        self.assertTrue(self.client.config_overlay.isVisible())
+        QTest.keyClick(self.client.theme_combo, Qt.Key.Key_Escape)
+        self.app.processEvents()
+        self.assertFalse(self.client.config_overlay.isVisible())
+        self.assertFalse(self.client.config_toggle.isChecked())
+
+    def test_large_qimage_no_longer_uses_24_mp_restriction(self):
+        image = QImage(2, 2, QImage.Format.Format_RGBA8888)
+        image.fill(QColor(50, 100, 150))
+        source = mock.Mock()
+        source.isNull.return_value = False
+        source.width.return_value = 6000
+        source.height.return_value = 5000
+        source.convertToFormat.return_value = image
+        converted = self.client._qimage_import_source(source)
+        self.assertEqual(converted.size, (2, 2))
+
+    def test_large_file_import_no_longer_uses_24_mp_restriction(self):
+        import spritelink_drawing
+        source = mock.MagicMock()
+        source.width, source.height = 6000, 5000
+        source.__enter__.return_value = source
+        with mock.patch.object(spritelink_drawing.Image, "open", return_value=source):
+            with mock.patch.object(
+                spritelink_drawing.ImageOps, "exif_transpose",
+                return_value=Image.new("RGBA", (2, 2)),
+            ):
+                image = spritelink_drawing.load_import_image("large.png")
+        self.assertEqual(image.size, (2, 2))
+
     def test_other_dragged_content_is_ignored(self):
         self.assertTrue(self.root.acceptDrops())
         mime = QMimeData()
