@@ -1,6 +1,7 @@
 import copy
 import os
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -79,6 +80,36 @@ class ChatroomPreferenceTests(unittest.TestCase):
         self.client._activate_chatroom("room-b")
         self.assertEqual(self.client._applied_theme_color, ("Modern", 175))
 
+    def test_room_color_switch_restylizes_only_main_window(self):
+        self.config["room_settings"] = {
+            "room-a": {"theme_colors": {"Glassy": 70}},
+            "room-b": {"theme_colors": {"Glassy": 210}},
+        }
+        application_stylesheet = self.app.styleSheet()
+        self.client._activate_chatroom("room-a")
+        first_window_stylesheet = self.root.styleSheet()
+        self.assertTrue(first_window_stylesheet)
+        self.assertEqual(self.app.styleSheet(), application_stylesheet)
+        self.assertEqual(self.client._applied_theme_color, ("Glassy", 70))
+
+        self.client._activate_chatroom("room-b")
+        self.assertNotEqual(self.root.styleSheet(), first_window_stylesheet)
+        self.assertEqual(self.app.styleSheet(), application_stylesheet)
+        self.assertEqual(self.client._applied_theme_color, ("Glassy", 210))
+
+        # Changing the application theme still replaces the full app style.
+        self.client._on_theme_changed("Modern")
+        self.assertEqual(self.root.styleSheet(), "")
+        self.assertEqual(self.client._applied_theme_color, ("Modern", 0))
+
+    def test_hue_style_revisits_use_cached_result(self):
+        S.hue_theme_stylesheet.cache_clear()
+        stylesheet = "QPushButton { background: #438eaf; color: #222222; }"
+        first = S.hue_theme_stylesheet(stylesheet, 65)
+        self.assertEqual(S.hue_theme_stylesheet.cache_info().misses, 1)
+        self.assertEqual(S.hue_theme_stylesheet(stylesheet, 65), first)
+        self.assertGreaterEqual(S.hue_theme_stylesheet.cache_info().hits, 1)
+
     def test_default_color_follows_config_for_selected_theme(self):
         self.client._on_theme_changed("Classic")
         self.client.active_chatroom_id = "room-a"
@@ -153,6 +184,157 @@ class ChatroomPreferenceTests(unittest.TestCase):
         error.assert_called_once()
         self.assertEqual(self.config["room_settings"]["room-a"]["theme_colors"], {"Glassy": 70})
 
+    def test_dynamic_key_security_feedback(self):
+        create = S.ChatroomDetailsDialog(self.client.root)
+        self.dialogs.append(create)
+        self.assertEqual(len(create.chatroom_key()), 48)
+        self.assertEqual(create.key_security_label.text(), "Security: Excellent")
+        dark = bool(self.app.property("spritelinkGlassyDark"))
+        normal_color = "#aab4bd" if dark else "#777777"
+        weak_color = "#bb5555" if dark else "#a94444"
+        self.assertIn(normal_color, create.key_security_label.styleSheet())
+        self.assertFalse(create.key_security_label.isHidden())
+        create.key_entry.setText("a" * 48)
+        self.assertEqual(create.key_security_label.text(), "Security: Unsecure")
+        self.assertIn(weak_color, create.key_security_label.styleSheet())
+        create.key_entry.setText("abc" * 16)
+        self.assertEqual(create.key_security_label.text(), "Security: Weak")
+        self.assertIn(weak_color, create.key_security_label.styleSheet())
+        create.key_entry.setText(S.generate_chatroom_key())
+        self.assertEqual(create.key_security_label.text(), "Security: Excellent")
+        self.assertIn(normal_color, create.key_security_label.styleSheet())
+
+        edit = self.dialog()
+        original = edit.chatroom_key()
+        self.assertTrue(edit.key_security_label.isHidden())
+        edit.key_entry.setText("Ag4!vP6@Km2?Q7x$")
+        self.assertEqual(edit.key_security_label.text(), "Security: Strong")
+        self.assertFalse(edit.key_security_label.isHidden())
+        edit.key_entry.setText(original)
+        self.assertTrue(edit.key_security_label.isHidden())
+
+    def test_edit_key_warning_can_cancel_without_accepting(self):
+        edit = self.dialog()
+        edit.key_entry.setText("NewKey123!ForConfirming")
+        with mock.patch.object(S.ChangeChatroomKeyDialog, "exec", return_value=QDialog.DialogCode.Rejected) as warning:
+            edit.accept()
+            warning.assert_called_once()
+        self.assertNotEqual(edit.result(), QDialog.DialogCode.Accepted)
+
+        with mock.patch.object(S.ChangeChatroomKeyDialog, "exec", return_value=QDialog.DialogCode.Accepted) as warning:
+            edit.accept()
+            warning.assert_called_once()
+        self.assertEqual(edit.result(), QDialog.DialogCode.Accepted)
+
+        unchanged = self.dialog("room-b")
+        with mock.patch.object(S.ChangeChatroomKeyDialog, "exec", side_effect=AssertionError("Unexpected warning")):
+            unchanged.accept()
+        self.assertEqual(unchanged.result(), QDialog.DialogCode.Accepted)
+
+    def test_key_warning_buttons_are_cancel_then_change(self):
+        dialog = S.ChangeChatroomKeyDialog(self.client.root)
+        self.dialogs.append(dialog)
+        self.assertEqual(dialog.change_key_button.text(), "Change Key")
+        self.assertEqual(dialog.cancel_button.text(), "Cancel")
+        self.assertLess(
+            dialog.button_row.indexOf(dialog.cancel_button),
+            dialog.button_row.indexOf(dialog.change_key_button),
+        )
+        self.assertTrue(dialog.cancel_button.isDefault())
+        self.assertEqual(
+            dialog.warning_message.text(),
+            "The chatroom key will be changed. Log history will persist "
+            "locally but others must update their chatroom key to keep "
+            "chatting with you.",
+        )
+
+    def test_key_edit_moves_saved_history_to_new_key(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            new_key = "NewKeyWith48Characters0123456789AbCdEfGhIjKlMnO"
+            old_key = self.config["chatrooms"][0]["key"]
+            server = self.config["server_url"]
+            entry = {"message": {"i": "old-message", "t": 123, "m": "Retained locally"}}
+            with mock.patch.object(S, "CHATROOM_HISTORY_DIRECTORY", Path(temporary_directory)), \
+                 mock.patch.object(S, "room_scope_id", side_effect=lambda _server, key: key), \
+                 mock.patch.object(S, "dpapi_encrypt", side_effect=lambda data, _entropy: data), \
+                 mock.patch.object(S, "dpapi_decrypt", side_effect=lambda data, _entropy: data):
+                # An inactive room must migrate its full saved history too.
+                S.save_chatroom_history(server, old_key, [entry])
+                edit = self.dialog()
+                edit.key_entry.setText(new_key)
+                with mock.patch.object(S, "EditChatroomDialog", return_value=edit), \
+                     mock.patch.object(edit, "exec", return_value=QDialog.DialogCode.Accepted):
+                    self.client._edit_chatroom("room-a")
+                self.assertEqual(self.config["chatrooms"][0]["key"], new_key)
+                self.assertFalse(S.chatroom_history_path(server, old_key).exists())
+                self.assertEqual(S.load_chatroom_history(server, new_key), [{
+                    **entry,
+                    "history_origin_topic": S.derive_ntfy_topic(old_key),
+                }])
+
+    def test_active_room_key_edit_flushes_pending_history_before_moving(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            old_key = self.config["chatrooms"][0]["key"]
+            new_key = "AnotherLongNewKey1234!@#$"
+            server = self.config["server_url"]
+            stored = {"message": {"i": "saved", "t": 100}}
+            pending = {"message": {"i": "pending", "t": 101}}
+            with mock.patch.object(S, "CHATROOM_HISTORY_DIRECTORY", Path(temporary_directory)), \
+                 mock.patch.object(S, "room_scope_id", side_effect=lambda _server, key: key), \
+                 mock.patch.object(S, "dpapi_encrypt", side_effect=lambda data, _entropy: data), \
+                 mock.patch.object(S, "dpapi_decrypt", side_effect=lambda data, _entropy: data):
+                S.save_chatroom_history(server, old_key, [stored])
+                self.client.active_chatroom_id = "room-a"
+                self.client.pending_history_entries = [pending]
+                edit = self.dialog()
+                edit.key_entry.setText(new_key)
+                with mock.patch.object(S, "EditChatroomDialog", return_value=edit), \
+                     mock.patch.object(edit, "exec", return_value=QDialog.DialogCode.Accepted):
+                    self.client._edit_chatroom("room-a")
+                self.assertEqual(self.config["chatrooms"][0]["key"], new_key)
+                self.assertFalse(S.chatroom_history_path(server, old_key).exists())
+                self.assertEqual(
+                    S.load_chatroom_history(server, new_key),
+                    [
+                        {**stored, "history_origin_topic": S.derive_ntfy_topic(old_key)},
+                        {**pending, "history_origin_topic": S.derive_ntfy_topic(old_key)},
+                    ],
+                )
+
+    def test_key_edit_preserves_original_history_if_config_save_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            old_key = self.config["chatrooms"][0]["key"]
+            new_key = "RekeyedRoom0123456789"
+            server = self.config["server_url"]
+            entry = {"message": {"i": "retained", "t": 10}}
+            with mock.patch.object(S, "CHATROOM_HISTORY_DIRECTORY", Path(temporary_directory)), \
+                 mock.patch.object(S, "room_scope_id", side_effect=lambda _server, key: key), \
+                 mock.patch.object(S, "dpapi_encrypt", side_effect=lambda data, _entropy: data), \
+                 mock.patch.object(S, "dpapi_decrypt", side_effect=lambda data, _entropy: data):
+                S.save_chatroom_history(server, old_key, [entry])
+                edit = self.dialog()
+                edit.key_entry.setText(new_key)
+                with mock.patch.object(S, "EditChatroomDialog", return_value=edit), \
+                     mock.patch.object(edit, "exec", return_value=QDialog.DialogCode.Accepted), \
+                     mock.patch.object(S, "save_config", side_effect=OSError("disk full")), \
+                     mock.patch.object(S.messagebox, "showerror") as error:
+                    self.client._edit_chatroom("room-a")
+                error.assert_called_once()
+                self.assertEqual(self.config["chatrooms"][0]["key"], old_key)
+                self.assertEqual(S.load_chatroom_history(server, old_key), [entry])
+
+    def test_key_edit_does_not_switch_or_remove_history_on_migration_error(self):
+        original_key = self.config["chatrooms"][0]["key"]
+        edit = self.dialog()
+        edit.key_entry.setText("new-room-key-1234567890")
+        with mock.patch.object(S, "EditChatroomDialog", return_value=edit), \
+             mock.patch.object(edit, "exec", return_value=QDialog.DialogCode.Accepted), \
+             mock.patch.object(S, "copy_chatroom_history_for_key_change", side_effect=OSError("disk full")), \
+             mock.patch.object(S.messagebox, "showerror") as error:
+            self.client._edit_chatroom("room-a")
+        error.assert_called_once()
+        self.assertEqual(self.config["chatrooms"][0]["key"], original_key)
+
     def test_active_edit_applies_and_global_can_override(self):
         self.client._activate_chatroom("room-a")
         d = self.dialog()
@@ -164,6 +346,9 @@ class ChatroomPreferenceTests(unittest.TestCase):
         d = self.dialog(S.GLOBAL_CHATROOM_ID)
         self.assertFalse(d.name_entry.isEnabled())
         self.assertFalse(d.key_entry.isEnabled())
+        self.assertEqual(d.name_entry.objectName(), "lockedChatroomDetail")
+        self.assertEqual(d.key_entry.objectName(), "lockedChatroomDetail")
+        self.assertTrue(d.key_security_label.isHidden())
         d.settings["theme_colors"] = {"Glassy": 210}
         with mock.patch.object(S, "EditChatroomDialog", return_value=d), \
              mock.patch.object(d, "exec", return_value=QDialog.DialogCode.Accepted):

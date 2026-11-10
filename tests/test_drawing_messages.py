@@ -62,3 +62,32 @@ class DrawingMessageTests(unittest.TestCase):
         S.sign_message_identity(received, room_key, private_key)
         with self.assertRaisesRegex(ValueError, "cannot contain message text"):
             S.EncryptedChatClient._validate_decrypted_message(received, room_key)
+
+    def test_inline_emoji_data_is_signed_and_names_are_legacy_text(self):
+        encoded = encode_drawing(S.EMOJI_SIZE, bytes([1]) * 256)
+        markup = f"<b>🐈 {S.emoji_markup('sleepy cat', encoded)}</b>"
+        text, emojis = S.pack_message_emojis(markup)
+        self.assertEqual(text, "<b>🐈 :sleepy cat:</b>")
+        private_key = S.generate_identity_private_key()
+        room_key = "emoji test room"
+        message = {
+            "v": S.APP_VERSION, "i": "test-id", "u": "Artist",
+            "k": "#ffffff", "t": 1000, "m": text, "emojis": emojis,
+        }
+        S.sign_message_identity(message, room_key, private_key)
+        packet = S.make_opaque_packet(message, room_key)
+        self.assertEqual(len(packet), S.estimate_opaque_packet_size(message))
+        received = S.open_opaque_packet(packet, room_key)
+        S.EncryptedChatClient._validate_decrypted_message(received, room_key)
+        self.assertEqual(S.message_emoji_markup(received), markup)
+
+        legacy = {key: value for key, value in received.items() if key not in {"emojis", "emoji_signature"}}
+        S.EncryptedChatClient._validate_decrypted_message(legacy, room_key)
+        self.assertEqual(S.message_plain_text(legacy["m"]), "🐈 :sleepy cat:")
+
+        received["emojis"][0][2] = encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+        with self.assertRaises(InvalidSignature):
+            S.EncryptedChatClient._validate_decrypted_message(received, room_key)
+        received["emojis"][0][0] += 1
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            S.EncryptedChatClient._validate_decrypted_message(received, room_key)

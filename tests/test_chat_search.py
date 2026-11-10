@@ -4,7 +4,7 @@ import unittest
 from unittest import mock
 
 from PySide6.QtCore import QUrl
-from PySide6.QtGui import QColor, QImage, QPainter, QTextDocument
+from PySide6.QtGui import QColor, QImage, QPainter, QTextCursor, QTextDocument
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QPushButton
 from spritelink_video import VideoInfo
@@ -139,11 +139,48 @@ class ChatSearchTests(unittest.TestCase):
         document.setHtml(body.toHtml())
         image_format = document.begin().begin().fragment().charFormat().toImageFormat()
         self.assertEqual(image_format.width(), S.PROFILE_ICON_SIZE)
+        self.assertEqual(image_format.height(), S.PROFILE_ICON_SIZE)
         image = document.resource(QTextDocument.ResourceType.ImageResource,
                                   QUrl(image_format.name()))
         self.assertFalse(image.isNull())
+        self.assertEqual((image.width(), image.height()), (16, 16))
         self.client.config_data["ui_size"] = "Tiny"
         self.assertNotIn("<img", self.client._search_result_message(message).toHtml())
+
+    def test_chat_profile_icons_remain_exactly_16_pixels_in_normal_and_large_ui(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.png"
+            S.Image.new("RGB", (16, 16), (20, 100, 180)).save(path)
+            encoded_icon = S.encode_profile_icon(S.optimize_profile_icon(str(path)))
+
+        for ui_size in ("Small (Default)", "Large"):
+            with self.subTest(ui_size=ui_size):
+                self.client.config_data["ui_size"] = ui_size
+                self.assertTrue(self.client._chat_icons_visible())
+                document = QTextDocument()
+                cursor = QTextCursor(document)
+                self.assertTrue(
+                    self.client._insert_profile_icon(
+                        cursor, encoded_icon, "profile-icon-test"
+                    )
+                )
+                image_format = (
+                    document.begin().begin().fragment().charFormat().toImageFormat()
+                )
+                self.assertEqual(
+                    (image_format.width(), image_format.height()), (16.0, 16.0),
+                )
+                resource = document.resource(
+                    QTextDocument.ResourceType.ImageResource,
+                    QUrl(image_format.name()),
+                )
+                self.assertEqual(
+                    (resource.width(), resource.height()), (16, 16),
+                )
+                self.assertEqual(resource.devicePixelRatio(), 1.0)
+
+        self.client.config_data["ui_size"] = "Tiny"
+        self.assertFalse(self.client._chat_icons_visible())
 
     def test_search_embeds_noninteractive_media_and_clears_query_on_room_change(self):
         client = self.client

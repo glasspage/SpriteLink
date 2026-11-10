@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import binascii
 from bisect import bisect_right, insort_right
+from collections import Counter
 import ctypes
 from contextlib import closing
 from ctypes import wintypes
@@ -45,9 +46,11 @@ try:
         QByteArray,
         QEvent,
         QIODevice,
+        QMimeData,
         QObject,
         QPoint,
         QPointF,
+        QRect,
         QRectF,
         QSize,
         QTimer,
@@ -67,6 +70,7 @@ try:
         QFontMetricsF,
         QIcon,
         QImage,
+        QKeySequence,
         QLinearGradient,
         QMovie,
         QPainter,
@@ -78,6 +82,7 @@ try:
         QPolygon,
         QRegion,
         QShortcut,
+        QValidator,
         QTextBlockFormat,
         QTextBlockUserData,
         QTextCharFormat,
@@ -98,6 +103,7 @@ try:
         QColorDialog,
         QComboBox,
         QDialog,
+        QDialogButtonBox,
         QFrame,
         QFileDialog,
         QGraphicsBlurEffect,
@@ -105,6 +111,7 @@ try:
         QGraphicsScene,
         QGridLayout,
         QHBoxLayout,
+        QInputDialog,
         QLabel,
         QLineEdit,
         QListWidget,
@@ -112,7 +119,6 @@ try:
         QMainWindow,
         QMenu,
         QMessageBox,
-        QPlainTextEdit,
         QProgressBar,
         QProxyStyle,
         QPushButton,
@@ -163,6 +169,13 @@ def ensure_qt_multimedia_loaded() -> None:
 
 
 from spritelink_http import requests
+from spritelink_data_dialog import DataTransferDialog
+from spritelink_history_merge import merge_imported_history
+from spritelink_import_merge import merge_emoji_data, merge_identity_data
+from spritelink_data_transfer import (
+    ARCHIVE_CATEGORIES, CONFIG_EXPORT_FIELDS, MAX_ARCHIVE_BYTES,
+    config_for_export, create_archive, inspect_archive, open_archive,
+)
 
 from spritelink_update import (
     ReleaseInfo,
@@ -205,7 +218,10 @@ except ImportError as exc:
 from spritelink_drawing import (
     DrawingImportPanel, DrawingMenu, drawing_image, load_import_image,
 )
-from spritelink_image_codec import decode_drawing, encode_drawing
+from spritelink_image_codec import (
+    EMOJI_MARKUP, EMOJI_SIZE, MAX_MESSAGE_EMOJIS, decode_drawing, emoji_markup, encode_drawing,
+    pack_message_emojis, unpack_message_emojis, valid_emoji, valid_emoji_name,
+)
 
 APP_NAME = "SpriteLink"
 APP_VERSION = 1
@@ -532,6 +548,7 @@ def shift_theme_color(color: Any, degrees: int | None = None) -> QColor:
     return QColor.fromHslF((hue + degrees / 360.0) % 1.0, saturation, lightness, alpha)
 
 
+@lru_cache(maxsize=64)
 def hue_theme_stylesheet(stylesheet: str, degrees: int) -> str:
     if degrees == 0:
         return stylesheet
@@ -554,6 +571,7 @@ def hue_theme_stylesheet(stylesheet: str, degrees: int) -> str:
     return re.sub(r"#[0-9a-fA-F]{6}\b|\brgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+(?:\s*,\s*\d+)?\s*\)", replace, stylesheet)
 
 
+@lru_cache(maxsize=32)
 def classic_theme_stylesheet(stylesheet: str, position: int) -> str:
     if position == 0:
         return stylesheet
@@ -603,12 +621,12 @@ NTFY_DAILY_MESSAGE_LIMIT = 250
 MESSAGE_LIMIT_BAR_THRESHOLD = 50
 PACKET_PADDING_BLOCK = 128
 PROFILE_ICON_SIZE = 16
-PROFILE_ICON_VERTICAL_OFFSET_PX = 2
 PROFILE_ICON_MAX_COLORS = 16
 MAX_PROFILE_ICON_GIF_BYTES = 2048
 MAX_IDENTITY_PRESETS = 64
 MESSAGE_SIZE_DEBOUNCE_MS = 1500
 CHAT_TOOLTIP_HOVER_DELAY_MS = 100
+CHAT_TOOLTIP_ICON_SIZE = 64
 CHAT_TOOLTIP_DISPLAY_TIME_MS = 2_147_483_647
 TOOLTIP_SPACER_DATA_URI = (
     "data:image/png;base64,"
@@ -620,7 +638,6 @@ EMBEDDED_IMAGE_MAX_WIDTH = 256
 EMBEDDED_IMAGE_MAX_HEIGHT = 96
 EMBEDDED_IMAGE_PLACEHOLDER_SIZE = 48
 NSFW_IMAGE_PLACEHOLDER_SIZE = 64
-TOP_ALIGNED_PROFILE_ICON_PADDING = 3
 IMAGE_PREVIEW_MAX_WIDTH = CONFIG_POPUP_MAX_WIDTH - 32
 IMAGE_PREVIEW_MAX_HEIGHT = 480
 MAX_REMOTE_IMAGE_BYTES = 50 * 1024 * 1024
@@ -1015,7 +1032,7 @@ QPushButton:pressed, QPushButton:checked {
 QPushButton:disabled {
     color: #808080;
 }
-QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
+QLineEdit, QTextEdit#messageEntry, QTextBrowser, QListWidget, QComboBox {
     background-color: #ffffff;
     color: #000000;
     border-top: 2px solid #808080;
@@ -1026,7 +1043,9 @@ QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
     selection-background-color: #007f82;
     selection-color: #000000;
 }
-QLineEdit#serverUrl:disabled { background-color: #c0c0c0; color: #808080; }
+QLineEdit#serverUrl:disabled, QLineEdit#lockedChatroomDetail:disabled {
+    background-color: #c0c0c0; color: #808080;
+}
 QComboBox {
     padding: 2px 4px;
 }
@@ -1115,7 +1134,7 @@ QPushButton:default:pressed { background: #005ba9; }
 QPushButton:disabled {
     background: #f0f0f0; color: #777777; border-color: #cccccc;
 }
-QLineEdit, QPlainTextEdit, QComboBox {
+QLineEdit, QTextEdit#messageEntry, QComboBox {
     background: #ffffff;
     color: #1b1b1b;
     border: 1px solid #b8b8b8;
@@ -1125,11 +1144,11 @@ QLineEdit, QPlainTextEdit, QComboBox {
     selection-color: #ffffff;
 }
 QLineEdit { padding: 3px 6px; }
-QPlainTextEdit { padding: 3px; }
+QTextEdit#messageEntry { padding: 3px; }
 QComboBox { padding: 3px 26px 3px 8px; min-height: 18px; }
-QLineEdit:hover, QPlainTextEdit:hover, QComboBox:hover { border-color: #959595; }
-QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus { border-bottom-color: #0067c0; }
-QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {
+QLineEdit:hover, QTextEdit#messageEntry:hover, QComboBox:hover { border-color: #959595; }
+QLineEdit:focus, QTextEdit#messageEntry:focus, QComboBox:focus { border-bottom-color: #0067c0; }
+QLineEdit:disabled, QTextEdit#messageEntry:disabled, QComboBox:disabled {
     background: #f0f0f0; color: #777777; border-color: #cccccc;
 }
 QComboBox::drop-down { border: none; width: 24px; }
@@ -1251,12 +1270,13 @@ QPushButton:disabled {
 QPushButton#identityMenuButton,
 QPushButton#fontMenuButton,
 QPushButton#formattingMenuButton,
+QPushButton#emojisMenuButton,
 QPushButton#imageMenuButton {
     min-height: 17px;
     padding-top: 2px;
     padding-bottom: 2px;
 }
-QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
+QLineEdit, QTextEdit#messageEntry, QTextBrowser, QListWidget, QComboBox {
     color: #172532;
     background-color: rgba(255, 255, 255, 226);
     border: 1px solid rgba(49, 91, 118, 235);
@@ -1264,15 +1284,15 @@ QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
     selection-background-color: #5ba7d5;
     selection-color: #ffffff;
 }
-QLineEdit#serverUrl:disabled {
+QLineEdit#serverUrl:disabled, QLineEdit#lockedChatroomDetail:disabled {
     color: rgba(49, 68, 82, 125); background-color: rgba(216, 226, 233, 156);
     border-color: rgba(99, 132, 151, 110);
 }
-QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus,
+QLineEdit:focus, QTextEdit#messageEntry:focus, QTextBrowser:focus,
 QListWidget:focus, QComboBox:focus {
     border: 1px solid #3188bd;
 }
-QLineEdit, QPlainTextEdit {
+QLineEdit, QTextEdit#messageEntry {
     padding: 3px 5px;
 }
 QComboBox {
@@ -1504,14 +1524,14 @@ QPushButton:pressed, QPushButton:checked {
 QPushButton:default { border-color: #000000; }
 QPushButton:disabled { color: #858d96; background: rgba(51, 56, 63, 104); border-color: #000000; }
 QLabel:disabled, QCheckBox:disabled { color: #87919a; }
-QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
+QLineEdit, QTextEdit#messageEntry, QTextBrowser, QListWidget, QComboBox {
     color: #e1e6eb; background-color: rgba(22, 26, 31, 136);
     border-color: #000000; selection-background-color: #586e80; selection-color: #ffffff;
 }
-QLineEdit#serverUrl:disabled {
+QLineEdit#serverUrl:disabled, QLineEdit#lockedChatroomDetail:disabled {
     color: #858d96; background-color: rgba(51, 56, 63, 104); border-color: #000000;
 }
-QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus, QListWidget:focus, QComboBox:focus {
+QLineEdit:focus, QTextEdit#messageEntry:focus, QTextBrowser:focus, QListWidget:focus, QComboBox:focus {
     border-color: #000000;
 }
 QComboBox::drop-down {
@@ -1715,7 +1735,7 @@ def profile_icon_tooltip_data_uri(encoded_icon: str) -> str:
         gif_data = decode_profile_icon(encoded_icon)
         with Image.open(io.BytesIO(gif_data)) as icon:
             preview = icon.convert("RGBA").resize(
-                (64, 64),
+                (CHAT_TOOLTIP_ICON_SIZE, CHAT_TOOLTIP_ICON_SIZE),
                 Image.Resampling.NEAREST,
             )
         output = io.BytesIO()
@@ -2350,8 +2370,10 @@ def group_messages_for_display(
             and message_items_are_contiguous(previous_item, item)
             and (
                 client_id in muted_user_ids
-                or str(message.get("m", ""))
-                == str(previous_message.get("m", ""))
+                or (
+                    message.get("emojis") == previous_message.get("emojis")
+                    and str(message.get("m", "")) == str(previous_message.get("m", ""))
+                )
             )
         )
         if should_combine:
@@ -2416,6 +2438,7 @@ def consecutive_duplicate_message_ordinal(
             str(previous_message.get("c", ""))
             != str(message.get("c", ""))
             or "drawing" in previous_message
+            or message.get("emojis") != previous_message.get("emojis")
             or str(previous_message.get("m", ""))
             != str(message.get("m", ""))
             or not message_items_are_contiguous(
@@ -3032,7 +3055,69 @@ def is_image_url_trusted_for_sender(
 
 
 def generate_chatroom_key() -> str:
-    return secrets.token_urlsafe(24)
+    # 36 random bytes produce exactly 48 URL-safe characters.
+    return secrets.token_urlsafe(36)
+
+
+def chatroom_key_security_level(key: str) -> str:
+    """Heuristic guidance for user-entered keys, not a measure of true entropy."""
+    if not key:
+        return "Unsecure"
+
+    character_types = (
+        any(character.islower() for character in key),
+        any(character.isupper() for character in key),
+        any(character.isdigit() for character in key),
+        any(not character.isalnum() for character in key),
+    )
+    alphabet_size = sum(
+        size for present, size in zip(character_types, (26, 26, 10, 32))
+        if present
+    )
+    estimated_bits = len(key) * math.log2(max(1, alphabet_size))
+
+    counts = Counter(key)
+    most_common_count = max(counts.values())
+    longest_run = 1
+    current_run = 1
+    longest_sequence = 1
+    current_sequence = 1
+    for previous, character in zip(key, key[1:]):
+        current_run = current_run + 1 if character == previous else 1
+        longest_run = max(longest_run, current_run)
+        current_sequence = (
+            current_sequence + 1
+            if character.isalnum() and previous.isalnum()
+            and abs(ord(character) - ord(previous)) == 1
+            else 1
+        )
+        longest_sequence = max(longest_sequence, current_sequence)
+
+    repeated_pattern = any(
+        all(key[index] == key[index % period]
+            for index in range(period, len(key)))
+        for period in range(1, min(12, len(key) // 2) + 1)
+    )
+    if len(key) < 12 or len(counts) < 3 or longest_run >= max(8, len(key) // 2):
+        return "Unsecure"
+    if (
+        len(key) < 16
+        or estimated_bits < 80
+        or len(counts) < 6
+        or most_common_count * 2 > len(key)
+        or repeated_pattern
+        or longest_sequence >= 8
+    ):
+        return "Weak"
+    if (
+        len(key) < 32
+        or estimated_bits < 120
+        or len(counts) < 9
+        or most_common_count * 3 > len(key)
+        or longest_run >= 7
+    ):
+        return "Strong"
+    return "Excellent"
 
 
 INVITE_CODE_PREFIX = "SL-"
@@ -3360,10 +3445,13 @@ def visible_user_id(client_id: str) -> str:
 def _signed_message_payload(
     message: dict[str, Any],
     encryption_key: str,
+    *,
+    include_emojis: bool = False,
+    signed_topic: str | None = None,
 ) -> bytes:
     values = [
         SIGNED_MESSAGE_CONTEXT,
-        derive_ntfy_topic(encryption_key),
+        signed_topic if signed_topic is not None else derive_ntfy_topic(encryption_key),
         message["a"],
         message["v"],
         message["i"],
@@ -3379,6 +3467,8 @@ def _signed_message_payload(
     ]
     if "drawing" in message:
         values.append(message["drawing"])
+    if include_emojis:
+        values.extend(("emojis", message["emojis"]))
     return json.dumps(
         values,
         ensure_ascii=False,
@@ -3410,12 +3500,21 @@ def sign_message_identity(
             _signed_message_payload(message, encryption_key)
         )
     )
+    if "emojis" in message:
+        # Sign the extension separately so older clients can verify and display the text.
+        message["emoji_signature"] = _encode_identity_bytes(private_key.sign(
+            _signed_message_payload(message, encryption_key, include_emojis=True)
+        ))
+    else:
+        message.pop("emoji_signature", None)
     return message
 
 
 def verify_message_identity(
     message: dict[str, Any],
     encryption_key: str,
+    *,
+    signed_topic: str | None = None,
 ) -> None:
     if message.get("a") != MESSAGE_AUTH_VERSION:
         raise ValueError("Message authentication version is unsupported.")
@@ -3435,10 +3534,24 @@ def verify_message_identity(
         ED25519_SIGNATURE_BYTES,
         "Message signature",
     )
-    Ed25519PublicKey.from_public_bytes(public_key).verify(
-        signature,
-        _signed_message_payload(message, encryption_key),
-    )
+    verifier = Ed25519PublicKey.from_public_bytes(public_key)
+    if signed_topic is not None and not re.fullmatch(r"e2chat-[a-z2-7]+", signed_topic):
+        raise ValueError("Stored signature topic is invalid.")
+    verifier.verify(signature, _signed_message_payload(
+        message, encryption_key, signed_topic=signed_topic,
+    ))
+    if "emojis" in message or "emoji_signature" in message:
+        if "emojis" not in message:
+            raise ValueError("Missing signed emoji data.")
+        emoji_signature = _decode_identity_bytes(
+            message.get("emoji_signature"), ED25519_SIGNATURE_BYTES, "Emoji signature",
+        )
+        verifier.verify(
+            emoji_signature, _signed_message_payload(
+                message, encryption_key, include_emojis=True,
+                signed_topic=signed_topic,
+            ),
+        )
 
 
 def normalize_chatroom_history_limit(value: Any) -> int:
@@ -3506,9 +3619,14 @@ def _open_chatroom_history(path: Path) -> sqlite3.Connection:
                 ntfy_id TEXT,
                 sort_time INTEGER NOT NULL,
                 sent_time INTEGER NOT NULL,
-                payload BLOB NOT NULL
+                payload BLOB NOT NULL,
+                origin_topic TEXT
             )
         """)
+        if "origin_topic" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(messages)")
+        }:
+            connection.execute("ALTER TABLE messages ADD COLUMN origin_topic TEXT")
         connection.execute("""
             CREATE INDEX IF NOT EXISTS messages_by_time
             ON messages (sort_time, sent_time, message_id)
@@ -3529,13 +3647,19 @@ def _history_rows(entries: Iterable[dict[str, Any]]) -> Iterable[tuple]:
         if not isinstance(message, dict) or not message.get("i"):
             continue
         sort_time, sent_time, message_id = message_item_sort_key(item)
-        entry = {key: value for key, value in item.items() if key != "is_local"}
+        entry = {
+            key: value for key, value in item.items()
+            if key not in ("is_local", "history_origin_topic")
+        }
         raw = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
         payload = dpapi_encrypt(
             zlib.compress(raw.encode("utf-8"), level=1),
             CHATROOM_HISTORY_DPAPI_ENTROPY,
         )
-        yield message_id, item.get("ntfy_id"), sort_time, sent_time, payload
+        yield (
+            message_id, item.get("ntfy_id"), sort_time, sent_time, payload,
+            item.get("history_origin_topic"),
+        )
 
 
 def _insert_chatroom_history(
@@ -3543,8 +3667,8 @@ def _insert_chatroom_history(
     entries: Iterable[dict[str, Any]],
 ) -> None:
     connection.executemany("""
-        INSERT INTO messages (message_id, ntfy_id, sort_time, sent_time, payload)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO messages (message_id, ntfy_id, sort_time, sent_time, payload, origin_topic)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(message_id) DO NOTHING
     """, _history_rows(entries))
 
@@ -3582,17 +3706,29 @@ def load_chatroom_history(
     if not path.exists():
         return []
     with closing(sqlite3.connect(path)) as connection:
-        query = "SELECT payload FROM messages"
+        has_origin_topic = any(
+            row[1] == "origin_topic"
+            for row in connection.execute("PRAGMA table_info(messages)")
+        )
+        query = (
+            "SELECT payload, origin_topic FROM messages"
+            if has_origin_topic else "SELECT payload, NULL FROM messages"
+        )
         params = ()
         if before is not None:
             query += " WHERE (sort_time, sent_time, message_id) < (?, ?, ?)"
             params = before
         query += " ORDER BY sort_time DESC, sent_time DESC, message_id DESC LIMIT ?"
         rows = connection.execute(query, (*params, limit)).fetchall()
-    return [
-        json.loads(zlib.decompress(dpapi_decrypt(payload, CHATROOM_HISTORY_DPAPI_ENTROPY)))
-        for (payload,) in reversed(rows)
-    ]
+    entries = []
+    for payload, origin_topic in reversed(rows):
+        entry = json.loads(zlib.decompress(
+            dpapi_decrypt(payload, CHATROOM_HISTORY_DPAPI_ENTROPY)
+        ))
+        if origin_topic is not None:
+            entry["history_origin_topic"] = origin_topic
+        entries.append(entry)
+    return entries
 
 
 def save_chatroom_history(
@@ -3609,6 +3745,99 @@ def save_chatroom_history(
             _insert_chatroom_history(connection, entries)
             if maximum_messages is not None:
                 _prune_history_rows(connection, maximum_messages)
+
+
+def merge_imported_chatroom_history(
+    server_url: str,
+    encryption_key: str,
+    entries: list[dict[str, Any]],
+) -> int:
+    """Fill history gaps while preserving every existing local message.
+
+    A single write transaction covers duplicate detection and insertion,
+    so concurrent chat messages cannot slip between the two operations.
+    Never prune history during import: transferred records must survive.
+    """
+    if not entries:
+        return 0
+
+    def encode_entry(item: dict[str, Any]) -> tuple:
+        return next(_history_rows((item,)))
+
+    def decode_entry(payload: bytes) -> dict[str, Any]:
+        return json.loads(zlib.decompress(
+            dpapi_decrypt(payload, CHATROOM_HISTORY_DPAPI_ENTROPY)
+        ))
+
+    path = chatroom_history_path(server_url, encryption_key)
+    with closing(_open_chatroom_history(path)) as connection:
+        # Network polling may briefly write to this room at the same time.
+        # Wait for that write rather than reporting a spurious lock error.
+        connection.execute("PRAGMA busy_timeout = 30000")
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return merge_imported_history(
+                connection, entries,
+                encode_entry=encode_entry, decode_entry=decode_entry,
+            )
+
+
+def overwrite_imported_chatroom_history(
+    server_url: str,
+    encryption_key: str,
+    entries: list[dict[str, Any]],
+) -> int:
+    """Atomically replace one selected chatroom history, including empty lists."""
+    path = chatroom_history_path(server_url, encryption_key)
+    with closing(_open_chatroom_history(path)) as connection:
+        connection.execute("PRAGMA busy_timeout = 30000")
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM messages")
+            _insert_chatroom_history(connection, entries)
+            return connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+
+
+def copy_chatroom_history_for_key_change(
+    server_url: str, old_key: str, new_key: str,
+) -> bool:
+    """Copy saved history into the new key's scope without removing the old copy.
+
+    History payloads use local DPAPI encryption rather than the chatroom key,
+    so the encrypted SQLite records can be transferred without re-encoding.
+    The caller removes the old history only after settings are saved.
+    """
+    old_path = chatroom_history_path(server_url, old_key)
+    new_path = chatroom_history_path(server_url, new_key)
+    if old_path == new_path:
+        return False
+
+    legacy_path = old_path.with_suffix(".bin")
+    if legacy_path.exists():
+        _upgrade_chatroom_history(legacy_path)
+    if not old_path.exists():
+        return False
+
+    # Ensure pre-migration databases have the provenance column.
+    with closing(_open_chatroom_history(old_path)):
+        pass
+
+    # Merge rather than replace: users may have previously used the new key.
+    # This preserves both histories while deduplicating message IDs.
+    with closing(_open_chatroom_history(new_path)) as connection:
+        connection.execute("ATTACH DATABASE ? AS previous_history", (str(old_path),))
+        try:
+            with connection:
+                connection.execute("""
+                    INSERT OR IGNORE INTO messages
+                    (message_id, ntfy_id, sort_time, sent_time, payload, origin_topic)
+                    SELECT message_id, ntfy_id, sort_time, sent_time, payload,
+                           COALESCE(origin_topic, ?)
+                    FROM previous_history.messages
+                """, (derive_ntfy_topic(old_key),))
+        finally:
+            connection.execute("DETACH DATABASE previous_history")
+    return True
 
 
 def _prune_history_rows(connection: sqlite3.Connection, limit: int) -> bool:
@@ -3686,6 +3915,7 @@ def default_config() -> dict[str, Any]:
             GLOBAL_CHATROOM_ID: global_profile,
         },
         "identity_presets": [default_preset],
+        "saved_emojis": {},
         "muted_chatrooms": [],
         "muted_chatroom_deadlines": {},
         "unread_counts": {},
@@ -3728,6 +3958,10 @@ def load_config() -> dict[str, Any]:
         except Exception:
             return config
 
+    saved_emojis = config.get("saved_emojis")
+    config["saved_emojis"] = {
+        name: encoded for name, encoded in saved_emojis.items() if valid_emoji(name, encoded)
+    } if isinstance(saved_emojis, dict) else {}
     server_preset = str(config.get("server_preset", DEFAULT_SERVER_PRESET))
     if server_preset == "ntfy.sh (public)":
         server_preset = DEFAULT_SERVER_PRESET
@@ -4522,30 +4756,108 @@ class MessageBoxes:
 messagebox = MessageBoxes()
 
 
-class ComposeTextEdit(QPlainTextEdit):
+INLINE_EMOJI_PROPERTY = QTextFormat.Property.UserProperty + 40
+EMOJI_REVEALED_IMAGE_PROPERTY = QTextFormat.Property.UserProperty + 41
+
+
+@lru_cache(maxsize=256)
+def emoji_image(encoded: str, size: int = PROFILE_ICON_SIZE) -> QImage:
+    image = drawing_image(*decode_drawing(encoded))
+    return image.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio)
+
+
+def message_emoji_markup(message: dict[str, Any]) -> str:
+    text = str(message["m"])
+    if "emojis" in message:
+        try:
+            return unpack_message_emojis(text, message["emojis"])
+        except ValueError:
+            pass
+    return text
+
+
+def inline_emoji_format(
+    cursor: QTextCursor,
+    name: str,
+    encoded: str,
+    size: int,
+    base: QTextCharFormat,
+) -> QTextImageFormat:
+    formatting = QTextImageFormat()
+    formatting.merge(base)
+    image = emoji_image(encoded, size)
+    resource = QUrl(f"spritelink-emoji-image:{encoded}:{size}")
+    cursor.document().addResource(QTextDocument.ResourceType.ImageResource, resource, image)
+    formatting.setName(resource.toString())
+    formatting.setWidth(size)
+    formatting.setHeight(size)
+    formatting.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignBaseline)
+    formatting.setProperty(QTextFormat.Property.ImageAltText, name)
+    formatting.setProperty(INLINE_EMOJI_PROPERTY, emoji_markup(name, encoded))
+    formatting.setToolTip(name)
+    return formatting
+
+
+class EmojiNameValidator(QValidator):
+    @staticmethod
+    def normalize(name: str) -> str:
+        return re.sub(r"\s", "_", name)
+
+    def validate(self, text: str, position: int) -> tuple[QValidator.State, str, int]:
+        return QValidator.State.Acceptable, self.normalize(text), position
+
+
+class ComposeTextEdit(QTextEdit):
     send_requested = Signal()
     formatting_shortcut_requested = Signal(str)
     width_changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("messageEntry")
+        self.setAcceptRichText(False)
+
+    def insert_emoji(self, name: str, encoded: str) -> None:
+        cursor = self.textCursor()
+        base = self.currentCharFormat()
+        cursor.insertImage(inline_emoji_format(cursor, name, encoded, PROFILE_ICON_SIZE, base))
+        self.setTextCursor(cursor)
+        self.setCurrentCharFormat(base)
+        self.setFocus()
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
         if event.size().width() != event.oldSize().width():
             self.width_changed.emit()
 
-    def to_message_text(self) -> str:
+    def to_message_text(self, selection: QTextCursor | None = None) -> str:
         segments: list[tuple[str, bool, bool, bool, bool]] = []
-        block = self.document().begin()
+        document = self.document()
+        start = selection.selectionStart() if selection is not None else 0
+        end = selection.selectionEnd() if selection is not None else document.characterCount() - 1
+        block = document.findBlock(start)
         first_block = True
-        while block.isValid():
+        while block.isValid() and block.position() <= end:
             if not first_block:
                 segments.append(("\n", False, False, False, False))
             iterator = block.begin()
             while not iterator.atEnd():
                 fragment = iterator.fragment()
-                if fragment.isValid():
+                left = max(start, fragment.position())
+                right = min(end, fragment.position() + fragment.length())
+                if fragment.isValid() and left < right:
                     formatting = fragment.charFormat()
+                    if formatting.hasProperty(INLINE_EMOJI_PROPERTY):
+                        text = str(formatting.property(INLINE_EMOJI_PROPERTY)) * (right - left)
+                    elif left == fragment.position() and right == fragment.position() + fragment.length():
+                        text = fragment.text()
+                    else:
+                        cursor = QTextCursor(document)
+                        cursor.setPosition(left)
+                        cursor.setPosition(right, QTextCursor.MoveMode.KeepAnchor)
+                        text = cursor.selectedText()
                     segments.append((
-                        fragment.text(),
+                        text,
                         formatting.fontWeight() >= QFont.Weight.Bold,
                         formatting.fontItalic(),
                         formatting.fontUnderline(),
@@ -4556,49 +4868,62 @@ class ComposeTextEdit(QPlainTextEdit):
             block = block.next()
         return serialize_message_rich_text(segments)
 
-    def set_message_text(self, text: str) -> None:
-        plain_text, runs = parse_message_rich_text(text)
-        self.setPlainText(plain_text)
+    def createMimeDataFromSelection(self) -> QMimeData:
+        markup = self.to_message_text(self.textCursor())
+        fallback, emojis = pack_message_emojis(markup)
+        if not emojis:
+            return super().createMimeDataFromSelection()
+        mime = QMimeData()
+        mime.setText(message_plain_text(fallback))
+        mime.setData("application/x-spritelink-emoji-text", markup.encode("utf-8"))
+        return mime
 
+    def insertFromMimeData(self, source: QMimeData) -> None:
+        if source.hasFormat("application/x-spritelink-emoji-text"):
+            markup = bytes(source.data("application/x-spritelink-emoji-text"))
+            if len(markup) <= MAX_UNCOMPRESSED_MESSAGE_BYTES:
+                cursor = self.textCursor()
+                cursor.beginEditBlock()
+                cursor.removeSelectedText()
+                self._insert_message_text(cursor, markup.decode("utf-8", errors="replace"))
+                cursor.endEditBlock()
+                self.setTextCursor(cursor)
+                return
+        super().insertFromMimeData(source)
+
+    def set_message_text(self, text: str) -> None:
         document = self.document()
+        document.setUndoRedoEnabled(False)
+        self.clear()
+        cursor = QTextCursor(document)
+        self._insert_message_text(cursor, text)
+        self.setTextCursor(cursor)
+        self.setCurrentCharFormat(QTextCharFormat())
+        document.setUndoRedoEnabled(True)
+
+    def _insert_message_text(self, cursor: QTextCursor, text: str) -> None:
+        plain_text, runs = parse_message_rich_text(text)
         for run in runs:
-            if not (
-                run.bold
-                or run.italic
-                or run.underline
-                or run.spoiler is not None
-            ):
-                continue
-            cursor = QTextCursor(document)
-            cursor.setPosition(run.start)
-            cursor.setPosition(
-                run.end,
-                QTextCursor.MoveMode.KeepAnchor,
-            )
             formatting = QTextCharFormat()
-            formatting.setFontWeight(
-                QFont.Weight.Bold
-                if run.bold
-                else QFont.Weight.Normal
-            )
+            formatting.setFontWeight(QFont.Weight.Bold if run.bold else QFont.Weight.Normal)
             formatting.setFontItalic(run.italic)
             formatting.setFontUnderline(run.underline)
             is_spoiler = run.spoiler is not None
-            formatting.setProperty(
-                COMPOSER_SPOILER_PROPERTY,
-                is_spoiler,
-            )
-            block_color = QColor(SPOILER_BLOCK_COLOR)
-            block_color.setAlpha(
-                REVEALED_SPOILER_BLOCK_ALPHA if is_spoiler else 0
-            )
-            formatting.setBackground(block_color)
-            cursor.mergeCharFormat(formatting)
-
-        cursor = QTextCursor(document)
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.setTextCursor(cursor)
-        self.clear_formatting_state()
+            formatting.setProperty(COMPOSER_SPOILER_PROPERTY, is_spoiler)
+            if is_spoiler:
+                block_color = QColor(SPOILER_BLOCK_COLOR)
+                block_color.setAlpha(REVEALED_SPOILER_BLOCK_ALPHA)
+                formatting.setBackground(block_color)
+            chunk = plain_text[run.start:run.end]
+            offset = 0
+            for match in EMOJI_MARKUP.finditer(chunk):
+                encoded, name = match.groups()
+                if not valid_emoji(name, encoded):
+                    continue
+                cursor.insertText(chunk[offset:match.start()], formatting)
+                cursor.insertImage(inline_emoji_format(cursor, name, encoded, PROFILE_ICON_SIZE, formatting))
+                offset = match.end()
+            cursor.insertText(chunk[offset:], formatting)
 
     def apply_formatting(self, style: str, enabled: bool) -> None:
         formatting = QTextCharFormat()
@@ -5028,6 +5353,44 @@ class RemoveChatroomDialog(QDialog):
         layout.addLayout(buttons)
 
 
+class ChangeChatroomKeyDialog(QDialog):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Change Chatroom Key")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+
+        layout = QVBoxLayout(self)
+        message_row = QHBoxLayout()
+        warning_icon = QLabel()
+        warning_icon.setPixmap(
+            self.style().standardIcon(
+                QStyle.StandardPixmap.SP_MessageBoxWarning
+            ).pixmap(32, 32)
+        )
+        message_row.addWidget(warning_icon, 0, Qt.AlignmentFlag.AlignTop)
+        self.warning_message = QLabel(
+            "The chatroom key will be changed. Log history will persist "
+            "locally but others must update their chatroom key to keep "
+            "chatting with you."
+        )
+        self.warning_message.setWordWrap(True)
+        message_row.addWidget(self.warning_message, 1)
+        layout.addLayout(message_row)
+
+        self.button_row = QHBoxLayout()
+        self.button_row.addStretch(1)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setDefault(True)
+        self.cancel_button.clicked.connect(self.reject)
+        self.button_row.addWidget(self.cancel_button)
+        self.change_key_button = QPushButton("Change Key")
+        self.change_key_button.clicked.connect(self.accept)
+        self.button_row.addWidget(self.change_key_button)
+        layout.addLayout(self.button_row)
+        self.cancel_button.setFocus()
+
+
 class AddChatroomChoiceDialog(QDialog):
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
@@ -5059,7 +5422,7 @@ class ChatroomDetailsDialog(QDialog):
         submit_label: str = "Create Chatroom",
         name: str = "",
         chatroom_key: str | None = None,
-        history_note: str = "",
+        show_security_on_change_only: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -5095,16 +5458,18 @@ class ChatroomDetailsDialog(QDialog):
         )
         form.addWidget(show_key, 1, 2)
 
-        key_hint = QLabel(
-            "32+ characters recommended."
-            + (f" {history_note}" if history_note else "")
-        )
-        key_hint.setWordWrap(True)
+        self._initial_key = self.key_entry.text()
+        self._security_on_change_only = show_security_on_change_only
+        self.key_security_label = QLabel()
+        self.key_security_label.setWordWrap(True)
         app = QApplication.instance()
-        hint_color = "#aab4bd" if app is not None and app.property("spritelinkGlassyDark") else "#777777"
-        key_hint.setStyleSheet(f"color: {hint_color}; font-size: 8pt;")
-        form.addWidget(key_hint, 2, 1, 1, 2)
+        dark = app is not None and app.property("spritelinkGlassyDark")
+        self._security_hint_color = "#aab4bd" if dark else "#777777"
+        self._weak_security_hint_color = "#bb5555" if dark else "#a94444"
+        form.addWidget(self.key_security_label, 2, 1, 1, 2)
         layout.addLayout(form)
+        self.key_entry.textChanged.connect(self._update_key_security)
+        self._update_key_security(self._initial_key)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -5119,6 +5484,19 @@ class ChatroomDetailsDialog(QDialog):
 
         self.name_entry.setFocus()
 
+    def _update_key_security(self, key: str) -> None:
+        level = chatroom_key_security_level(key)
+        self.key_security_label.setText(f"Security: {level}")
+        color = (
+            self._weak_security_hint_color
+            if level in ("Unsecure", "Weak")
+            else self._security_hint_color
+        )
+        self.key_security_label.setStyleSheet(f"color: {color}; font-size: 8pt;")
+        self.key_security_label.setVisible(
+            not self._security_on_change_only or key != self._initial_key
+        )
+
     def name(self) -> str:
         return self.name_entry.text().strip()
 
@@ -5128,12 +5506,16 @@ class ChatroomDetailsDialog(QDialog):
 
 class EditChatroomDialog(ChatroomDetailsDialog):
     def __init__(self, client: Any, room_id: str, **kwargs: Any) -> None:
-        super().__init__(client.root, title="Edit Chatroom", submit_label="Save", **kwargs)
+        super().__init__(
+            client.root, title="Edit Chatroom", submit_label="Save",
+            show_security_on_change_only=True, **kwargs
+        )
         self.client = client
         self.settings = client_room_settings(client, room_id)
         if room_id == GLOBAL_CHATROOM_ID:
-            self.name_entry.setEnabled(False)
-            self.key_entry.setEnabled(False)
+            for entry in (self.name_entry, self.key_entry):
+                entry.setObjectName("lockedChatroomDetail")
+                entry.setEnabled(False)
 
         panel = QWidget(self)
         form = QGridLayout(panel)
@@ -5197,6 +5579,14 @@ class EditChatroomDialog(ChatroomDetailsDialog):
         self.volume_slider.valueChanged.connect(self._set_volume)
         self.finished.connect(client._stop_message_sound)
         self._sync_color()
+
+    def accept(self) -> None:
+        if self.key_entry.isEnabled() and self.chatroom_key() != self._initial_key:
+            warning = ChangeChatroomKeyDialog(self)
+            self.client._apply_window_titlebar_theme(warning)
+            if warning.exec() != QDialog.DialogCode.Accepted:
+                return
+        super().accept()
 
     def _theme(self) -> str:
         return str(self.client.theme_var.get())
@@ -5999,6 +6389,214 @@ class NoFocusRectItemDelegate(QStyledItemDelegate):
         clean_option = QStyleOptionViewItem(option)
         clean_option.state &= ~QStyle.StateFlag.State_HasFocus
         super().paint(painter, clean_option, index)
+
+
+class EmojiItemDelegate(NoFocusRectItemDelegate):
+    """Center both the New button and 32px emojis inside square grid cells."""
+
+    def _icon_rect(
+        self, option: QStyleOptionViewItem, list_widget: "EmojiListWidget",
+    ) -> QRect:
+        rect = QRect(QPoint(0, 0), list_widget.iconSize())
+        rect.moveCenter(option.rect.center())
+        return rect
+
+    def _new_button_rect(
+        self, option: QStyleOptionViewItem, list_widget: "EmojiListWidget",
+    ) -> QRect:
+        return self._icon_rect(option, list_widget)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
+        list_widget = self.parent()
+        if (
+            isinstance(list_widget, EmojiListWidget)
+            and list_widget.new_item is list_widget.itemFromIndex(index)
+        ):
+            # Drawing with a QListWidget's style bypasses QPushButton QSS
+            # selectors. Use an actual (hidden) QPushButton as the style
+            # context, while still painting only a 32x32 control in the cell.
+            button = list_widget.new_style_button
+            button_option = QStyleOptionButton()
+            button_option.initFrom(button)
+            button_option.rect = self._new_button_rect(option, list_widget)
+            button_option.text = button.text()
+            button_option.state |= QStyle.StateFlag.State_Raised
+            if option.state & QStyle.StateFlag.State_MouseOver:
+                button_option.state |= QStyle.StateFlag.State_MouseOver
+            if list_widget._new_pressed:
+                button_option.state |= QStyle.StateFlag.State_Sunken
+                button_option.state &= ~QStyle.StateFlag.State_Raised
+            button.style().drawControl(
+                QStyle.ControlElement.CE_PushButton, button_option, painter, button,
+            )
+            return
+        # Qt's built-in IconMode decoration layout includes font metrics and
+        # item stylesheet padding, causing icons to sit higher than New.
+        # Paint each pre-scaled 32x32 icon directly into the same centered rect.
+        if isinstance(list_widget, EmojiListWidget):
+            item = list_widget.itemFromIndex(index)
+            if item is not None:
+                pixmap = item.icon().pixmap(list_widget.iconSize())
+                if not pixmap.isNull():
+                    painter.drawPixmap(self._icon_rect(option, list_widget).topLeft(), pixmap)
+
+
+class EmojiListWidget(QListWidget):
+    reordered = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.new_item: QListWidgetItem | None = None
+        self._new_pressed = False
+        self.new_style_button = QPushButton("+", self)
+        self.new_style_button.setFixedSize(32, 32)
+        # Keep the theme's button colors/borders but fit text inside 32px.
+        self.new_style_button.setStyleSheet(
+            "padding: 0px; min-width: 0px; min-height: 0px;"
+        )
+        self.new_style_button.hide()
+        self._dragged_item: QListWidgetItem | None = None
+        self._drop_insert_row: int | None = None
+        self.setSpacing(0)
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.setViewportMargins(0, 0, 0, 0)
+
+    def sync_grid_viewport_height(self) -> None:
+        cell_height = self.gridSize().height()
+        if cell_height > 0:
+            # Fixed outer height must account for the frame so the *viewport*
+            # shows precisely two rows, regardless of theme border width.
+            self.setFixedHeight(cell_height * 2 + self.frameWidth() * 2)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.StyleChange:
+            self.sync_grid_viewport_height()
+
+    def showEvent(self, event: QEvent) -> None:
+        self.sync_grid_viewport_height()
+        super().showEvent(event)
+
+    def mousePressEvent(self, event: Any) -> None:
+        self._new_pressed = (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.itemAt(event.position().toPoint()) is self.new_item
+        )
+        if self._new_pressed:
+            self.viewport().update()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        was_pressed = self._new_pressed
+        self._new_pressed = False
+        super().mouseReleaseEvent(event)
+        if was_pressed:
+            self.viewport().update()
+
+    def move_saved_emoji(self, source_row: int, insert_row: int) -> bool:
+        # The final item is the fixed New button, never a draggable emoji.
+        last_emoji_row = self.count() - 2
+        if source_row < 0 or source_row > last_emoji_row:
+            return False
+        insert_row = max(0, min(last_emoji_row + 1, insert_row))
+        target_row = insert_row - (1 if insert_row > source_row else 0)
+        if target_row == source_row:
+            return False
+        item = self.takeItem(source_row)
+        self.insertItem(target_row, item)
+        self.setCurrentItem(item)
+        self.clearSelection()
+        self.doItemsLayout()
+        self.reordered.emit()
+        return True
+
+    def _insertion_row_at(self, position: QPoint) -> int:
+        destination = self.itemAt(position)
+        if destination is None or destination is self.new_item:
+            return self.count() - 1
+        row = self.row(destination)
+        bounds = self.visualItemRect(destination)
+        if position.x() >= bounds.center().x():
+            row += 1
+        return row
+
+    def startDrag(self, supported_actions: Any) -> None:
+        item = self.currentItem()
+        if item is None or item is self.new_item:
+            return
+        self._dragged_item = item
+        try:
+            mime_data = self.model().mimeData([self.currentIndex()])
+            if mime_data is None:
+                return
+            drag = QDrag(self)
+            drag.setMimeData(mime_data)
+            pixmap = item.icon().pixmap(self.iconSize())
+            pixmap.setDevicePixelRatio(1.0)
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
+            drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+        finally:
+            self._dragged_item = None
+            self._drop_insert_row = None
+            self.viewport().update()
+
+    def _internal_emoji_drag(self, event: Any) -> bool:
+        return event.source() is self and self._dragged_item is not None
+
+    def dragEnterEvent(self, event: Any) -> None:
+        if self._internal_emoji_drag(event):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: Any) -> None:
+        if self._internal_emoji_drag(event):
+            self._drop_insert_row = self._insertion_row_at(event.position().toPoint())
+            self.viewport().update()
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event: Any) -> None:
+        self._drop_insert_row = None
+        self.viewport().update()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: Any) -> None:
+        if not self._internal_emoji_drag(event):
+            event.ignore()
+            return
+        item = self._dragged_item
+        source_row = self.row(item)
+        insert_row = self._insertion_row_at(event.position().toPoint())
+        self._drop_insert_row = None
+        self.move_saved_emoji(source_row, insert_row)
+        self.viewport().update()
+        # Always accept internal drops, even a no-op. No native model move
+        # runs here, so the New item remains anchored at the end.
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    def paintEvent(self, event: Any) -> None:
+        super().paintEvent(event)
+        insert_row = self._drop_insert_row
+        if insert_row is None or insert_row >= self.count():
+            return
+        target = self.item(insert_row)
+        bounds = self.visualItemRect(target)
+        if not bounds.isValid():
+            return
+        painter = QPainter(self.viewport())
+        pen = QPen(self.palette().highlight().color(), 2)
+        painter.setPen(pen)
+        x = bounds.left() + 1
+        painter.drawLine(x, bounds.top() + 4, x, bounds.bottom() - 4)
+        painter.end()
 
 
 class IdentityPresetSelector(QPushButton):
@@ -7900,10 +8498,7 @@ class EncryptedChatClient(QObject):
             self._update_chatrooms_toggle_unread_style()
 
     def _chat_icons_visible(self) -> bool:
-        return (
-            self._text_size("chat_log")
-            >= DEFAULT_TEXT_SIZES["chat_log"]
-        )
+        return not self._is_tiny_ui()
 
     def _chat_line_height(
         self,
@@ -8673,7 +9268,7 @@ QComboBox::drop-down {
 QLineEdit {
     padding: 1px 5px;
 }
-QPlainTextEdit {
+QTextEdit#messageEntry {
     padding: 1px;
 }
 QMenu {
@@ -8700,12 +9295,13 @@ QPushButton:pressed, QPushButton:checked {
 QPushButton#identityMenuButton,
 QPushButton#fontMenuButton,
 QPushButton#formattingMenuButton,
+QPushButton#emojisMenuButton,
 QPushButton#imageMenuButton {
     min-height: 14px;
     padding-top: 1px;
     padding-bottom: 1px;
 }
-QLineEdit, QPlainTextEdit {
+QLineEdit, QTextEdit#messageEntry {
     padding-top: 1px;
     padding-bottom: 1px;
 }
@@ -8750,6 +9346,11 @@ QComboBox::drop-down {
         app.setProperty("spritelinkClassicColor", position if theme == "Classic" else 0)
         app.setProperty("spritelinkTinyUI", client_is_tiny_ui(self))
         app.setProperty("spritelinkGlassyDark", theme == "Glassy Dark")
+
+        # Full theme changes must replace the app stylesheet. Clear any room
+        # color override first so it cannot mask the newly selected theme.
+        if hasattr(self, "root") and self.root.styleSheet():
+            self.root.setStyleSheet("")
 
         available_styles = {
             name.casefold(): name for name in QStyleFactory.keys()
@@ -9674,10 +10275,6 @@ QComboBox::drop-down {
             room_id,
             name=old_name,
             chatroom_key=old_key,
-            history_note=(
-                "All locally stored history will remain here even if the "
-                "chatroom key is changed."
-            ),
         )
         self._apply_window_titlebar_theme(dialog)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -9724,7 +10321,29 @@ QComboBox::drop-down {
             room_id in self.initial_history_pending_rooms
         )
         if key_changed and room_id == self.active_chatroom_id:
-            self._persist_local_history()
+            if not self._persist_local_history():
+                messagebox.showerror(
+                    "Could not change chatroom key",
+                    "Could not save pending chat history. The key was not changed.",
+                    parent=self.root,
+                )
+                return
+        migrated_history = False
+        if key_changed:
+            try:
+                server_url = normalize_server_url(
+                    str(self.config_data.get("server_url", ""))
+                )
+                migrated_history = copy_chatroom_history_for_key_change(
+                    server_url, old_key, key,
+                )
+            except Exception as exc:
+                messagebox.showerror(
+                    "Could not change chatroom key",
+                    f"Could not transfer local history: {exc}",
+                    parent=self.root,
+                )
+                return
         room["nickname"] = name
         room["key"] = key
         room_settings = self.config_data.setdefault("room_settings", {})
@@ -9751,6 +10370,8 @@ QComboBox::drop-down {
             return
 
         if key_changed:
+            if migrated_history:
+                delete_local_chatroom_history(server_url, old_key)
             self._request_subscription_refresh()
         if room_id == self.active_chatroom_id and key_changed:
             self._switch_active_chatroom()
@@ -9931,6 +10552,7 @@ QComboBox::drop-down {
         self.initial_history_pending_rooms.discard(room_id)
         self.chatroom_drafts.pop(room_id, None)
         self.drawing_drafts.pop(room_id, None)
+        self.emoji_edit_sources.pop(room_id, None)
         self._request_subscription_refresh()
 
         if self.active_chatroom_id == room_id:
@@ -10472,6 +11094,11 @@ QComboBox::drop-down {
             self._on_formatting_menu_toggled
         )
         composer_actions.addWidget(self.formatting_menu_button)
+        self.emojis_menu_button = QPushButton("Emojis")
+        self.emojis_menu_button.setObjectName("emojisMenuButton")
+        self.emojis_menu_button.setCheckable(True)
+        self.emojis_menu_button.toggled.connect(self._on_emojis_menu_toggled)
+        composer_actions.addWidget(self.emojis_menu_button)
         self.image_menu_button = QPushButton("Image")
         self.image_menu_button.setObjectName("imageMenuButton")
         self.image_menu_button.setCheckable(True)
@@ -10608,6 +11235,41 @@ QComboBox::drop-down {
         formatting_layout.addStretch(1)
         self.formatting_menu.hide()
         content_layout.addWidget(self.formatting_menu)
+        self.emojis_panel = QWidget()
+        emojis_layout = QVBoxLayout(self.emojis_panel)
+        emojis_layout.setContentsMargins(0, 0, 0, 0)
+        self.emojis_menu = EmojiListWidget()
+        self.emojis_menu.setViewMode(QListWidget.ViewMode.IconMode)
+        self.emojis_menu.setMovement(QListWidget.Movement.Snap)
+        self.emojis_menu.setResizeMode(QListWidget.ResizeMode.Adjust)
+        picker_icon_size = PROFILE_ICON_SIZE * 2
+        cell_size = picker_icon_size + 8
+        self.emojis_menu.setGridSize(QSize(cell_size, cell_size))
+        self.emojis_menu.setIconSize(QSize(picker_icon_size, picker_icon_size))
+        self.emojis_menu.sync_grid_viewport_height()
+        # Dragging needs a selection, but the delegate hides its highlight.
+        self.emojis_menu.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.emojis_menu.setItemDelegate(EmojiItemDelegate(self.emojis_menu))
+        self.emojis_menu.setDragEnabled(True)
+        self.emojis_menu.setAcceptDrops(True)
+        self.emojis_menu.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.emojis_menu.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.emojis_menu.setDropIndicatorShown(True)
+        self.emojis_menu.reordered.connect(self._persist_saved_emoji_order)
+        self.emojis_menu.setAccessibleName("Saved emojis")
+        self.emojis_menu.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.emojis_menu.customContextMenuRequested.connect(self._show_saved_emoji_menu)
+        self.emojis_menu.itemClicked.connect(self._insert_saved_emoji)
+        self.emojis_menu.itemDoubleClicked.connect(self._insert_saved_emoji)
+        for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            shortcut = QShortcut(QKeySequence(key), self.emojis_menu)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(self._insert_current_saved_emoji)
+        emojis_layout.addWidget(self.emojis_menu)
+        self.emojis_panel.hide()
+        content_layout.addWidget(self.emojis_panel)
+        self._refresh_saved_emojis()
+        self.emoji_edit_sources: dict[str, str] = {}
         self.image_menu = DrawingMenu(ThemeComboBox)
         self.image_menu.changed.connect(self._on_drawing_changed)
         self.image_menu.importRequested.connect(self._open_drawing_import)
@@ -10624,7 +11286,7 @@ QComboBox::drop-down {
         self.message_entry.setFont(
             self._make_message_font(DEFAULT_MESSAGE_FONT)
         )
-        self.message_entry.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.message_entry.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.message_entry.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
@@ -10708,6 +11370,191 @@ QComboBox::drop-down {
             self._sync_formatting_buttons()
         self._restore_chat_bottom_after_layout_change(keep_at_bottom)
 
+    def _on_emojis_menu_toggled(self, checked: bool) -> None:
+        keep_at_bottom = self._chat_is_scrolled_to_bottom()
+        self._set_composer_menu_visibility(self.emojis_panel if checked else None)
+        self.message_entry.setFocus()
+        self._restore_chat_bottom_after_layout_change(keep_at_bottom)
+
+    def _open_emoji_canvas(self) -> None:
+        self.image_menu_button.setChecked(True)
+        self.image_menu.size_combo.setCurrentIndex(EMOJI_SIZE)
+
+    def _refresh_saved_emojis(self) -> None:
+        self.emojis_menu.clear()
+        self.emojis_menu.new_item = None
+        emojis = self.config_data.get("saved_emojis", {})
+        icon_size = self.emojis_menu.iconSize().width()
+        for name, encoded in emojis.items():
+            item = QListWidgetItem(QIcon(QPixmap.fromImage(emoji_image(encoded, icon_size))), "")
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsDragEnabled
+            )
+            item.setSizeHint(self.emojis_menu.gridSize())
+            item.setToolTip(name)
+            item.setData(Qt.ItemDataRole.AccessibleTextRole, name)
+            item.setData(Qt.ItemDataRole.UserRole, (name, encoded))
+            self.emojis_menu.addItem(item)
+
+        # Painted directly by EmojiItemDelegate: no QWidget or stylesheet
+        # background behind the 32x32 New button.
+        new_item = QListWidgetItem()
+        new_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        new_item.setData(Qt.ItemDataRole.AccessibleTextRole, "Create emoji")
+        new_item.setSizeHint(self.emojis_menu.gridSize())
+        self.emojis_menu.addItem(new_item)
+        self.emojis_menu.new_item = new_item
+
+    def _persist_saved_emoji_order(self) -> None:
+        saved = self.config_data.get("saved_emojis", {})
+        order = [
+            data[0]
+            for index in range(self.emojis_menu.count())
+            if isinstance((data := self.emojis_menu.item(index).data(Qt.ItemDataRole.UserRole)), (tuple, list))
+        ]
+        if len(order) != len(saved) or set(order) != set(saved):
+            self._refresh_saved_emojis()
+            return
+        if order != list(saved):
+            # Do not rebuild QListWidget while Qt is completing a drag drop.
+            reordered = {name: saved[name] for name in order}
+            self.config_data["saved_emojis"] = reordered
+            try:
+                save_config(self.config_data)
+            except Exception as exc:
+                self.config_data["saved_emojis"] = saved
+                QTimer.singleShot(0, self._refresh_saved_emojis)
+                QTimer.singleShot(
+                    0, lambda error=str(exc): messagebox.showerror(
+                        "Could not save emojis", error, parent=self.root,
+                    ),
+                )
+
+    def _insert_current_saved_emoji(self) -> None:
+        item = self.emojis_menu.currentItem()
+        if item is not None:
+            self._insert_saved_emoji(item)
+
+    def _insert_saved_emoji(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if item is self.emojis_menu.new_item:
+            self._open_emoji_canvas()
+        elif isinstance(data, (tuple, list)) and len(data) == 2:
+            self.message_entry.insert_emoji(*data)
+        # Keep the current item for keyboard navigation, not visual selection.
+        self.emojis_menu.clearSelection()
+
+    def _store_saved_emojis(self, emojis: dict[str, str]) -> bool:
+        previous = self.config_data.get("saved_emojis", {})
+        self.config_data["saved_emojis"] = emojis
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            self.config_data["saved_emojis"] = previous
+            messagebox.showerror("Could not save emojis", str(exc), parent=self.root)
+            return False
+        self._refresh_saved_emojis()
+        return True
+
+    def _save_emoji_dialog(
+        self, encoded: str, name: str = "", *, replace_name: str = "",
+        title: str = "Save to Emojis", rename_original: bool = False,
+    ) -> bool:
+        dialog = QDialog(self.root)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+        preview = QLabel()
+        preview.setPixmap(QPixmap.fromImage(emoji_image(encoded, 64)))
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(preview)
+        entry = QLineEdit(EmojiNameValidator.normalize(name))
+        entry.setValidator(EmojiNameValidator(entry))
+        entry.setMaxLength(32)
+        label = QLabel("Emoji name")
+        label.setBuddy(entry)
+        layout.addWidget(label)
+        layout.addWidget(entry)
+        hint = QLabel("Name already used.")
+        layout.addWidget(hint)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(buttons)
+
+        def name_conflicts(candidate: str, saved: dict[str, str]) -> bool:
+            return any(
+                other.casefold() == candidate.casefold()
+                and other != replace_name
+                for other in saved
+            ) or (
+                candidate.casefold() == replace_name.casefold()
+                and candidate != replace_name
+                and not rename_original
+            )
+
+        def update() -> None:
+            candidate = entry.text().strip()
+            saved = self.config_data.get("saved_emojis", {})
+            conflict = name_conflicts(candidate, saved)
+            valid = valid_emoji_name(candidate)
+            buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(valid and not conflict)
+            hint.setVisible(conflict)
+
+        def save() -> None:
+            emojis = dict(self.config_data.get("saved_emojis", {}))
+            candidate = entry.text().strip()
+            if not valid_emoji_name(candidate) or name_conflicts(candidate, emojis):
+                update()
+                return
+            # Editing and saving under a new name creates another emoji.
+            # Only an explicit Rename action removes the original name.
+            if rename_original and replace_name in emojis:
+                # Renaming an existing emoji should not disturb a custom order.
+                emojis = {
+                    (candidate if old_name == replace_name else old_name):
+                    (encoded if old_name == replace_name else old_encoded)
+                    for old_name, old_encoded in emojis.items()
+                }
+            else:
+                emojis[candidate] = encoded
+            if self._store_saved_emojis(emojis):
+                dialog.accept()
+
+        entry.textChanged.connect(update)
+        buttons.accepted.connect(save)
+        buttons.rejected.connect(dialog.reject)
+        update()
+        entry.setFocus()
+        entry.selectAll()
+        return dialog.exec() == QDialog.DialogCode.Accepted
+
+    def _show_saved_emoji_menu(self, position: QPoint) -> None:
+        item = self.emojis_menu.itemAt(position)
+        if item is None or item is self.emojis_menu.new_item:
+            return
+        name, encoded = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self.emojis_menu)
+        rename = menu.addAction("Rename")
+        edit = menu.addAction("Edit")
+        delete = menu.addAction("Delete")
+        selected = menu.exec(self.emojis_menu.viewport().mapToGlobal(position))
+        if selected == rename:
+            self._save_emoji_dialog(
+                encoded, name, replace_name=name,
+                title="Rename Emoji", rename_original=True,
+            )
+        elif selected == edit:
+            self._import_chat_drawing(*decode_drawing(encoded))
+            self.emoji_edit_sources[self.active_chatroom_id] = name
+        elif selected == delete:
+            emojis = dict(self.config_data.get("saved_emojis", {}))
+            emojis.pop(name, None)
+            self._store_saved_emojis(emojis)
+
+    def _is_emoji_drawing(self) -> bool:
+        return self.image_menu_button.isChecked() and self.image_menu.canvas.canvas_size == EMOJI_SIZE
+
     def _on_image_menu_toggled(self, checked: bool) -> None:
         keep_at_bottom = self._chat_is_scrolled_to_bottom()
         self._set_composer_menu_visibility(self.image_menu if checked else None)
@@ -10723,6 +11570,8 @@ QComboBox::drop-down {
             self.message_size_check_pending = True
             self.message_size_timer.start(MESSAGE_SIZE_DEBOUNCE_MS)
             self._draw_message_size_bar()
+        if self.image_menu.canvas.canvas_size != EMOJI_SIZE:
+            self.emoji_edit_sources.pop(self.active_chatroom_id, None)
 
     def _open_drawing_import(self, *, profile_icon: bool = False) -> None:
         self._close_drawing_import()
@@ -10802,6 +11651,7 @@ QComboBox::drop-down {
             source, ThemeComboBox,
             icon_size=PROFILE_ICON_SIZE if profile_icon else None,
             icon_encoder=_encode_profile_icon_canvas if profile_icon else None,
+            emoji=not profile_icon and self._is_emoji_drawing(),
         )
         overlay.layout().removeWidget(previous_panel)
         previous_panel.hide()
@@ -10844,6 +11694,7 @@ QComboBox::drop-down {
                 (self.identity_menu, self.identity_menu_button),
                 (self.font_menu, self.font_menu_button),
                 (self.formatting_menu, self.formatting_menu_button),
+                (self.emojis_panel, self.emojis_menu_button),
                 (self.image_menu, self.image_menu_button),
             ):
                 should_show = menu is visible_menu
@@ -11527,7 +12378,6 @@ QComboBox::drop-down {
             cursor,
             icon,
             str(message["i"]),
-            line_height_px=self._chat_line_height(font_name),
             inline_html=True,
         ):
             cursor.insertText(" ", body_format)
@@ -11537,10 +12387,11 @@ QComboBox::drop-down {
             cursor = media_row.cellAt(0, 1).firstCursorPosition()
         else:
             self._insert_message_text_with_links(
-                cursor, str(message["m"]), body_color, font_name,
+                cursor, message_emoji_markup(message), body_color, font_name,
                 str(message["c"]), str(message["i"]),
                 muted=False, ui_font=False, embedded_image_urls=set(embedded_urls),
                 align_top=False, top_align_height=0, preview=True,
+                render_emojis="emojis" in message,
             )
             if embedded_urls and not visible_text.rstrip(" \t").endswith(("\n", "\r")):
                 cursor.insertBlock()
@@ -12585,6 +13436,17 @@ QComboBox::drop-down {
 
         advanced_layout.addWidget(self._heading("Data Management"), advanced_row, 0, 1, 3)
         advanced_row += 1
+        data_buttons = QHBoxLayout()
+        data_buttons.setContentsMargins(0, 0, 0, 0)
+        self.export_data_button = QPushButton("Export Data")
+        self.export_data_button.clicked.connect(self._export_data)
+        data_buttons.addWidget(self.export_data_button)
+        self.import_data_button = QPushButton("Import Data")
+        self.import_data_button.clicked.connect(self._import_data)
+        data_buttons.addWidget(self.import_data_button)
+        data_buttons.addStretch()
+        advanced_layout.addLayout(data_buttons, advanced_row, 0, 1, 3)
+        advanced_row += 1
         open_storage_button = QPushButton("Open storage folder")
         open_storage_button.clicked.connect(self._open_storage_folder)
         advanced_layout.addWidget(
@@ -12661,6 +13523,475 @@ QComboBox::drop-down {
             "Advanced ▼" if expanded else "Advanced ▶"
         )
         self.advanced_config_content.setVisible(expanded)
+
+    def _export_data(self) -> None:
+        dialog = DataTransferDialog(
+            "export", ARCHIVE_CATEGORIES, self._chatroom_definitions(), self.root,
+        )
+        self._apply_window_titlebar_theme(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        filename, _filter = QFileDialog.getSaveFileName(
+            self.root, "Export SpriteLink data", "SpriteLink Backup.sldata",
+            "SpriteLink Data (*.sldata)",
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        if path.suffix.lower() != ".sldata":
+            path = path.with_suffix(".sldata")
+        try:
+            categories = dialog.selected_categories()
+            payload: dict[str, Any] = {}
+            if "Chatrooms" in categories:
+                if not self._persist_local_history():
+                    raise OSError("Could not save the current chatroom history.")
+                server_url = normalize_server_url(str(self.config_data["server_url"]))
+                selected_ids = dialog.selected_room_ids()
+                pending_upgrades = set(_pending_history_upgrades())
+                rooms = []
+                for room in self._chatroom_definitions():
+                    if selected_ids is not None and room["id"] not in selected_ids:
+                        continue
+                    key = room["key"]
+                    legacy = chatroom_history_path(server_url, key).with_suffix(".bin")
+                    if legacy in pending_upgrades:
+                        _upgrade_chatroom_history(legacy)
+                    rooms.append({
+                        "nickname": room["nickname"], "key": key,
+                        "history": load_chatroom_history(server_url, key),
+                    })
+                payload["Chatrooms"] = rooms
+            if "Config" in categories:
+                payload["Config"] = config_for_export(self.config_data)
+            if "Emoji" in categories:
+                payload["Emoji"] = dict(self.config_data.get("saved_emojis", {}))
+            if "Identity" in categories:
+                payload["Identity"] = {
+                    "private_key": self._identity_private_key(),
+                    "presets": self._identity_presets(),
+                    "active_preset_id": self._room_profile(
+                        GLOBAL_CHATROOM_ID
+                    ).get("identity_preset_id", ""),
+                }
+
+            packed = create_archive(payload, dialog.password())
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".sldata.tmp")
+            try:
+                temporary.write_bytes(packed)
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        except Exception as exc:
+            messagebox.showerror("Could not export data", str(exc), parent=self.root)
+            return
+        messagebox.showinfo(
+            "Data exported", f"Data saved to {path}", parent=self.root,
+        )
+
+    def _prepare_data_import(
+        self, payload: dict[str, Any], categories: tuple[str, ...],
+        *, behavior: str = "merge",
+    ) -> tuple[dict[str, Any], list[tuple[str, list[dict[str, Any]]]], dict[str, int]]:
+        if behavior not in ("merge", "overwrite"):
+            raise ValueError("Unknown import behavior.")
+        # Complete validation before changing settings or writing history.
+        staged = json.loads(json.dumps(self.config_data))
+        history_jobs: list[tuple[str, list[dict[str, Any]]]] = []
+        counts = {"chatrooms": 0, "messages": 0, "emojis": 0, "identities": 0}
+
+        if "Config" in categories:
+            values = payload["Config"]
+            if not isinstance(values, dict):
+                raise ValueError("Invalid Config data in archive.")
+            for key in CONFIG_EXPORT_FIELDS:
+                if key in values:
+                    staged[key] = values[key]
+            preset = staged.get("server_preset", DEFAULT_SERVER_PRESET)
+            if preset not in SERVER_PRESETS:
+                preset = "Custom ntfy server"
+            staged["server_preset"] = preset
+            if preset in SERVER_PRESETS:
+                staged["server_url"] = SERVER_PRESETS[preset]
+            server_url = normalize_server_url(str(staged.get("server_url", "")))
+            if not server_url.startswith(("http://", "https://")):
+                raise ValueError("Invalid server URL in Config.")
+            staged["server_url"] = server_url
+            staged["theme"] = (
+                staged.get("theme") if staged.get("theme") in THEMES else DEFAULT_THEME
+            )
+            staged["theme_colors"] = normalize_theme_colors(
+                staged.get("theme_colors")
+            )
+            staged["ui_size"] = normalize_ui_size(staged.get("ui_size"))
+            staged["chatroom_history_limit"] = normalize_chatroom_history_limit(
+                staged.get("chatroom_history_limit")
+            )
+            staged["message_sound"] = (
+                staged.get("message_sound")
+                if staged.get("message_sound") in MESSAGE_SOUND_OPTIONS
+                else DEFAULT_MESSAGE_SOUND
+            )
+            try:
+                staged["message_sound_volume"] = max(
+                    10, min(100, int(staged.get("message_sound_volume", 100)))
+                )
+            except (ValueError, TypeError):
+                staged["message_sound_volume"] = 100
+            for key in ("text_shadows", "desktop_notifications",
+                        "minimize_to_tray", "start_with_windows"):
+                staged[key] = bool(staged.get(key, False))
+            if os.name != "nt":
+                staged["start_with_windows"] = False
+            width, height = normalize_window_size(
+                staged.get("window_width"), staged.get("window_height"),
+                staged["ui_size"],
+            )
+            staged["window_width"], staged["window_height"] = width, height
+            staged["custom_message_sound_path"] = str(
+                staged.get("custom_message_sound_path", "")
+            )
+
+        if "Chatrooms" in categories:
+            imported_rooms = payload["Chatrooms"]
+            if not isinstance(imported_rooms, list) or len(imported_rooms) > 1000:
+                raise ValueError("Invalid Chatrooms list in archive.")
+            existing_keys = {
+                room["key"] for room in self._chatroom_definitions()
+            }
+            existing_rooms = {
+                room["key"]: room for room in staged.get("chatrooms", [])
+            }
+            already_seen: set[str] = set()
+            new_rooms = staged.setdefault("chatrooms", [])
+            profiles = staged.setdefault("room_profiles", {})
+            global_profile = dict(profiles.get(GLOBAL_CHATROOM_ID, {}))
+            for room in imported_rooms:
+                if not isinstance(room, dict):
+                    raise ValueError("Invalid chatroom entry.")
+                name, key = room.get("nickname"), room.get("key")
+                history = room.get("history")
+                if (
+                    not isinstance(name, str) or not isinstance(key, str)
+                    or not isinstance(history, list)
+                ):
+                    raise ValueError("Invalid chatroom entry.")
+                if key != GLOBAL_CHATROOM_KEY:
+                    make_chatroom_invite_code(name, key)
+                if key in already_seen:
+                    raise ValueError("Duplicate chatroom key in archive.")
+                already_seen.add(key)
+                for item in history:
+                    if (
+                        not isinstance(item, dict)
+                        or not isinstance(item.get("message"), dict)
+                        or not isinstance(item["message"].get("i"), str)
+                        or not item["message"]["i"]
+                        or len(item["message"]["i"]) > 128
+                    ):
+                        raise ValueError("Invalid chatroom history entry.")
+                    for field in ("ntfy_id", "history_origin_topic"):
+                        value = item.get(field)
+                        if value is not None and not isinstance(value, str):
+                            raise ValueError("Invalid chatroom history metadata.")
+                    for field in ("ntfy_time", "display_sort_time"):
+                        value = item.get(field)
+                        if value is not None and type(value) is not int:
+                            raise ValueError("Invalid chatroom history timestamp.")
+                    try:
+                        sort_time, sent_time, _message_id = message_item_sort_key(item)
+                        if (
+                            not 0 <= sort_time <= 2**63 - 1
+                            or not 0 <= sent_time <= 2**63 - 1
+                        ):
+                            raise ValueError("Timestamp outside SQLite's range.")
+                    except (ValueError, TypeError, OverflowError) as exc:
+                        raise ValueError("Invalid chatroom history timestamp.") from exc
+                if key not in existing_keys:
+                    room_id = uuid.uuid4().hex
+                    new_rooms.append({
+                        "id": room_id, "nickname": name, "key": key,
+                    })
+                    # Room appearance, identity assignment and notification
+                    # preferences are intentionally not transferred.
+                    profiles[room_id] = dict(global_profile)
+                    existing_keys.add(key)
+                    counts["chatrooms"] += 1
+                elif behavior == "overwrite" and key in existing_rooms:
+                    # Only an explicit overwrite replaces a local room name.
+                    # Room appearance/notification settings remain local.
+                    existing_rooms[key]["nickname"] = name
+                history_jobs.append((key, history))
+
+        if "Emoji" in categories:
+            imported_emojis = payload["Emoji"]
+            if not isinstance(imported_emojis, dict):
+                raise ValueError("Invalid Emoji data in archive.")
+            if behavior == "overwrite":
+                for name, encoded in imported_emojis.items():
+                    if not valid_emoji(name, encoded):
+                        raise ValueError("Invalid emoji in archive.")
+                staged["saved_emojis"] = dict(imported_emojis)
+                counts["emojis"] = len(imported_emojis)
+            else:
+                staged["saved_emojis"], counts["emojis"] = merge_emoji_data(
+                    staged.setdefault("saved_emojis", {}),
+                    imported_emojis,
+                    valid_emoji,
+                )
+
+        if "Identity" in categories:
+            imported = payload["Identity"]
+            if not isinstance(imported, dict):
+                raise ValueError("Invalid Identity data in archive.")
+            private_key = imported.get("private_key")
+            if not isinstance(private_key, str):
+                raise ValueError("Invalid identity key in archive.")
+            identity_public_key_bytes(private_key)
+            raw_presets = imported.get("presets")
+            if not isinstance(raw_presets, list) or not raw_presets:
+                raise ValueError("Invalid identity presets in archive.")
+
+            if behavior == "merge":
+                # The signing key is a single global value, not part of the
+                # named identity presets. Never replace it during a merge.
+                presets, added, updated = merge_identity_data(
+                    staged.get("identity_presets", []),
+                    raw_presets, normalize_identity_preset,
+                    lambda: uuid.uuid4().hex, MAX_IDENTITY_PRESETS,
+                )
+                staged["identity_presets"] = presets
+                counts["identities"] = added + updated
+                updated_profiles = staged.setdefault("room_profiles", {})
+                by_id = {preset["id"]: preset for preset in presets}
+                for profile in updated_profiles.values():
+                    if not isinstance(profile, dict):
+                        continue
+                    preset = by_id.get(profile.get("identity_preset_id"))
+                    if preset is not None:
+                        apply_identity_preset_to_profile(profile, preset)
+            else:
+                if len(raw_presets) > MAX_IDENTITY_PRESETS:
+                    raise ValueError("Too many identities in archive.")
+                presets = []
+                used_ids: set[str] = set()
+                for raw in raw_presets:
+                    if (
+                        not isinstance(raw, dict)
+                        or not isinstance(raw.get("id"), str)
+                        or not isinstance(raw.get("username"), str)
+                    ):
+                        raise ValueError("Invalid identity preset in archive.")
+                    preset = normalize_identity_preset(raw)
+                    if preset["id"] in used_ids:
+                        raise ValueError("Duplicate identity ID in archive.")
+                    used_ids.add(preset["id"])
+                    presets.append(preset)
+                staged["identity_presets"] = presets
+                staged["identity_private_key"] = private_key
+                counts["identities"] = len(presets)
+                by_id = {preset["id"]: preset for preset in presets}
+                active_id = imported.get("active_preset_id")
+                default_preset = by_id.get(active_id, presets[0])
+                profiles = staged.setdefault("room_profiles", {})
+                for profile in profiles.values():
+                    if not isinstance(profile, dict):
+                        continue
+                    selected = by_id.get(profile.get("identity_preset_id"))
+                    apply_identity_preset_to_profile(
+                        profile, selected or default_preset,
+                    )
+                global_profile = profiles.setdefault(GLOBAL_CHATROOM_ID, {})
+                apply_identity_preset_to_profile(global_profile, default_preset)
+
+        return staged, history_jobs, counts
+
+    def _import_data(self) -> None:
+        filename, _filter = QFileDialog.getOpenFileName(
+            self.root, "Import SpriteLink data", "",
+            "SpriteLink Data (*.sldata)",
+        )
+        if not filename:
+            return
+        try:
+            path = Path(filename)
+            if path.stat().st_size > MAX_ARCHIVE_BYTES:
+                raise ValueError("The .sldata file is too large.")
+            blob = path.read_bytes()
+            _envelope, available = inspect_archive(blob)
+        except Exception as exc:
+            messagebox.showerror("Could not open data", str(exc), parent=self.root)
+            return
+
+        # Room names and keys are encrypted, so unlock the archive before
+        # building the room picker. Keep this data out of the public header.
+        try:
+            if _envelope["cipher"] == "none":
+                payload = open_archive(blob)
+            else:
+                unlock = QInputDialog(self.root)
+                unlock.setWindowTitle("Import Data")
+                unlock.setLabelText("Password")
+                unlock.setTextEchoMode(QLineEdit.EchoMode.Password)
+                self._apply_window_titlebar_theme(unlock)
+                while True:
+                    if unlock.exec() != QDialog.DialogCode.Accepted:
+                        return
+                    try:
+                        payload = open_archive(blob, unlock.textValue())
+                        break
+                    except ValueError as exc:
+                        messagebox.showerror(
+                            "Could not unlock data", str(exc), parent=self.root,
+                        )
+                        unlock.setTextValue("")
+
+            room_options = []
+            if "Chatrooms" in available:
+                imported_rooms = payload["Chatrooms"]
+                if not isinstance(imported_rooms, list) or len(imported_rooms) > 1000:
+                    raise ValueError("Invalid Chatrooms list in archive.")
+                for index, room in enumerate(imported_rooms):
+                    if (
+                        not isinstance(room, dict)
+                        or not isinstance(room.get("nickname"), str)
+                    ):
+                        raise ValueError("Invalid chatroom entry.")
+                    room_options.append({
+                        "id": str(index), "nickname": room["nickname"],
+                    })
+        except Exception as exc:
+            messagebox.showerror("Could not open data", str(exc), parent=self.root)
+            return
+
+        dialog = DataTransferDialog(
+            "import", available, room_options, parent=self.root,
+            password_required=False,
+        )
+        self._apply_window_titlebar_theme(dialog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        behavior = dialog.import_behavior()
+        if behavior == "overwrite":
+            answer = QMessageBox.warning(
+                self.root, "Overwrite local data",
+                "Overwrite replaces selected local chatroom histories, "
+                "emojis, and identities with the data in this file. "
+                "Existing messages and presets may be lost. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            categories = dialog.selected_categories()
+            if "Chatrooms" in categories:
+                selected_ids = dialog.selected_room_ids()
+                if selected_ids is not None:
+                    payload["Chatrooms"] = [
+                        room for index, room in enumerate(payload["Chatrooms"])
+                        if str(index) in selected_ids
+                    ]
+            if (
+                ("Chatrooms" in categories or "Config" in categories)
+                and not self._persist_local_history()
+            ):
+                raise OSError("Could not save the current chatroom history.")
+            staged, history_jobs, counts = self._prepare_data_import(
+                payload, categories, behavior=behavior,
+            )
+            old_config = self.config_data
+            old_server = normalize_server_url(
+                str(old_config.get("server_url", ""))
+            )
+            # Merge history before committing imported settings. A failed
+            # history merge must not change the user's live configuration.
+            server_url = normalize_server_url(
+                str(staged.get("server_url", ""))
+            )
+            pending_upgrades = set(_pending_history_upgrades()) if history_jobs else set()
+            for key, history in history_jobs:
+                # Migrate any old local history *before* filling gaps, so
+                # local copies always win on duplicate message IDs.
+                legacy = chatroom_history_path(server_url, key).with_suffix(".bin")
+                if legacy in pending_upgrades:
+                    _upgrade_chatroom_history(legacy)
+                if behavior == "overwrite":
+                    counts["messages"] += overwrite_imported_chatroom_history(
+                        server_url, key, history,
+                    )
+                else:
+                    # Preserve local copies, including near-identical messages
+                    # whose IDs changed during relay or earlier exports.
+                    counts["messages"] += merge_imported_chatroom_history(
+                        server_url, key, history,
+                    )
+
+            self.config_data = staged
+            try:
+                save_config(staged)
+            except Exception:
+                self.config_data = old_config
+                raise
+
+            if "Config" in categories:
+                self._apply_imported_config_controls()
+                if not set_start_with_windows(
+                    bool(self.config_data.get("start_with_windows", False))
+                ):
+                    raise OSError("Could not apply the imported startup setting.")
+            if "Emoji" in categories:
+                self._refresh_saved_emojis()
+            if "Identity" in categories:
+                self._load_active_room_profile_into_controls()
+            if "Chatrooms" in categories or server_url != old_server:
+                self.initial_history_pending_rooms.update(
+                    room["id"] for room in self._chatroom_definitions()
+                )
+                self._switch_active_chatroom(
+                    poll_immediately=True, refresh_subscription=True,
+                )
+            elif "Identity" in categories:
+                self._refresh_identity_preset_selector()
+            if hasattr(self, "config_overlay") and self.config_overlay.isVisible():
+                self._config_snapshot_at_open = self._config_ui_snapshot()
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not import data",
+                f"{exc}\n\nRetrying an import will not duplicate chat history.",
+                parent=self.root,
+            )
+            return
+        messagebox.showinfo(
+            "Data imported",
+            f"Imported {counts['chatrooms']} new chatrooms, "
+            f"{counts['messages']} history records, "
+            f"{counts['emojis']} emojis, and "
+            f"{counts['identities']} identity presets added or updated.",
+            parent=self.root,
+        )
+
+    def _apply_imported_config_controls(self) -> None:
+        settings = self.config_data
+        self.server_preset_var.set(str(settings["server_preset"]))
+        self.server_url_var.set(str(settings["server_url"]))
+        self.text_shadows_var.set(bool(settings["text_shadows"]))
+        self.ui_size_var.set(settings["ui_size"])
+        self.message_sound_var.set(str(settings["message_sound"]))
+        self.message_sound_volume_var.set(int(settings["message_sound_volume"]))
+        self.custom_message_sound_path_var.set(
+            str(settings["custom_message_sound_path"])
+        )
+        self.desktop_notifications_var.set(bool(settings["desktop_notifications"]))
+        self.chatroom_history_limit_var.set(int(settings["chatroom_history_limit"]))
+        self.minimize_to_tray_var.set(bool(settings["minimize_to_tray"]))
+        self.start_with_windows_var.set(bool(settings["start_with_windows"]))
+        self.theme_var.set(str(settings["theme"]))
+        self._apply_theme()
+        self._apply_application_font_strategy()
+        self._apply_ui_size()
+        self._saved_theme_colors = dict(settings["theme_colors"])
 
     def _open_storage_folder(self) -> None:
         try:
@@ -13081,7 +14412,10 @@ QComboBox::drop-down {
             root.setUpdatesEnabled(False)
         try:
             app.setPalette(palette)
-            app.setStyleSheet(stylesheet)
+            # Updating QApplication's stylesheet on every room switch makes
+            # Qt repolish every widget (including unrelated windows). Limit
+            # color-only changes to this window's widget tree instead.
+            self.root.setStyleSheet(stylesheet)
             if app.font() != application_font:
                 app.setFont(application_font)
             for widget, font in fonts:
@@ -13295,7 +14629,7 @@ QComboBox::drop-down {
 
     def _build_draft_message(self, text: str, drawing: str = "") -> dict[str, Any]:
         profile = self._active_room_profile()
-        text = trim_message_text(text)
+        text, emojis = pack_message_emojis(trim_message_text(text))
 
         message = {
             "v": APP_VERSION,
@@ -13310,6 +14644,8 @@ QComboBox::drop-down {
         if drawing:
             message["m"] = ""
             message["drawing"] = drawing
+        elif emojis:
+            message["emojis"] = emojis
         if profile["profile_icon"]:
             message["p"] = profile["profile_icon"]
         return sign_message_identity(
@@ -13404,7 +14740,7 @@ QComboBox::drop-down {
 
     def _drawing_payload(self) -> str:
         canvas = self.image_menu.canvas
-        if self.image_menu_button.isChecked() and canvas.edited:
+        if self.image_menu_button.isChecked() and canvas.edited and not self._is_emoji_drawing():
             return encode_drawing(canvas.canvas_size, bytes(canvas.pixels), canvas.palette_index)
         return ""
 
@@ -13413,6 +14749,8 @@ QComboBox::drop-down {
         text = trim_message_text(self.message_entry.to_message_text())
 
         try:
+            if not self.image_menu_button.isChecked() and len(pack_message_emojis(text)[1]) > MAX_MESSAGE_EMOJIS:
+                raise ValueError("Too many emojis.")
             draft_message = self._build_draft_message(
                 "" if self.image_menu_button.isChecked() else text,
                 self._drawing_payload(),
@@ -13581,12 +14919,29 @@ QComboBox::drop-down {
                 f"{message_limit_suffix}"
             )
 
+        emoji_mode = self._is_emoji_drawing()
+        self.image_composer_label.setText("Creating Emoji" if emoji_mode else "Image message")
+        self.send_button.setText("Save to Emojis" if emoji_mode else "Send")
+        self.message_size_bar.setVisible(not emoji_mode)
+        if emoji_mode:
+            self.send_button.setEnabled(self.image_menu.canvas.edited)
+            return
+
         self.send_button.setEnabled(
             (self.message_size_check_pending or not at_or_over_limit)
             and (not self.image_menu_button.isChecked() or self.image_menu.canvas.edited)
         )
 
     def _send_current_message(self) -> None:
+        if self._is_emoji_drawing():
+            canvas = self.image_menu.canvas
+            if canvas.edited:
+                encoded = encode_drawing(EMOJI_SIZE, bytes(canvas.pixels), canvas.palette_index)
+                original = self.emoji_edit_sources.get(self.active_chatroom_id, "")
+                if self._save_emoji_dialog(encoded, original, replace_name=original):
+                    self.emoji_edit_sources.pop(self.active_chatroom_id, None)
+            return
+
         image_mode = self.image_menu_button.isChecked()
         drawing = self._drawing_payload()
         if image_mode:
@@ -13598,7 +14953,15 @@ QComboBox::drop-down {
             if not message_plain_text(text):
                 return
 
-        if len(text) > MAX_MESSAGE_CHARS:
+        fallback, emojis = pack_message_emojis(text)
+        if len(emojis) > MAX_MESSAGE_EMOJIS:
+            messagebox.showwarning(
+                "Too many emojis",
+                f"Messages can contain up to {MAX_MESSAGE_EMOJIS} emojis.",
+                parent=self.root,
+            )
+            return
+        if len(fallback) > MAX_MESSAGE_CHARS:
             messagebox.showwarning(
                 "Message too long",
                 f"Messages are limited to {MAX_MESSAGE_CHARS} characters.",
@@ -14468,6 +15831,7 @@ QComboBox::drop-down {
         encryption_key: str,
         *,
         ntfy_time: int | None = None,
+        history_origin_topic: str | None = None,
     ) -> None:
         required = {
             "a": int,
@@ -14500,10 +15864,16 @@ QComboBox::drop-down {
             raise ValueError("Username contains unsupported characters.")
         if len(message["m"]) > MAX_MESSAGE_CHARS:
             raise ValueError("Message text is too long.")
+        if "emojis" in message:
+            if "drawing" in message:
+                raise ValueError("Drawings cannot contain emojis.")
+            unpack_message_emojis(message["m"], message["emojis"])
         if "drawing" in message:
             if message["m"]:
                 raise ValueError("Drawings cannot contain message text.")
-            decode_drawing(message["drawing"])
+            size, _, _ = decode_drawing(message["drawing"])
+            if size == EMOJI_SIZE:
+                raise ValueError("Emoji drawings must be sent inline.")
         if not QColor(message["k"]).isValid():
             raise ValueError("Username color is invalid.")
 
@@ -14524,7 +15894,9 @@ QComboBox::drop-down {
         if profile_icon:
             decode_profile_icon(profile_icon)
 
-        verify_message_identity(message, encryption_key)
+        verify_message_identity(
+            message, encryption_key, signed_topic=history_origin_topic,
+        )
 
         if ntfy_time is not None:
             if type(ntfy_time) is not int:
@@ -14536,7 +15908,8 @@ QComboBox::drop-down {
                 raise ValueError(
                     "Signed message time differs too far from Ntfy time."
                 )
-        message["m"] = trim_message_text(message["m"])
+        if "emojis" not in message:
+            message["m"] = trim_message_text(message["m"])
 
     def _queue_ui_event(self, event: tuple[str, Any]) -> None:
         self.ui_queue.put(event)
@@ -15394,6 +16767,7 @@ QComboBox::drop-down {
                             if stored_ntfy_time > 0
                             else None
                         ),
+                        history_origin_topic=item.get("history_origin_topic"),
                     )
                 except Exception:
                     continue
@@ -15478,14 +16852,14 @@ QComboBox::drop-down {
         self._history_initial_render_complete = True
         self._flush_pending_live_message_render()
 
-    def _persist_local_history(self) -> None:
+    def _persist_local_history(self) -> bool:
         server_url = normalize_server_url(
             str(self.config_data.get("server_url", ""))
         )
         encryption_key = self._active_chatroom()["key"]
 
         if not server_url or not encryption_key:
-            return
+            return not self.pending_history_entries
 
         try:
             save_chatroom_history(
@@ -15496,8 +16870,10 @@ QComboBox::drop-down {
             )
         except Exception:
             self.status_var.set("Could not save chat history")
+            return False
         else:
             self.pending_history_entries.clear()
+            return True
 
     def _chatroom_history_limit(self) -> int:
         value = (
@@ -15870,7 +17246,10 @@ QComboBox::drop-down {
         self._pending_tooltip_message_id = None
         if not message_id or message_id != self._hovered_message_id:
             return
-        if message_id.startswith("video:"):
+        if message_id.startswith("spritelink-emoji:"):
+            emoji = EMOJI_MARKUP.fullmatch(message_id.removeprefix("spritelink-emoji:"))
+            tooltip = self._tooltip_for_emoji(emoji[1], emoji[2]) if emoji else ""
+        elif message_id.startswith("video:"):
             url = message_id[len("video:"):]
             media = self.image_preview_cache.get(url)
             tooltip = (
@@ -15890,6 +17269,18 @@ QComboBox::drop-down {
                 CHAT_TOOLTIP_DISPLAY_TIME_MS,
             )
 
+    def _tooltip_for_emoji(self, encoded: str, name: str) -> str:
+        image_format = QTextImageFormat()
+        size = CHAT_TOOLTIP_ICON_SIZE
+        if not self._set_inline_html_image(image_format, emoji_image(encoded, size)):
+            return escape(name)
+        return (
+            '<table align="center" cellspacing="0" cellpadding="0">'
+            f'<tr><td align="center"><img src="{image_format.name()}" width="{size}" height="{size}"></td></tr>'
+            f'<tr><td align="center">{escape(name)}</td></tr>'
+            '</table>'
+        )
+
     def _tooltip_for_message_item(
         self,
         item: dict[str, Any],
@@ -15906,7 +17297,7 @@ QComboBox::drop-down {
         )
         icon_row = (
             '<tr><td align="center">'
-            f'<img src="{tooltip_icon_uri}" width="64" height="64">'
+            f'<img src="{tooltip_icon_uri}" width="{CHAT_TOOLTIP_ICON_SIZE}" height="{CHAT_TOOLTIP_ICON_SIZE}">'
             "</td></tr>"
             if tooltip_icon_uri
             else ""
@@ -16597,26 +17988,17 @@ QComboBox::drop-down {
 
             elif event_type == QEvent.Type.MouseMove:
                 position = event.position().toPoint()
-                anchor = self.chat_display.anchorAt(position)
+                anchor = self._chat_anchor_at_position(position)
                 message_id = self._message_id_from_anchor(anchor)
-                item = self.rendered_message_items.get(message_id or "")
-                if item is not None and "drawing" in item["message"]:
-                    cursor = self.chat_display.cursorForPosition(position)
-                    cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
-                    top = self.chat_display.cursorRect(cursor).top()
-                    font = str(item["message"].get("f", DEFAULT_MESSAGE_FONT))
-                    if position.y() >= top + self._chat_line_height(font):
-                        anchor = ""
-                        message_id = None
                 spoiler_id = self._spoiler_id_at_position(position)
 
                 if anchor or spoiler_id:
                     self.chat_display.viewport().setCursor(
                         Qt.CursorShape.PointingHandCursor
                     )
-                    if message_id:
+                    if message_id or anchor.startswith("spritelink-emoji:"):
                         self._schedule_chat_tooltip(
-                            message_id,
+                            message_id or anchor,
                             event.globalPosition().toPoint(),
                         )
                     elif (image_url := self._image_url_from_anchor(anchor)) and is_click_to_play_video_url(image_url):
@@ -16652,6 +18034,8 @@ QComboBox::drop-down {
                     )
                     if self._message_id_from_anchor(anchor):
                         # Consume user-link clicks to prevent navigation and Qt focus outlines.
+                        return True
+                    if anchor.startswith("spritelink-emoji:"):
                         return True
                     if anchor.startswith("spritelink-drawing:"):
                         if event_type == QEvent.Type.MouseButtonRelease:
@@ -16689,8 +18073,20 @@ QComboBox::drop-down {
                             )
                         return True
 
+            elif event_type == QEvent.Type.ToolTip:
+                if self.chat_display.anchorAt(event.pos()).startswith("spritelink-emoji:"):
+                    return True
+
             elif event_type == QEvent.Type.ContextMenu:
-                anchor = self.chat_display.anchorAt(event.pos())
+                anchor = self._chat_anchor_at_position(event.pos())
+                emoji = EMOJI_MARKUP.fullmatch(anchor.removeprefix("spritelink-emoji:"))
+                if anchor.startswith("spritelink-emoji:") and emoji:
+                    self._hide_chat_tooltip()
+                    menu = QMenu(self.root)
+                    save = menu.addAction("Save to Emojis")
+                    if menu.exec(event.globalPos()) == save:
+                        self._save_emoji_dialog(emoji[1], emoji[2])
+                    return True
                 message_id = self._message_id_from_anchor(anchor)
                 item = self.rendered_message_items.get(message_id or "")
                 if item is not None:
@@ -16719,6 +18115,7 @@ QComboBox::drop-down {
                             self._show_message_context_menu(
                                 clicked_item,
                                 event.globalPos(),
+                                on_native_image=anchor == f"spritelink-drawing:{clicked_message_id}",
                             )
                 return True
 
@@ -16730,6 +18127,19 @@ QComboBox::drop-down {
         if anchor.startswith(prefix):
             return anchor[len(prefix):]
         return None
+
+    def _chat_anchor_at_position(self, position: QPoint) -> str:
+        anchor = self.chat_display.anchorAt(position)
+        message_id = self._message_id_from_anchor(anchor)
+        item = self.rendered_message_items.get(message_id or "")
+        if item is not None and "drawing" in item["message"]:
+            cursor = self.chat_display.cursorForPosition(position)
+            cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+            top = self.chat_display.cursorRect(cursor).top()
+            font = str(item["message"].get("f", DEFAULT_MESSAGE_FONT))
+            if position.y() >= top + self._chat_line_height(font):
+                return ""
+        return anchor
 
     def _message_id_at_position(self, position: QPoint) -> str | None:
         cursor = self.chat_display.cursorForPosition(position)
@@ -16798,6 +18208,18 @@ QComboBox::drop-down {
                 RENDERED_SPOILER_REVEALED_PROPERTY,
                 reveal,
             )
+            if formatting.hasProperty(EMOJI_REVEALED_IMAGE_PROPERTY):
+                image_format = formatting.toImageFormat()
+                if reveal:
+                    image_format.setName(str(formatting.property(EMOJI_REVEALED_IMAGE_PROPERTY)))
+                    image_format.setToolTip("")
+                else:
+                    hidden = QImage(int(image_format.width()), int(image_format.height()), QImage.Format.Format_RGB32)
+                    hidden.fill(QColor(SPOILER_BLOCK_COLOR))
+                    self._set_inline_html_image(image_format, hidden)
+                    image_format.setToolTip("")
+                image_format.setAnchor(reveal)
+                formatting = image_format
             cursor = QTextCursor(document)
             cursor.setPosition(position)
             cursor.setPosition(
@@ -16901,9 +18323,7 @@ QComboBox::drop-down {
         encoded_icon: str,
         message_id: str,
         *,
-        align_top: bool = False,
         opacity: float = 1.0,
-        line_height_px: int = DEFAULT_MESSAGE_LINE_HEIGHT_PX,
         inline_html: bool = False,
     ) -> bool:
         if not encoded_icon:
@@ -16922,45 +18342,14 @@ QComboBox::drop-down {
             return False
         image.setDevicePixelRatio(1.0)
 
+        # The GIF is guaranteed to be 16x16 by decode_profile_icon.
+        # Do not add transparent padding here: rich-text image formats use
+        # the resource's dimensions, and fixed-height chat rows can clip or
+        # rescale padded images.
+        if image.width() != PROFILE_ICON_SIZE or image.height() != PROFILE_ICON_SIZE:
+            return False
         displayed_image = image
         resource_suffix = ""
-        top_padding = (
-            max(
-                0,
-                TOP_ALIGNED_PROFILE_ICON_PADDING
-                - PROFILE_ICON_VERTICAL_OFFSET_PX,
-            )
-            if align_top
-            else max(
-                0,
-                round(
-                    (max(PROFILE_ICON_SIZE, line_height_px)
-                     - PROFILE_ICON_SIZE)
-                    / 2.0
-                    - PROFILE_ICON_VERTICAL_OFFSET_PX
-                ),
-            )
-        )
-        bottom_padding = (
-            0
-            if align_top
-            else PROFILE_ICON_VERTICAL_OFFSET_PX
-        )
-        if top_padding or bottom_padding:
-            padded_image = QImage(
-                image.width(),
-                image.height() + top_padding + bottom_padding,
-                QImage.Format.Format_ARGB32,
-            )
-            padded_image.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(padded_image)
-            painter.drawImage(0, top_padding, image)
-            painter.end()
-            padded_image.setDevicePixelRatio(1.0)
-            displayed_image = padded_image
-            resource_suffix = (
-                f"-vertical-offset-{PROFILE_ICON_VERTICAL_OFFSET_PX}"
-            )
 
         opacity = max(0.0, min(1.0, opacity))
         if opacity < 1.0:
@@ -16997,9 +18386,9 @@ QComboBox::drop-down {
             image_format.setName(resource_url.toString())
             image_format.setAnchor(True)
             image_format.setAnchorHref(f"spritelink:{message_id}")
-        image_format.setWidth(displayed_image.width())
-        image_format.setHeight(displayed_image.height())
-        # Keep the optical offset; AlignTop avoids half-pixel AlignMiddle rounding.
+        image_format.setWidth(PROFILE_ICON_SIZE)
+        image_format.setHeight(PROFILE_ICON_SIZE)
+        # Pixel-aligned placement keeps the 16x16 resource unscaled.
         image_format.setVerticalAlignment(
             QTextCharFormat.VerticalAlignment.AlignTop
         )
@@ -17051,6 +18440,8 @@ QComboBox::drop-down {
         self,
         item: dict[str, Any],
         global_position: Any,
+        *,
+        on_native_image: bool = False,
     ) -> None:
         message = item["message"]
         message_id = str(message["i"])
@@ -17063,7 +18454,7 @@ QComboBox::drop-down {
         )
 
         menu = QMenu(self.root)
-        if "drawing" in message:
+        if on_native_image and "drawing" in message:
             copy_action = menu.addAction("Copy Image")
             import_action = menu.addAction("Import Image")
             try:
@@ -17082,11 +18473,10 @@ QComboBox::drop-down {
             copy_action = menu.addAction("Copy Message")
             copy_action.triggered.connect(
                 lambda: QApplication.clipboard().setText(
-                    message_plain_text(str(message["m"]))
+                    "[Image]" if "drawing" in message else message_plain_text(str(message["m"]))
                 )
             )
 
-        if "drawing" not in message:
             collapse_action = menu.addAction(
                 "Expand Message"
                 if is_manually_collapsed
@@ -17162,9 +18552,19 @@ QComboBox::drop-down {
         align_top: bool,
         top_align_height: int,
         preview: bool = False,
+        render_emojis: bool = False,
     ) -> None:
         plain_text, rich_runs = parse_message_rich_text(text)
-        url_spans = message_url_spans(plain_text)
+        link_text = (
+            EMOJI_MARKUP.sub(lambda match: " " * len(match[0]), plain_text)
+            if render_emojis else plain_text
+        )
+        url_spans = message_url_spans(link_text)
+        emoji_size = PROFILE_ICON_SIZE
+        emoji_alignment = QTextCharFormat.VerticalAlignment.AlignMiddle
+        if render_emojis and self._is_tiny_ui() and self._chat_line_height(font_name) <= emoji_size + 2:
+            # Qt's middle alignment can extend into the next row with very short fonts.
+            emoji_alignment = QTextCharFormat.VerticalAlignment.AlignTop
         link_color = (
             "#0000ee"
             if self._is_windows_classic_theme()
@@ -17244,6 +18644,34 @@ QComboBox::drop-down {
                 content = plain_text[start:end]
                 if preview and run.spoiler is not None:
                     content = "".join(char if char == "\n" else "█" for char in content)
+                if render_emojis and not anchor and not (preview and run.spoiler is not None):
+                    offset = 0
+                    for match in EMOJI_MARKUP.finditer(content):
+                        encoded, name = match.groups()
+                        if not valid_emoji(name, encoded):
+                            continue
+                        cursor.insertText(content[offset:match.start()], formatting)
+                        image_format = inline_emoji_format(cursor, name, encoded, emoji_size, formatting)
+                        # The editor retains name tooltips, but chat/search
+                        # emojis use the custom preview instead of Qt's
+                        # name-only tooltips over surrounding message text.
+                        image_format.setToolTip("")
+                        image_format.setVerticalAlignment(emoji_alignment)
+                        if preview:
+                            self._set_inline_html_image(image_format, emoji_image(encoded, emoji_size))
+                        else:
+                            image_format.setAnchor(True)
+                            image_format.setAnchorHref(f"spritelink-emoji:{match[0]}")
+                        if run.spoiler is not None:
+                            hidden = QImage(emoji_size, emoji_size, QImage.Format.Format_RGB32)
+                            hidden.fill(QColor(SPOILER_BLOCK_COLOR))
+                            image_format.setProperty(EMOJI_REVEALED_IMAGE_PROPERTY, image_format.name())
+                            self._set_inline_html_image(image_format, hidden)
+                            image_format.setToolTip("")
+                            image_format.setAnchor(False)
+                        cursor.insertImage(image_format)
+                        offset = match.end()
+                    content = content[offset:]
                 cursor.insertText(content, formatting)
 
             first_spoiler_run = (
@@ -17568,7 +18996,14 @@ QComboBox::drop-down {
                     )
                 )
             message["m"] = " | ".join(combined_parts)
+            message.pop("emojis", None)
         elif len(group) > 1:
+            if "emojis" in message:
+                prefix_length = len(self._repeat_prefixed_message_text("", len(group)))
+                message["emojis"] = [
+                    [start + prefix_length, name, encoded]
+                    for start, name, encoded in message["emojis"]
+                ]
             message["m"] = self._repeat_prefixed_message_text(
                 str(group[0]["message"].get("m", "")),
                 len(group),
@@ -18217,9 +19652,7 @@ QComboBox::drop-down {
             if is_muted
             else message_plain_text(text)
         )
-        is_collapsed = is_muted or (
-            not drawing and bool(source_message_ids.intersection(collapsed_ids))
-        )
+        is_collapsed = is_muted or bool(source_message_ids.intersection(collapsed_ids))
         message_block_format = QTextBlockFormat()
         message_block_format.setNonBreakableLines(is_collapsed)
         cursor.setBlockFormat(message_block_format)
@@ -18251,11 +19684,11 @@ QComboBox::drop-down {
                 )
         elif has_untrusted_image:
             display_text = message_text_with_untrusted_images_hidden(
-                text,
+                message_emoji_markup(message) if "emojis" in message else text,
                 untrusted_image_urls,
             )
         else:
-            display_text = text
+            display_text = message_emoji_markup(message) if "emojis" in message else text
         plain_display_text = message_plain_text(display_text)
         image_urls = (
             []
@@ -18351,8 +19784,6 @@ QComboBox::drop-down {
                 cursor,
                 "" if is_muted else profile_icon,
                 message_id,
-                align_top=align_message_top,
-                line_height_px=message_line_height,
             )
         if has_profile_icon:
             cursor.insertText(
@@ -18440,6 +19871,7 @@ QComboBox::drop-down {
                 embedded_image_urls=set(image_urls),
                 align_top=align_message_top,
                 top_align_height=top_align_height,
+                render_emojis="emojis" in message,
             )
         cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
         if add_image_line_break:

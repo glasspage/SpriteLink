@@ -354,6 +354,105 @@ class BehaviorSettingsTests(unittest.TestCase):
                     background_entries,
                 )
 
+    def test_changing_key_copies_and_merges_history_without_reencrypting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            patches = self._history_storage_patches(directory)
+            with patches[0], patches[1], patches[2], patches[3]:
+                server = "https://ntfy.sh"
+                old_key, new_key = "active-key", "background-key"
+                old_messages = [
+                    {"message": {"i": "old-1", "t": 1, "m": "Old chat"}},
+                    {"message": {"i": "shared", "t": 2, "m": "Old copy"}},
+                ]
+                new_messages = [
+                    {"message": {"i": "shared", "t": 2, "m": "New copy"}},
+                    {"message": {"i": "new-1", "t": 3, "m": "Previously saved"}},
+                ]
+                SPRITELINK.save_chatroom_history(server, old_key, old_messages)
+                SPRITELINK.save_chatroom_history(server, new_key, new_messages)
+                self.assertTrue(SPRITELINK.copy_chatroom_history_for_key_change(
+                    server, old_key, new_key,
+                ))
+                from_old_room = {
+                    **old_messages[0],
+                    "history_origin_topic": SPRITELINK.derive_ntfy_topic(old_key),
+                }
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(server, new_key),
+                    [from_old_room, *new_messages],
+                )
+                # A settings-write failure must still leave the original data intact.
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(server, old_key),
+                    old_messages,
+                )
+                SPRITELINK.delete_local_chatroom_history(server, old_key)
+                self.assertFalse(SPRITELINK.chatroom_history_path(server, old_key).exists())
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(server, new_key),
+                    [from_old_room, *new_messages],
+                )
+
+    def test_changing_key_upgrades_legacy_history_before_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            patches = self._history_storage_patches(directory)
+            with patches[0], patches[1], patches[2], patches[3]:
+                server = "https://ntfy.sh"
+                old_key, new_key = "active-key", "other-key"
+                original = [{"message": {"i": "legacy-1", "t": 1}}]
+                legacy = SPRITELINK.chatroom_history_path(
+                    server, old_key,
+                ).with_suffix(".bin")
+                SPRITELINK._write_dpapi_json(
+                    legacy, original, SPRITELINK.CHATROOM_HISTORY_DPAPI_ENTROPY,
+                )
+                self.assertTrue(SPRITELINK.copy_chatroom_history_for_key_change(
+                    server, old_key, new_key,
+                ))
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(server, new_key),
+                    [{
+                        **original[0],
+                        "history_origin_topic": SPRITELINK.derive_ntfy_topic(old_key),
+                    }],
+                )
+                self.assertTrue(legacy.exists())
+
+    def test_repeated_key_changes_preserve_original_signature_topic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            patches = self._history_storage_patches(Path(temporary_directory))
+            with patches[0], patches[1], patches[2], patches[3]:
+                server = "https://ntfy.sh"
+                original = [{"message": {"i": "message-from-first-key", "t": 1}}]
+                SPRITELINK.save_chatroom_history(server, "active-key", original)
+                self.assertTrue(SPRITELINK.copy_chatroom_history_for_key_change(
+                    server, "active-key", "background-key",
+                ))
+                SPRITELINK.delete_local_chatroom_history(server, "active-key")
+                self.assertTrue(SPRITELINK.copy_chatroom_history_for_key_change(
+                    server, "background-key", "other-key",
+                ))
+                self.assertEqual(
+                    SPRITELINK.load_chatroom_history(server, "other-key"),
+                    [{
+                        **original[0],
+                        "history_origin_topic": SPRITELINK.derive_ntfy_topic("active-key"),
+                    }],
+                )
+
+    def test_changing_key_without_history_creates_no_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            patches = self._history_storage_patches(Path(temporary_directory))
+            with patches[0], patches[1], patches[2], patches[3]:
+                self.assertFalse(SPRITELINK.copy_chatroom_history_for_key_change(
+                    "https://ntfy.sh", "active-key", "other-key",
+                ))
+                self.assertFalse(SPRITELINK.chatroom_history_path(
+                    "https://ntfy.sh", "other-key",
+                ).exists())
+
     def test_history_pruning_is_per_chatroom(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -3586,12 +3685,34 @@ class HttpsOnlyMediaAndLinkTests(unittest.TestCase):
 
 
 class RoomKeyTests(unittest.TestCase):
-    def test_generated_room_keys_are_exactly_32_url_safe_characters(self) -> None:
-        keys = {SPRITELINK.generate_chatroom_key() for _ in range(16)}
-        self.assertEqual(len(keys), 16)
+    def test_generated_room_keys_are_exactly_48_url_safe_characters(self) -> None:
+        keys = {SPRITELINK.generate_chatroom_key() for _ in range(64)}
+        self.assertEqual(len(keys), 64)
         for key in keys:
+            self.assertEqual(len(key), 48)
+            self.assertRegex(key, r"^[A-Za-z0-9_-]{48}$")
+            self.assertEqual(SPRITELINK.chatroom_key_security_level(key), "Excellent")
+
+    def test_legacy_autogenerated_32_character_keys_are_excellent(self) -> None:
+        for _ in range(256):
+            key = SPRITELINK.secrets.token_urlsafe(24)
             self.assertEqual(len(key), 32)
-            self.assertRegex(key, r"^[A-Za-z0-9_-]{32}$")
+            self.assertEqual(SPRITELINK.chatroom_key_security_level(key), "Excellent")
+
+    def test_key_security_rejects_repetitions_and_short_keys(self) -> None:
+        cases = (
+            ("", "Unsecure"),
+            ("a" * 48, "Unsecure"),
+            ("Short8!", "Unsecure"),
+            ("abc" * 16, "Weak"),
+            ("abcdefghijklmnopqrstuvwxyzabcdef", "Weak"),
+            ("Ag4!vP6@Km2?Q7x$", "Strong"),
+        )
+        for key, expected in cases:
+            with self.subTest(key=key):
+                self.assertEqual(
+                    SPRITELINK.chatroom_key_security_level(key), expected
+                )
 
 
 class ChatroomInviteCodeTests(unittest.TestCase):
@@ -4040,6 +4161,49 @@ class SignedClientIdentityTests(unittest.TestCase):
 
         with self.assertRaises(Exception):
             SPRITELINK.verify_message_identity(message, self.ROOM_TWO)
+
+    def test_rekeyed_local_history_keeps_signature_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with mock.patch.object(
+                SPRITELINK, "CHATROOM_HISTORY_DIRECTORY",
+                Path(temporary_directory),
+            ), mock.patch.object(
+                SPRITELINK, "dpapi_encrypt",
+                side_effect=lambda data, _entropy: data,
+            ), mock.patch.object(
+                SPRITELINK, "dpapi_decrypt",
+                side_effect=lambda data, _entropy: data,
+            ):
+                message = self._signed_message(self.ROOM_ONE)
+                server = "https://ntfy.sh"
+                SPRITELINK.save_chatroom_history(
+                    server, self.ROOM_ONE, [{"message": message}],
+                )
+                self.assertTrue(SPRITELINK.copy_chatroom_history_for_key_change(
+                    server, self.ROOM_ONE, self.ROOM_TWO,
+                ))
+                moved = SPRITELINK.load_chatroom_history(
+                    server, self.ROOM_TWO,
+                )[0]
+                self.assertEqual(
+                    moved["history_origin_topic"],
+                    SPRITELINK.derive_ntfy_topic(self.ROOM_ONE),
+                )
+                SPRITELINK.EncryptedChatClient._validate_decrypted_message(
+                    moved["message"],
+                    self.ROOM_TWO,
+                    history_origin_topic=moved["history_origin_topic"],
+                )
+                with self.assertRaises(Exception):
+                    SPRITELINK.EncryptedChatClient._validate_decrypted_message(
+                        moved["message"], self.ROOM_TWO,
+                    )
+                forged = dict(moved["message"], m="tampered")
+                with self.assertRaises(Exception):
+                    SPRITELINK.EncryptedChatClient._validate_decrypted_message(
+                        forged, self.ROOM_TWO,
+                        history_origin_topic=moved["history_origin_topic"],
+                    )
 
     def test_unsigned_messages_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -4805,25 +4969,12 @@ class Version120ReleaseTests(unittest.TestCase):
         icon_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_profile_icon
         )
-        self.assertEqual(SPRITELINK.PROFILE_ICON_VERTICAL_OFFSET_PX, 2)
-        self.assertIn("line_height_px", icon_source)
-        self.assertIn("PROFILE_ICON_VERTICAL_OFFSET_PX", icon_source)
-        self.assertNotIn(
-            "VerticalAlignment.AlignMiddle",
-            icon_source,
-        )
-        self.assertIn(
-            "VerticalAlignment.AlignTop",
-            icon_source,
-        )
-        self.assertIn(
-            "TOP_ALIGNED_PROFILE_ICON_PADDING",
-            icon_source,
-        )
-        self.assertIn(
-            "- PROFILE_ICON_VERTICAL_OFFSET_PX",
-            icon_source,
-        )
+        self.assertNotIn("top_padding", icon_source)
+        self.assertNotIn("bottom_padding", icon_source)
+        self.assertNotIn("padded_image", icon_source)
+        self.assertIn("image_format.setWidth(PROFILE_ICON_SIZE)", icon_source)
+        self.assertIn("image_format.setHeight(PROFILE_ICON_SIZE)", icon_source)
+        self.assertIn("VerticalAlignment.AlignTop", icon_source)
 
         separator_source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._insert_log_separator
