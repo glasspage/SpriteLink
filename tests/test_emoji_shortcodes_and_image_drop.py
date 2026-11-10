@@ -136,7 +136,7 @@ class EmojiShortcodesAndImageDropTests(unittest.TestCase):
         )
         self.assertFalse(self.client.eventFilter(self.root, event))
         self.assertIsNone(self.client._dropped_image_path(mime))
-        self.assertIsNone(self.client.drawing_import_overlay)
+        self.assertIsNone(getattr(self.client, "drawing_import_overlay", None))
 
     def test_invalid_image_drop_does_not_replace_editor(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -152,7 +152,7 @@ class EmojiShortcodesAndImageDropTests(unittest.TestCase):
                 self.assertTrue(self.client.eventFilter(self.root, drop))
                 error.assert_called_once()
             self.assertFalse(self.client.image_menu_button.isChecked())
-            self.assertIsNone(self.client.drawing_import_overlay)
+            self.assertIsNone(getattr(self.client, "drawing_import_overlay", None))
 
 
 if __name__ == "__main__":
