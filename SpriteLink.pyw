@@ -4816,6 +4816,7 @@ class ComposeTextEdit(QTextEdit):
         super().__init__()
         self.setObjectName("messageEntry")
         self.setAcceptRichText(False)
+        self.saved_emoji_lookup: Callable[[], dict[str, str]] = lambda: {}
 
     def insert_emoji(self, name: str, encoded: str) -> None:
         cursor = self.textCursor()
@@ -4824,6 +4825,36 @@ class ComposeTextEdit(QTextEdit):
         self.setTextCursor(cursor)
         self.setCurrentCharFormat(base)
         self.setFocus()
+
+    def _replace_typed_emoji_shortcode(self) -> None:
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            return
+        preceding = QTextCursor(cursor)
+        preceding.movePosition(
+            QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor,
+        )
+        match = re.search(r":([^:\r\n]{1,32}):$", preceding.selectedText())
+        if match is None:
+            return
+
+        requested_name = match.group(1).casefold()
+        for name, encoded in self.saved_emoji_lookup().items():
+            if name.casefold() != requested_name or not valid_emoji(name, encoded):
+                continue
+            original_format = self.currentCharFormat()
+            end = cursor.position()
+            length = len(match.group(0).encode("utf-16-le")) // 2
+            cursor.beginEditBlock()
+            cursor.setPosition(end - length)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            cursor.insertImage(inline_emoji_format(
+                cursor, name, encoded, PROFILE_ICON_SIZE, original_format,
+            ))
+            cursor.endEditBlock()
+            self.setTextCursor(cursor)
+            self.setCurrentCharFormat(original_format)
+            return
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
@@ -4984,6 +5015,8 @@ class ComposeTextEdit(QTextEdit):
             event.accept()
             return
         super().keyPressEvent(event)
+        if event.text() == ":":
+            self._replace_typed_emoji_shortcode()
 
 
 class ClickableProgressBar(QProgressBar):
@@ -7552,6 +7585,7 @@ class SearchResultMessage(QTextBrowser):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.setAcceptDrops(True)
         if os.name == "nt":
             # Allocate alpha before HWND creation; keep this format across themes for DWM.
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -11283,6 +11317,7 @@ QComboBox::drop-down {
         compose_layout.setVerticalSpacing(5)
 
         self.message_entry = ComposeTextEdit()
+        self.message_entry.saved_emoji_lookup = lambda: self.config_data.get("saved_emojis", {})
         self.message_entry.setFont(
             self._make_message_font(DEFAULT_MESSAGE_FONT)
         )
@@ -11573,6 +11608,47 @@ QComboBox::drop-down {
         if self.image_menu.canvas.canvas_size != EMOJI_SIZE:
             self.emoji_edit_sources.pop(self.active_chatroom_id, None)
 
+    @staticmethod
+    def _dropped_image_path(mime: QMimeData) -> str | None:
+        extensions = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+        for url in mime.urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                if Path(path).suffix.casefold() in extensions:
+                    return path
+        return None
+
+    @staticmethod
+    def _qimage_import_source(image: QImage) -> Image.Image:
+        if image.isNull():
+            raise ValueError("The image is empty.")
+        if image.width() * image.height() > 24_000_000:
+            raise ValueError("Choose an image under 24 megapixels.")
+        rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        return Image.frombytes(
+            "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
+            "raw", "RGBA", rgba.bytesPerLine(), 1,
+        )
+
+    def _open_dropped_image(self, mime: QMimeData) -> None:
+        try:
+            path = self._dropped_image_path(mime)
+            if path is not None:
+                source = load_import_image(path)
+            else:
+                image = mime.imageData()
+                if isinstance(image, QPixmap):
+                    image = image.toImage()
+                if not isinstance(image, QImage):
+                    raise ValueError("The dropped item contains no readable image.")
+                source = self._qimage_import_source(image)
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
+            messagebox.showerror("Cannot import image", str(exc), parent=self.root)
+            return
+        self.image_menu_button.setChecked(True)
+        self._open_drawing_import()
+        self._show_drawing_import_preview(source)
+
     def _open_drawing_import(self, *, profile_icon: bool = False) -> None:
         self._close_drawing_import()
         title = "Import profile icon" if profile_icon else "Import image"
@@ -11632,14 +11708,11 @@ QComboBox::drop-down {
         if image.isNull():
             messagebox.showwarning("Import image", "The clipboard has no image.", parent=self.root)
             return
-        if image.width() * image.height() > 24_000_000:
-            messagebox.showwarning("Import image", "Choose an image under 24 megapixels.", parent=self.root)
+        try:
+            source = self._qimage_import_source(image)
+        except ValueError as exc:
+            messagebox.showwarning("Import image", str(exc), parent=self.root)
             return
-        rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
-        source = Image.frombytes(
-            "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
-            "raw", "RGBA", rgba.bytesPerLine(), 1,
-        )
         self._show_drawing_import_preview(source, profile_icon=profile_icon)
 
     def _show_drawing_import_preview(self, source: Image.Image, *, profile_icon: bool = False) -> None:
@@ -17910,12 +17983,27 @@ QComboBox::drop-down {
         QEvent.Type.MouseButtonRelease,
         QEvent.Type.MouseButtonDblClick,
         QEvent.Type.ContextMenu,
+        QEvent.Type.DragEnter,
+        QEvent.Type.DragMove,
+        QEvent.Type.Drop,
     ))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         event_type = event.type()
         if event_type not in EncryptedChatClient._ui_event_types:
             return False
+        if (
+            event_type in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop)
+            and isinstance(watched, QWidget)
+            and watched.window() is self.root
+            and hasattr(self, "image_menu_button")
+        ):
+            mime = event.mimeData()
+            if self._dropped_image_path(mime) is not None or mime.hasImage():
+                if event_type == QEvent.Type.Drop:
+                    self._open_dropped_image(mime)
+                event.acceptProposedAction()
+                return True
         if (
             isinstance(watched, QDialog)
             and not isinstance(watched, QFileDialog)
