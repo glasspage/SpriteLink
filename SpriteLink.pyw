@@ -4810,6 +4810,7 @@ class EmojiNameValidator(QValidator):
 class ComposeTextEdit(QTextEdit):
     send_requested = Signal()
     formatting_shortcut_requested = Signal(str)
+    image_paste_requested = Signal(object)
     width_changed = Signal()
 
     def __init__(self) -> None:
@@ -4910,6 +4911,9 @@ class ComposeTextEdit(QTextEdit):
         return mime
 
     def insertFromMimeData(self, source: QMimeData) -> None:
+        if source.hasImage() or EncryptedChatClient._dropped_image_path(source) is not None:
+            self.image_paste_requested.emit(source)
+            return
         if source.hasFormat("application/x-spritelink-emoji-text"):
             markup = bytes(source.data("application/x-spritelink-emoji-text"))
             if len(markup) <= MAX_UNCOMPRESSED_MESSAGE_BYTES:
@@ -11318,6 +11322,7 @@ QComboBox::drop-down {
 
         self.message_entry = ComposeTextEdit()
         self.message_entry.saved_emoji_lookup = lambda: self.config_data.get("saved_emojis", {})
+        self.message_entry.image_paste_requested.connect(self._open_dropped_image)
         self.message_entry.setFont(
             self._make_message_font(DEFAULT_MESSAGE_FONT)
         )
@@ -17986,12 +17991,27 @@ QComboBox::drop-down {
         QEvent.Type.DragEnter,
         QEvent.Type.DragMove,
         QEvent.Type.Drop,
+        QEvent.Type.KeyPress,
     ))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         event_type = event.type()
         if event_type not in EncryptedChatClient._ui_event_types:
             return False
+        if (
+            event_type == QEvent.Type.KeyPress
+            and isinstance(watched, QWidget)
+            and watched.window() is self.root
+            and hasattr(self, "image_menu_button")
+            and event.matches(QKeySequence.StandardKey.Paste)
+        ):
+            clipboard_mime = QApplication.clipboard().mimeData()
+            if clipboard_mime is not None and (
+                clipboard_mime.hasImage() or self._dropped_image_path(clipboard_mime) is not None
+            ):
+                self._open_dropped_image(clipboard_mime)
+                event.accept()
+                return True
         if (
             event_type in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop)
             and isinstance(watched, QWidget)
