@@ -172,6 +172,7 @@ from spritelink_http import requests
 from spritelink_data_dialog import DataTransferDialog
 from spritelink_history_merge import merge_imported_history
 from spritelink_import_merge import merge_emoji_data, merge_identity_data
+from spritelink_import_recovery import ImportRecovery
 from spritelink_data_transfer import (
     ARCHIVE_CATEGORIES, CONFIG_EXPORT_FIELDS, MAX_ARCHIVE_BYTES,
     config_for_export, create_archive, inspect_archive, open_archive,
@@ -7772,6 +7773,12 @@ class EncryptedChatClient(QObject):
         self.current_link_warning_url: str | None = None
         self.root = root
         self.root.setWindowTitle("SpriteLink")
+        # A crash during a multi-room import may leave several databases changed.
+        # Restore the encrypted pre-import snapshot before loading local settings.
+        ImportRecovery.recover_pending(
+            APP_DATA_DIR / "import-recovery", CONFIG_PATH,
+            CHATROOM_HISTORY_DIRECTORY,
+        )
         self.config_data = load_config()
         self.root.setMinimumSize(
             *minimum_window_size(self.config_data.get("ui_size"))
@@ -13912,6 +13919,7 @@ QComboBox::drop-down {
         return staged, history_jobs, counts
 
     def _import_data(self) -> None:
+        global _loaded_config_snapshot
         filename, _filter = QFileDialog.getOpenFileName(
             self.root, "Import SpriteLink data", "",
             "SpriteLink Data (*.sldata)",
@@ -13988,6 +13996,8 @@ QComboBox::drop-down {
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
+        recovery: ImportRecovery | None = None
+        old_config: dict[str, Any] | None = None
         try:
             categories = dialog.selected_categories()
             if "Chatrooms" in categories:
@@ -13997,14 +14007,16 @@ QComboBox::drop-down {
                         room for index, room in enumerate(payload["Chatrooms"])
                         if str(index) in selected_ids
                     ]
+            # Fully validate every selected category before touching settings
+            # or any imported room. A bad later room must not partially apply.
+            staged, history_jobs, counts = self._prepare_data_import(
+                payload, categories, behavior=behavior,
+            )
             if (
                 ("Chatrooms" in categories or "Config" in categories)
                 and not self._persist_local_history()
             ):
                 raise OSError("Could not save the current chatroom history.")
-            staged, history_jobs, counts = self._prepare_data_import(
-                payload, categories, behavior=behavior,
-            )
             old_config = self.config_data
             old_server = normalize_server_url(
                 str(old_config.get("server_url", ""))
@@ -14013,6 +14025,14 @@ QComboBox::drop-down {
             # history merge must not change the user's live configuration.
             server_url = normalize_server_url(
                 str(staged.get("server_url", ""))
+            )
+            # Each room write is individually transactional, but a multi-room
+            # import needs a recoverable pre-import snapshot as well. SQLite's
+            # backup API captures committed data even when a journal is present.
+            recovery = ImportRecovery.capture(
+                APP_DATA_DIR / "import-recovery", CONFIG_PATH,
+                CHATROOM_HISTORY_DIRECTORY,
+                [chatroom_history_path(server_url, key) for key, _ in history_jobs],
             )
             pending_upgrades = set(_pending_history_upgrades()) if history_jobs else set()
             for key, history in history_jobs:
@@ -14060,19 +14080,59 @@ QComboBox::drop-down {
                 self._refresh_identity_preset_selector()
             if hasattr(self, "config_overlay") and self.config_overlay.isVisible():
                 self._config_snapshot_at_open = self._config_ui_snapshot()
+            recovery.complete(keep=behavior == "overwrite")
         except Exception as exc:
+            recovery_detail = ""
+            if recovery is not None:
+                try:
+                    recovery.rollback()
+                    recovery.complete(keep=False)
+                    if old_config is not None:
+                        _loaded_config_snapshot = _config_snapshot(old_config)
+                    recovery_detail = "\n\nPrevious local data was restored."
+                except Exception as restore_exc:
+                    # Preserve the on-disk snapshot for manual recovery.
+                    recovery_detail = (
+                        f"\n\nAutomatic recovery failed: {restore_exc}"
+                        f"\nRecovery snapshot: {recovery.folder}"
+                    )
+                if old_config is not None:
+                    self.config_data = old_config
+                    try:
+                        if "Config" in categories:
+                            self._apply_imported_config_controls()
+                            set_start_with_windows(
+                                bool(old_config.get("start_with_windows", False))
+                            )
+                        if "Emoji" in categories:
+                            self._refresh_saved_emojis()
+                        if "Identity" in categories:
+                            self._load_active_room_profile_into_controls()
+                        if "Chatrooms" in categories:
+                            self.initial_history_pending_rooms.update(
+                                room["id"] for room in self._chatroom_definitions()
+                            )
+                            self._switch_active_chatroom(
+                                poll_immediately=True, refresh_subscription=True,
+                            )
+                    except Exception as ui_exc:
+                        recovery_detail += f"\nCould not refresh the UI: {ui_exc}"
             messagebox.showerror(
-                "Could not import data",
-                f"{exc}\n\nRetrying an import will not duplicate chat history.",
+                "Could not import data", f"{exc}{recovery_detail}",
                 parent=self.root,
             )
             return
+        recovery_detail = (
+            f"\n\nPrevious local data saved to:\n{recovery.folder}"
+            if behavior == "overwrite" else ""
+        )
         messagebox.showinfo(
             "Data imported",
             f"Imported {counts['chatrooms']} new chatrooms, "
             f"{counts['messages']} history records, "
             f"{counts['emojis']} emojis, and "
-            f"{counts['identities']} identity presets added or updated.",
+            f"{counts['identities']} identity presets added or updated."
+            f"{recovery_detail}",
             parent=self.root,
         )
 
