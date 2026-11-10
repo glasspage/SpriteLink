@@ -7,7 +7,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6.QtCore import QMimeData, QPoint, QPointF, QTimer, QUrl, Qt
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QTimer, QUrl, Qt
 from PySide6.QtGui import QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage, QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -175,7 +175,7 @@ class EmojiShortcodesAndImageDropTests(unittest.TestCase):
         image.fill(QColor(20, 30, 40))
         self.app.clipboard().setImage(image)
         event = QKeyEvent(
-            QKeyEvent.Type.KeyPress, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier,
+            QEvent.Type.KeyPress, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier,
         )
         from PySide6.QtWidgets import QDialog
         dialog = QDialog()
