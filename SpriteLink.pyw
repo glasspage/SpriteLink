@@ -4807,6 +4807,16 @@ class EmojiNameValidator(QValidator):
         return QValidator.State.Acceptable, self.normalize(text), position
 
 
+def image_path_from_mime(mime: QMimeData) -> str | None:
+    extensions = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+    for url in mime.urls():
+        if url.isLocalFile():
+            path = url.toLocalFile()
+            if Path(path).suffix.casefold() in extensions:
+                return path
+    return None
+
+
 class ComposeTextEdit(QTextEdit):
     send_requested = Signal()
     formatting_shortcut_requested = Signal(str)
@@ -4911,7 +4921,7 @@ class ComposeTextEdit(QTextEdit):
         return mime
 
     def insertFromMimeData(self, source: QMimeData) -> None:
-        if source.hasImage() or EncryptedChatClient._dropped_image_path(source) is not None:
+        if source.hasImage() or image_path_from_mime(source) is not None:
             self.image_paste_requested.emit(source)
             return
         if source.hasFormat("application/x-spritelink-emoji-text"):
@@ -11615,13 +11625,7 @@ QComboBox::drop-down {
 
     @staticmethod
     def _dropped_image_path(mime: QMimeData) -> str | None:
-        extensions = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
-        for url in mime.urls():
-            if url.isLocalFile():
-                path = url.toLocalFile()
-                if Path(path).suffix.casefold() in extensions:
-                    return path
-        return None
+        return image_path_from_mime(mime)
 
     @staticmethod
     def _qimage_import_source(image: QImage) -> Image.Image:
