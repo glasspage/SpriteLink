@@ -147,6 +147,7 @@ class EmojiShortcodesAndImageDropTests(unittest.TestCase):
         image.fill(QColor(80, 40, 190))
         mime = QMimeData()
         mime.setImageData(image)
+        self.assertTrue(self.edit.canInsertFromMimeData(mime))
         self.edit.insertFromMimeData(mime)
         panel = self.client.drawing_import_overlay.panel
         self.assertIsInstance(panel, S.DrawingImportPanel)
