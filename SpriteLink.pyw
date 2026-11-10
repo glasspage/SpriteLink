@@ -4920,6 +4920,13 @@ class ComposeTextEdit(QTextEdit):
         mime.setData("application/x-spritelink-emoji-text", markup.encode("utf-8"))
         return mime
 
+    def canInsertFromMimeData(self, source: QMimeData) -> bool:
+        return (
+            source.hasImage()
+            or image_path_from_mime(source) is not None
+            or super().canInsertFromMimeData(source)
+        )
+
     def insertFromMimeData(self, source: QMimeData) -> None:
         if source.hasImage() or image_path_from_mime(source) is not None:
             self.image_paste_requested.emit(source)
