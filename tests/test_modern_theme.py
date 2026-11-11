@@ -23,7 +23,7 @@ class ModernThemeTests(unittest.TestCase):
         self.previous_sheet = self.app.styleSheet()
         self.properties = {
             name: self.app.property(name) for name in (
-                "spritelinkGlassy", "spritelinkModern",
+                "spritelinkGlassy", "spritelinkGlassyDark", "spritelinkModern",
                 "spritelinkWindowsClassic", "spritelinkTextShadows",
             )
         }
@@ -37,7 +37,7 @@ class ModernThemeTests(unittest.TestCase):
             text_shadows_var=SimpleNamespace(get=lambda: False),
             _apply_titlebar_theme=mock.Mock(),
         )
-        for name in ("_modern_palette", "_glassy_palette", "_windows_classic_palette"):
+        for name in ("_modern_palette", "_glassy_palette", "_windows_classic_palette", "_config_panel_stylesheet"):
             setattr(self.client, name, lambda name=name: getattr(
                 SPRITELINK.EncryptedChatClient, name
             )(self.client))
@@ -87,13 +87,13 @@ class ModernThemeTests(unittest.TestCase):
         self.apply()
         checkbox = QCheckBox("Theme change", self.window)
         self.assertTrue(self.app.property("spritelinkModern"))
-        self.assertEqual(self.app.styleSheet(), SPRITELINK.MODERN_STYLESHEET)
+        self.assertEqual(self.app.styleSheet(), SPRITELINK.MODERN_STYLESHEET + self.client._config_panel_stylesheet())
         for theme, sheet in (("Glassy", SPRITELINK.GLASSY_STYLESHEET),
                              ("Classic", SPRITELINK.WINDOWS_CLASSIC_STYLESHEET)):
             self.theme = theme
             self.apply()
             self.assertFalse(self.app.property("spritelinkModern"))
-            self.assertEqual(self.app.styleSheet(), sheet)
+            self.assertEqual(self.app.styleSheet(), sheet + self.client._config_panel_stylesheet())
         self.theme = "Modern"
         self.apply()
         self.assertFalse(self.app.property("spritelinkGlassy"))
@@ -133,12 +133,14 @@ class ModernThemeTests(unittest.TestCase):
 
     def test_segoe_font_prefers_static_faces_and_falls_back_without_it(self):
         family = SPRITELINK.EncryptedChatClient._ui_font_family
+        self.client._font_families = lambda: SPRITELINK.EncryptedChatClient._font_families(self.client)
         for available, expected in (
             (["Segoe UI", "Segoe UI Variable"], "Segoe UI"),
             (["Segoe UI"], "Segoe UI"),
             (["Segoe UI Variable"], "Segoe UI Variable"),
             ([], "Fallback"),
         ):
+            self.client._available_font_families = None
             with mock.patch.object(SPRITELINK.QFontDatabase, "families", return_value=available):
                 self.assertEqual(family(self.client), expected)
         self.theme = "Glassy"
