@@ -608,8 +608,6 @@ class ImportPreview(PixelView):
 
 def load_import_image(path: str) -> Image.Image:
     with Image.open(path) as source:
-        if source.width * source.height > 24_000_000:
-            raise ValueError("Choose an image under 24 megapixels.")
         return ImageOps.exif_transpose(source).convert("RGBA")
 
 

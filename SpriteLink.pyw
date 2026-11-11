@@ -172,6 +172,7 @@ from spritelink_http import requests
 from spritelink_data_dialog import DataTransferDialog
 from spritelink_history_merge import merge_imported_history
 from spritelink_import_merge import merge_emoji_data, merge_identity_data
+from spritelink_import_recovery import ImportRecovery
 from spritelink_data_transfer import (
     ARCHIVE_CATEGORIES, CONFIG_EXPORT_FIELDS, MAX_ARCHIVE_BYTES,
     config_for_export, create_archive, inspect_archive, open_archive,
@@ -4807,15 +4808,27 @@ class EmojiNameValidator(QValidator):
         return QValidator.State.Acceptable, self.normalize(text), position
 
 
+def image_path_from_mime(mime: QMimeData) -> str | None:
+    extensions = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+    for url in mime.urls():
+        if url.isLocalFile():
+            path = url.toLocalFile()
+            if Path(path).suffix.casefold() in extensions:
+                return path
+    return None
+
+
 class ComposeTextEdit(QTextEdit):
     send_requested = Signal()
     formatting_shortcut_requested = Signal(str)
+    image_paste_requested = Signal(object)
     width_changed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("messageEntry")
         self.setAcceptRichText(False)
+        self.saved_emoji_lookup: Callable[[], dict[str, str]] = lambda: {}
 
     def insert_emoji(self, name: str, encoded: str) -> None:
         cursor = self.textCursor()
@@ -4824,6 +4837,36 @@ class ComposeTextEdit(QTextEdit):
         self.setTextCursor(cursor)
         self.setCurrentCharFormat(base)
         self.setFocus()
+
+    def _replace_typed_emoji_shortcode(self) -> None:
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            return
+        preceding = QTextCursor(cursor)
+        preceding.movePosition(
+            QTextCursor.MoveOperation.StartOfBlock, QTextCursor.MoveMode.KeepAnchor,
+        )
+        match = re.search(r":([^:\r\n]{1,32}):$", preceding.selectedText())
+        if match is None:
+            return
+
+        requested_name = match.group(1).casefold()
+        for name, encoded in self.saved_emoji_lookup().items():
+            if name.casefold() != requested_name or not valid_emoji(name, encoded):
+                continue
+            original_format = self.currentCharFormat()
+            end = cursor.position()
+            length = len(match.group(0).encode("utf-16-le")) // 2
+            cursor.beginEditBlock()
+            cursor.setPosition(end - length)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            cursor.insertImage(inline_emoji_format(
+                cursor, name, encoded, PROFILE_ICON_SIZE, original_format,
+            ))
+            cursor.endEditBlock()
+            self.setTextCursor(cursor)
+            self.setCurrentCharFormat(original_format)
+            return
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
@@ -4878,7 +4921,17 @@ class ComposeTextEdit(QTextEdit):
         mime.setData("application/x-spritelink-emoji-text", markup.encode("utf-8"))
         return mime
 
+    def canInsertFromMimeData(self, source: QMimeData) -> bool:
+        return (
+            source.hasImage()
+            or image_path_from_mime(source) is not None
+            or super().canInsertFromMimeData(source)
+        )
+
     def insertFromMimeData(self, source: QMimeData) -> None:
+        if source.hasImage() or image_path_from_mime(source) is not None:
+            self.image_paste_requested.emit(source)
+            return
         if source.hasFormat("application/x-spritelink-emoji-text"):
             markup = bytes(source.data("application/x-spritelink-emoji-text"))
             if len(markup) <= MAX_UNCOMPRESSED_MESSAGE_BYTES:
@@ -4984,6 +5037,8 @@ class ComposeTextEdit(QTextEdit):
             event.accept()
             return
         super().keyPressEvent(event)
+        if event.text() == ":":
+            self._replace_typed_emoji_shortcode()
 
 
 class ClickableProgressBar(QProgressBar):
@@ -7552,6 +7607,7 @@ class SearchResultMessage(QTextBrowser):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.setAcceptDrops(True)
         if os.name == "nt":
             # Allocate alpha before HWND creation; keep this format across themes for DWM.
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -7717,6 +7773,12 @@ class EncryptedChatClient(QObject):
         self.current_link_warning_url: str | None = None
         self.root = root
         self.root.setWindowTitle("SpriteLink")
+        # A crash during a multi-room import may leave several databases changed.
+        # Restore the encrypted pre-import snapshot before loading local settings.
+        ImportRecovery.recover_pending(
+            APP_DATA_DIR / "import-recovery", CONFIG_PATH,
+            CHATROOM_HISTORY_DIRECTORY,
+        )
         self.config_data = load_config()
         self.root.setMinimumSize(
             *minimum_window_size(self.config_data.get("ui_size"))
@@ -11027,6 +11089,11 @@ QComboBox::drop-down {
         self.search_toggle = QPushButton("Search")
         self.search_toggle.setCheckable(True)
         self.search_toggle.toggled.connect(self._on_search_toggled)
+        self.search_shortcut = QShortcut(
+            QKeySequence(QKeySequence.StandardKey.Find), self.root,
+        )
+        self.search_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.search_shortcut.activated.connect(self._focus_chat_search)
         status_layout.addWidget(self.search_toggle)
 
         self.config_toggle = QPushButton("Config")
@@ -11283,6 +11350,8 @@ QComboBox::drop-down {
         compose_layout.setVerticalSpacing(5)
 
         self.message_entry = ComposeTextEdit()
+        self.message_entry.saved_emoji_lookup = lambda: self.config_data.get("saved_emojis", {})
+        self.message_entry.image_paste_requested.connect(self._open_dropped_image)
         self.message_entry.setFont(
             self._make_message_font(DEFAULT_MESSAGE_FONT)
         )
@@ -11573,6 +11642,39 @@ QComboBox::drop-down {
         if self.image_menu.canvas.canvas_size != EMOJI_SIZE:
             self.emoji_edit_sources.pop(self.active_chatroom_id, None)
 
+    @staticmethod
+    def _dropped_image_path(mime: QMimeData) -> str | None:
+        return image_path_from_mime(mime)
+
+    @staticmethod
+    def _qimage_import_source(image: QImage) -> Image.Image:
+        if image.isNull():
+            raise ValueError("The image is empty.")
+        rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        return Image.frombytes(
+            "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
+            "raw", "RGBA", rgba.bytesPerLine(), 1,
+        )
+
+    def _open_dropped_image(self, mime: QMimeData) -> None:
+        try:
+            path = self._dropped_image_path(mime)
+            if path is not None:
+                source = load_import_image(path)
+            else:
+                image = mime.imageData()
+                if isinstance(image, QPixmap):
+                    image = image.toImage()
+                if not isinstance(image, QImage):
+                    raise ValueError("The dropped item contains no readable image.")
+                source = self._qimage_import_source(image)
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
+            messagebox.showerror("Cannot import image", str(exc), parent=self.root)
+            return
+        self.image_menu_button.setChecked(True)
+        self._open_drawing_import()
+        self._show_drawing_import_preview(source)
+
     def _open_drawing_import(self, *, profile_icon: bool = False) -> None:
         self._close_drawing_import()
         title = "Import profile icon" if profile_icon else "Import image"
@@ -11632,14 +11734,11 @@ QComboBox::drop-down {
         if image.isNull():
             messagebox.showwarning("Import image", "The clipboard has no image.", parent=self.root)
             return
-        if image.width() * image.height() > 24_000_000:
-            messagebox.showwarning("Import image", "Choose an image under 24 megapixels.", parent=self.root)
+        try:
+            source = self._qimage_import_source(image)
+        except ValueError as exc:
+            messagebox.showwarning("Import image", str(exc), parent=self.root)
             return
-        rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
-        source = Image.frombytes(
-            "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
-            "raw", "RGBA", rgba.bytesPerLine(), 1,
-        )
         self._show_drawing_import_preview(source, profile_icon=profile_icon)
 
     def _show_drawing_import_preview(self, source: Image.Image, *, profile_icon: bool = False) -> None:
@@ -12055,6 +12154,9 @@ QComboBox::drop-down {
     def _build_search_popup(self) -> None:
         self.search_overlay = ConfigOverlay(self.chat_content)
         self.search_overlay.dismissed.connect(self.search_toggle.click)
+        escape = QShortcut(Qt.Key.Key_Escape, self.search_overlay)
+        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        escape.activated.connect(lambda: self.search_toggle.setChecked(False))
         overlay_layout = QVBoxLayout(self.search_overlay)
         overlay_layout.setContentsMargins(24, 24, 24, 24)
         panel = QFrame()
@@ -12119,6 +12221,12 @@ QComboBox::drop-down {
         self.search_entry.returnPressed.connect(self._start_chat_search)
         self.chat_content.installEventFilter(self)
         self._apply_ui_size_to_widget_tree(self.search_overlay)
+
+    def _focus_chat_search(self) -> None:
+        if self.search_toggle.isChecked():
+            self.search_entry.setFocus()
+        else:
+            self.search_toggle.setChecked(True)
 
     def _on_search_toggled(self, checked: bool) -> None:
         if not checked:
@@ -12487,6 +12595,9 @@ QComboBox::drop-down {
     def _build_config_popup(self) -> None:
         self.config_overlay = ConfigOverlay(self.chat_content)
         self.config_overlay.dismissed.connect(self._dismiss_config_popup)
+        escape = QShortcut(Qt.Key.Key_Escape, self.config_overlay)
+        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        escape.activated.connect(self._dismiss_config_popup)
 
         overlay_layout = QVBoxLayout(self.config_overlay)
         overlay_layout.setContentsMargins(24, 24, 24, 24)
@@ -13808,6 +13919,7 @@ QComboBox::drop-down {
         return staged, history_jobs, counts
 
     def _import_data(self) -> None:
+        global _loaded_config_snapshot
         filename, _filter = QFileDialog.getOpenFileName(
             self.root, "Import SpriteLink data", "",
             "SpriteLink Data (*.sldata)",
@@ -13884,6 +13996,8 @@ QComboBox::drop-down {
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
+        recovery: ImportRecovery | None = None
+        old_config: dict[str, Any] | None = None
         try:
             categories = dialog.selected_categories()
             if "Chatrooms" in categories:
@@ -13893,14 +14007,16 @@ QComboBox::drop-down {
                         room for index, room in enumerate(payload["Chatrooms"])
                         if str(index) in selected_ids
                     ]
+            # Fully validate every selected category before touching settings
+            # or any imported room. A bad later room must not partially apply.
+            staged, history_jobs, counts = self._prepare_data_import(
+                payload, categories, behavior=behavior,
+            )
             if (
                 ("Chatrooms" in categories or "Config" in categories)
                 and not self._persist_local_history()
             ):
                 raise OSError("Could not save the current chatroom history.")
-            staged, history_jobs, counts = self._prepare_data_import(
-                payload, categories, behavior=behavior,
-            )
             old_config = self.config_data
             old_server = normalize_server_url(
                 str(old_config.get("server_url", ""))
@@ -13909,6 +14025,14 @@ QComboBox::drop-down {
             # history merge must not change the user's live configuration.
             server_url = normalize_server_url(
                 str(staged.get("server_url", ""))
+            )
+            # Each room write is individually transactional, but a multi-room
+            # import needs a recoverable pre-import snapshot as well. SQLite's
+            # backup API captures committed data even when a journal is present.
+            recovery = ImportRecovery.capture(
+                APP_DATA_DIR / "import-recovery", CONFIG_PATH,
+                CHATROOM_HISTORY_DIRECTORY,
+                [chatroom_history_path(server_url, key) for key, _ in history_jobs],
             )
             pending_upgrades = set(_pending_history_upgrades()) if history_jobs else set()
             for key, history in history_jobs:
@@ -13956,19 +14080,59 @@ QComboBox::drop-down {
                 self._refresh_identity_preset_selector()
             if hasattr(self, "config_overlay") and self.config_overlay.isVisible():
                 self._config_snapshot_at_open = self._config_ui_snapshot()
+            recovery.complete(keep=behavior == "overwrite")
         except Exception as exc:
+            recovery_detail = ""
+            if recovery is not None:
+                try:
+                    recovery.rollback()
+                    recovery.complete(keep=False)
+                    if old_config is not None:
+                        _loaded_config_snapshot = _config_snapshot(old_config)
+                    recovery_detail = "\n\nPrevious local data was restored."
+                except Exception as restore_exc:
+                    # Preserve the on-disk snapshot for manual recovery.
+                    recovery_detail = (
+                        f"\n\nAutomatic recovery failed: {restore_exc}"
+                        f"\nRecovery snapshot: {recovery.folder}"
+                    )
+                if old_config is not None:
+                    self.config_data = old_config
+                    try:
+                        if "Config" in categories:
+                            self._apply_imported_config_controls()
+                            set_start_with_windows(
+                                bool(old_config.get("start_with_windows", False))
+                            )
+                        if "Emoji" in categories:
+                            self._refresh_saved_emojis()
+                        if "Identity" in categories:
+                            self._load_active_room_profile_into_controls()
+                        if "Chatrooms" in categories:
+                            self.initial_history_pending_rooms.update(
+                                room["id"] for room in self._chatroom_definitions()
+                            )
+                            self._switch_active_chatroom(
+                                poll_immediately=True, refresh_subscription=True,
+                            )
+                    except Exception as ui_exc:
+                        recovery_detail += f"\nCould not refresh the UI: {ui_exc}"
             messagebox.showerror(
-                "Could not import data",
-                f"{exc}\n\nRetrying an import will not duplicate chat history.",
+                "Could not import data", f"{exc}{recovery_detail}",
                 parent=self.root,
             )
             return
+        recovery_detail = (
+            f"\n\nPrevious local data saved to:\n{recovery.folder}"
+            if behavior == "overwrite" else ""
+        )
         messagebox.showinfo(
             "Data imported",
             f"Imported {counts['chatrooms']} new chatrooms, "
             f"{counts['messages']} history records, "
             f"{counts['emojis']} emojis, and "
-            f"{counts['identities']} identity presets added or updated.",
+            f"{counts['identities']} identity presets added or updated."
+            f"{recovery_detail}",
             parent=self.root,
         )
 
@@ -17910,12 +18074,42 @@ QComboBox::drop-down {
         QEvent.Type.MouseButtonRelease,
         QEvent.Type.MouseButtonDblClick,
         QEvent.Type.ContextMenu,
+        QEvent.Type.DragEnter,
+        QEvent.Type.DragMove,
+        QEvent.Type.Drop,
+        QEvent.Type.KeyPress,
     ))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         event_type = event.type()
         if event_type not in EncryptedChatClient._ui_event_types:
             return False
+        if (
+            event_type == QEvent.Type.KeyPress
+            and isinstance(watched, QWidget)
+            and watched.window() is self.root
+            and hasattr(self, "image_menu_button")
+            and event.matches(QKeySequence.StandardKey.Paste)
+        ):
+            clipboard_mime = QApplication.clipboard().mimeData()
+            if clipboard_mime is not None and (
+                clipboard_mime.hasImage() or self._dropped_image_path(clipboard_mime) is not None
+            ):
+                self._open_dropped_image(clipboard_mime)
+                event.accept()
+                return True
+        if (
+            event_type in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop)
+            and isinstance(watched, QWidget)
+            and watched.window() is self.root
+            and hasattr(self, "image_menu_button")
+        ):
+            mime = event.mimeData()
+            if self._dropped_image_path(mime) is not None or mime.hasImage():
+                if event_type == QEvent.Type.Drop:
+                    self._open_dropped_image(mime)
+                event.acceptProposedAction()
+                return True
         if (
             isinstance(watched, QDialog)
             and not isinstance(watched, QFileDialog)
