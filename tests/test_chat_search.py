@@ -327,6 +327,18 @@ class ChatSearchTests(unittest.TestCase):
             f"lines={body.document().begin().layout().lineCount()}",
         )
         self.assertEqual(document.toPlainText().count("Wrapped message"), 5)
+        # Ensure that a second and third resize rebuild from the original
+        # rich text, rather than from a truncated copy of the first preview.
+        original_html = body._source_html
+        full_text = document.toPlainText()
+        for _ in range(3):
+            body.resize(250, body.heightForWidth(250))
+            self.app.processEvents()
+            self.assertIn("[...]", document.toPlainText())
+            body.resize(wide_width, body.heightForWidth(wide_width))
+            self.app.processEvents()
+            self.assertEqual(document.toPlainText(), full_text)
+            self.assertEqual(body._source_html, original_html)
         body.close()
 
     def test_saved_history_search_pagination_and_jump(self):
