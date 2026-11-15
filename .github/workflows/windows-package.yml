@@ -33,6 +33,11 @@ on:
 permissions:
   contents: read
 
+# A new commit supersedes previous PR runs, but never cancels releases.
+concurrency:
+  group: windows-package-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-windows:
     runs-on: windows-latest
