@@ -19,7 +19,7 @@ def messages(path):
 
 def put(path, *ids):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute("CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY)")
         conn.executemany("INSERT OR IGNORE INTO messages VALUES (?)",
                          [(value,) for value in ids])
