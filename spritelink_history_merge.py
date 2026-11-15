@@ -88,8 +88,30 @@ def merge_imported_history(
             cache.popitem(last=False)
         return fingerprints
 
+    def import_order(entry: dict[str, Any]) -> tuple[int, str]:
+        """Pick a stable representative when fuzzy matches form a time chain.
+
+        E.g. 100s, 102s and 104s must retain both outer messages even if
+        102s appears first in an unsorted archive. Existing local records
+        always take priority over every imported record.
+        """
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            raise ValueError("Invalid imported chatroom history entry.")
+        message_id = message.get("i")
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError("Invalid imported message ID.")
+        signed_time = int(message.get("t", 0) or 0)
+        sort_time = int(entry.get(
+            "display_sort_time", entry.get("ntfy_time", signed_time)
+        ) or 0)
+        return (signed_time if signed_time > 0 else sort_time, message_id)
+
+    # Exports are normally ordered, but malformed, concatenated or reordered
+    # archives must not change which near-duplicates survive. Sorting only
+    # holds a list of references to the input records, not copies of them.
     inserted = 0
-    for entry in entries:
+    for entry in sorted(entries, key=import_order):
         message = entry.get("message")
         if not isinstance(message, dict):
             raise ValueError("Invalid imported chatroom history entry.")
