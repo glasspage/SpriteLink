@@ -185,10 +185,12 @@ class ComposerLayoutTests(unittest.TestCase):
                 formatting = image_format()
                 self.assertFalse(formatting.isAnchor())
                 self.assertEqual(formatting.height(), 16)
-                if ui_size == "Small":
-                    self.assertEqual(
-                        formatting.verticalAlignment(), S.QTextCharFormat.VerticalAlignment.AlignMiddle,
-                    )
+                # Small and Tiny both center the 16px emoji on the text line.
+                # Any slight Qt layout overlap is hidden by the message stripe.
+                self.assertEqual(
+                    formatting.verticalAlignment(),
+                    S.QTextCharFormat.VerticalAlignment.AlignMiddle,
+                )
                 client._toggle_rendered_spoiler("message:1")
                 self.assertTrue(image_format().isAnchor())
                 self.assertEqual(image_format().toolTip(), "")
