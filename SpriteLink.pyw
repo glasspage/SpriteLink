@@ -7483,13 +7483,13 @@ class SearchResultMessage(QTextBrowser):
         QTimer.singleShot(0, self._update_preview)
 
     @staticmethod
-    def _elide_preview(document: QTextDocument, width: int) -> None:
+    def _elide_preview(document: QTextDocument, width: int) -> bool:
         document.setTextWidth(width)
         document.size()
         first = document.begin()
         layout = first.layout()
         if not layout.lineCount():
-            return
+            return False
         if layout.lineCount() == 1:
             # QTextDocument HTML can contain trailing empty paragraphs. They
             # are not overflowing message text and must not produce "[...]".
@@ -7499,7 +7499,7 @@ class SearchResultMessage(QTextBrowser):
             ):
                 extra = extra.next()
             if not extra.isValid():
-                return
+                return False
 
         # Keep the separate media block (or media cell) after the text preview.
         cursor = QTextCursor(document)
@@ -7513,7 +7513,7 @@ class SearchResultMessage(QTextBrowser):
         line_end = first.position() + layout.lineAt(0).textLength()
         end = block.position() - 1 if block.isValid() else document.characterCount() - 1
         if line_end >= end:
-            return
+            return False
 
         cursor.setPosition(line_end)
         cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
@@ -7531,6 +7531,7 @@ class SearchResultMessage(QTextBrowser):
             cut.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor)
             cut.removeSelectedText()
             document.size()
+        return True
 
     def _update_preview(self) -> None:
         width = max(1, self.viewport().width())
@@ -7549,8 +7550,14 @@ class SearchResultMessage(QTextBrowser):
         preview.setDocumentMargin(document.documentMargin())
         preview.setDefaultFont(document.defaultFont())
         preview.setHtml(self._source_html)
-        self._elide_preview(preview, width)
-        super().setHtml(preview.toHtml())
+        if self._elide_preview(preview, width):
+            # Never truncate the source itself: the next wider render starts
+            # from the original content, not the already shortened preview.
+            super().setHtml(preview.toHtml())
+        else:
+            # Bypass the converted preview HTML when everything fits. This
+            # restores the original links, formatting, and full text exactly.
+            super().setHtml(self._source_html)
         self.updateGeometry()
 
     def _make_shadow_document(self) -> QTextDocument:
@@ -18784,9 +18791,9 @@ QComboBox::drop-down {
         url_spans = message_url_spans(link_text)
         emoji_size = PROFILE_ICON_SIZE
         emoji_alignment = QTextCharFormat.VerticalAlignment.AlignMiddle
-        if render_emojis and self._is_tiny_ui():
-            # Center the emoji inside Qt's expanded minimum-height row.
-            emoji_alignment = QTextCharFormat.VerticalAlignment.AlignMiddle
+        if render_emojis and self._is_tiny_ui() and self._chat_line_height(font_name) <= emoji_size + 2:
+            # Qt's middle alignment can extend into the next row with very short fonts.
+            emoji_alignment = QTextCharFormat.VerticalAlignment.AlignTop
         link_color = (
             "#0000ee"
             if self._is_windows_classic_theme()
@@ -20132,15 +20139,9 @@ QComboBox::drop-down {
                 QTextFormat.Property.BackgroundBrush
             )
             if block.blockNumber() not in embedded_media_block_numbers:
-                # MinimumHeight lets Qt allocate enough ascent/descent for
-                # 16px emoji while keeping ordinary Tiny text rows compact.
-                line_height_type = (
-                    QTextBlockFormat.LineHeightTypes.MinimumHeight
-                    if self._is_tiny_ui() and "emojis" in message
-                    else QTextBlockFormat.LineHeightTypes.FixedHeight
-                )
                 block_format.setLineHeight(
-                    float(message_line_height), int(line_height_type.value),
+                    float(message_line_height),
+                    int(QTextBlockFormat.LineHeightTypes.FixedHeight.value),
                 )
             block_cursor.setBlockFormat(block_format)
 
