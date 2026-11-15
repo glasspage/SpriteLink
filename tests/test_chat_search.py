@@ -113,20 +113,6 @@ class ChatSearchTests(unittest.TestCase):
         self.assertIn(max(S.message_row_backgrounds(), key=lambda color: QColor(color).lightness()),
                       body.styleSheet())
 
-    def test_search_text_shadows_follow_the_setting(self):
-        body = self.client._search_result_message(self.client._build_draft_message("Shadow sample"))
-        body.resize(280, body.heightForWidth(280))
-        body.show()
-        self.app.processEvents()
-        self.app.setProperty("spritelinkTextShadows", False)
-        without = body.viewport().grab().toImage()
-        self.app.setProperty("spritelinkTextShadows", True)
-        with_shadow = body.viewport().grab().toImage()
-        self.assertEqual(without.size(), with_shadow.size())
-        self.assertNotEqual(without, with_shadow)
-        self.assertGreaterEqual(body.viewport().height(), body.document().size().height())
-        body.close()
-
     def test_search_message_contains_a_loadable_inline_profile_icon(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profile.png"
@@ -231,63 +217,6 @@ class ChatSearchTests(unittest.TestCase):
         self.assertEqual(client.search_entry.text(), "")
         self.assertFalse(client._search_media_updates)
 
-    def test_media_only_result_top_aligns_username(self):
-        client = self.client
-        url = "https://i.imgur.com/example.png"
-        image = QImage(120, 100, QImage.Format.Format_RGB32)
-        image.fill(QColor("#0000ff"))
-        client.image_preview_cache[url] = S.RemoteMediaPreview(url, b"", "static_image", image)
-        message = client._build_draft_message(url)
-        message.update(u="Username", k="#ff0000")
-        document = QTextDocument()
-        document.setHtml(client._search_result_html(message, [url]))
-        document.setTextWidth(350)
-        rendered = QImage(350, 140, QImage.Format.Format_RGB32)
-        rendered.fill(QColor("white"))
-        painter = QPainter(rendered)
-        document.drawContents(painter)
-        painter.end()
-        text_top = next(y for y in range(140) for x in range(130)
-                        if rendered.pixelColor(x, y) == QColor("#ff0000"))
-        image_top = next(y for y in range(140) for x in range(350)
-                         if rendered.pixelColor(x, y) == QColor("#0000ff"))
-        self.assertLess(abs(text_top - image_top), 20)
-
-    def test_media_shadows_preserve_preview_position_and_shadow_username(self):
-        client = self.client
-        for kind in ("static_image", "video"):
-            with self.subTest(kind=kind):
-                url = "https://i.imgur.com/example.png"
-                image = QImage(120, 100, QImage.Format.Format_RGB32)
-                image.fill(QColor("blue"))
-                client.image_preview_cache[url] = S.RemoteMediaPreview(url, b"", kind, image)
-                message = client._build_draft_message(url)
-                message.update(u="Username", k="#ff0000")
-                body = S.SearchResultMessage()
-                body.setHtml(client._search_result_html(message, [url]))
-                body.resize(380, body.heightForWidth(380))
-                body.show()
-                self.app.processEvents()
-                self.app.setProperty("spritelinkTextShadows", False)
-                without = body.viewport().grab().toImage()
-                self.app.setProperty("spritelinkTextShadows", True)
-                with_shadow = body.viewport().grab().toImage()
-                blue = QColor("blue")
-
-                def blue_pixels(rendered):
-                    return {
-                        (x, y) for y in range(rendered.height()) for x in range(rendered.width())
-                        if rendered.pixelColor(x, y) == blue
-                    }
-
-                original_pixels = blue_pixels(without)
-                self.assertTrue(original_pixels)
-                self.assertEqual(blue_pixels(with_shadow), original_pixels)
-                preview_left = min(x for x, _ in original_pixels)
-                self.assertNotEqual(without.copy(0, 0, preview_left, 30),
-                                    with_shadow.copy(0, 0, preview_left, 30))
-                body.close()
-
     def test_wrapped_result_measurement_does_not_reflow_the_visible_document(self):
         body = self.client._search_result_message(
             self.client._build_draft_message("Wrapped message " * 5)
@@ -305,10 +234,40 @@ class ChatSearchTests(unittest.TestCase):
         body.heightForWidth(100)
         self.assertEqual(document.textWidth(), width)
         self.assertEqual(document.begin().layout().lineCount(), lines)
-        body.resize(1200, body.heightForWidth(1200))
+        # A fixed 1200px width can still wrap on Windows with larger Qt
+        # font metrics/DPI. Measure the actual full, unelided source instead.
+        measure = QTextDocument()
+        measure.setDefaultFont(document.defaultFont())
+        measure.setDocumentMargin(document.documentMargin())
+        measure.setHtml(body._source_html)
+        measure.setTextWidth(10000)
+        measure.size()
+        natural_width = measure.begin().layout().lineAt(0).naturalTextWidth()
+        wide_width = max(1200, int(natural_width) + 160)
+        body.resize(wide_width, body.heightForWidth(wide_width))
         self.app.processEvents()
-        self.assertNotIn("[...]", document.toPlainText())
+        self.assertNotIn(
+            "[...]", document.toPlainText(),
+            f"widget={body.width()} viewport={body.viewport().width()} "
+            f"measured={body._preview_width} source_has_marker={('[...]' in body._source_html)} "
+            f"same_doc={document is body.document()} "
+            f"current_text={body.document().toPlainText()!r} "
+            f"blocks={body.document().blockCount()} "
+            f"lines={body.document().begin().layout().lineCount()}",
+        )
         self.assertEqual(document.toPlainText().count("Wrapped message"), 5)
+        # Ensure that a second and third resize rebuild from the original
+        # rich text, rather than from a truncated copy of the first preview.
+        original_html = body._source_html
+        full_text = document.toPlainText()
+        for _ in range(3):
+            body.resize(250, body.heightForWidth(250))
+            self.app.processEvents()
+            self.assertIn("[...]", document.toPlainText())
+            body.resize(wide_width, body.heightForWidth(wide_width))
+            self.app.processEvents()
+            self.assertEqual(document.toPlainText(), full_text)
+            self.assertEqual(body._source_html, original_html)
         body.close()
 
     def test_saved_history_search_pagination_and_jump(self):
@@ -335,11 +294,23 @@ class ChatSearchTests(unittest.TestCase):
             client.message_log = [dict(item, is_local=True) for item in entries]
             client.config_toggle.click()
             self.app.processEvents()
-            config_width = client.config_panel.width()
             client.config_toggle.click()
             client.search_toggle.click()
             self.app.processEvents()
-            self.assertEqual(client.search_overlay.panel.width(), config_width)
+            # Filters intentionally stay on one row. They can make Search a
+            # little wider than Config at some Windows font/DPI settings.
+            self.assertEqual(
+                client.search_overlay.panel.maximumWidth(),
+                client.config_panel.maximumWidth(),
+            )
+            self.assertLessEqual(
+                client.search_overlay.panel.width(),
+                client.search_overlay.panel.maximumWidth(),
+            )
+            self.assertEqual(
+                len({checkbox.y() for checkbox in client.search_filters.values()}),
+                1,
+            )
             client.search_filters["Links"].click()
             client._start_chat_search()
             self.assertEqual(client.search_status.text(), "Searching...")

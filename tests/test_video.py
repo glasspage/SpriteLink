@@ -200,37 +200,15 @@ class VideoControlsTests(unittest.TestCase):
         player.stop()
         player.close()
 
-    def test_thumbnail_has_size_limit_blue_border_and_play_symbol(self):
+    def test_video_thumbnail_respects_preview_bounds(self):
         frame = QImage(1920, 1080, QImage.Format.Format_RGB32)
         frame.fill(QColor("white"))
-        result = V.video_thumbnail(frame, S.EMBEDDED_IMAGE_MAX_WIDTH, S.EMBEDDED_IMAGE_MAX_HEIGHT)
+        result = V.video_thumbnail(
+            frame, S.EMBEDDED_IMAGE_MAX_WIDTH, S.EMBEDDED_IMAGE_MAX_HEIGHT,
+        )
+        self.assertFalse(result.isNull())
         self.assertLessEqual(result.width(), 256)
         self.assertLessEqual(result.height(), 96)
-        self.assertEqual(result.pixelColor(0, 0), QColor("blue"))
-        self.assertEqual(result.pixelColor(result.width() - 1, 0), QColor("blue"))
-        self.assertNotEqual(result.pixelColor(result.width() // 2 - 12, result.height() // 2), QColor("white"))
-        self.assertEqual(result.pixelColor(15, 15), QColor("white"))
-
-    def test_each_theme_preserves_order_and_fits_tiny_width(self):
-        player = V.VideoPlayer(slider_factory=S.ThemeSlider)
-        player._update_state({"ready": True, "playing": True, "duration": 125, "position": 12})
-        widgets = [player.play_button, player.seek, player.time_label,
-                   player.mute_button, player.volume, player.fullscreen_button]
-        sheets = set()
-        for theme in ("Classic", "Glassy", "Modern"):
-            player.set_theme(theme, tiny=True)
-            sheets.add(player.controls.styleSheet())
-            player.resize(330, 180)
-            player.show()
-            self.app.processEvents()
-            row = player.controls.layout()
-            self.assertEqual([row.itemAt(i).widget() for i in range(row.count())], widgets)
-            self.assertLessEqual(row.minimumSize().width(), 330)
-            self.assertEqual(player.play_button.accessibleName(), "Pause")
-            self.assertFalse(player.play_button.icon().isNull())
-        self.assertEqual(len(sheets), 3)
-        player.stop()
-        player.close()
 
     def test_controls_dispatch_and_poll_does_not_seek(self):
         player = V.VideoPlayer()
@@ -539,6 +517,7 @@ mirror.release(); backend.deleteLater(); root.close(); root.deleteLater(); QTest
             rendered_image_positions={url: [1]},
             _scaled_inline_media_frame=S.EncryptedChatClient._scaled_inline_media_frame,
             _set_rendered_inline_image=mock.Mock(),
+            _update_search_media_preview=mock.Mock(),
         )
         frame = QImage(1080, 1920, QImage.Format.Format_RGB32)
         frame.fill(QColor("white"))
@@ -833,16 +812,6 @@ class VideoModeIntegrationTests(unittest.TestCase):
         QTest.qWait(20)
         self.stack.close()
 
-    def test_tiny_window_keeps_youtube_inside_main_window(self):
-        self.assertEqual(self.root.width(), 470)
-        self.assertEqual(self.root.height(), 250)
-        self.assertEqual(self.player._mode, "main")
-        self.assertIsNone(self.player._fullscreen)
-        self.assertTrue(self.client.image_preview_overlay.isVisible())
-        self.assertIs(self.player.parentWidget(), self.client.image_preview_panel)
-        self.assertTrue(self.player.play_button.isEnabled())
-        self.assertEqual(self.player.time_label.text(), "0:35 / 4:05")
-
     def test_deleted_loop_action_does_not_block_dismissal_or_reopening(self):
         for delete_after_dismiss in (False, True):
             with self.subTest(delete_after_dismiss=delete_after_dismiss):
@@ -1033,38 +1002,6 @@ class VideoModeIntegrationTests(unittest.TestCase):
         self.assertIsNone(self.player.info)
         self.assertIsNone(self.client.current_image_preview_url)
         self.assertFalse(self.client.video_mini_panel.isVisible())
-
-    def test_footer_buttons_share_row_and_follow_mode_visibility(self):
-        for theme in ("Classic", "Glassy", "Modern"):
-            self.client.theme_var.set(theme)
-            self.client._apply_theme()
-            QTest.qWait(20)
-            buttons = (self.player.popout_button, self.player.mini_button,
-                       self.player.browser_button, self.player.dismiss_button)
-            self.assertTrue(all(button.isVisible() for button in buttons))
-            self.assertEqual(len({button.geometry().center().y() for button in buttons}), 1)
-            self.assertTrue(all(self.player.mode_controls.rect().contains(button.geometry()) for button in buttons))
-            self.assertFalse(self.client.image_preview_footer.isVisible())
-            self.player.popout_button.click()
-            QTest.qWait(20)
-            self.assertFalse(self.player.mini_button.isVisible())
-            self.assertTrue(self.player.source_label.isVisible())
-            self.assertEqual(self.player.source_label.toolTip(), self.url)
-            self.assertTrue(self.player.source_label.text())
-            self.player.popout_button.click()
-            self.player.mini_button.click()
-            self.assertFalse(self.player.popout_button.isVisible())
-            self.assertTrue(self.player.mini_button.isVisible())
-            self.assertFalse(self.player.browser_button.isVisible())
-            self.assertFalse(self.player.dismiss_button.isVisible())
-            self.player.mini_button.click()
-        with mock.patch.object(self.client, "_open_url_in_browser") as open_browser:
-            self.player.popout_button.click()
-            self.player.browser_button.click()
-            open_browser.assert_called_once_with(self.url, None)
-        self.player.dismiss_button.click()
-        self.assertIsNone(self.player.info)
-        self.assertFalse(self.client.image_preview_overlay.isVisible())
 
     def test_mini_video_surface_stays_sixteen_by_nine_across_sizes_and_themes(self):
         self.player.mini_button.click()

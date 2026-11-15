@@ -7478,15 +7478,28 @@ class SearchResultMessage(QTextBrowser):
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
         self._update_preview()
+        # QTextBrowser may resize its viewport after the outer resize event;
+        # update once again when Qt has finalized the viewport geometry.
+        QTimer.singleShot(0, self._update_preview)
 
     @staticmethod
-    def _elide_preview(document: QTextDocument, width: int) -> None:
+    def _elide_preview(document: QTextDocument, width: int) -> bool:
         document.setTextWidth(width)
         document.size()
         first = document.begin()
         layout = first.layout()
         if not layout.lineCount():
-            return
+            return False
+        if layout.lineCount() == 1:
+            # QTextDocument HTML can contain trailing empty paragraphs. They
+            # are not overflowing message text and must not produce "[...]".
+            extra = first.next()
+            while extra.isValid() and (
+                not extra.text().strip() or extra.text().startswith("\ufffc")
+            ):
+                extra = extra.next()
+            if not extra.isValid():
+                return False
 
         # Keep the separate media block (or media cell) after the text preview.
         cursor = QTextCursor(document)
@@ -7500,7 +7513,7 @@ class SearchResultMessage(QTextBrowser):
         line_end = first.position() + layout.lineAt(0).textLength()
         end = block.position() - 1 if block.isValid() else document.characterCount() - 1
         if line_end >= end:
-            return
+            return False
 
         cursor.setPosition(line_end)
         cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
@@ -7518,9 +7531,10 @@ class SearchResultMessage(QTextBrowser):
             cut.movePosition(QTextCursor.MoveOperation.PreviousCharacter, QTextCursor.MoveMode.KeepAnchor)
             cut.removeSelectedText()
             document.size()
+        return True
 
     def _update_preview(self) -> None:
-        width = max(1, self.maximumViewportSize().width())
+        width = max(1, self.viewport().width())
         if width == self._preview_width:
             return
         self._preview_width = width
@@ -7528,8 +7542,22 @@ class SearchResultMessage(QTextBrowser):
         if self._shadow_document is not None:
             self._shadow_document.deleteLater()
             self._shadow_document = None
-        super().setHtml(self._source_html)
-        self._elide_preview(self.document(), width)
+        # Measure and elide independently of QTextBrowser's live document.
+        # Qt can keep an earlier viewport wrap constraint while it resizes,
+        # which otherwise permanently truncates an already-wide preview.
+        document = self.document()
+        preview = QTextDocument()
+        preview.setDocumentMargin(document.documentMargin())
+        preview.setDefaultFont(document.defaultFont())
+        preview.setHtml(self._source_html)
+        if self._elide_preview(preview, width):
+            # Never truncate the source itself: the next wider render starts
+            # from the original content, not the already shortened preview.
+            super().setHtml(preview.toHtml())
+        else:
+            # Bypass the converted preview HTML when everything fits. This
+            # restores the original links, formatting, and full text exactly.
+            super().setHtml(self._source_html)
         self.updateGeometry()
 
     def _make_shadow_document(self) -> QTextDocument:
@@ -8971,9 +8999,15 @@ class EncryptedChatClient(QObject):
                 window.setProperty("spritelinkLegacyBlur", desktop_blur)
             window.setProperty("spritelinkDesktopBlur", desktop_blur)
             window.update()
+        except RuntimeError:
+            # A deferred theme update may run after Qt has deleted a popup.
+            return
         except Exception:
-            window.setProperty("spritelinkDesktopBlur", False)
-            window.update()
+            try:
+                window.setProperty("spritelinkDesktopBlur", False)
+                window.update()
+            except RuntimeError:
+                pass
 
     def _apply_dialog_window_theme(self, dialog: QDialog) -> None:
         if isinstance(dialog, QFileDialog):
@@ -18755,10 +18789,8 @@ QComboBox::drop-down {
         )
         url_spans = message_url_spans(link_text)
         emoji_size = PROFILE_ICON_SIZE
+        # Center 16x16 emojis on the text line at every UI size, including Tiny.
         emoji_alignment = QTextCharFormat.VerticalAlignment.AlignMiddle
-        if render_emojis and self._is_tiny_ui() and self._chat_line_height(font_name) <= emoji_size + 2:
-            # Qt's middle alignment can extend into the next row with very short fonts.
-            emoji_alignment = QTextCharFormat.VerticalAlignment.AlignTop
         link_color = (
             "#0000ee"
             if self._is_windows_classic_theme()
