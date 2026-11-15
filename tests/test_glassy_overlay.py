@@ -51,9 +51,26 @@ class GlassyOverlayTests(unittest.TestCase):
         self.overlay.show()
         before = self.overlay.grab().toImage()
         self.parent.setStyleSheet("background-color: rgba(0, 0, 0, 100);")
-        # Do not refresh the snapshot: only the underlying live UI changes.
+        # Leave the snapshot stale while changing the live UI.
         after = self.overlay.grab().toImage()
         self.assertEqual(before, after)
+
+    def test_frosted_overlay_preserves_background_brightness(self) -> None:
+        app = self.app
+        previous = app.property("spritelinkGlassyDark")
+        try:
+            for dark in (False, True):
+                with self.subTest(dark=dark):
+                    app.setProperty("spritelinkGlassyDark", dark)
+                    self.overlay.show()
+                    app.processEvents()
+                    image = self.overlay.grab().toImage()
+                    color = image.pixelColor(image.width() // 2, image.height() // 2)
+                    for channel in (color.red(), color.green(), color.blue()):
+                        self.assertAlmostEqual(channel, 240, delta=2)
+                    self.overlay.hide()
+        finally:
+            app.setProperty("spritelinkGlassyDark", previous)
 
     def test_high_dpi_blur_keeps_the_entire_source(self) -> None:
         for ratio in (1.0, 1.5, 2.0):
@@ -123,6 +140,48 @@ class GlassyOverlayTests(unittest.TestCase):
             )
             self.assertTrue(self.overlay.isVisible())
             self.assertIs(self.app.focusWidget(), entry)
+
+    def test_background_refresh_does_not_hide_or_reopen_embedded_widgets(self) -> None:
+        class EmbeddedRenderer(QWidget):
+            hides = 0
+            shows = 0
+
+            def hideEvent(self, event):
+                self.hides += 1
+                super().hideEvent(event)
+
+            def showEvent(self, event):
+                self.shows += 1
+                super().showEvent(event)
+
+        renderer = EmbeddedRenderer(self.overlay)
+        renderer.resize(160, 90)
+        renderer.show()
+        self.overlay.show()
+        self.app.processEvents()
+        shows = renderer.shows
+        for size in ((400, 260), (300, 220), (450, 300)):
+            self.parent.resize(*size)
+            self.overlay.setGeometry(self.parent.rect())
+            self.app.processEvents()
+            self.assertEqual(renderer.hides, 0)
+            self.assertEqual(renderer.shows, shows)
+            self.assertTrue(renderer.isVisible())
+
+    def test_background_capture_includes_siblings_without_capturing_the_player(self) -> None:
+        sibling = QWidget(self.parent)
+        sibling.setGeometry(100, 70, 120, 60)
+        sibling.setStyleSheet("background: rgb(0, 0, 255)")
+        sibling.show()
+        player = QWidget(self.overlay)
+        player.setGeometry(100, 70, 120, 60)
+        player.setStyleSheet("background: rgb(255, 0, 0)")
+        player.show()
+        with mock.patch.object(self.overlay, "_blur_pixmap", wraps=self.overlay._blur_pixmap) as blur:
+            self.overlay.show()
+            capture = blur.call_args.args[0].toImage()
+            self.assertEqual(capture.pixelColor(160, 100), QColor("blue"))
+        self.assertTrue(player.isVisible())
 
     def test_leaving_glassy_cancels_pending_capture(self) -> None:
         self.overlay.show()

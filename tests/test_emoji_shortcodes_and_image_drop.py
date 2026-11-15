@@ -1,0 +1,273 @@
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PIL import Image
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QTimer, QUrl, Qt
+from PySide6.QtGui import QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage, QKeyEvent
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
+
+from test_security import SPRITELINK as S
+
+
+class EmojiShortcodesAndImageDropTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        config = S.default_config()
+        self.patches = [
+            mock.patch.object(S, "load_config", return_value=config),
+            mock.patch.object(S, "save_config"),
+            mock.patch.object(S.EncryptedChatClient, "_start_network_thread"),
+            mock.patch.object(S.EncryptedChatClient, "_check_for_updates"),
+            mock.patch.object(S.EncryptedChatClient, "_load_saved_history_for_current_room"),
+        ]
+        for patch in self.patches:
+            patch.start()
+        self.root = S.MainWindow()
+        self.client = S.EncryptedChatClient(self.root)
+        self.root.show()
+        QTest.qWait(10)
+        self.edit = self.client.message_entry
+
+    def tearDown(self):
+        for timer in self.root.findChildren(QTimer):
+            timer.stop()
+        self.client.stop_event.set()
+        self.client.history_load_executor.shutdown(wait=False, cancel_futures=True)
+        self.client.image_fetch_executor.shutdown(wait=False, cancel_futures=True)
+        self.root.close_callback = None
+        self.app.clipboard().clear()
+        self.root.close()
+        self.root.deleteLater()
+        self.app.processEvents()
+        for patch in reversed(self.patches):
+            patch.stop()
+
+    def _save_emoji(self, name="happy"):
+        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
+        self.assertTrue(self.client._store_saved_emojis({name: encoded}))
+        return encoded
+
+    def test_typing_closing_colon_replaces_saved_shortcode_inline(self):
+        encoded = self._save_emoji("Happy_Cat")
+        QTest.keyClicks(self.edit, "hello :happy_cat: and :MISSING:")
+        self.assertEqual(
+            self.edit.to_message_text(),
+            "hello " + S.emoji_markup("Happy_Cat", encoded) + " and :MISSING:",
+        )
+        self.assertEqual(self.edit.toPlainText(), "hello \ufffc and :MISSING:")
+        self.assertEqual(self.client._build_draft_message(self.edit.to_message_text())["emojis"][0][1], "Happy_Cat")
+
+    def test_shortcodes_work_after_emoji_and_non_bmp_characters(self):
+        encoded = self._save_emoji("cat")
+        original = S.emoji_markup("cat", encoded)
+        self.edit.set_message_text("🐈 " + original + " :cat")
+        QTest.keyClicks(self.edit, ":")
+        self.assertEqual(self.edit.to_message_text(), "🐈 " + original + " " + original)
+
+    def test_partial_shortcodes_and_paste_stay_literal(self):
+        self._save_emoji("cat")
+        QTest.keyClicks(self.edit, ":ca")
+        self.assertEqual(self.edit.to_message_text(), ":ca")
+        mime = QMimeData()
+        mime.setText(" :cat:")
+        self.edit.insertFromMimeData(mime)
+        self.assertEqual(self.edit.to_message_text(), ":ca :cat:")
+        self.edit.clear()
+        QTest.keyClicks(self.edit, ":not-saved:")
+        self.assertEqual(self.edit.to_message_text(), ":not-saved:")
+
+    def _send_drop(self, mime):
+        enter = QDragEnterEvent(
+            QPoint(10, 10), Qt.DropAction.CopyAction, mime,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        )
+        self.assertTrue(self.client.eventFilter(self.root, enter))
+        self.assertTrue(enter.isAccepted())
+        move = QDragMoveEvent(
+            QPoint(10, 10), Qt.DropAction.CopyAction, mime,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        )
+        self.assertTrue(self.client.eventFilter(self.root, move))
+        self.assertTrue(move.isAccepted())
+        drop = QDropEvent(
+            QPointF(10, 10), Qt.DropAction.CopyAction, mime,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        )
+        self.assertTrue(self.client.eventFilter(self.root, drop))
+        self.assertTrue(drop.isAccepted())
+        return self.client.drawing_import_overlay.panel
+
+    def test_drop_png_opens_import_preview_without_file_dialog(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "pixel.PNG"
+            Image.new("RGBA", (7, 9), (200, 30, 50, 255)).save(path)
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(str(path))])
+            with mock.patch.object(S.QFileDialog, "getOpenFileName", side_effect=AssertionError("No file chooser expected")):
+                panel = self._send_drop(mime)
+            self.assertIsInstance(panel, S.DrawingImportPanel)
+            self.assertEqual(panel.source.size, (7, 9))
+            self.assertTrue(self.client.image_menu_button.isChecked())
+
+    def test_drop_inline_image_data_opens_import_preview(self):
+        image = QImage(5, 4, QImage.Format.Format_RGBA8888)
+        image.fill(QColor(30, 90, 200))
+        mime = QMimeData()
+        mime.setImageData(image)
+        panel = self._send_drop(mime)
+        self.assertEqual(panel.source.size, (5, 4))
+        self.assertEqual(panel.source.getpixel((1, 1))[:3], (30, 90, 200))
+
+    def test_ctrl_v_with_clipboard_bitmap_opens_import_preview(self):
+        image = QImage(13, 7, QImage.Format.Format_RGBA8888)
+        image.fill(QColor(70, 140, 20))
+        self.app.clipboard().setImage(image)
+        self.edit.setPlainText("keep this draft")
+        self.edit.setFocus()
+
+        QTest.keyClick(self.edit, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+
+        panel = self.client.drawing_import_overlay.panel
+        self.assertIsInstance(panel, S.DrawingImportPanel)
+        self.assertEqual(panel.source.size, (13, 7))
+        self.assertTrue(self.client.image_menu_button.isChecked())
+        self.assertEqual(self.edit.to_message_text(), "keep this draft")
+
+    def test_pasting_image_from_composer_context_menu_uses_same_importer(self):
+        image = QImage(4, 6, QImage.Format.Format_RGBA8888)
+        image.fill(QColor(80, 40, 190))
+        mime = QMimeData()
+        mime.setImageData(image)
+        self.assertTrue(self.edit.canInsertFromMimeData(mime))
+        self.edit.insertFromMimeData(mime)
+        panel = self.client.drawing_import_overlay.panel
+        self.assertIsInstance(panel, S.DrawingImportPanel)
+        self.assertEqual(panel.source.size, (4, 6))
+
+    def test_clipboard_image_file_url_opens_preview_with_paste_shortcut(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "pasted.png"
+            Image.new("RGB", (11, 5), (20, 60, 80)).save(path)
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(str(path))])
+            self.app.clipboard().setMimeData(mime)
+            self.edit.setFocus()
+            QTest.keyClick(self.edit, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+            self.assertEqual(self.client.drawing_import_overlay.panel.source.size, (11, 5))
+
+    def test_text_clipboard_paste_remains_text(self):
+        self.app.clipboard().setText("plain text :unknown:")
+        self.edit.setFocus()
+        QTest.keyClick(self.edit, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual(self.edit.to_message_text(), "plain text :unknown:")
+        self.assertIsNone(getattr(self.client, "drawing_import_overlay", None))
+
+    def test_shortcut_for_image_clipboard_ignored_outside_main_window(self):
+        image = QImage(3, 5, QImage.Format.Format_RGBA8888)
+        image.fill(QColor(20, 30, 40))
+        self.app.clipboard().setImage(image)
+        event = QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier,
+        )
+        from PySide6.QtWidgets import QDialog
+        dialog = QDialog()
+        try:
+            self.assertFalse(self.client.eventFilter(dialog, event))
+            self.assertIsNone(getattr(self.client, "drawing_import_overlay", None))
+        finally:
+            dialog.deleteLater()
+
+    def test_ctrl_f_opens_search_and_escape_closes_it(self):
+        self.edit.setFocus()
+        QTest.keyClick(self.edit, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+        self.app.processEvents()
+        self.assertTrue(self.client.search_toggle.isChecked())
+        self.assertTrue(self.client.search_overlay.isVisible())
+        self.assertTrue(self.client.search_entry.hasFocus())
+
+        QTest.keyClick(self.client.search_entry, Qt.Key.Key_Escape)
+        self.app.processEvents()
+        self.assertFalse(self.client.search_toggle.isChecked())
+        self.assertFalse(self.client.search_overlay.isVisible())
+
+    def test_ctrl_f_refocuses_already_open_search(self):
+        self.client.search_toggle.setChecked(True)
+        self.edit.setFocus()
+        QTest.keyClick(self.edit, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+        self.app.processEvents()
+        self.assertTrue(self.client.search_overlay.isVisible())
+        self.assertTrue(self.client.search_entry.hasFocus())
+
+    def test_escape_closes_config_panel(self):
+        self.client.config_toggle.setChecked(True)
+        self.app.processEvents()
+        self.assertTrue(self.client.config_overlay.isVisible())
+        QTest.keyClick(self.client.theme_combo, Qt.Key.Key_Escape)
+        self.app.processEvents()
+        self.assertFalse(self.client.config_overlay.isVisible())
+        self.assertFalse(self.client.config_toggle.isChecked())
+
+    def test_large_qimage_no_longer_uses_24_mp_restriction(self):
+        image = QImage(2, 2, QImage.Format.Format_RGBA8888)
+        image.fill(QColor(50, 100, 150))
+        source = mock.Mock()
+        source.isNull.return_value = False
+        source.width.return_value = 6000
+        source.height.return_value = 5000
+        source.convertToFormat.return_value = image
+        converted = self.client._qimage_import_source(source)
+        self.assertEqual(converted.size, (2, 2))
+
+    def test_large_file_import_no_longer_uses_24_mp_restriction(self):
+        import spritelink_drawing
+        source = mock.MagicMock()
+        source.width, source.height = 6000, 5000
+        source.__enter__.return_value = source
+        with mock.patch.object(spritelink_drawing.Image, "open", return_value=source):
+            with mock.patch.object(
+                spritelink_drawing.ImageOps, "exif_transpose",
+                return_value=Image.new("RGBA", (2, 2)),
+            ):
+                image = spritelink_drawing.load_import_image("large.png")
+        self.assertEqual(image.size, (2, 2))
+
+    def test_other_dragged_content_is_ignored(self):
+        self.assertTrue(self.root.acceptDrops())
+        mime = QMimeData()
+        mime.setText("hello")
+        event = QDragEnterEvent(
+            QPoint(10, 10), Qt.DropAction.CopyAction, mime,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        )
+        self.assertFalse(self.client.eventFilter(self.root, event))
+        self.assertIsNone(self.client._dropped_image_path(mime))
+        self.assertIsNone(getattr(self.client, "drawing_import_overlay", None))
+
+    def test_invalid_image_drop_does_not_replace_editor(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "broken.png"
+            path.write_bytes(b"not an image")
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(str(path))])
+            with mock.patch.object(S.messagebox, "showerror") as error:
+                drop = QDropEvent(
+                    QPointF(10, 10), Qt.DropAction.CopyAction, mime,
+                    Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                )
+                self.assertTrue(self.client.eventFilter(self.root, drop))
+                error.assert_called_once()
+            self.assertFalse(self.client.image_menu_button.isChecked())
+            self.assertIsNone(getattr(self.client, "drawing_import_overlay", None))
+
+
+if __name__ == "__main__":
+    unittest.main()
