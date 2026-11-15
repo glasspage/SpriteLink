@@ -7495,7 +7495,7 @@ class SearchResultMessage(QTextBrowser):
             # are not overflowing message text and must not produce "[...]".
             extra = first.next()
             while extra.isValid() and (
-                not extra.text().strip() or extra.text().startswith("\\ufffc")
+                not extra.text().strip() or extra.text().startswith("\ufffc")
             ):
                 extra = extra.next()
             if not extra.isValid():
