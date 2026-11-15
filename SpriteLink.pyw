@@ -12210,16 +12210,15 @@ QComboBox::drop-down {
         self.search_entry = QLineEdit()
         self.search_entry.setPlaceholderText("Find words or phrases")
         panel_layout.addWidget(self.search_entry)
-        # Two rows prevent long filter labels from enlarging the search panel
-        # beyond the same width as Config at smaller window sizes.
-        filters = QGridLayout()
+        filters = QHBoxLayout()
         self.search_filters = {
             name: QCheckBox(name)
             for name in ("Images", "Links", "Embedded Images", "Embedded Videos")
         }
-        for index, checkbox in enumerate(self.search_filters.values()):
-            filters.addWidget(checkbox, index // 2, index % 2)
+        for checkbox in self.search_filters.values():
+            filters.addWidget(checkbox)
             checkbox.toggled.connect(self._reset_chat_search)
+        filters.addStretch()
         panel_layout.addLayout(filters)
 
         scroll = QScrollArea()
@@ -18790,10 +18789,8 @@ QComboBox::drop-down {
         )
         url_spans = message_url_spans(link_text)
         emoji_size = PROFILE_ICON_SIZE
+        # Center 16x16 emojis on the text line at every UI size, including Tiny.
         emoji_alignment = QTextCharFormat.VerticalAlignment.AlignMiddle
-        if render_emojis and self._is_tiny_ui() and self._chat_line_height(font_name) <= emoji_size + 2:
-            # Qt's middle alignment can extend into the next row with very short fonts.
-            emoji_alignment = QTextCharFormat.VerticalAlignment.AlignTop
         link_color = (
             "#0000ee"
             if self._is_windows_classic_theme()
