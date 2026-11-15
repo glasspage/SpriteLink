@@ -4206,7 +4206,6 @@ class _FakeUpdateClient:
         SPRITELINK.EncryptedChatClient._show_no_available_update(self)
 
 
-class NotificationButtonThemeTests(unittest.TestCase):
 class UpdateConfigTests(unittest.TestCase):
     @staticmethod
     def _release(version: str) -> object:
