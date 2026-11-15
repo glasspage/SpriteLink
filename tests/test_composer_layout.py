@@ -676,7 +676,7 @@ class ComposerLayoutTests(unittest.TestCase):
                 )
                 for category in ("Config", "Emoji", "Identity"):
                     dialog.category_checks[category].setChecked(False)
-                dialog.specific_rooms.setChecked(True)
+                self.assertFalse(hasattr(dialog, "specific_rooms"))
                 for room_id, check in dialog.room_checks.items():
                     check.setChecked(room_id == "two")
                 dialog.password_entry.setText(password)
@@ -690,8 +690,10 @@ class ComposerLayoutTests(unittest.TestCase):
                                   return_value=(str(path), "")),
                 mock.patch.object(S, "load_chatroom_history", return_value=[]),
                 mock.patch.object(S.messagebox, "showinfo"),
+                mock.patch.object(S.messagebox, "showerror") as errors,
             ):
                 client._export_data()
+                errors.assert_not_called()
 
             self.assertTrue(path.is_file())
             payload = S.open_archive(path.read_bytes(), password)
@@ -722,17 +724,24 @@ class ComposerLayoutTests(unittest.TestCase):
                 self.assertFalse(dialog.category_checks["Config"].isEnabled())
                 self.assertFalse(dialog.category_checks["Identity"].isEnabled())
                 dialog.category_checks["Chatrooms"].setChecked(False)
-                dialog.password_entry.setText(password)
+                self.assertFalse(dialog.password_required)
+                self.assertFalse(dialog.password_entry.isVisible())
                 self.assertTrue(dialog.action_button.isEnabled())
                 return S.QDialog.DialogCode.Accepted
 
             with (
+                mock.patch.object(S.QInputDialog, "exec",
+                                  return_value=S.QDialog.DialogCode.Accepted) as unlock_dialog,
+                mock.patch.object(S.QInputDialog, "textValue", return_value=password),
                 mock.patch.object(S.DataTransferDialog, "exec", import_dialog),
                 mock.patch.object(S.QFileDialog, "getOpenFileName",
                                   return_value=(str(path), "")),
                 mock.patch.object(S.messagebox, "showinfo"),
+                mock.patch.object(S.messagebox, "showerror") as errors,
             ):
                 client._import_data()
+                unlock_dialog.assert_called_once()
+                errors.assert_not_called()
 
         self.assertEqual(client.config_data["chatrooms"], [])
         self.assertEqual(
@@ -750,7 +759,7 @@ class ComposerLayoutTests(unittest.TestCase):
                 for category in ("Chatrooms", "Config", "Identity"):
                     dialog.category_checks[category].setChecked(False)
                 self.assertEqual(dialog.selected_categories(), ("Emoji",))
-                self.assertEqual(dialog.password_entry.placeholderText(), "Recommended")
+                self.assertEqual(dialog.password_entry.placeholderText(), "Optional, recommended")
                 self.assertEqual(dialog.password(), "")
                 self.assertTrue(dialog.action_button.isEnabled())
                 return S.QDialog.DialogCode.Accepted
