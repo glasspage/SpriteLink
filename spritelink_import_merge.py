@@ -18,7 +18,7 @@ def merge_emoji_data(
     if not isinstance(incoming, dict):
         raise ValueError("Invalid Emoji data in archive.")
     for name, encoded in incoming.items():
-        if not validate(name, encoded):
+        if not isinstance(name, str) or any(char.isspace() for char in name) or not validate(name, encoded):
             raise ValueError("Invalid emoji in archive.")
 
     def numbered_name(name: str, suffix: str, encoded: str) -> str:
