@@ -7531,8 +7531,11 @@ class SearchResultMessage(QTextBrowser):
         if self._shadow_document is not None:
             self._shadow_document.deleteLater()
             self._shadow_document = None
-        super().setHtml(self._source_html)
-        self._elide_preview(self.document(), width)
+        # Rebuild the existing document from pristine HTML, not the elided
+        # document currently shown at the previous (narrower) width.
+        document = self.document()
+        document.setHtml(self._source_html)
+        self._elide_preview(document, width)
         self.updateGeometry()
 
     def _make_shadow_document(self) -> QTextDocument:
@@ -20108,7 +20111,12 @@ QComboBox::drop-down {
             block_format.setLeftMargin(10)
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
-            block_format.setTopMargin(0.0)
+            # Tiny rows normally have minimal padding, but 16px inline emoji
+            # need a little ascent space on Windows to avoid drawing over the
+            # previous message. Preserve compact spacing for text-only rows.
+            block_format.setTopMargin(
+                3.0 if self._is_tiny_ui() and "emojis" in message else 0.0
+            )
             block_format.setBottomMargin(0.0)
             # Clear inherited block backgrounds; the full-width painter owns the stripe.
             block_format.clearProperty(
