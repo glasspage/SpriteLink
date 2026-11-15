@@ -369,7 +369,20 @@ class ChatSearchTests(unittest.TestCase):
             client.config_toggle.click()
             client.search_toggle.click()
             self.app.processEvents()
-            self.assertEqual(client.search_overlay.panel.width(), config_width)
+            # Filters intentionally stay on one row. They can make Search a
+            # little wider than Config at some Windows font/DPI settings.
+            self.assertEqual(
+                client.search_overlay.panel.maximumWidth(),
+                client.config_panel.maximumWidth(),
+            )
+            self.assertLessEqual(
+                client.search_overlay.panel.width(),
+                client.search_overlay.panel.maximumWidth(),
+            )
+            self.assertEqual(
+                len({checkbox.y() for checkbox in client.search_filters.values()}),
+                1,
+            )
             client.search_filters["Links"].click()
             client._start_chat_search()
             self.assertEqual(client.search_status.text(), "Searching...")
