@@ -273,46 +273,6 @@ class ComposerLayoutTests(unittest.TestCase):
                     if any(image.pixel(x, y) == color for x in range(image.width()))
                 ]
                 self.assertEqual(len(colored_rows), 16)
-                if colored_rows[0] < top:
-                    # Diagnostic: Qt's inline-image metrics vary on Windows.
-                    # Print all available alignments so the correct one can be
-                    # selected without guessing at offsets.
-                    it = emoji_block.begin()
-                    while not it.atEnd() and not it.fragment().charFormat().isImageFormat():
-                        it += 1
-                    fragment = it.fragment()
-                    char_position, char_length = fragment.position(), fragment.length()
-                    original_format = fragment.charFormat().toImageFormat()
-                    deltas = {}
-                    for name in (
-                        "AlignNormal", "AlignMiddle", "AlignTop", "AlignBottom",
-                        "AlignBaseline", "AlignSubScript", "AlignSuperScript",
-                    ):
-                        modified = S.QTextImageFormat()
-                        modified.merge(original_format)
-                        modified.setVerticalAlignment(
-                            getattr(S.QTextCharFormat.VerticalAlignment, name)
-                        )
-                        selection = S.QTextCursor(document)
-                        selection.setPosition(char_position)
-                        selection.setPosition(
-                            char_position + char_length,
-                            S.QTextCursor.MoveMode.KeepAnchor,
-                        )
-                        selection.setCharFormat(modified)
-                        document.size()
-                        sample = S.QImage(400, 100, S.QImage.Format.Format_RGB32)
-                        sample.fill(S.QColor("white"))
-                        paint = S.QPainter(sample)
-                        document.drawContents(paint)
-                        paint.end()
-                        pixels = [
-                            y for y in range(sample.height())
-                            if any(sample.pixel(x, y) == color for x in range(sample.width()))
-                        ]
-                        if pixels:
-                            deltas[name] = (pixels[0] - top, bottom - pixels[-1] - 1)
-                    print(f"EMOJI ALIGNMENTS ({font}): {deltas}", flush=True)
                 self.assertGreaterEqual(colored_rows[0], top)
                 self.assertLess(colored_rows[-1], bottom)
 
