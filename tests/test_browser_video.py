@@ -164,7 +164,7 @@ for provider, factor, extent in [('youtube',0.25,10),('vimeo',1.0,40)]:
     info=V.VideoInfo(V.VideoLink(provider,'M7lc1UVf-VE','https://example.org'),provider)
     with mock.patch.object(V, 'provider_player_html', return_value=html) as make_html:
         player.load(info)
-        make_html.assert_called_once_with(info, player.volume.value())
+        make_html.assert_called_once_with(info, player.volume.value(), False)
     web, mirror = player.web, player.video_widget
     assert web.zoomFactor() == factor
     for _ in range(100):
