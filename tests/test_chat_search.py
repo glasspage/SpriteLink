@@ -310,7 +310,11 @@ class ChatSearchTests(unittest.TestCase):
         self.assertNotIn(
             "[...]", document.toPlainText(),
             f"widget={body.width()} viewport={body.viewport().width()} "
-            f"measured={body._preview_width} source_has_marker={('[...]' in body._source_html)}",
+            f"measured={body._preview_width} source_has_marker={('[...]' in body._source_html)} "
+            f"same_doc={document is body.document()} "
+            f"current_text={body.document().toPlainText()!r} "
+            f"blocks={body.document().blockCount()} "
+            f"lines={body.document().begin().layout().lineCount()}",
         )
         self.assertEqual(document.toPlainText().count("Wrapped message"), 5)
         body.close()
