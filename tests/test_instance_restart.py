@@ -136,7 +136,9 @@ class RestartTransportTests(unittest.TestCase):
             socket.flush()
             QTest.qWait(20)
             callback.assert_called_once_with()
-            self.assertTrue(S.request_instance_restart())
+            # The receiver deliberately ignores further requests and may close
+            # before the sender's write-completion notification on Windows.
+            self.assertIsInstance(S.request_instance_restart(), bool)
             QTest.qWait(20)
             callback.assert_called_once_with()
         finally:
