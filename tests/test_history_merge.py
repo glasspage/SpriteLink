@@ -265,6 +265,35 @@ class HistoryMergeTests(unittest.TestCase):
         self.assertEqual(self.merge(*messages), 1200)
         self.assertEqual(len(self.messages()), 1200)
 
+    def test_fifty_thousand_local_messages_and_sixty_thousand_imports(self):
+        # Exercise the largest configured room history with re-ordered
+        # duplicates and fresh messages. Do not assert wall-clock timing,
+        # which varies across Windows and CI runners.
+        local = [
+            self.item(f"local-{i}", time=1000 + 7 * i,
+                      text=f"payload-{i}")
+            for i in range(50000)
+        ]
+        self.insert_local(*local)
+        incoming = [
+            self.item(f"renamed-{i}", time=1002 + 7 * i,
+                      text=f"payload-{i}")
+            for i in range(50000)
+        ]
+        incoming.extend(
+            self.item(f"fresh-{i}", time=400000 + 7 * i,
+                      text=f"new-{i}")
+            for i in range(10000)
+        )
+        import random
+        random.Random(4242).shuffle(incoming)
+        self.assertEqual(self.merge(*incoming), 10000)
+        self.assertEqual(self.merge(*incoming), 0)
+        self.assertEqual(
+            self.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
+            60000,
+        )
+
     def test_large_overlapping_histories_and_time_index(self):
         originals = [
             self.item(f"local-{i}", time=1000 + i * 10, text=f"message-{i}")
