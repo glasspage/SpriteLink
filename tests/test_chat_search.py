@@ -307,7 +307,11 @@ class ChatSearchTests(unittest.TestCase):
         self.assertEqual(document.begin().layout().lineCount(), lines)
         body.resize(1200, body.heightForWidth(1200))
         self.app.processEvents()
-        self.assertNotIn("[...]", document.toPlainText())
+        self.assertNotIn(
+            "[...]", document.toPlainText(),
+            f"widget={body.width()} viewport={body.viewport().width()} "
+            f"measured={body._preview_width} source_has_marker={('[...]' in body._source_html)}",
+        )
         self.assertEqual(document.toPlainText().count("Wrapped message"), 5)
         body.close()
 
