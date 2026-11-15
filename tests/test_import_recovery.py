@@ -3,13 +3,14 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import closing
 from unittest import mock
 
 from spritelink_import_recovery import ImportRecovery
 
 
 def messages(path):
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute("CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY)")
         return [row[0] for row in conn.execute(
             "SELECT id FROM messages ORDER BY id"
@@ -128,7 +129,7 @@ class ImportRecoveryTests(unittest.TestCase):
         self.assertTrue((snapshot.folder / ImportRecovery.PENDING).exists())
 
     def test_snapshot_reads_committed_wal_rows(self):
-        with sqlite3.connect(self.first) as conn:
+        with closing(sqlite3.connect(self.first)) as conn, conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("INSERT INTO messages VALUES ('wal-message')")
         snapshot = self.capture([self.first])
