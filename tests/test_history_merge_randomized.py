@@ -43,7 +43,7 @@ def encode(item):
 class RandomizedHistoryMergeTests(unittest.TestCase):
     def test_randomized_merge_matches_reference(self):
         # Fixed seeds make the result reproducible on Windows and CI.
-        for seed in range(30):
+        for seed in range(100):
             with self.subTest(seed=seed):
                 rng = random.Random(seed)
                 db = sqlite3.connect(":memory:")
@@ -112,8 +112,20 @@ class RandomizedHistoryMergeTests(unittest.TestCase):
                             }
                         imported.append(message)
 
+                    # Reference implementation processes imported records
+                    # in canonical time order, independently of archive layout.
                     expected = list(local)
-                    for message in imported:
+                    ordered = sorted(
+                        imported,
+                        key=lambda item: (
+                            item["message"]["t"] if item["message"]["t"] > 0
+                            else item.get("display_sort_time", item.get(
+                                "ntfy_time", item["message"]["t"],
+                            )),
+                            item["message"]["i"],
+                        ),
+                    )
+                    for message in ordered:
                         if not any(
                             same_message(other, message) for other in expected
                         ):
