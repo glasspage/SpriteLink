@@ -305,7 +305,17 @@ class ChatSearchTests(unittest.TestCase):
         body.heightForWidth(100)
         self.assertEqual(document.textWidth(), width)
         self.assertEqual(document.begin().layout().lineCount(), lines)
-        body.resize(1200, body.heightForWidth(1200))
+        # A fixed 1200px width can still wrap on Windows with larger Qt
+        # font metrics/DPI. Measure the actual full, unelided source instead.
+        measure = QTextDocument()
+        measure.setDefaultFont(document.defaultFont())
+        measure.setDocumentMargin(document.documentMargin())
+        measure.setHtml(body._source_html)
+        measure.setTextWidth(10000)
+        measure.size()
+        natural_width = measure.begin().layout().lineAt(0).naturalTextWidth()
+        wide_width = max(1200, int(natural_width) + 160)
+        body.resize(wide_width, body.heightForWidth(wide_width))
         self.app.processEvents()
         self.assertNotIn(
             "[...]", document.toPlainText(),
