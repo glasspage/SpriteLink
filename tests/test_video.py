@@ -539,6 +539,7 @@ mirror.release(); backend.deleteLater(); root.close(); root.deleteLater(); QTest
             rendered_image_positions={url: [1]},
             _scaled_inline_media_frame=S.EncryptedChatClient._scaled_inline_media_frame,
             _set_rendered_inline_image=mock.Mock(),
+            _update_search_media_preview=mock.Mock(),
         )
         frame = QImage(1080, 1920, QImage.Format.Format_RGB32)
         frame.fill(QColor("white"))
