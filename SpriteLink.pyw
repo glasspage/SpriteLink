@@ -7490,6 +7490,16 @@ class SearchResultMessage(QTextBrowser):
         layout = first.layout()
         if not layout.lineCount():
             return
+        if layout.lineCount() == 1:
+            # QTextDocument HTML can contain trailing empty paragraphs. They
+            # are not overflowing message text and must not produce "[...]".
+            extra = first.next()
+            while extra.isValid() and (
+                not extra.text().strip() or extra.text().startswith("\\ufffc")
+            ):
+                extra = extra.next()
+            if not extra.isValid():
+                return
 
         # Keep the separate media block (or media cell) after the text preview.
         cursor = QTextCursor(document)
