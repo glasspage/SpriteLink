@@ -240,7 +240,7 @@ class ComposerLayoutTests(unittest.TestCase):
                     client._chat_line_height(S.DEFAULT_MESSAGE_FONT),
                 )
 
-    def test_full_size_emoji_pixels_fit_between_tiny_chat_rows(self):
+    def test_full_size_emoji_pixels_render_in_tiny_chat_rows(self):
         client = self.client
         client.config_data["ui_size"] = "Tiny"
         client._apply_ui_size()
