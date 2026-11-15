@@ -288,7 +288,8 @@ class ComposerLayoutTests(unittest.TestCase):
                         "AlignNormal", "AlignMiddle", "AlignTop", "AlignBottom",
                         "AlignBaseline", "AlignSubScript", "AlignSuperScript",
                     ):
-                        modified = S.QTextImageFormat(original_format)
+                        modified = S.QTextImageFormat()
+                        modified.merge(original_format)
                         modified.setVerticalAlignment(
                             getattr(S.QTextCharFormat.VerticalAlignment, name)
                         )
