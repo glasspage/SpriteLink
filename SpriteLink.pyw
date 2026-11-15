@@ -18756,8 +18756,9 @@ QComboBox::drop-down {
         url_spans = message_url_spans(link_text)
         emoji_size = PROFILE_ICON_SIZE
         emoji_alignment = QTextCharFormat.VerticalAlignment.AlignMiddle
-        if render_emojis and self._is_tiny_ui() and self._chat_line_height(font_name) <= emoji_size + 2:
-            # Qt's middle alignment can extend into the next row with very short fonts.
+        if render_emojis and self._is_tiny_ui():
+            # Keep all 16 emoji pixel rows inside the fixed-height chat row.
+            # Qt's AlignMiddle can clip a row depending on Windows font metrics.
             emoji_alignment = QTextCharFormat.VerticalAlignment.AlignTop
         link_color = (
             "#0000ee"
