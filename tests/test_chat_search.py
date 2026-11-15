@@ -365,7 +365,6 @@ class ChatSearchTests(unittest.TestCase):
             client.message_log = [dict(item, is_local=True) for item in entries]
             client.config_toggle.click()
             self.app.processEvents()
-            config_width = client.config_panel.width()
             client.config_toggle.click()
             client.search_toggle.click()
             self.app.processEvents()
