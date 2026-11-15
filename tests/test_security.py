@@ -2517,7 +2517,7 @@ class QualityOfLifeUpdateTests(unittest.TestCase):
         )
         self.assertLess(
             user_source.index(
-                'menu.addAction("Trust Links && Images from User")'
+                'menu.addAction("Trust Links && Embeds from User")'
             ),
             user_source.index('"Unmute User" if is_muted else "Mute User"'),
         )
@@ -3023,13 +3023,11 @@ class ProfileIconTests(unittest.TestCase):
             SPRITELINK.encode_profile_icon(gif_data)
         )
 
-    def test_profile_icon_picker_uses_native_thumbnail_dialog(self) -> None:
+    def test_profile_icon_picker_opens_importer(self) -> None:
         source = inspect.getsource(
             SPRITELINK.EncryptedChatClient._choose_profile_icon
         )
-        self.assertNotIn("DontUseNativeDialog", source)
-        self.assertIn("*.png *.jpg *.jpeg", source)
-        self.assertIn("_exec_themed_file_dialog", source)
+        self.assertIn("_open_drawing_import(profile_icon=True)", source)
 
     def test_custom_chime_picker_uses_native_themed_dialog(self) -> None:
         source = inspect.getsource(
