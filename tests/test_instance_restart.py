@@ -272,6 +272,7 @@ class RestartEntryPointTests(unittest.TestCase):
             control = stack.enter_context(mock.patch.object(S, "SingleInstanceControl"))
             stack.enter_context(mock.patch.object(S, "QIcon"))
             stack.enter_context(mock.patch.object(S.QTimer, "singleShot"))
+            stack.enter_context(mock.patch.object(S, "begin_history_startup"))
             S.main()
         return popup, activation, application, root, client, control
 
