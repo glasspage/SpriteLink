@@ -7478,6 +7478,9 @@ class SearchResultMessage(QTextBrowser):
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
         self._update_preview()
+        # QTextBrowser may resize its viewport after the outer resize event;
+        # update once again when Qt has finalized the viewport geometry.
+        QTimer.singleShot(0, self._update_preview)
 
     @staticmethod
     def _elide_preview(document: QTextDocument, width: int) -> None:
@@ -7520,7 +7523,7 @@ class SearchResultMessage(QTextBrowser):
             document.size()
 
     def _update_preview(self) -> None:
-        width = max(1, self.maximumViewportSize().width())
+        width = max(1, self.viewport().width())
         if width == self._preview_width:
             return
         self._preview_width = width
@@ -8971,9 +8974,15 @@ class EncryptedChatClient(QObject):
                 window.setProperty("spritelinkLegacyBlur", desktop_blur)
             window.setProperty("spritelinkDesktopBlur", desktop_blur)
             window.update()
+        except RuntimeError:
+            # A deferred theme update may run after Qt has deleted a popup.
+            return
         except Exception:
-            window.setProperty("spritelinkDesktopBlur", False)
-            window.update()
+            try:
+                window.setProperty("spritelinkDesktopBlur", False)
+                window.update()
+            except RuntimeError:
+                pass
 
     def _apply_dialog_window_theme(self, dialog: QDialog) -> None:
         if isinstance(dialog, QFileDialog):
@@ -12176,15 +12185,16 @@ QComboBox::drop-down {
         self.search_entry = QLineEdit()
         self.search_entry.setPlaceholderText("Find words or phrases")
         panel_layout.addWidget(self.search_entry)
-        filters = QHBoxLayout()
+        # Two rows prevent long filter labels from enlarging the search panel
+        # beyond the same width as Config at smaller window sizes.
+        filters = QGridLayout()
         self.search_filters = {
             name: QCheckBox(name)
             for name in ("Images", "Links", "Embedded Images", "Embedded Videos")
         }
-        for checkbox in self.search_filters.values():
-            filters.addWidget(checkbox)
+        for index, checkbox in enumerate(self.search_filters.values()):
+            filters.addWidget(checkbox, index // 2, index % 2)
             checkbox.toggled.connect(self._reset_chat_search)
-        filters.addStretch()
         panel_layout.addLayout(filters)
 
         scroll = QScrollArea()
@@ -18757,9 +18767,9 @@ QComboBox::drop-down {
         emoji_size = PROFILE_ICON_SIZE
         emoji_alignment = QTextCharFormat.VerticalAlignment.AlignMiddle
         if render_emojis and self._is_tiny_ui():
-            # Keep all 16 emoji pixel rows inside the fixed-height chat row.
-            # Qt's AlignMiddle can clip a row depending on Windows font metrics.
-            emoji_alignment = QTextCharFormat.VerticalAlignment.AlignTop
+            # Keep the 16px image inside the fixed-height Tiny chat row.
+            # AlignTop places it above the block on some Windows fonts.
+            emoji_alignment = QTextCharFormat.VerticalAlignment.AlignBottom
         link_color = (
             "#0000ee"
             if self._is_windows_classic_theme()
