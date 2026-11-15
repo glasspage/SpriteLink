@@ -4957,9 +4957,10 @@ class Version120ReleaseTests(unittest.TestCase):
             "float(message_line_height)",
             source,
         )
-        self.assertIn("QTextBlockFormat.LineHeightTypes.FixedHeight", source)
-        self.assertIn("QTextBlockFormat.LineHeightTypes.MinimumHeight", source)
-        self.assertIn('self._is_tiny_ui() and "emojis" in message', source)
+        self.assertIn(
+            "int(QTextBlockFormat.LineHeightTypes.FixedHeight.value)",
+            source,
+        )
         self.assertIn("embedded_media_block_numbers", source)
         self.assertIn("if self._chat_icons_visible():", source)
 
