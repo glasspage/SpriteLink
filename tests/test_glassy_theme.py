@@ -132,11 +132,17 @@ class GlassyThemeTests(unittest.TestCase):
         self.assertTrue(self.window.property("spritelinkDesktopBlur"))
 
     def test_message_stripes_are_translucent_only_for_glassy(self):
-        self.app.setProperty("spritelinkGlassy", True)
-        for color in SPRITELINK.message_row_backgrounds():
-            self.assertLess(SPRITELINK.QColor(color).alpha(), 255)
-        self.app.setProperty("spritelinkGlassy", False)
-        self.assertEqual(SPRITELINK.message_row_backgrounds(), SPRITELINK.MESSAGE_ROW_BACKGROUNDS)
+        # Other tests may have left Classic style enabled on the shared app.
+        old_classic = self.app.property("spritelinkWindowsClassic")
+        self.app.setProperty("spritelinkWindowsClassic", False)
+        try:
+            self.app.setProperty("spritelinkGlassy", True)
+            for color in SPRITELINK.message_row_backgrounds():
+                self.assertLess(SPRITELINK.QColor(color).alpha(), 255)
+            self.app.setProperty("spritelinkGlassy", False)
+            self.assertEqual(SPRITELINK.message_row_backgrounds(), SPRITELINK.MESSAGE_ROW_BACKGROUNDS)
+        finally:
+            self.app.setProperty("spritelinkWindowsClassic", old_classic)
 
     def test_windows_fullscreen_marker_calls_shell_and_balances_com_lifetime(self):
         from ctypes import wintypes
