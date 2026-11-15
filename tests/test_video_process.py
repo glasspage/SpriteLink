@@ -44,7 +44,7 @@ if(command==='seek')state.position=value;
 if(command==='mute')state.muted=value;
 };</script>"""
 # Simulate slow Windows backend initialization.
-code="import sys,time,runpy;time.sleep(0.8)\nimport spritelink_video as V\nV.provider_player_html=lambda info,volume: "+repr(html)+".replace('INITIAL_VOLUME',str(volume))\nsys.argv=['SpriteLink.pyw','--spritelink-video-worker',sys.argv[1]]\nrunpy.run_path('SpriteLink.pyw',run_name='__main__')"
+code="import sys,time,runpy;time.sleep(0.8)\nimport spritelink_video as V\nV.provider_player_html=lambda info,volume,loop=False: "+repr(html)+".replace('INITIAL_VOLUME',str(volume))\nsys.argv=['SpriteLink.pyw','--spritelink-video-worker',sys.argv[1]]\nrunpy.run_path('SpriteLink.pyw',run_name='__main__')"
 info=VideoInfo(VideoLink('youtube','M7lc1UVf-VE','https://youtu.be/M7lc1UVf-VE'),'youtube.com')
 with mock.patch.object(P,'worker_arguments',side_effect=lambda name:['-c',code,name]):
     start=time.monotonic();player.load(info)
@@ -101,7 +101,7 @@ app=QApplication([]);root=QWidget();root.resize(640,480);QVBoxLayout(root);root.
 player=VideoPlayer(root);root.layout().addWidget(player)
 code="""import sys,time;time.sleep(0.5)
 import spritelink_video as V
-V.provider_player_html=lambda info,volume: '<body style="background:'+('red' if info.link.provider=='youtube' else 'blue')+'"><script>window.spriteState=()=>({ready:true,duration:120,volume:'+str(volume)+'});</script>'
+V.provider_player_html=lambda info,volume,loop=False: '<body style="background:'+('red' if info.link.provider=='youtube' else 'blue')+'"><script>window.spriteState=()=>({ready:true,duration:120,volume:'+str(volume)+'});</script>'
 from spritelink_video_worker import main
 main(sys.argv[1])
 """
