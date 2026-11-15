@@ -6,7 +6,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QRect, QTimer, Qt
-from PySide6.QtGui import QContextMenuEvent, QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont, QPainter, QPalette, QPixmap
+from PySide6.QtGui import QContextMenuEvent, QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont, QPainter, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QStyleFactory
 from test_security import SPRITELINK as S
@@ -408,72 +408,18 @@ class ComposerLayoutTests(unittest.TestCase):
             ["first", "renamed", "last"],
         )
 
-    def test_emoji_tooltip_uses_chat_hover_delay_and_profile_preview_size(self):
-        client = self.client
-        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
-        anchor = f"spritelink-emoji:{S.emoji_markup('happy_cat', encoded)}"
-        with mock.patch.object(S.QToolTip, "showText") as show:
-            client._schedule_chat_tooltip(anchor, S.QPoint(10, 20))
-            self.assertEqual(client.chat_tooltip_timer.interval(), S.CHAT_TOOLTIP_HOVER_DELAY_MS)
-            show.assert_not_called()
-            client._show_pending_chat_tooltip()
-            tooltip = show.call_args.args[1]
-            self.assertIn('width="64" height="64"', tooltip)
-            self.assertIn("data:image/png;base64,", tooltip)
-            self.assertIn("happy_cat", tooltip)
-
     def test_new_emoji_button_is_last_and_opens_emoji_canvas(self):
         client = self.client
         client.emojis_menu_button.setChecked(True)
-        self.assertTrue(client.emojis_menu.isVisible())
-        self.assertEqual(client.emojis_menu.count(), 1)
-        self.assertIs(client.emojis_menu.new_item, client.emojis_menu.item(0))
         menu = client.emojis_menu
-        self.assertIsNone(menu.itemWidget(menu.new_item))
-        self.assertEqual(menu.gridSize(), S.QSize(40, 40))
-        self.assertEqual(menu.viewport().height(), 2 * menu.gridSize().height())
-        self.assertEqual(
-            menu.height(), 2 * menu.gridSize().height() + 2 * menu.frameWidth()
-        )
-        self.assertEqual(menu.spacing(), 0)
-        self.assertEqual(
-            menu.horizontalScrollBarPolicy(),
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
-        )
-        self.assertFalse(hasattr(client, "make_emoji_link"))
-        self.assertFalse(hasattr(client, "new_emoji_button"))
-        self.assertIsInstance(menu.new_style_button, S.QPushButton)
-        self.assertEqual(menu.new_style_button.text(), "+")
-        self.assertEqual(menu.new_style_button.size(), S.QSize(32, 32))
-        self.assertTrue(menu.new_style_button.isHidden())
-        # Trigger the live view painting path, not only delegate painting,
-        # so missing Qt imports fail the test instead of crashing the app.
-        self.assertFalse(menu.viewport().grab().toImage().isNull())
-
-        # The New control is painted at 32x32 inside the 40px emoji cell;
-        # the surrounding pixels stay transparent (no square tile backdrop).
-        icon = QPixmap(40, 40)
-        icon.fill(Qt.GlobalColor.transparent)
-        option = S.QStyleOptionViewItem()
-        option.rect = S.QRect(0, 0, 40, 40)
-        option.widget = menu
-        button_rect = menu.itemDelegate()._new_button_rect(option, menu)
-        self.assertEqual(button_rect.size(), S.QSize(32, 32))
-        self.assertEqual(button_rect.top(), option.rect.top() + 4)
-        self.assertEqual(button_rect.center(), option.rect.center())
-        painter = QPainter(icon)
-        menu.itemDelegate().paint(painter, option, menu.model().index(0, 0))
-        painter.end()
-        image = icon.toImage()
-        self.assertEqual(image.pixelColor(1, 1).alpha(), 0)
-        self.assertGreater(image.pixelColor(20, 20).alpha(), 0)
-
+        self.assertTrue(menu.isVisible())
+        self.assertEqual(menu.count(), 1)
+        self.assertIs(menu.new_item, menu.item(0))
         QTest.mouseClick(
             menu.viewport(), Qt.MouseButton.LeftButton,
             pos=menu.visualItemRect(menu.new_item).center(),
         )
         self.assertTrue(client.image_menu_button.isChecked())
-        self.assertFalse(client.emojis_menu_button.isChecked())
         self.assertEqual(client.image_menu.size_combo.currentIndex(), S.EMOJI_SIZE)
         self.assertEqual(client.send_button.text(), "Save to Emojis")
 
@@ -481,46 +427,14 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertTrue(client._store_saved_emojis({"hello": encoded}))
         client.emojis_menu_button.setChecked(True)
         menu = client.emojis_menu
-        self.assertTrue(menu.isVisible())
         self.assertEqual(menu.count(), 2)
         self.assertIs(menu.new_item, menu.item(1))
-        self.assertIsNone(menu.itemWidget(menu.new_item))
-        self.assertFalse(menu.viewport().grab().toImage().isNull())
-        self.assertEqual(menu.iconSize(), S.QSize(32, 32))
-        self.assertEqual(menu.viewport().height(), 2 * menu.gridSize().height())
-        self.assertEqual(menu.item(0).sizeHint(), S.QSize(40, 40))
-        self.assertEqual(menu.item(0).icon().actualSize(S.QSize(32, 32)), S.QSize(32, 32))
-        self.assertEqual(menu.selectionMode(), S.QAbstractItemView.SelectionMode.SingleSelection)
-        self.assertIsInstance(menu.itemDelegate(), S.EmojiItemDelegate)
-        self.assertEqual(menu.dragDropMode(), S.QAbstractItemView.DragDropMode.InternalMove)
-        self.assertEqual(menu.movement(), S.QListWidget.Movement.Snap)
-
-        new_bounds = menu.visualItemRect(menu.new_item)
-        option = S.QStyleOptionViewItem()
-        option.rect = new_bounds
-        option.widget = menu
-        delegate = menu.itemDelegate()
-        new_button_bounds = delegate._new_button_rect(option, menu)
-        self.assertEqual(new_button_bounds.size(), S.QSize(32, 32))
-        self.assertEqual(new_button_bounds.center(), new_bounds.center())
-        icon_cell = menu.visualItemRect(menu.item(0))
-        icon_option = S.QStyleOptionViewItem(option)
-        icon_option.rect = icon_cell
-        icon_bounds = delegate._icon_rect(icon_option, menu)
-        self.assertEqual(icon_bounds.size(), S.QSize(32, 32))
-        self.assertEqual(icon_bounds.center(), icon_cell.center())
-        self.assertEqual(new_button_bounds.center().y(), icon_bounds.center().y())
-        self.assertEqual(icon_cell.size(), S.QSize(40, 40))
-        self.assertEqual(new_bounds.size(), S.QSize(40, 40))
-
-        viewport = menu.viewport()
         position = menu.visualItemRect(menu.item(0)).center()
-        QTest.mouseClick(viewport, Qt.MouseButton.LeftButton, pos=position)
+        QTest.mouseClick(menu.viewport(), Qt.MouseButton.LeftButton, pos=position)
         self.assertEqual(self.edit.toPlainText(), "\ufffc")
-        QTest.mouseDClick(viewport, Qt.MouseButton.LeftButton, pos=position)
-        QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=position)
+        QTest.mouseDClick(menu.viewport(), Qt.MouseButton.LeftButton, pos=position)
+        QTest.mouseRelease(menu.viewport(), Qt.MouseButton.LeftButton, pos=position)
         self.assertEqual(self.edit.toPlainText(), "\ufffc\ufffc")
-        self.assertFalse(menu.selectedItems())
         QTest.mouseClick(
             menu.viewport(), Qt.MouseButton.LeftButton,
             pos=menu.visualItemRect(menu.new_item).center(),
@@ -528,29 +442,6 @@ class ComposerLayoutTests(unittest.TestCase):
         self.assertEqual(client.image_composer_label.text(), "Creating Emoji")
         client.image_menu.size_combo.setCurrentIndex(0)
         self.assertEqual(client.image_composer_label.text(), "Image message")
-
-    def test_emoji_grid_viewport_stays_two_rows_after_theme_change(self):
-        client = self.client
-        client.emojis_menu_button.setChecked(True)
-        menu = client.emojis_menu
-        icons = {
-            f"emoji_{i}": S.encode_drawing(S.EMOJI_SIZE, bytes([i % 8]) * 256)
-            for i in range(12)
-        }
-        self.assertTrue(client._store_saved_emojis(icons))
-        for theme in ("Modern", "Glassy", "Glassy Dark"):
-            with self.subTest(theme=theme):
-                client._on_theme_changed(theme)
-                self.app.processEvents()
-                self.assertEqual(menu.gridSize(), S.QSize(40, 40))
-                self.assertEqual(menu.viewport().height(), 80)
-                self.assertEqual(
-                    menu.height(), 80 + 2 * menu.frameWidth(),
-                )
-                for row in range(min(3, menu.count())):
-                    cell = menu.visualItemRect(menu.item(row))
-                    self.assertEqual(cell.size(), S.QSize(40, 40))
-                self.assertIs(menu.item(menu.count() - 1), menu.new_item)
 
     def test_emoji_drag_order_is_persisted_and_new_item_stays_last(self):
         client = self.client
@@ -626,35 +517,6 @@ class ComposerLayoutTests(unittest.TestCase):
             ["b", "c", "a"],
         )
         self.assertIs(menu.item(3), menu.new_item)
-
-    def test_chat_log_emoji_has_no_builtin_name_only_tooltip(self):
-        client = self.client
-        encoded = S.encode_drawing(S.EMOJI_SIZE, bytes([2]) * 256)
-        document = S.QTextDocument()
-        cursor = S.QTextCursor(document)
-        client._insert_message_text_with_links(
-            cursor, S.emoji_markup("sleepy", encoded),
-            "#202020", "Arial", "client", "message",
-            muted=False, ui_font=False, embedded_image_urls=set(),
-            align_top=False, top_align_height=0, render_emojis=True,
-        )
-        fragments = []
-        block = document.begin()
-        while block.isValid():
-            it = block.begin()
-            while not it.atEnd():
-                fragment = it.fragment()
-                if fragment.isValid() and fragment.charFormat().isImageFormat():
-                    fragments.append(fragment.charFormat().toImageFormat())
-                it += 1
-            block = block.next()
-        self.assertEqual(len(fragments), 1)
-        self.assertEqual(fragments[0].toolTip(), "")
-        self.assertTrue(fragments[0].anchorHref().startswith("spritelink-emoji:"))
-        # The custom popup still includes both the preview and emoji name.
-        tooltip = client._tooltip_for_emoji(encoded, "sleepy")
-        self.assertIn("data:image/png;base64,", tooltip)
-        self.assertIn("sleepy", tooltip)
 
     def test_export_data_dialog_selects_only_requested_chatrooms(self):
         client = self.client

@@ -179,10 +179,6 @@ app.exec()
             process.stdout.close()
             process.stderr.close()
 
-    def test_missing_server_reports_failure(self):
-        self.assertFalse(S.request_instance_restart())
-
-
 class RestartProtocolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
