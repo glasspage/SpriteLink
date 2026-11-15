@@ -30,6 +30,9 @@ class TimedTestResult(unittest.TextTestResult):
 
 def main() -> int:
     tests_dir = Path(__file__).resolve().parent
+    # Running a file from tests/ does not automatically put the repo root on
+    # sys.path; application modules are imported directly by the test suite.
+    sys.path.insert(0, str(tests_dir.parent))
     suite = unittest.defaultTestLoader.discover(
         start_dir=str(tests_dir), pattern="test_*.py",
     )
