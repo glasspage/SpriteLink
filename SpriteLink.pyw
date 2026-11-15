@@ -7488,16 +7488,6 @@ class SearchResultMessage(QTextBrowser):
         document.size()
         first = document.begin()
         layout = first.layout()
-        if width >= 1000:
-            parts = []
-            test_block = first
-            while test_block.isValid():
-                parts.append((test_block.text()[:130], test_block.layout().lineCount()))
-                test_block = test_block.next()
-            print("SEARCH BEFORE ELIDE", width, "textWidth", document.textWidth(),
-                  "charcount", document.characterCount(), "blocks", parts,
-                  "firstline", layout.lineAt(0).textLength() if layout.lineCount() else None,
-                  "firstpos", first.position(), flush=True)
         if not layout.lineCount():
             return
         if layout.lineCount() == 1:
