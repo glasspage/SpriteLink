@@ -34,6 +34,7 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    timeout-minutes: 20
     outputs:
       version: ${{ steps.version.outputs.version }}
 
