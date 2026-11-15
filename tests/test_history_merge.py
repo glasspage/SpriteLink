@@ -226,7 +226,9 @@ class HistoryMergeTests(unittest.TestCase):
 
     def test_transaction_rolls_back_if_an_existing_record_cannot_be_decoded(self):
         self.insert_local(self.item("existing", time=100))
-        different = self.item("new", time=500, text="new")
+        # Deliberately order the new record earlier than the corrupt-data
+        # candidate, so it is inserted before the later read failure.
+        different = self.item("new", time=50, text="new")
         duplicate_candidate = self.item("candidate", time=101)
 
         def faulty_decode(_payload):
