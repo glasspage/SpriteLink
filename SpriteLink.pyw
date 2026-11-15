@@ -7541,11 +7541,16 @@ class SearchResultMessage(QTextBrowser):
         if self._shadow_document is not None:
             self._shadow_document.deleteLater()
             self._shadow_document = None
-        # Rebuild the existing document from pristine HTML, not the elided
-        # document currently shown at the previous (narrower) width.
+        # Measure and elide independently of QTextBrowser's live document.
+        # Qt can keep an earlier viewport wrap constraint while it resizes,
+        # which otherwise permanently truncates an already-wide preview.
         document = self.document()
-        document.setHtml(self._source_html)
-        self._elide_preview(document, width)
+        preview = QTextDocument()
+        preview.setDocumentMargin(document.documentMargin())
+        preview.setDefaultFont(document.defaultFont())
+        preview.setHtml(self._source_html)
+        self._elide_preview(preview, width)
+        super().setHtml(preview.toHtml())
         self.updateGeometry()
 
     def _make_shadow_document(self) -> QTextDocument:
@@ -18780,9 +18785,8 @@ QComboBox::drop-down {
         emoji_size = PROFILE_ICON_SIZE
         emoji_alignment = QTextCharFormat.VerticalAlignment.AlignMiddle
         if render_emojis and self._is_tiny_ui():
-            # Keep the 16px image inside the fixed-height Tiny chat row.
-            # AlignTop places it above the block on some Windows fonts.
-            emoji_alignment = QTextCharFormat.VerticalAlignment.AlignBottom
+            # Center the emoji inside Qt's expanded minimum-height row.
+            emoji_alignment = QTextCharFormat.VerticalAlignment.AlignMiddle
         link_color = (
             "#0000ee"
             if self._is_windows_classic_theme()
@@ -20121,21 +20125,22 @@ QComboBox::drop-down {
             block_format.setLeftMargin(10)
             block_format.setTextIndent(0)
             block_format.setRightMargin(10)
-            # Tiny rows normally have minimal padding, but 16px inline emoji
-            # need a little ascent space on Windows to avoid drawing over the
-            # previous message. Preserve compact spacing for text-only rows.
-            block_format.setTopMargin(
-                3.0 if self._is_tiny_ui() and "emojis" in message else 0.0
-            )
+            block_format.setTopMargin(0.0)
             block_format.setBottomMargin(0.0)
             # Clear inherited block backgrounds; the full-width painter owns the stripe.
             block_format.clearProperty(
                 QTextFormat.Property.BackgroundBrush
             )
             if block.blockNumber() not in embedded_media_block_numbers:
+                # MinimumHeight lets Qt allocate enough ascent/descent for
+                # 16px emoji while keeping ordinary Tiny text rows compact.
+                line_height_type = (
+                    QTextBlockFormat.LineHeightTypes.MinimumHeight
+                    if self._is_tiny_ui() and "emojis" in message
+                    else QTextBlockFormat.LineHeightTypes.FixedHeight
+                )
                 block_format.setLineHeight(
-                    float(message_line_height),
-                    int(QTextBlockFormat.LineHeightTypes.FixedHeight.value),
+                    float(message_line_height), int(line_height_type.value),
                 )
             block_cursor.setBlockFormat(block_format)
 
