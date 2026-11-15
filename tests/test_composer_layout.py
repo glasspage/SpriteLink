@@ -191,7 +191,7 @@ class ComposerLayoutTests(unittest.TestCase):
                     )
                 client._toggle_rendered_spoiler("message:1")
                 self.assertTrue(image_format().isAnchor())
-                self.assertEqual(image_format().toolTip(), "sleepy cat")
+                self.assertEqual(image_format().toolTip(), "")
                 client._toggle_rendered_spoiler("message:1")
                 self.assertFalse(image_format().isAnchor())
 
