@@ -183,7 +183,46 @@ class HistoryMergeTests(unittest.TestCase):
         later = self.item("later", time=303, text="same")
         earlier = self.item("earlier", time=300, text="same")
         self.assertEqual(self.merge(later, earlier), 1)
-        self.assertEqual(self.messages(), {"later": later})
+        self.assertEqual(self.messages(), {"earlier": earlier})
+
+    def test_fuzzy_three_second_bridge_is_stable_for_unsorted_archive(self):
+        # Without a stable import order, seeing 102 first removes *both*
+        # messages at 100 and 104, despite them being four seconds apart.
+        originals = [
+            self.item("first", time=100, text="repeat"),
+            self.item("middle", time=102, text="repeat"),
+            self.item("last", time=104, text="repeat"),
+        ]
+        for order in ((0, 1, 2), (1, 0, 2), (2, 1, 0),
+                      (1, 2, 0), (0, 2, 1), (2, 0, 1)):
+            with self.subTest(order=order):
+                self.db.execute("DELETE FROM messages")
+                self.db.commit()
+                shuffled = [originals[index] for index in order]
+                self.assertEqual(self.merge(*shuffled), 2)
+                self.assertEqual(
+                    set(self.messages()), {"first", "last"},
+                )
+                self.assertEqual(self.merge(*shuffled), 0)
+
+    def test_missing_signed_timestamps_sort_by_arrival_for_stable_dedup(self):
+        originals = [
+            self.item("first", time=0, ntfy_time=200, text="repeat"),
+            self.item("middle", time=0, ntfy_time=202, text="repeat"),
+            self.item("last", time=0, ntfy_time=204, text="repeat"),
+        ]
+        self.assertEqual(self.merge(originals[1], originals[2], originals[0]), 2)
+        self.assertEqual(set(self.messages()), {"first", "last"})
+
+    def test_local_messages_win_against_all_import_orderings(self):
+        local = self.item("local", time=102, text="repeat")
+        self.insert_local(local)
+        candidates = [
+            self.item("earlier", time=100, text="repeat"),
+            self.item("later", time=104, text="repeat"),
+        ]
+        self.assertEqual(self.merge(*candidates), 0)
+        self.assertEqual(self.messages(), {"local": local})
 
     def test_transaction_rolls_back_if_an_existing_record_cannot_be_decoded(self):
         self.insert_local(self.item("existing", time=100))
