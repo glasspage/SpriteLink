@@ -464,7 +464,7 @@ class UiSizePresetTests(unittest.TestCase):
 
     def test_tiny_condenses_identity_choose_buttons_only(self):
         self.assertEqual(self.client.identity_color_button.text(), "Choose...")
-        self.assertEqual(self.client.profile_icon_button.text(), "Browse...")
+        self.assertEqual(self.client.profile_icon_button.text(), "Import...")
 
         self._select_size("Tiny")
         self.assertEqual(self.client.identity_color_button.text(), "...")
@@ -472,7 +472,7 @@ class UiSizePresetTests(unittest.TestCase):
 
         self._select_size("Small (Default)")
         self.assertEqual(self.client.identity_color_button.text(), "Choose...")
-        self.assertEqual(self.client.profile_icon_button.text(), "Browse...")
+        self.assertEqual(self.client.profile_icon_button.text(), "Import...")
 
     def test_unread_attention_does_not_resize_chatroom_toggle(self):
         base_size = self.client.chatrooms_toggle.size()
